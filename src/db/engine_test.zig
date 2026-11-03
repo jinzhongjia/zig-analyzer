@@ -493,6 +493,30 @@ test "memoized: what a derived query last computed, without computing it" {
     try testing.expectEqualStrings("abc", ctx.memoized(Cached, 3).value);
 }
 
+test "inputChangedAt: moves only when that input gets a different value" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setText(&d, 1, "a");
+    try setText(&d, 2, "b");
+    const at = blk: {
+        var ctx = d.beginRead(testing.allocator);
+        defer ctx.end();
+        try testing.expectEqual(0, ctx.inputChangedAt(Text, 3));
+        break :blk ctx.inputChangedAt(Text, 1);
+    };
+    try setText(&d, 2, "c");
+    try setText(&d, 1, "a");
+    {
+        var ctx = d.beginRead(testing.allocator);
+        defer ctx.end();
+        try testing.expectEqual(at, ctx.inputChangedAt(Text, 1));
+    }
+    try setText(&d, 1, "x");
+    var ctx = d.beginRead(testing.allocator);
+    defer ctx.end();
+    try testing.expect(ctx.inputChangedAt(Text, 1) != at);
+}
+
 test "memo reused across read transactions" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();

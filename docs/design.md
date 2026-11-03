@@ -473,6 +473,15 @@ Write messages (document sync, configuration, workspace and file-watching events
 
 - No write transaction is opened when the inputs have not changed: a write of an identical value does not advance the revision, but it still cancels in-flight read requests (answered with `ContentModified`) and background computations. The module graph is recomputed after every build; when it is the same as the current one, the update returns immediately.
 
+### Requests during project loading
+
+- Requests that use name resolution and types are answered at once while the zig environment or a project's first load is pending, on what is known so far.
+- A hover then says that the project is still loading; other answers have no place for such a note and may lack results.
+- With `sema.wait_for_project`, these requests are held back until the load ends (or they are canceled, or the server shuts down) and every answer is complete; what changes meanwhile cancels a held request only when it changes the text of the request's own document (`ContentModified`), since its positions refer to that text.
+- While the configuration that starts the projects is on its way from the client, whether that setting is on is not known: these requests are held until it arrives in either case.
+- A restart (`build.zig` saved, settings changed) does not end a first load: it goes on in the new instance.
+- Syntax features never wait.
+
 ### Read requests
 
 - Read requests run concurrently on snapshots; both `$/cancelRequest` and write transactions can cancel them.

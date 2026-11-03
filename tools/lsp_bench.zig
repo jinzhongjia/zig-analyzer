@@ -8,11 +8,17 @@
 //! Request positions are sampled evenly over the identifiers of a file (at most `samples` per
 //! file); completion uses the position after a `.`.
 //!
+//! The exit code is 1 when a check enabled below fails its pass criterion in docs/perf.md, or
+//! when the server's semantic token deltas do not add up to its full result. Latency targets are
+//! marked `met` / `MISSED` in the output and do not affect the exit code: they apply to the
+//! benchmark project, and missing them on a very large file is a known gap.
+//!
 //! Environment variables:
 //! - `BENCH_CONFIG`: the configuration (JSON) to answer `workspace/configuration` with, e.g.
 //!   `{"build":{"args":["-Dno-bin"]}}`
-//! - `BENCH_SAVE=1`: measure save → build finished (rewrites files in the project and restores
-//!   them at the end)
+//! - `BENCH_SAVE=1`: measure save → build finished, and compare the published errors with the
+//!   output of `zig build` for the same step and arguments (see `compareWithBuild`; rewrites files
+//!   in the project and restores them at the end)
 //! - `BENCH_HOVER=line:col`: print the hover result at that position
 //! - `BENCH_VERBOSE=1`: print the slow requests of the first pass, their memory change, and the
 //!   execution count of each query
@@ -42,6 +48,7 @@
 //!   request their semantic tokens without waiting for the answers (see `concurrentTokens`)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const json = std.json;
@@ -49,9 +56,33 @@ const za = @import("zig_analyzer");
 const transport = za.lsp.transport;
 
 const samples = 200;
+/// Positions per method answered right after opening the first file, compared with the answers
+/// once the project is loaded
+const early_samples = 20;
+/// Server processes started to sample the latency of `initialize`
+const initialize_samples = 5;
+/// `diagnostics.debounce_ms` when `BENCH_CONFIG` does not set it
+const default_debounce_ms = 50;
+/// Delay before the server reports the progress of indexing (`index_progress_delay_ms`)
+const index_progress_delay_ms = 200;
 /// Prints the requests of the first pass that take more than 20ms, with their memory change
 /// (BENCH_VERBOSE=1)
 var verbose = false;
+/// Checks that failed their pass criterion: makes the exit code 1
+var failures: usize = 0;
+var targets_missed: usize = 0;
+
+fn checkFailed(comptime fmt: []const u8, args: anytype) void {
+    failures += 1;
+    std.debug.print("  FAILED: " ++ fmt ++ "\n", args);
+}
+
+/// Prints a latency against its target in docs/perf.md
+fn reportTarget(name: []const u8, value: f64, limit: f64) void {
+    const met = value < limit;
+    if (!met) targets_missed += 1;
+    std.debug.print("  target       {s}: {d:.1}ms (< {d:.0}ms) {s}\n", .{ name, value, limit, if (met) "met" else "MISSED" });
+}
 
 fn lineText(text: []const u8, line: u32) []const u8 {
     var it = std.mem.splitScalar(u8, text, '\n');
@@ -78,11 +109,53 @@ const Client = struct {
     build_tokens: std.ArrayList([]const u8) = .empty,
     /// Message at the end of the most recent build (e.g. `1 error(s)`)
     build_message: []const u8 = "",
+    /// Title of the most recent build (`zig build <steps>`)
+    build_title: []const u8 = "",
+    load_tokens: std.ArrayList([]const u8) = .empty,
+    /// Number of project loads that have ended; answers before the first are given without a project
+    loads_ended: usize = 0,
+    index_token: ?[]const u8 = null,
+    index_begin: Io.Timestamp = undefined,
+    /// Time from the start of the symbol index's progress to its end; null when the server
+    /// reported none
+    index_ms: ?f64 = null,
+    /// Diagnostics last published for each file (by uri)
+    published: std.StringArrayHashMapUnmanaged([]const json.Value) = .empty,
     /// Number of error diagnostics last published for each file (by uri)
     errors: std.StringHashMapUnmanaged(usize) = .empty,
     last_counts: []const QueryCount = &.{},
     /// Number of unresolved samples printed by the goto check (the value of BENCH_CHECK)
     unresolved_samples: usize = 0,
+
+    fn spawn(c: *Client, exe: []const u8) !void {
+        c.child = try std.process.spawn(c.io, .{ .argv = &.{exe}, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit });
+        c.reader = c.child.stdout.?.readerStreaming(c.io, &c.read_buffer);
+        c.writer = c.child.stdin.?.writerStreaming(c.io, &c.write_buffer);
+    }
+
+    fn initialize(c: *Client, root_uri: []const u8) !json.Value {
+        // Sample positions and the columns in the checks are byte offsets: positions must be counted in
+        // UTF-8, otherwise they are off on lines with multibyte characters
+        const resp, _ = try c.request("initialize", .{
+            .rootUri = root_uri,
+            .capabilities = .{
+                .general = .{ .positionEncodings = &[_][]const u8{"utf-8"} },
+                .workspace = .{ .configuration = true },
+                .window = .{ .workDoneProgress = true },
+                // Like common editors, completion uses snippets (turn them off with
+                // `BENCH_CONFIG='{"completion":{"snippets":false}}'`)
+                .textDocument = .{ .completion = .{ .completionItem = .{ .snippetSupport = true } } },
+            },
+        });
+        return resp;
+    }
+
+    /// A value of the configuration in `BENCH_CONFIG`
+    fn configValue(c: *const Client, section: []const u8, key: []const u8) ?json.Value {
+        if (c.config != .object) return null;
+        const s = c.config.object.get(section) orelse return null;
+        return if (s == .object) s.object.get(key) else null;
+    }
 
     fn send(c: *Client, value: anytype) !void {
         const body = try json.Stringify.valueAlloc(c.gpa, value, .{ .emit_null_optional_fields = false });
@@ -131,6 +204,7 @@ const Client = struct {
                 const entry = try c.errors.getOrPut(c.arena.allocator(), uri);
                 if (!entry.found_existing) entry.key_ptr.* = try c.arena.allocator().dupe(u8, uri);
                 entry.value_ptr.* = errors;
+                try c.published.put(c.arena.allocator(), entry.key_ptr.*, params.get("diagnostics").?.array.items);
             }
             // Progress events: print a timeline
             if (std.mem.eql(u8, method.string, "$/progress")) {
@@ -140,7 +214,26 @@ const Client = struct {
                     const title = if (v.get("title")) |t| t.string else if (v.get("message")) |m| m.string else "";
                     if (verbose or c.builds_done == 0) std.debug.print("    [{d:>8.0}ms] progress {s} {s}\n", .{ ms(c.io, c.start), kind, title });
                     const token = try json.Stringify.valueAlloc(c.arena.allocator(), msg.object.get("params").?.object.get("token").?, .{});
-                    if (std.mem.eql(u8, kind, "begin") and std.mem.startsWith(u8, title, "zig build")) try c.build_tokens.append(c.arena.allocator(), token);
+                    if (std.mem.eql(u8, kind, "begin") and std.mem.startsWith(u8, title, "zig build")) {
+                        try c.build_tokens.append(c.arena.allocator(), token);
+                        c.build_title = try c.arena.allocator().dupe(u8, title);
+                    }
+                    if (std.mem.eql(u8, kind, "begin") and std.mem.startsWith(u8, title, "Loading project")) {
+                        try c.load_tokens.append(c.arena.allocator(), token);
+                    }
+                    if (std.mem.eql(u8, kind, "begin") and std.mem.eql(u8, title, "Indexing")) {
+                        c.index_token = token;
+                        c.index_begin = Io.Clock.awake.now(c.io);
+                    }
+                    if (std.mem.eql(u8, kind, "end")) {
+                        for (c.load_tokens.items) |t| if (std.mem.eql(u8, t, token)) {
+                            c.loads_ended += 1;
+                        };
+                        if (c.index_token) |t| if (std.mem.eql(u8, t, token)) {
+                            c.index_ms = ms(c.io, c.index_begin);
+                            c.index_token = null;
+                        };
+                    }
                     if (std.mem.eql(u8, kind, "end")) for (c.build_tokens.items) |t| if (std.mem.eql(u8, t, token)) {
                         c.builds_done += 1;
                         c.build_message = title;
@@ -354,12 +447,12 @@ const Stats = struct {
     fn print(name: []const u8, times: []f64) void {
         if (times.len == 0) return;
         std.mem.sort(f64, times, {}, std.sort.asc(f64));
-        const p = struct {
-            fn at(t: []const f64, q: f64) f64 {
-                return t[@min(t.len - 1, @as(usize, @intFromFloat(q * @as(f64, @floatFromInt(t.len)))))];
-            }
-        }.at;
-        std.debug.print("  {s:<12} n={d:<4} p50 {d:>7.1}ms  p95 {d:>7.1}ms  max {d:>7.1}ms\n", .{ name, times.len, p(times, 0.5), p(times, 0.95), times[times.len - 1] });
+        std.debug.print("  {s:<12} n={d:<4} p50 {d:>7.1}ms  p95 {d:>7.1}ms  max {d:>7.1}ms\n", .{ name, times.len, at(times, 0.5), at(times, 0.95), times[times.len - 1] });
+    }
+
+    /// Quantile of times sorted by `print`
+    fn at(t: []const f64, q: f64) f64 {
+        return t[@min(t.len - 1, @as(usize, @intFromFloat(q * @as(f64, @floatFromInt(t.len)))))];
     }
 };
 
@@ -610,6 +703,7 @@ fn checkDeclarations(c: *Client, uri: []const u8, text: [:0]const u8, rel: []con
     std.debug.print("  declaration  checked {d} identifiers: resolved {d} ({d:.1}%), mismatched {d}, at construction {d}\n", .{ n, resolved, @as(f64, @floatFromInt(resolved)) * 100 / @as(f64, @floatFromInt(@max(n, 1))), mismatched, at_construction });
     std.debug.print("  declaration  unresolved by kind:", .{});
     for (kinds, 0..) |k, i| std.debug.print(" {t} {d}", .{ @as(UnresolvedKind, @fromBackingInt(@intCast(i))), k });
+    if (mismatched > 0) checkFailed("{d} goto targets have a different name in {s}", .{ mismatched, rel });
     // Built-in types and values, len / ptr, and error.X have no declaration position to begin with,
     // so they are excluded from the denominator
     const no_decl = kinds[@backingInt(UnresolvedKind.primitive)] + kinds[@backingInt(UnresolvedKind.len_ptr)] + kinds[@backingInt(UnresolvedKind.error_name)];
@@ -818,6 +912,7 @@ fn checkReferences(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
         };
     }
     Stats.print("references", times.items);
+    if (bad_name + false_pos + missing + rename_mismatch > 0) checkFailed("find references and rename in {s}: wrong name {d}, false positives {d}, missing {d}, rename mismatches {d}", .{ rel, bad_name, false_pos, missing, rename_mismatch });
     std.debug.print("  references   checked {d} declarations, {d} references: wrong name {d}, false positives {d}, missing in this file {d}, rename mismatches {d}, other instances {d}\n", .{ checked, total_refs, bad_name, false_pos, missing, rename_mismatch, other_instance });
 }
 
@@ -871,6 +966,7 @@ fn checkCompletion(c: *Client, uri: []const u8, text: [:0]const u8, rel: []const
         }
     }
     Stats.print("member compl.", times.items);
+    if (found * 100 < n * 95) checkFailed("completion recall in {s} is below 95%: {d}/{d}", .{ rel, found, n });
     std.debug.print("  completion   checked {d} member accesses: offered {d} ({d:.1}%), empty lists {d}\n", .{ n, found, @as(f64, @floatFromInt(found)) * 100 / @as(f64, @floatFromInt(@max(n, 1))), empty });
 }
 
@@ -1143,6 +1239,267 @@ fn atBase(n: usize, base: usize) bool {
     return n <= base;
 }
 
+/// Compares the errors published after a build with what `zig build` prints for the same steps
+/// and arguments: each must have a counterpart with the same file and message whose range contains
+/// the printed location, and the printed notes must be among its related information. Reference
+/// traces are not compared. The arguments come from `BENCH_CONFIG`, so a project with its own
+/// `zig-analyzer.zon` is skipped: it may set others.
+fn compareWithBuild(c: *Client, root: []const u8) !void {
+    const a = c.arena.allocator();
+    const io = c.io;
+    if (std.mem.eql(u8, c.build_title, "zig build (generated files)")) {
+        std.debug.print("  warning: not compared with zig build: the last build only made generated files\n", .{});
+        return;
+    }
+    if (Io.Dir.cwd().statFile(io, try std.fs.path.join(a, &.{ root, "zig-analyzer.zon" }), .{})) |_| {
+        std.debug.print("  warning: not compared with zig build: the project has a zig-analyzer.zon\n", .{});
+        return;
+    } else |_| {}
+    var argv: std.ArrayList([]const u8) = .empty;
+    const zig = c.configValue("zig", "path");
+    try argv.append(a, if (zig != null and zig.? == .string) zig.?.string else "zig");
+    var steps = std.mem.tokenizeScalar(u8, c.build_title, ' ');
+    _ = steps.next();
+    _ = steps.next();
+    try argv.append(a, "build");
+    while (steps.next()) |step| try argv.append(a, step);
+    try argv.appendSlice(a, &.{ "--color", "off", "--error-style", "verbose" });
+    if (c.configValue("build", "args")) |args| if (args == .array) for (args.array.items) |arg| try argv.append(a, arg.string);
+    const run = try std.process.run(a, io, .{ .argv = argv.items, .cwd = .{ .path = root }, .stderr_limit = .unlimited, .stdout_limit = .unlimited });
+    var bundle = try za.project.bsp.stderrErrors(c.gpa, io, root, run.stderr);
+    defer bundle.deinit(c.gpa);
+
+    const Published = struct { path: []const u8, diagnostic: json.Value, matched: bool = false };
+    var published: std.ArrayList(Published) = .empty;
+    var it = c.published.iterator();
+    while (it.next()) |entry| for (entry.value_ptr.*) |d| {
+        const severity = d.object.get("severity") orelse continue;
+        if (severity != .integer or severity.integer != 1) continue;
+        try published.append(a, .{ .path = try za.base.uri.toPath(a, entry.key_ptr.*), .diagnostic = d });
+    };
+
+    var printed: usize = 0;
+    var missing: usize = 0;
+    var missing_notes: usize = 0;
+    if (bundle.errorMessageCount() > 0) for (bundle.getMessages()) |index| {
+        const err = bundle.getErrorMessage(index);
+        const loc = bundle.getSourceLocation(err.src_loc);
+        const path = try std.fs.path.resolve(a, &.{ root, bundle.nullTerminatedString(loc.src_path) });
+        const message = bundle.nullTerminatedString(err.msg);
+        printed += 1;
+        const found = for (published.items) |*p| {
+            if (!std.mem.eql(u8, p.path, path) or !std.mem.eql(u8, p.diagnostic.object.get("message").?.string, message)) continue;
+            const range = p.diagnostic.object.get("range").?.object;
+            if (!positionWithin(.{ .line = loc.line, .character = loc.column }, range)) continue;
+            break p;
+        } else null;
+        const p = found orelse {
+            missing += 1;
+            std.debug.print("    not published {s}:{d}:{d} {s}\n", .{ path, loc.line + 1, loc.column + 1, message });
+            continue;
+        };
+        p.matched = true;
+        const related = p.diagnostic.object.get("relatedInformation");
+        for (bundle.getNotes(index)) |note_index| {
+            const note = bundle.nullTerminatedString(bundle.getErrorMessage(note_index).msg);
+            const has = related != null and for (related.?.array.items) |r| {
+                if (std.mem.eql(u8, r.object.get("message").?.string, note)) break true;
+            } else false;
+            if (has) continue;
+            missing_notes += 1;
+            std.debug.print("    note not published {s}:{d}: {s}\n", .{ path, loc.line + 1, note });
+        }
+    };
+    var extra: usize = 0;
+    for (published.items) |p| if (!p.matched) {
+        extra += 1;
+        const start = p.diagnostic.object.get("range").?.object.get("start").?.object;
+        std.debug.print("    not printed {s}:{d}:{d} {s}\n", .{ p.path, start.get("line").?.integer + 1, start.get("character").?.integer + 1, p.diagnostic.object.get("message").?.string });
+    };
+    std.debug.print("  save         `{s}` printed {d} errors: not published {d}, notes not published {d}, not printed {d}\n", .{ c.build_title, printed, missing, missing_notes, extra });
+    if (printed == 0) std.debug.print("  warning: zig build printed no located errors; the measured file may not be compiled by this step\n", .{});
+    if (missing + missing_notes + extra > 0) checkFailed("published diagnostics differ from `{s}`", .{c.build_title});
+}
+
+fn positionWithin(p: Position, range: json.ObjectMap) bool {
+    const start = range.get("start").?.object;
+    const end = range.get("end").?.object;
+    const before = p.line < start.get("line").?.integer or (p.line == start.get("line").?.integer and p.character < start.get("character").?.integer);
+    const after = p.line > end.get("line").?.integer or (p.line == end.get("line").?.integer and p.character > end.get("character").?.integer);
+    return !before and !after;
+}
+
+/// An answer given right after opening a file
+const EarlyAnswer = struct {
+    method: []const u8,
+    position: Position,
+    response: json.Value,
+    /// Whether the answer arrived before the first project load ended
+    loading: bool,
+};
+
+/// Requests hover, goto, and completion at positions spread over the file without waiting for the
+/// project to load
+fn earlyAnswers(c: *Client, uri: []const u8, idents: []const Position, dots: []const Position) ![]EarlyAnswer {
+    const a = c.arena.allocator();
+    var out: std.ArrayList(EarlyAnswer) = .empty;
+    inline for (.{ "textDocument/hover", "textDocument/definition", "textDocument/completion" }) |method| {
+        const positions = if (comptime std.mem.eql(u8, method, "textDocument/completion")) dots else idents;
+        const n = @min(positions.len, early_samples);
+        for (0..n) |i| {
+            const p = positions[i * positions.len / n];
+            const resp, _ = try c.request(method, .{ .textDocument = .{ .uri = uri }, .position = p });
+            try out.append(a, .{ .method = method, .position = p, .response = resp, .loading = c.loads_ended == 0 });
+        }
+    }
+    return out.items;
+}
+
+/// Start of the note a hover has while a project is loading, as a markdown client gets it
+const hover_loading_marker = "\n\n---\n\n_The project is still loading";
+
+const EarlyDifference = enum { same, incomplete, different };
+
+/// How an answer given while loading relates to the one after loading: `incomplete` means it only
+/// lacks results (null, or fewer completion labels), `different` that it has wrong ones
+fn compareEarly(a: Allocator, method: []const u8, before: json.Value, after: json.Value) !EarlyDifference {
+    if (std.mem.eql(u8, method, "textDocument/completion")) {
+        var labels: std.StringHashMapUnmanaged(void) = .empty;
+        for (completionItems(after)) |item| try labels.put(a, item.object.get("label").?.string, {});
+        const items = completionItems(before);
+        for (items) |item| if (!labels.contains(item.object.get("label").?.string)) return .different;
+        return if (items.len < labels.count()) .incomplete else .same;
+    }
+    const before_result = before.object.get("result") orelse .null;
+    // The note saying that the project is loading is not part of the result being compared
+    if (before_result == .object) if (before_result.object.get("contents")) |contents| {
+        const value = contents.object.getPtr("value").?;
+        if (std.mem.indexOf(u8, value.string, hover_loading_marker)) |end| value.string = value.string[0..end];
+    };
+    const after_result = after.object.get("result") orelse .null;
+    if (before_result == .null) return if (after_result == .null) .same else .incomplete;
+    const x = try json.Stringify.valueAlloc(a, before_result, .{});
+    const y = try json.Stringify.valueAlloc(a, after_result, .{});
+    return if (std.mem.eql(u8, x, y)) .same else .different;
+}
+
+/// Asks again at the positions of `early` now that the project is loaded and reports how the
+/// answers given while loading compare
+fn checkEarlyAnswers(c: *Client, uri: []const u8, rel: []const u8, early: []const EarlyAnswer) !void {
+    const a = c.arena.allocator();
+    if (c.load_tokens.items.len == 0) {
+        std.debug.print("  while loading: not compared, no project was loaded\n", .{});
+        return;
+    }
+    var counts: [@typeInfo(EarlyDifference).@"enum".field_names.len]usize = @splat(0);
+    var during_load: usize = 0;
+    var shown: usize = 0;
+    for (early) |answer| {
+        if (!answer.loading) continue;
+        during_load += 1;
+        const resp, _ = try c.request(answer.method, .{ .textDocument = .{ .uri = uri }, .position = answer.position });
+        const difference = try compareEarly(a, answer.method, answer.response, resp);
+        counts[@backingInt(difference)] += 1;
+        if (difference != .same and shown < 10) {
+            shown += 1;
+            std.debug.print("    {t} while loading: {s} {s}:{d}:{d}\n", .{ difference, answer.method["textDocument/".len..], rel, answer.position.line + 1, answer.position.character + 1 });
+            if (verbose) std.debug.print("      before {f}\n      after  {f}\n", .{ json.fmt(answer.response.object.get("result") orelse .null, .{}), json.fmt(resp.object.get("result") orelse .null, .{}) });
+        }
+    }
+    std.debug.print("  while loading {d}/{d} answers: same {d}, incomplete {d}, different {d}\n", .{ during_load, early.len, counts[@backingInt(EarlyDifference.same)], counts[@backingInt(EarlyDifference.incomplete)], counts[@backingInt(EarlyDifference.different)] });
+}
+
+/// Latency of `initialize` over fresh server processes; a single sample also measures whatever
+/// the first launch of a new binary costs
+fn sampleInitialize(gpa: Allocator, io: Io, exe: []const u8, root_uri: []const u8) !void {
+    var times: [initialize_samples]f64 = undefined;
+    for (&times) |*t| {
+        var c: Client = .{ .gpa = gpa, .io = io, .child = undefined, .reader = undefined, .writer = undefined, .arena = .init(gpa) };
+        defer c.arena.deinit();
+        const t0 = Io.Clock.awake.now(io);
+        c.start = t0;
+        try c.spawn(exe);
+        _ = try c.initialize(root_uri);
+        t.* = ms(io, t0);
+        _ = try c.request("shutdown", {});
+        try c.send(.{ .jsonrpc = "2.0", .method = "exit" });
+        _ = try c.child.wait(io);
+    }
+    Stats.print("initialize", &times);
+    reportTarget("start → initialize p50", Stats.at(&times, 0.5), 100);
+}
+
+fn semanticTokenData(a: Allocator, result: json.Value) ![]i64 {
+    const items = result.object.get("data").?.array.items;
+    const out = try a.alloc(i64, items.len);
+    for (items, out) |v, *d| d.* = v.integer;
+    return out;
+}
+
+/// Applies a response to a delta request to the tokens held by a client. The result is either
+/// the full data or a list of edits, sorted by position, that refer to the previous data
+fn applySemanticDelta(a: Allocator, data: *std.ArrayList(i64), result: json.Value) !void {
+    if (result.object.get("edits")) |edits| {
+        var i = edits.array.items.len;
+        while (i > 0) {
+            i -= 1;
+            const edit = edits.array.items[i].object;
+            const inserted = if (edit.get("data") != null) try semanticTokenData(a, edits.array.items[i]) else &[_]i64{};
+            try data.replaceRange(a, @intCast(edit.get("start").?.integer), @intCast(edit.get("deleteCount").?.integer), inserted);
+        }
+    } else {
+        data.clearRetainingCapacity();
+        try data.appendSlice(a, try semanticTokenData(a, result));
+    }
+}
+
+/// Warm semantic tokens: full, a 10-line range at positions spread over the file, and a delta after
+/// inserting or removing a comment at the top of the file (the timing includes the edit). The
+/// tokens obtained by applying the deltas must equal a full result at the end
+fn measureSemanticTokens(c: *Client, uri: []const u8, text: []const u8, rel: []const u8, version: *i64) !void {
+    const a = c.arena.allocator();
+    const doc = .{ .uri = uri };
+    _ = try c.request("zig-analyzer/waitIdle", {});
+    _ = try c.request("textDocument/semanticTokens/full", .{ .textDocument = doc });
+
+    var full_times: [20]f64 = undefined;
+    for (&full_times) |*t| _, t.* = try c.request("textDocument/semanticTokens/full", .{ .textDocument = doc });
+    Stats.print("sem full", &full_times);
+
+    const lines: u32 = @intCast(std.mem.count(u8, text, "\n") + 1);
+    var range_times: [20]f64 = undefined;
+    for (0..2) |_| for (&range_times, 0..) |*t, i| {
+        const start: u32 = @intCast(i * lines / range_times.len);
+        const range = .{ .start = Position{ .line = start, .character = 0 }, .end = Position{ .line = @min(start + 10, lines), .character = 0 } };
+        _, t.* = try c.request("textDocument/semanticTokens/range", .{ .textDocument = doc, .range = range });
+    };
+    Stats.print("sem range", &range_times);
+
+    const first, _ = try c.request("textDocument/semanticTokens/full", .{ .textDocument = doc });
+    var result = first.object.get("result").?;
+    var data: std.ArrayList(i64) = .empty;
+    try data.appendSlice(a, try semanticTokenData(a, result));
+    const comment = "// bench\n";
+    const top: Position = .{ .line = 0, .character = 0 };
+    var delta_times: [20]f64 = undefined;
+    for (&delta_times, 0..) |*t, i| {
+        const t0 = Io.Clock.awake.now(c.io);
+        if (i % 2 == 0) {
+            try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version.* }, .contentChanges = &.{.{ .range = .{ .start = top, .end = top }, .text = comment }} });
+        } else {
+            try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version.* }, .contentChanges = &.{.{ .range = .{ .start = top, .end = Position{ .line = 1, .character = 0 } }, .text = "" }} });
+        }
+        version.* += 1;
+        const resp, _ = try c.request("textDocument/semanticTokens/full/delta", .{ .textDocument = doc, .previousResultId = result.object.get("resultId").?.string });
+        t.* = ms(c.io, t0);
+        result = resp.object.get("result").?;
+        try applySemanticDelta(a, &data, result);
+    }
+    Stats.print("sem delta", &delta_times);
+    const last, _ = try c.request("textDocument/semanticTokens/full", .{ .textDocument = doc });
+    if (!std.mem.eql(i64, data.items, try semanticTokenData(a, last.object.get("result").?))) checkFailed("semantic token deltas in {s} do not add up to the full result", .{rel});
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
@@ -1152,6 +1509,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     }
     verbose = init.environ_map.get("BENCH_VERBOSE") != null;
+    if (builtin.mode == .debug) std.debug.print("warning: built in Debug mode; latencies are not comparable with the targets (use -Doptimize=ReleaseSafe)\n", .{});
     const root = try Io.Dir.cwd().realPathFileAlloc(io, args[2], gpa);
     defer gpa.free(root);
 
@@ -1159,26 +1517,12 @@ pub fn main(init: std.process.Init) !u8 {
     defer c.arena.deinit();
     const t_spawn = Io.Clock.awake.now(io);
     c.start = t_spawn;
-    c.child = try std.process.spawn(io, .{ .argv = &.{args[1]}, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit });
-    c.reader = c.child.stdout.?.readerStreaming(io, &c.read_buffer);
-    c.writer = c.child.stdin.?.writerStreaming(io, &c.write_buffer);
+    try c.spawn(args[1]);
 
     const a = c.arena.allocator();
     if (init.environ_map.get("BENCH_CONFIG")) |cfg| c.config = try json.parseFromSliceLeaky(json.Value, a, cfg, .{});
     const root_uri = try za.base.uri.fromPath(a, root);
-    // Sample positions and the columns in the checks are byte offsets: positions must be counted in
-    // UTF-8, otherwise they are off on lines with multibyte characters
-    const init_resp, _ = try c.request("initialize", .{
-        .rootUri = root_uri,
-        .capabilities = .{
-            .general = .{ .positionEncodings = &[_][]const u8{"utf-8"} },
-            .workspace = .{ .configuration = true },
-            .window = .{ .workDoneProgress = true },
-            // Like common editors, completion uses snippets (turn them off with
-            // `BENCH_CONFIG='{"completion":{"snippets":false}}'`)
-            .textDocument = .{ .completion = .{ .completionItem = .{ .snippetSupport = true } } },
-        },
-    });
+    const init_resp = try c.initialize(root_uri);
     const encoding = init_resp.object.get("result").?.object.get("capabilities").?.object.get("positionEncoding");
     if (encoding == null or encoding.? != .string or !std.mem.eql(u8, encoding.?.string, "utf-8")) {
         std.debug.print("error: the server does not count positions in UTF-8\n", .{});
@@ -1186,8 +1530,9 @@ pub fn main(init: std.process.Init) !u8 {
     }
     std.debug.print("cold start\n  initialize   {d:.1}ms\n", .{ms(io, t_spawn)});
     try c.notify("initialized", struct {}{});
+    try sampleInitialize(gpa, io, args[1], root_uri);
 
-    for (args[3..]) |rel| {
+    for (args[3..], 0..) |rel, file_index| {
         const path = try std.fs.path.join(a, &.{ root, rel });
         const text = try Io.Dir.cwd().readFileAllocOptions(io, path, a, .unlimited, .of(u8), 0);
         const uri = try za.base.uri.fromPath(a, path);
@@ -1197,12 +1542,40 @@ pub fn main(init: std.process.Init) !u8 {
         const t_open = Io.Clock.awake.now(io);
         try c.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
         _ = try c.request("textDocument/documentSymbol", .{ .textDocument = doc });
-        std.debug.print("  open → syntax          {d:.1}ms\n", .{ms(io, t_open)});
+        const to_syntax = ms(io, t_open);
+        std.debug.print("  open → syntax          {d:.1}ms\n", .{to_syntax});
+        reportTarget("open → syntax", to_syntax, 200);
         const first = samplePositions(a, text, false) catch unreachable;
         _, const first_hover = try c.request("textDocument/hover", .{ .textDocument = doc, .position = first[first.len / 2] });
         std.debug.print("  first hover            {d:.1}ms (open → {d:.1}ms)\n", .{ first_hover, ms(io, t_open) });
+        // Only the first file opens before the project has loaded
+        const cold = file_index == 0;
+        const idents = try samplePositions(a, text, false);
+        const dots = try samplePositions(a, text, true);
+        var early: []const EarlyAnswer = &.{};
+        if (cold) {
+            reportTarget("open → first hover", ms(io, t_open), 3000);
+            _ = try c.request("textDocument/definition", .{ .textDocument = doc, .position = first[first.len / 2] });
+            reportTarget("open → first goto", ms(io, t_open), 3000);
+            if (dots.len > 0) {
+                _ = try c.request("textDocument/completion", .{ .textDocument = doc, .position = dots[dots.len / 2] });
+                reportTarget("open → first completion", ms(io, t_open), 3000);
+            }
+            early = try earlyAnswers(&c, uri, idents, dots);
+        }
         _ = try c.request("zig-analyzer/waitIdle", {});
         std.debug.print("  open → project idle    {d:.1}ms\n", .{ms(io, t_open)});
+        if (cold) {
+            try checkEarlyAnswers(&c, uri, rel, early);
+            // A workspace symbol request waits for the index
+            _, const symbol_ms = try c.request("workspace/symbol", .{ .query = "bench" });
+            std.debug.print("  workspace symbol after idle {d:.1}ms\n", .{symbol_ms});
+            if (c.index_ms) |t| {
+                reportTarget("workspace symbol index", t + index_progress_delay_ms, 30000);
+            } else {
+                std.debug.print("  target       workspace symbol index: under {d}ms (no progress reported) met\n", .{index_progress_delay_ms});
+            }
+        }
         if (verbose) try c.phase("open + project load");
         if (try rssMb(gpa, io, c.child.id.?)) |mb| std.debug.print("  memory after idle {d:.0} MB\n", .{mb});
         _, const first_after = try c.request("textDocument/hover", .{ .textDocument = doc, .position = first[0] });
@@ -1218,8 +1591,6 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         // Warm state: warm up the same positions with one pass first, then time them
-        const idents = try samplePositions(a, text, false);
-        const dots = try samplePositions(a, text, true);
         inline for (.{ "textDocument/hover", "textDocument/definition", "textDocument/completion" }) |method| {
             const positions = if (comptime std.mem.eql(u8, method, "textDocument/completion")) dots else idents;
             const times = try a.alloc(f64, positions.len);
@@ -1244,6 +1615,7 @@ pub fn main(init: std.process.Init) !u8 {
                 };
             }
             Stats.print(method["textDocument/".len..], times);
+            if (times.len > 0) reportTarget(method["textDocument/".len..] ++ " p95", Stats.at(times, 0.95), if (comptime std.mem.eql(u8, method, "textDocument/completion")) 100 else 50);
             if (verbose) try c.phase(method);
             if (try rssMb(gpa, io, c.child.id.?)) |mb| std.debug.print("  {s:<12} memory {d:.0} MB\n", .{ "", mb });
             std.debug.print("  {s:<12} non-null {d}/{d}\n", .{ "", hits, positions.len });
@@ -1279,6 +1651,8 @@ pub fn main(init: std.process.Init) !u8 {
                 tc.* = try c.waitDiagnostics(uri, t0, atBase, base);
             }
             Stats.print("edit→diag", &edit_times);
+            const debounce: f64 = if (c.configValue("diagnostics", "debounce_ms")) |d| @floatFromInt(d.integer) else default_debounce_ms;
+            reportTarget("edit→diag p50 without debounce", @max(Stats.at(&edit_times, 0.5) - debounce, 0), 30);
             Stats.print("undo→clear", &clear_times);
 
             // Continuous typing: type a character every 30ms into a comment at the end of the file
@@ -1325,6 +1699,7 @@ pub fn main(init: std.process.Init) !u8 {
                     tc.* = try c.waitDiagnostics(uri, t0, atBase, body_base);
                 }
                 Stats.print("body edit→diag", &body_edit_times);
+                reportTarget("body edit→diag p50 without debounce", @max(Stats.at(&body_edit_times, 0.5) - debounce, 0), 30);
                 Stats.print("body undo→clear", &body_clear_times);
                 try c.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .range = .{ .start = at, .end = at }, .text = " //" }} });
                 version += 1;
@@ -1346,6 +1721,8 @@ pub fn main(init: std.process.Init) !u8 {
                 _ = try c.request("zig-analyzer/waitIdle", {});
                 try c.phase("in-body edits (incl. background work until idle)");
             }
+
+            try measureSemanticTokens(&c, uri, text, rel, &version);
 
             // Typing completion (BENCH_TYPE_COMPLETE=<count>): insert a character into a name
             // expression, request completion immediately, then undo. The timing includes the edit
@@ -1387,14 +1764,17 @@ pub fn main(init: std.process.Init) !u8 {
             // file on disk (not reported by AstGen, only by the compiler), wait for the diagnostic
             // to appear after saving, then restore the original file and wait for the diagnostic to
             // clear. Rewrites a file in the project and restores it at the end
-            if (init.environ_map.get("BENCH_SAVE") != null) {
+            const compare_saves = init.environ_map.get("BENCH_SAVE") != null;
+            // Only a project's save starts a `zig build`, which the timing waits for
+            if (compare_saves and c.load_tokens.items.len == 0) std.debug.print("  warning: save not measured: no project was loaded\n", .{});
+            if (compare_saves and c.load_tokens.items.len != 0) {
                 const bad = try std.mem.concat(a, u8, &.{ text, "\ncomptime {\n    _ = @as(u8, 300);\n}\n" });
                 var save_times: [5]f64 = undefined;
                 var restore_times: [5]f64 = undefined;
                 defer Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text }) catch {};
                 // Timed until the build triggered by this save finishes (the diagnostics are
                 // published with it)
-                for (&save_times, &restore_times) |*ts, *tr| {
+                for (&save_times, &restore_times, 0..) |*ts, *tr, round| {
                     for ([_][]const u8{ bad, text }, [_]*f64{ ts, tr }) |content, out| {
                         _ = try c.request("zig-analyzer/waitIdle", {});
                         try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = content });
@@ -1406,9 +1786,14 @@ pub fn main(init: std.process.Init) !u8 {
                         while (c.builds_done == done) _ = try c.next();
                         out.* = ms(io, t0);
                         if (verbose) std.debug.print("    save: {s}\n", .{c.build_message});
+                        if (round == 0 and content.ptr == bad.ptr) {
+                            _ = try c.request("zig-analyzer/waitIdle", {});
+                            try compareWithBuild(&c, root);
+                        }
                     }
                 }
                 Stats.print("save→build", &save_times);
+                reportTarget("save→build p50", Stats.at(&save_times, 0.5), 1000);
                 Stats.print("restore", &restore_times);
             }
         }
@@ -1420,5 +1805,6 @@ pub fn main(init: std.process.Init) !u8 {
     _ = try c.request("shutdown", {});
     try c.send(.{ .jsonrpc = "2.0", .method = "exit" });
     _ = try c.child.wait(io);
-    return 0;
+    std.debug.print("checks failed: {d}, latency targets missed: {d}\n", .{ failures, targets_missed });
+    return if (failures > 0) 1 else 0;
 }

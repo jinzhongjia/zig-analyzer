@@ -120,6 +120,18 @@ zig_paths_mutex: Io.Mutex = .init,
 /// when startup finishes): until projects start loading, compiling files that belong to a
 /// project cannot be deferred yet (see `projectsLoading`).
 startup_done: std.atomic.Value(bool) = .init(false),
+/// The startup task has ended, also when it gave up early (zig cannot be run). Until then the
+/// zig environment and the projects may still be unknown (see `projectsPending`)
+startup_ended: std.atomic.Value(bool) = .init(false),
+/// Restarts in progress of instances that had not finished loading (see `projectsPending`)
+first_load_restarts: std.atomic.Value(u32) = .init(0),
+/// The configuration that starts the projects has been requested from the client and has not
+/// arrived: whether `sema.wait_for_project` is on is not known yet (see `holdForProjects`)
+config_pulling: std.atomic.Value(bool) = .init(false),
+/// Protects nothing by itself: wakes the requests held by `waitForProjects`, which check under it
+/// (see `wakeProjectWaiters`)
+project_wait_mutex: Io.Mutex = .init,
+project_wait_cond: Io.Condition = .init,
 /// builtin.zig for files that belong to no project (native target, Debug); protected by env_mutex
 default_builtin: ?[]u8 = null,
 warned: bool = false,
@@ -361,6 +373,12 @@ const SingleFile = struct {
     }
 };
 
+const HeldDocument = struct {
+    file: Vfs.FileId,
+    /// When its text last changed (see `Db.Ctx.inputChangedAt`)
+    text_changed_at: za.db.Revision,
+};
+
 const Pending = struct {
     id: jsonrpc.Id,
     cancel: std.atomic.Value(bool) = .init(false),
@@ -370,6 +388,8 @@ const Pending = struct {
     /// the server's own updates are not ordered with requests, see `Db.WriteOrder`). A workspace
     /// symbol request that waited for the index moves it to the end of the wait.
     since: Db.Mark,
+    /// The document a request held by `waitForProjects` refers to, as it was when received
+    document: ?HeldDocument = null,
     /// Type information when the task started (see `maybeResetSema`)
     sema_start: SemaUsage = .{},
 };
@@ -510,6 +530,7 @@ pub fn run(server: *Server, reader: *Io.Reader) !u8 {
 /// main loop ends)
 fn abandonConfigRequests(server: *Server) void {
     server.startup_pending = false;
+    server.endConfigPull();
     while (server.config_outstanding > 0) : (server.config_outstanding -= 1) server.busyEnd();
 }
 
@@ -708,6 +729,9 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                         server.sendError(id, jsonrpc.error_codes.internal_error, "out of memory");
                         return err;
                     };
+                    if (h[1] == .semantic and @typeInfo(Params) == .@"struct" and @hasField(Params, "textDocument")) {
+                        server.rememberHeldDocument(a, pending, params.textDocument.uri);
+                    }
                     const Task = if (h[1] == .semantic) SemanticTask(func, h[0]) else ReadTask(func, h[0]);
                     // semantic must run on a separate thread: when the thread count reaches the
                     // limit (CPU core count - 1; long-blocking project tasks also take slots),
@@ -817,16 +841,23 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             defer server.finishRequest(arena, pending);
             pending.sema_start = server.semaUsage();
             const a = arena.allocator();
+            const waited_for_projects = server.waitForProjects(pending);
             if (comptime std.mem.eql(u8, method, "workspace/symbol")) {
                 // After a wait, reads the state at its end: the request has no position that
                 // refers to the text it was sent on, and an edit during the wait would otherwise
                 // answer it with `ContentModified`
-                if (server.waitSymbolIndex(pending)) pending.since = server.db.mark(pending.since.inputs);
+                if (server.waitSymbolIndex(pending) or waited_for_projects) pending.since = server.db.mark(pending.since.inputs);
             }
             server.testGate(method, .before_read, pending);
             var ctx = server.db.beginReadAt(a, pending.since);
             ctx.cancel = &pending.cancel;
             defer ctx.end();
+            // After a wait of seconds, writes since the request was received are common (another
+            // tab opened, a file changed on disk). Its positions only refer to its own document:
+            // when that text is unchanged it is answered on the state now
+            if (waited_for_projects) if (pending.document) |d| {
+                if (ctx.inputChangedAt(FileText, d.file) == d.text_changed_at) ctx.stale = false;
+            };
             server.testGate(method, .in_read, pending);
             var trace: za.db.Trace = .{ .gpa = a };
             ctx.trace = &trace;
@@ -1577,7 +1608,8 @@ fn removePending(server: *Server, pending: *Pending) void {
     }
 }
 
-/// Cancels the request `id`; one waiting for the workspace symbol index stops waiting
+/// Cancels the request `id`; one waiting for the workspace symbol index or for projects stops
+/// waiting
 fn cancelPending(server: *Server, id: jsonrpc.Id) void {
     server.pending_mutex.lockUncancelable(server.io);
     defer server.pending_mutex.unlock(server.io);
@@ -1585,6 +1617,7 @@ fn cancelPending(server: *Server, id: jsonrpc.Id) void {
         if (p.id.eql(id)) p.cancel.store(true, .release);
     }
     server.wakeSymbolWaiters();
+    server.wakeProjectWaiters();
 }
 
 fn cancelAllPending(server: *Server) void {
@@ -1592,6 +1625,7 @@ fn cancelAllPending(server: *Server) void {
     defer server.pending_mutex.unlock(server.io);
     for (server.pending.items) |p| p.cancel.store(true, .release);
     server.wakeSymbolWaiters();
+    server.wakeProjectWaiters();
 }
 
 const semantic_refresh_id = "zig-analyzer/semanticTokensRefresh";
@@ -2672,6 +2706,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     server.config.deinit(server.gpa);
     server.config = new;
     server.config_mutex.unlock(server.io);
+    server.wakeProjectWaiters();
     if (inactive_changed or naming_changed) server.publishOpenFiles();
     if (watcher_changed) server.resyncWatcher();
 
@@ -2922,6 +2957,7 @@ fn handleConfigResponse(server: *Server, id: []const u8, result: json.Value, fai
     defer if (server.startup_pending) {
         server.startup_pending = false;
         server.startProjects();
+        server.endConfigPull();
     };
     if (failed) return log.info("client failed to provide configuration", .{});
     // The result corresponds one-to-one to the requested items. A null section means the client
@@ -2962,6 +2998,7 @@ fn initialized(server: *Server, arena: Allocator, _: types.InitializedParams) !v
     if (server.pull_config) {
         // Start projects once the configuration has been pulled
         server.startup_pending = true;
+        server.config_pulling.store(true, .release);
         server.requestConfig();
     } else {
         server.startProjects();
@@ -2972,6 +3009,7 @@ fn startProjects(server: *Server) void {
     server.started = true;
     server.busyBegin();
     server.bg_group.concurrent(server.io, startup, .{server}) catch |err| {
+        server.endStartup();
         server.busyEnd();
         log.err("failed to start project loading task: {t}", .{err});
     };
@@ -3006,6 +3044,7 @@ const version_mismatch_message = "zig {s} differs from zig {s} that zig-analyzer
 /// system protocol for each workspace with a build.zig
 fn startup(server: *Server) Io.Cancelable!void {
     defer server.busyEnd();
+    defer server.endStartup();
     // The origin rules (the Zig installation and the global cache) are known from here on, also
     // when the zig environment cannot be queried
     defer server.scheduleScan();
@@ -3284,6 +3323,73 @@ fn projectsLoading(server: *Server) bool {
     return false;
 }
 
+/// The zig environment or a project's first load is still pending: name resolution and types may
+/// be incomplete. A restart does not end a first load: it goes on in the new instance.
+fn projectsPending(server: *Server) bool {
+    if (!server.startup_ended.load(.acquire) or server.first_load_restarts.load(.acquire) != 0) return true;
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    for (server.workspaces.items) |ws| {
+        if (ws.isLoading()) return true;
+        if (ws.successor) |fresh| if (!ws.inModuleGraph() and fresh.isLoading()) return true;
+    }
+    return false;
+}
+
+/// Whether a semantic request must not be answered yet: with `sema.wait_for_project`, while a
+/// project is pending; and while the configuration that says whether that setting is on is on its
+/// way from the client
+fn holdForProjects(server: *Server) bool {
+    if (server.config_pulling.load(.acquire)) return true;
+    const enabled = blk: {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        break :blk server.config.wait_for_project;
+    };
+    return enabled and server.projectsPending();
+}
+
+/// Holds a semantic request back (see `holdForProjects`) until it can be answered, or until it is
+/// canceled or the server shuts down. Returns whether it waited.
+fn waitForProjects(server: *Server, pending: *const Pending) bool {
+    server.project_wait_mutex.lockUncancelable(server.io);
+    defer server.project_wait_mutex.unlock(server.io);
+    var waited = false;
+    while (server.holdForProjects() and !pending.cancel.load(.acquire) and !server.isShuttingDown()) {
+        waited = true;
+        server.project_wait_cond.wait(server.io, &server.project_wait_mutex) catch break;
+    }
+    return waited;
+}
+
+/// Called after changing anything `waitForProjects` checks. The caller must not hold the locks it
+/// takes while checking (`config_mutex`, `workspaces_mutex`, a workspace's mutex).
+pub fn wakeProjectWaiters(server: *Server) void {
+    server.project_wait_mutex.lockUncancelable(server.io);
+    defer server.project_wait_mutex.unlock(server.io);
+    server.project_wait_cond.broadcast(server.io);
+}
+
+fn endStartup(server: *Server) void {
+    server.startup_ended.store(true, .release);
+    server.wakeProjectWaiters();
+}
+
+fn endConfigPull(server: *Server) void {
+    server.config_pulling.store(false, .release);
+    server.wakeProjectWaiters();
+}
+
+/// Called on the main loop when a request that refers to a document is received: if it may be held
+/// back, records that document's state (see `SemanticTask`)
+fn rememberHeldDocument(server: *Server, arena: Allocator, pending: *Pending, document_uri: []const u8) void {
+    if (!server.holdForProjects()) return;
+    const file = (server.lookupFile(arena, document_uri) catch return) orelse return;
+    var ctx = server.db.beginRead(arena);
+    defer ctx.end();
+    pending.document = .{ .file = file, .text_changed_at = ctx.inputChangedAt(FileText, file) };
+}
+
 /// Compiles a detached file in the background with `zig build-obj -fno-emit-bin`; when requested
 /// again during a compile, recompiles after that compile finishes
 fn compileSingle(server: *Server, file: Vfs.FileId) void {
@@ -3551,12 +3657,13 @@ pub fn startWorkspace(server: *Server, root: []const u8) void {
     };
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
-    // The list takes over the reference returned by `start`. If a project was started for the same
-    // root directory meanwhile, the root directory was removed or lost its build.zig meanwhile, or
-    // the list cannot grow, the new instance is discarded. A removal updates the root directories
-    // before it takes the project out of this list, so either it is seen here or it finds the
-    // project in the list.
-    const added = server.isProjectRoot(root) and server.visibleFor(root) == null and
+    // The list takes over the reference returned by `start`. If the server began shutting down
+    // meanwhile (stopping the projects missed this one, and waiting for idle would never end), a
+    // project was started for the same root directory meanwhile, the root directory was removed or
+    // lost its build.zig meanwhile, or the list cannot grow, the new instance is discarded. A
+    // removal updates the root directories before it takes the project out of this list, so either
+    // it is seen here or it finds the project in the list.
+    const added = !server.shutting_down and server.isProjectRoot(root) and server.visibleFor(root) == null and
         (if (server.workspaces.append(server.gpa, ws)) |_| true else |_| false);
     if (!added) ws.stop();
     ws.placed.set(server.io);
@@ -3632,6 +3739,7 @@ fn removeProject(server: *Server, root: []const u8) void {
     }
     const ws = removed orelse return;
     defer ws.release();
+    server.wakeProjectWaiters();
     server.stopProject(ws);
     ws.mutex.lockUncancelable(server.io);
     const stale = server.gpa.dupe(Vfs.FileId, ws.result_files.keys()) catch &.{};
@@ -3665,6 +3773,13 @@ fn didChangeWorkspaceFolders(server: *Server, arena: Allocator, params: types.Di
 /// set and compiler diagnostics stay in effect, and build requests are forwarded to the new
 /// instance (see `requestBuild`).
 pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) void {
+    // Stopping ends this instance's load before the new instance is known
+    const first_load = !ws.inModuleGraph();
+    if (first_load) _ = server.first_load_restarts.fetchAdd(1, .acq_rel);
+    defer if (first_load) {
+        _ = server.first_load_restarts.fetchSub(1, .acq_rel);
+        server.wakeProjectWaiters();
+    };
     ws.stop();
     {
         server.workspaces_mutex.lockUncancelable(server.io);
@@ -3836,6 +3951,7 @@ fn stopWorkspaces(server: *Server) void {
             if (ws.successor) |s| s.stop();
         }
     }
+    server.wakeProjectWaiters();
     if (server.watcher) |w| w.stop();
     server.single_compiles.stop(server.io);
 }
@@ -5724,12 +5840,19 @@ fn textPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: [
     return .{ .file = file, .text = text, .offset = @intCast(offsets.positionToOffset(text, pos, server.encoding)) };
 }
 
+/// Shown under a hover answered while a project is pending, so that a less precise type or an
+/// `unknown` is not taken for the final result
+const hover_loading_note = "The project is still loading, so this result may be incomplete.";
+
 fn hover(server: *Server, r: *Resolver, arena: Allocator, params: types.HoverParams) HandlerError!types.ResultType("textDocument/hover") {
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
+    // Checked before computing: a load that ends during the computation cancels this read
+    const incomplete = server.projectsPending();
     const info = try ide.hover.hover(r, at.file, at.offset, try server.rootsAlloc(arena)) orelse return null;
     const lines = try offsets.LineIndex.init(arena, at.text);
+    const text = if (!incomplete) info.text else try std.mem.concat(arena, u8, &.{ info.text, if (server.hover_markdown) "\n\n---\n\n_" ++ hover_loading_note ++ "_" else "\n\n" ++ hover_loading_note });
     return .{
-        .contents = .{ .MarkupContent = try markup(arena, server.hover_markdown, info.text) },
+        .contents = .{ .MarkupContent = try markup(arena, server.hover_markdown, text) },
         .range = lines.range(info.start, info.end, server.encoding),
     };
 }

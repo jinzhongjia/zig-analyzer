@@ -136,6 +136,12 @@
     //       // Inside generic functions with no concrete types, infer with the instances from call
     //       // sites (hover, completion, inlay hints, ...).
     //       .callsite_seeding = true,
+    //       // Requests that use name resolution and types (hover, goto, completion, semantic
+    //       // tokens, references, ...) wait until the projects have loaded, so that every answer is
+    //       // complete; the wait can be several seconds on large projects. false answers at once
+    //       // with what is known so far: a hover then says that the project is still loading, while
+    //       // other answers may lack results. Syntax features never wait.
+    //       .wait_for_project = false,
     //       // Discard all cached type information when the intern pool exceeds this many MB and
     //       // twice the most that one request has added; it is recomputed on demand. 0 never
     //       // discards.
