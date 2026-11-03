@@ -2791,7 +2791,9 @@ test "build.zig.zon fields are completed from the schema" {
         // name
         .{ ".{ .dependencies = .{ .foo = .{ .<|> } } }", "url hash path lazy" },
         .{ ".{ .dependencies = .{ .foo = .{ .url = \"https://example.com/foo.tar.gz\", .<|> } } }", "hash lazy" },
-        .{ ".{ .dependencies = .{ .@\"foo-bar\" = .{ .path = \"libs/foo\", .<|> } } }", "hash lazy" },
+        // A path-based dependency has no hash, and a hash belongs to a fetched one
+        .{ ".{ .dependencies = .{ .@\"foo-bar\" = .{ .path = \"libs/foo\", .<|> } } }", "lazy" },
+        .{ ".{ .dependencies = .{ .foo = .{ .hash = \"abc\", .<|> } } }", "url lazy" },
         // Dependency names, elements of `.paths`, field values, and objects outside the schema
         .{ ".{ .dependencies = .{ .<|> } }", "" },
         .{ ".{ .paths = .{ .<|> } }", "" },
