@@ -43,7 +43,7 @@
 
     .diagnostics = .{
         // Build steps for compiler diagnostics. Empty: `check` if the project has it, otherwise the
-        // default step. `.step = "name"` adds a single step.
+        // default step.
         .steps = .{},
         // Run the compiler on save for diagnostics; false gives only live diagnostics (syntax and
         // AstGen) while typing.

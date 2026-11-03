@@ -650,9 +650,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             if (!model.hasCompileSteps()) try ws.loadExports(&model);
             try ws.generateBuiltins(&model);
             {
-                const names = try ws.config.diagnosticsSteps(ws.gpa);
-                defer if (names.ptr != ws.config.diagnostics_steps.ptr) ws.gpa.free(names);
-                if (try model.setDiagnosticsSteps(ws.gpa, names) != 0) {
+                if (try model.setDiagnosticsSteps(ws.gpa, ws.config.diagnostics_steps) != 0) {
                     var buf: [256]u8 = undefined;
                     ws.server.showWarning(std.fmt.bufPrint(&buf, "some diagnostics.steps are not steps of {s}, they are ignored", .{ws.root}) catch "some diagnostics.steps are not steps of the project, they are ignored");
                 }
