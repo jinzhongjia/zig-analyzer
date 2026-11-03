@@ -1578,7 +1578,7 @@ const settings_project: []const fixture.File = &.{
     .{ .path = "t.zig", .text = "test {\n    const y: u8 = \"t\";\n    _ = y;\n}\n" },
 };
 
-test "settings: -D build args from initializationOptions, diagnostics.step change restarts the project" {
+test "settings: -D build args from initializationOptions, diagnostics.steps change restarts the project" {
     var project = try fixture.Project.create(settings_project);
     defer project.deinit();
     var h: Harness = undefined;
@@ -1598,7 +1598,7 @@ test "settings: -D build args from initializationOptions, diagnostics.step chang
     // 2. Switch to the unit step for diagnostics and drop the -D argument: the project restarts,
     //    main.zig's old diagnostics are cleared, and t.zig reports an error
     try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
-        \\{"zig-analyzer": {"diagnostics": {"step": "unit"}}}
+        \\{"zig-analyzer": {"diagnostics": {"steps": ["unit"]}}}
     ) });
     try waitIdle(&h);
     diags = try h.diagnostics();
@@ -1629,7 +1629,7 @@ test "settings: pulled with workspace/configuration at startup and on change not
 
     // The configuration change notification carries no content: the server pulls again
     h.configuration = try jsonValue(&h,
-        \\{"diagnostics": {"step": "unit"}}
+        \\{"diagnostics": {"steps": ["unit"]}}
     );
     try h.notify("workspace/didChangeConfiguration", .{ .settings = null });
     try waitIdle(&h);
@@ -1669,7 +1669,7 @@ test "few CPU cores: async tasks run inline, waitIdle, progress and pulled setti
     // Pulled again after the configuration change; waitIdle waits until the project restarts and
     // the build finishes
     h.configuration = try jsonValue(&h,
-        \\{"diagnostics": {"step": "unit"}}
+        \\{"diagnostics": {"steps": ["unit"]}}
     );
     try h.notify("workspace/didChangeConfiguration", .{ .settings = null });
     try waitIdle(&h);
