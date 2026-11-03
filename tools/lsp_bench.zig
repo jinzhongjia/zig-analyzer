@@ -1,4 +1,4 @@
-//! LSP benchmark (the performance goals in docs/design.md): starts zig-analyzer as a child
+//! LSP benchmark (the performance goals in docs/perf.md): starts zig-analyzer as a child
 //! process and talks to it over stdin/stdout the way a real editor does, measuring the phases of
 //! a cold start, the latency distribution of hover / goto / completion in a warm state, the
 //! latency from an edit to diagnostics, and resident memory.

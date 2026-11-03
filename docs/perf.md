@@ -16,11 +16,17 @@ Benchmark project: the Zig 0.17.0 compiler source (540k lines + standard library
 | | keystroke → hover (continuous typing) | — | `Sema.zig` p50 97 ms; other projects 5-21 ms | — |
 | | keystroke → name completion (typing words in a method) | — | `Sema.zig`: auto-import on p50 72-84 ms, p95 160-181 ms; off p50 43-45 ms, p95 67-73 ms (see below) | — |
 | | save → compiler diagnostics (`check` step) | < 1 s | small projects about 120 ms; Zig compiler 5.2 s | ⚠️ limited by the compiler |
-| | resident memory (long session) | does not grow over the session | Zig compiler source, 240 rounds on Linux: 1.1-1.4 GB from round 120 on, heap about 520 MB. The allocator's memory stays flat (0.43 GB of pages for 0.18 GB of live small blocks, and 0.36 GB of large allocations); the rest, mostly worker stacks (0.57 GB at round 240), grows in steps as deeper recursions touch more of them. The rounds that compute the largest type graphs peak at 10.1 GB, which is returned to the system afterwards. macOS, 240 rounds: RSS 0.89-1.24 GB and physical footprint 1.12-1.36 GB from round 120 on (peak footprint 11.6 GB). Windows, 40 rounds: working set 0.87 GB with 0.98 GB committed at round 40 (peak working set 10.1 GB) | ⚠️ worker stacks |
+| | resident memory (long session) | does not grow over the session | Zig compiler source: 1.1-1.4 GB from round 120 on (Linux, see below) | ⚠️ worker stacks |
 | Cold start | process start → `initialize` | < 100 ms | 1-9 ms | ✅ |
 | | open file → syntax features | < 200 ms | 53 ms (`Sema.zig`) | ✅ |
 | | open file → hover / goto / completion | < 3 s | project loading 1.5-4.4 s; hover is available before loading finishes (with incomplete name resolution) | ✅ |
 | | workspace symbol index (background) | < 30 s | 1.9 s | ✅ |
+
+Resident memory over a long session on the Zig compiler source:
+
+- Zig compiler source, 240 rounds on Linux: 1.1-1.4 GB from round 120 on, heap about 520 MB. The allocator's memory stays flat (0.43 GB of pages for 0.18 GB of live small blocks, and 0.36 GB of large allocations); the rest, mostly worker stacks (0.57 GB at round 240), grows in steps as deeper recursions touch more of them. The rounds that compute the largest type graphs peak at 10.1 GB, which is returned to the system afterwards.
+- macOS, 240 rounds: RSS 0.89-1.24 GB and physical footprint 1.12-1.36 GB from round 120 on (peak footprint 11.6 GB).
+- Windows, 40 rounds: working set 0.87 GB with 0.98 GB committed at round 40 (peak working set 10.1 GB).
 
 ## Real projects
 
@@ -41,11 +47,16 @@ All edit → diagnostics times include the 50 ms debounce.
 
 The completion numbers in this section and in Targets and results are measured without snippets (`BENCH_CONFIG='{"completion":{"snippets":false}}'`); the benchmark client declares `snippetSupport` and uses snippets by default, and their cost is described in `docs/features/completion.md`.
 
-Semantic tokens are additionally measured serially on the 97 files specified in `docs/test-list.md` (ReleaseSafe, project loading finished, call-site inference enabled):
-warm full p95 5.83 ms; delta after inserting/undoing a comment p95 10.12 ms, max 20.71 ms; warm range p95 0.38 ms.
-The first 10-line range on Cubyz, strand, flow, and element-0 takes 0.31-2.89 ms; an empty range runs no Infer / seed queries.
+### Semantic tokens
 
-Measured with auto-import enabled (ReleaseSafe): in a function at the end of the measured file, eight names that need an import (`ArrayLi`, `Allocat`, `asser`, `Resolv`, `Hash`, `mem`, `Thread`, `parseIn`) are typed character by character, three times over; each character is an edit followed by a completion request, and the timing includes both. Every completion offered auto-import candidates. Ready is the time from the first completion, which triggers building the index, until auto-import candidates appear, while typing continues at 150 ms intervals; ordinary completion is provided as usual in the meantime (the slowest such completion took 24-31 ms). Memory is the peak resident memory of the process.
+Semantic tokens are additionally measured serially on the 97 files specified in `docs/test-list.md` (ReleaseSafe, project loading finished, call-site inference enabled): warm full p95 5.83 ms; delta after inserting/undoing a comment p95 10.12 ms, max 20.71 ms; warm range p95 0.38 ms. The first 10-line range on Cubyz, strand, flow, and element-0 takes 0.31-2.89 ms; an empty range runs no Infer / seed queries.
+
+### Auto-import
+
+- Measured with auto-import enabled (ReleaseSafe): in a function at the end of the measured file, eight names that need an import (`ArrayLi`, `Allocat`, `asser`, `Resolv`, `Hash`, `mem`, `Thread`, `parseIn`) are typed character by character, three times over; each character is an edit followed by a completion request, and the timing includes both.
+- Every completion offered auto-import candidates.
+- Ready is the time from the first completion, which triggers building the index, until auto-import candidates appear, while typing continues at 150 ms intervals; ordinary completion is provided as usual in the meantime (the slowest such completion took 24-31 ms).
+- Memory is the peak resident memory of the process.
 
 | Project (measured file) | completion p50 | completion p95 | Ready | Resident memory |
 |---|---|---|---|---|
@@ -54,17 +65,32 @@ Measured with auto-import enabled (ReleaseSafe): in a function at the end of the
 | zig-analyzer (`src/sema/infer.zig`) | 4.3 ms | 6.7 ms | 0.7 s | 188 MB |
 | Zig compiler (`src/Sema.zig`, 35k lines) | 27 ms | 57 ms | 2.9 s | 680 MB |
 
-With the same input on `Sema.zig` but auto-import disabled, completion p50 is 12.5 ms and p95 30.7 ms, with about 510 MB of resident memory; the difference comes mainly from `FileIndex`, `ItemSummaries` (which `Resolver` depends on when resolving imports of named modules and finding container locations), and `ImportSites`, recomputed for the current file after each keystroke. Completing right after adding or removing an `@import` line at the top of the file takes p50 6-7 ms, slowest 17 ms on Cubyz, flow, and zig-analyzer, and p50 37 ms, slowest 70 ms on `Sema.zig`, mostly for the reparse after an edit at the top of the file; recomputing `TestOnlyFiles` takes less than 1 ms of that.
+- With the same input on `Sema.zig` but auto-import disabled, completion p50 is 12.5 ms and p95 30.7 ms, with about 510 MB of resident memory; the difference comes mainly from `FileIndex`, `ItemSummaries` (which `Resolver` depends on when resolving imports of named modules and finding container locations), and `ImportSites`, recomputed for the current file after each keystroke.
+- Completing right after adding or removing an `@import` line at the top of the file takes p50 6-7 ms, slowest 17 ms on Cubyz, flow, and zig-analyzer, and p50 37 ms, slowest 70 ms on `Sema.zig`, mostly for the reparse after an edit at the top of the file; recomputing `TestOnlyFiles` takes less than 1 ms of that.
 
 When whole paths are typed (`memeql`, `fmtalloc`, `heaparena`, `ArrayHashMap`, `debugassert`, likewise character by character, three times over), completion on `Sema.zig` takes p50 24 ms and p95 44 ms: each completion fuzzy-matches and scores all exports within two segments below the visible namespaces and the module roots.
 
-The kind of a completion item may require the declaration's type the first time a candidate appears: among auto-import candidates, the keystroke at which a declaration that must be evaluated (such as `std.Target.x86.all_features = blk: {...}`) first appears is the slowest, at about 0.2 s, and later keystrokes hit the cache; the first name completion after `Sema.zig` is opened takes about 70 ms (inferring the declared types of the members in scope), and about 2 ms afterwards; the first round of completion after `.` takes at most 19 ms.
+- The kind of a completion item may require the declaration's type the first time a candidate appears:
+  - among auto-import candidates, the keystroke at which a declaration that must be evaluated (such as `std.Target.x86.all_features = blk: {...}`) first appears is the slowest, at about 0.2 s, and later keystrokes hit the cache;
+  - the first name completion after `Sema.zig` is opened takes about 70 ms (inferring the declared types of the members in scope), and about 2 ms afterwards;
+  - the first round of completion after `.` takes at most 19 ms.
 
-When typing in a method (`BENCH_TYPE_WORDS`: `zirSliceStart` in `Sema.zig` has 11 local values such as `sema: *Sema` and `block: *Block`; `zcu`, `gpa`, `typeOf`, `resolveInst`, `instructions`, `fail`, `arena`, and `ptr_src` are typed character by character in a new statement after line 9803, waiting for background work to finish before each keystroke, and the timing covers only the edit and the completion), each completion returns about 820 candidates, of which member paths of local values average 86 (with auto-import on, at most 128 together with the auto-import candidates) or 111 (with it off). With auto-import on, completion p50 is 72-84 ms and p95 160-181 ms, with about 470 MB of resident memory; with it off, p50 is 43-45 ms and p95 67-73 ms, with about 310 MB. Of this, member paths take about 1.5-3 ms per keystroke, and at most about 10 ms when the signature of a matched method is first computed. When typing where there is an expected type (`const probe: Air.Inst.Ref = ▮;`), types are computed for all returned candidates: under 1.2 ms per keystroke with auto-import off; with it on, p50 1.8 ms and at most 31 ms (the declaration's type is computed the first time a standard library candidate appears, and hits the cache afterwards); the completion latency differs from typing where there is no expected type (`_ = ▮;`) only within the measurement noise. Completion after `.` has p50 2.0-2.6 ms.
+### Typing in a method
 
-Naming checks (enabled, ReleaseSafe): on the Zig compiler's `src/Sema.zig`, edit → diagnostics p50 is 170 ms (169 ms when disabled); each edit recomputes only the edited
-member and reads no other files; codeAction p50 is 3.8 ms, and resolving the fix for a local name (including AstGen of the whole file after the rename) takes 68 ms. On ZLS, zigimg, and Cubyz,
-codeAction p50 is 1.0-1.5 ms, resolving a fix p50 12-19 ms, and the slowest cross-file one 128 ms (a field with 63 references).
+- Setup (`BENCH_TYPE_WORDS`): `zirSliceStart` in `Sema.zig` has 11 local values such as `sema: *Sema` and `block: *Block`; `zcu`, `gpa`, `typeOf`, `resolveInst`, `instructions`, `fail`, `arena`, and `ptr_src` are typed character by character in a new statement after line 9803, waiting for background work to finish before each keystroke, and the timing covers only the edit and the completion.
+- When typing in a method, each completion returns about 820 candidates, of which member paths of local values average 86 (with auto-import on, at most 128 together with the auto-import candidates) or 111 (with it off).
+- With auto-import on, completion p50 is 72-84 ms and p95 160-181 ms, with about 470 MB of resident memory; with it off, p50 is 43-45 ms and p95 67-73 ms, with about 310 MB.
+- Of this, member paths take about 1.5-3 ms per keystroke, and at most about 10 ms when the signature of a matched method is first computed.
+- When typing where there is an expected type (`const probe: Air.Inst.Ref = ▮;`), types are computed for all returned candidates:
+  - under 1.2 ms per keystroke with auto-import off;
+  - with it on, p50 1.8 ms and at most 31 ms (the declaration's type is computed the first time a standard library candidate appears, and hits the cache afterwards);
+  - the completion latency differs from typing where there is no expected type (`_ = ▮;`) only within the measurement noise.
+- Completion after `.` has p50 2.0-2.6 ms.
+
+### Naming checks
+
+- Naming checks (enabled, ReleaseSafe): on the Zig compiler's `src/Sema.zig`, edit → diagnostics p50 is 170 ms (169 ms when disabled); each edit recomputes only the edited member and reads no other files; codeAction p50 is 3.8 ms, and resolving the fix for a local name (including AstGen of the whole file after the rename) takes 68 ms.
+- On ZLS, zigimg, and Cubyz, codeAction p50 is 1.0-1.5 ms, resolving a fix p50 12-19 ms, and the slowest cross-file one 128 ms (a field with 63 references).
 
 ## Known gaps
 
