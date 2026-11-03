@@ -147,7 +147,7 @@ fn listSlots(r: *Resolver, nodes: []const SyntaxNode) resolve.Error!?Slots {
 }
 
 /// The position in the root value of the value or field name that holds `tok`
-fn tokenSlots(r: *Resolver, file: FileId, tok: SyntaxToken) resolve.Error!?Slots {
+pub fn tokenSlots(r: *Resolver, file: FileId, tok: SyntaxToken) resolve.Error!?Slots {
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const nodes = try root.coveringPath(r.arena, tok.offset);
     if (nodes.len < 2) return null;

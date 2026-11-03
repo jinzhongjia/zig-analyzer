@@ -66,6 +66,7 @@ pub const ide = struct {
     pub const format = @import("ide/format.zig");
     pub const definition = @import("ide/definition.zig");
     pub const manifest = @import("ide/manifest.zig");
+    pub const project_config = @import("ide/project_config.zig");
     pub const completion = @import("ide/completion.zig");
     pub const context = @import("ide/context.zig");
     pub const hover = @import("ide/hover.zig");

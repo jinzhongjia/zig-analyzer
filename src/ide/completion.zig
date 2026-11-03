@@ -30,6 +30,7 @@ const database = @import("../database.zig");
 const ModuleGraph = @import("../names/ModuleGraph.zig");
 const builtins = @import("builtins.zig");
 const manifest = @import("manifest.zig");
+const project_config = @import("project_config.zig");
 const imports = @import("../ide_db/imports.zig");
 const tree_mod = @import("../syntax/tree.zig");
 const SyntaxNode = tree_mod.SyntaxNode;
@@ -319,6 +320,11 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     const literal = try commentOrString(r, file, offset);
     if (literal == .comment) return .{ .context = .ignored };
     if (literal == .quoted) return quotedName(r, file, offset, cursor_owner);
+    if (literal == .none and !paths_only) if (try project_config.valueCompletions(r, file, text, offset, (try r.ctx.get(database.syntax.ParseFile, file)).rootNode())) |values| {
+        out.member_mode = true;
+        for (values.names) |v| try out.add(.{ .label = v, .kind = if (values.tags) .enum_member else .constant });
+        return .{ .items = out.items.items, .context = if (values.tags) .enum_literal else .ignored };
+    };
     // The following contexts are mostly error nodes in the syntax tree (such as a lone `@` or an
     // unterminated string), so they are recognized directly from the source text
     if (literal == .none and !paths_only) if (builtinStart(text, offset)) |start| {
@@ -395,6 +401,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
             const x = b.expr(init).init;
             const ty = if (x.ty == null) a.literalExpected(init) orelse {
                 for (try manifest.fieldCompletions(r, file, b, init)) |f| try out.add(.{ .label = f.name, .kind = .field, .doc = f.doc });
+                for (try project_config.fieldCompletions(r, file, b, init)) |f| try out.add(.{ .label = f.name, .kind = .field, .doc = f.doc });
                 return .{ .items = out.items.items, .context = .init_field };
             } else a.exprType(init).ty;
             if (fieldsType(r.ctx.db.env.ip, ty)) |t| {

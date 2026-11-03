@@ -2655,6 +2655,97 @@ test "zon result types follow the importers across files and edits" {
     }
 }
 
+test "zig-analyzer.zon settings are completed from the schema" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ ".{ .<|> }", "build diagnostics imports naming" },
+        // Settings already given are not listed again
+        .{ ".{ .build = .{}, .<|> }", "diagnostics imports naming" },
+        .{ ".{ .build = .{ .<|> } }", "args" },
+        .{ ".{ .diagnostics = .{ .steps = .{}, .<|> } }", "step compiler" },
+        .{ ".{ .naming = .{ .rules = .{ .type = false, .<|> } } }", "type_function function namespace value field" },
+        // Values: the names of an enum, and booleans
+        .{ ".{ .imports = .{ .derived = .<|> } }", "with_import separate" },
+        .{ ".{ .imports = .{ .sort = .na<|> } }", "path name" },
+        .{ ".{\n    .imports = .{\n        .sort =\n            .<|>\n    },\n}", "path name" },
+        .{ ".{ .naming = .{ .enable = <|> } }", "true false" },
+        .{ ".{ .naming = .{ .rules = .{ .field = t<|> } } }", "true false" },
+        // Neither applies, or the position is outside the schema
+        .{ ".{ .imports = .{ .sort = <|> } }", "" },
+        .{ ".{ .naming = .{ .enable = .<|> } }", "" },
+        .{ ".{ .build = .{ .args = .{ .<|> } } }", "" },
+        .{ ".{ .unknown = .{ .<|> } }", "" },
+        .{ ".{ .unknown = .<|> }", "" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const at = try w.add("/p/zig-analyzer.zon", c[0]);
+        testing.expectEqualStrings(c[1], try completionAt(&w, at)) catch |err| {
+            std.debug.print("zig-analyzer.zon: `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+    // Other `.zon` files are not affected
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    try testing.expectEqualStrings("", try completionAt(&w, try w.add("/p/other.zon", ".{ .<|> }")));
+    try testing.expectEqualStrings("", try completionAt(&w, try w.add("/p/more.zon", ".{ .imports = .{ .sort = .<|> } }")));
+}
+
+test "zig-analyzer.zon settings have the descriptions of the default settings" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\.{
+        \\    .imports = .{ .sort = .name },
+        \\    .naming = .{ .enable = true, .rules = .{ .field = false } },
+        \\    .build = .{ .nope = 1 },
+        \\    .log = .{ .level = .debug },
+        \\}
+        \\
+    ;
+    const file = (try w.add("/p/zig-analyzer.zon", text)).file;
+    const other = (try w.add("/p/other.zon", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "imports", "How top-level imports are arranged" },
+        .{ "sort", "Order within a group: .path by what is imported" },
+        .{ "enable", "Hint names that do not follow the Names section" },
+        .{ "rules", "Turn individual rules on or off" },
+        .{ "field", "Fields and enum members, by the type of the field.\n\nDefault: `true`" },
+        // Values, and what the file cannot set
+        .{ "name }", null },
+        .{ "true", null },
+        .{ "nope", null },
+        .{ "log", null },
+        .{ "level", null },
+    };
+    for (cases) |c| {
+        const offset: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).?);
+        const info = try hover.hover(&r, file, offset, &.{});
+        const got = if (info) |i| i.text else "";
+        if (c[1]) |want| {
+            testing.expect(std.mem.startsWith(u8, got, want)) catch |err| {
+                std.debug.print("hover at `{s}`: {s}\n", .{ c[0], got });
+                return err;
+            };
+            try testing.expectEqual(null, try hover.hover(&r, other, offset, &.{}));
+        } else {
+            testing.expect(std.mem.indexOf(u8, got, "\n\nDefault") == null and !std.mem.startsWith(u8, got, "How")) catch |err| {
+                std.debug.print("hover at `{s}`: {s}\n", .{ c[0], got });
+                return err;
+            };
+        }
+    }
+    const with_default = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "sort").?), &.{})).?.text;
+    try testing.expect(std.mem.endsWith(u8, with_default, "\n\nDefault: `.path`"));
+}
+
 test "build.zig.zon fields are completed from the schema" {
     const cases = [_]struct { []const u8, []const u8 }{
         .{ ".{ .<|> }", "name fingerprint version minimum_zig_version dependencies paths" },

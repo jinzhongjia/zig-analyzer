@@ -288,6 +288,59 @@ fn isProjectSetting(comptime field: []const u8) bool {
     return false;
 }
 
+/// The value of an entry of the project configuration file
+pub const SchemaValue = union(enum) {
+    /// A section or a setting with fields of its own
+    fields: []const SchemaField,
+    /// The names of an enum, written as enum literals
+    tags: []const []const u8,
+    bool,
+    string,
+    strings,
+    other,
+};
+
+pub const SchemaField = struct { name: []const u8, value: SchemaValue };
+
+fn schemaValue(comptime T: type) SchemaValue {
+    if (T == []const u8) return .string;
+    if (T == []const []const u8) return .strings;
+    return switch (@typeInfo(T)) {
+        .bool => .bool,
+        .optional => |o| schemaValue(o.child),
+        .@"enum" => |e| blk: {
+            var names: []const []const u8 = &.{};
+            for (e.field_names) |name| names = names ++ .{@as([]const u8, name)};
+            break :blk .{ .tags = names };
+        },
+        .@"struct" => |info| blk: {
+            var fields: []const SchemaField = &.{};
+            for (info.field_names) |name| fields = fields ++ .{SchemaField{ .name = name, .value = schemaValue(@FieldType(T, name)) }};
+            break :blk .{ .fields = fields };
+        },
+        else => .other,
+    };
+}
+
+/// What the project configuration file can set: its sections and their settings
+pub const project_schema: []const SchemaField = blk: {
+    @setEvalBranchQuota(8000);
+    var sections: []const SchemaField = &.{};
+    for (settings) |first| {
+        if (!isProjectSetting(first.field)) continue;
+        for (sections) |done| {
+            if (std.mem.eql(u8, done.name, first.section)) break;
+        } else {
+            var keys: []const SchemaField = &.{};
+            for (settings) |s| if (isProjectSetting(s.field) and std.mem.eql(u8, s.section, first.section)) {
+                keys = keys ++ .{SchemaField{ .name = s.key, .value = schemaValue(@FieldType(Config, s.field)) }};
+            };
+            sections = sections ++ .{SchemaField{ .name = first.section, .value = .{ .fields = keys } }};
+        }
+    }
+    break :blk sections;
+};
+
 /// A problem in the project configuration file
 pub const ProjectProblem = struct {
     /// Byte offset in the file; null when it cannot be located
