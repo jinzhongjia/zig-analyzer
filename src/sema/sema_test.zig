@@ -2340,6 +2340,29 @@ test "destructuring infers each element" {
     });
 }
 
+test "peer types of tuples, also when destructuring" {
+    try expectTypes(
+        \\fn f(rest: []const u8) !void {
+        \\    const a, const b = if (rest.len > 3) blk: {
+        \\        break :blk .{ rest[2..4], rest[4..] };
+        \\    } else if (rest.len > 1) .{ "", rest } else return error.X;
+        \\    const c, const d = if (rest.len > 2) .{ rest[0..1], @as(u8, 1) } else .{ rest[1..], @as(u16, 2) };
+        \\    const t = if (rest.len > 2) .{ rest[0..1], @as(u8, 1) } else .{ rest[1..], @as(u16, 2) };
+        \\    const u = if (rest.len > 2) .{ @as(u8, 1), true } else .{ @as(u8, 1), true };
+        \\    const v = if (rest.len > 2) .{ @as(u8, 1), rest } else .{ @as(u8, 2), rest };
+        \\    _ = .{ a, b, c, d, t, u, v };
+        \\}
+    , &.{
+        .{ "a", "[]const u8" },
+        .{ "b", "[]const u8" },
+        .{ "c", "[]const u8" },
+        .{ "d", "u16" },
+        .{ "t", "struct { []const u8, u16 }" },
+        .{ "u", "struct { comptime u8 = 1, comptime bool = true }" },
+        .{ "v", "struct { u8, []const u8 }" },
+    });
+}
+
 test "slices with comptime-known bounds are pointers to arrays" {
     try expectTypes(
         \\fn f(n: usize, sl: []u8, mp: [*]u8, s0: [:0]const u8, p0: [*:0]const u8) void {
