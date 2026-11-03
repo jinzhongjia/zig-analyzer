@@ -3584,12 +3584,13 @@ pub fn startWorkspace(server: *Server, root: []const u8) void {
     };
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
-    // The list takes over the reference returned by `start`. If a project was started for the same
-    // root directory meanwhile, the root directory was removed or lost its build.zig meanwhile, or
-    // the list cannot grow, the new instance is discarded. A removal updates the root directories
-    // before it takes the project out of this list, so either it is seen here or it finds the
-    // project in the list.
-    const added = server.isProjectRoot(root) and server.visibleFor(root) == null and
+    // The list takes over the reference returned by `start`. If the server began shutting down
+    // meanwhile (stopping the projects missed this one, and waiting for idle would never end), a
+    // project was started for the same root directory meanwhile, the root directory was removed or
+    // lost its build.zig meanwhile, or the list cannot grow, the new instance is discarded. A
+    // removal updates the root directories before it takes the project out of this list, so either
+    // it is seen here or it finds the project in the list.
+    const added = !server.shutting_down and server.isProjectRoot(root) and server.visibleFor(root) == null and
         (if (server.workspaces.append(server.gpa, ws)) |_| true else |_| false);
     if (!added) ws.stop();
     ws.placed.set(server.io);
