@@ -591,6 +591,77 @@ test "rename reaches typed .zon files imported from files outside any build grap
     try h.notify("exit", {});
 }
 
+/// The result of renaming the field `x` of `S` to `count`, with `main.zig` opened and `cfg.zon`
+/// closed: the edits, or the error message when the rename is refused
+fn renameZonField(h: *Harness, main_body: []const u8, zon: []const u8) ![]const u8 {
+    const files = [_]fixture.File{
+        .{ .path = "main.zig", .text = main_body },
+        .{ .path = "cfg.zon", .text = zon },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = main_body } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = main_uri }, .position = position(main_body, "x: u32"), .newName = "count" });
+    const result = if (renamed.object.get("error")) |e| e.object.get("message").?.string else try renameEdits(h, renamed);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+    return result;
+}
+
+test "rename refuses fields of .zon files whose import sites do not all give the same result type" {
+    const refused = "cannot rename `x` to `count`: this `.zon` file is imported with different or generic result types, or also without one, so its uses cannot all be confirmed (cfg.zon:1:5)";
+    const cases = [_]struct { name: []const u8, body: []const u8 }{
+        // Each of these left `.x` or `raw.x` behind, and the build failed
+        .{ .name = "also imported without a result type", .body = "const S = struct { x: u32 };\nconst cfg: S = @import(\"cfg.zon\");\nconst raw = @import(\"cfg.zon\");\npub fn main() void {\n    _ = .{ cfg.x, raw.x };\n}\n" },
+        .{ .name = "different result types", .body = "const S = struct { x: u32 };\nconst T = struct { x: u8 };\nconst a: S = @import(\"cfg.zon\");\nconst b: T = @import(\"cfg.zon\");\npub fn main() void {\n    _ = .{ a.x, b.x };\n}\n" },
+        .{ .name = "a generic result type", .body = "const S = struct { x: u32 };\nfn load(comptime T: type) T {\n    return @import(\"cfg.zon\");\n}\npub fn main() void {\n    _ = load(S).x;\n}\n" },
+    };
+    for (cases) |c| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const got = try renameZonField(&h, c.body, ".{ .x = 1 }\n");
+        testing.expectEqualStrings(refused, got) catch |err| {
+            std.debug.print("case: {s}\n", .{c.name});
+            return err;
+        };
+    }
+}
+
+test "rename leaves .zon files alone when their fields cannot refer to the renamed field" {
+    const cases = [_]struct { name: []const u8, body: []const u8, zon: []const u8, edits: []const u8 }{
+        // No import site gives a result type: the field in the `.zon` file is its own definition
+        .{
+            .name = "only imported without a result type",
+            .body = "const S = struct { x: u32 };\nconst raw = @import(\"cfg.zon\");\npub fn main() void {\n    const s: S = .{ .x = raw.x };\n    _ = s.x;\n}\n",
+            .zon = ".{ .x = 1 }\n",
+            .edits = "main.zig:0:19 main.zig:3:21 main.zig:4:10",
+        },
+        // The sites disagree, but the `.zon` file does not mention the name
+        .{
+            .name = "different result types without the name",
+            .body = "const S = struct { x: u32 = 0, y: u8 };\nconst T = struct { y: u8 };\nconst a: S = @import(\"cfg.zon\");\nconst b: T = @import(\"cfg.zon\");\npub fn main() void {\n    _ = .{ a.x, b.y };\n}\n",
+            .zon = ".{ .y = 1 }\n",
+            .edits = "main.zig:0:19 main.zig:5:13",
+        },
+    };
+    for (cases) |c| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const got = try renameZonField(&h, c.body, c.zon);
+        testing.expectEqualStrings(c.edits, got) catch |err| {
+            std.debug.print("case: {s}\n", .{c.name});
+            return err;
+        };
+    }
+}
+
 test "renames and fixes refuse to edit fetched packages" {
     // A dependency fetched by hash (faked: maker does not fetch it again when the package
     // directory already has it), placed outside the build root with `--pkg-dir`

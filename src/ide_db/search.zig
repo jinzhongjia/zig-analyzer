@@ -93,7 +93,15 @@ pub const Options = struct {
     /// while the instances are incomplete (truncated because instantiation grows without bound; see
     /// `seed.AllInstances`): it may or may not be a reference in the other instances
     incomplete: ?*?Reference = null,
+    /// When not null, records the first use of the field in a `.zon` file whose import sites do not
+    /// all give it the same result type: other sites use the field of the value without going
+    /// through `def`, or it may refer to `def` under a result type that cannot be named (see
+    /// `sema.ZonImports`), and renaming would break them; see `zon_import_message`
+    zon_import: ?*?Reference = null,
 };
+
+/// Why a reference recorded in `Options.zon_import` prevents a rename
+pub const zon_import_message = "this `.zon` file is imported with different or generic result types, or also without one, so its uses cannot all be confirmed";
 
 /// Why an ambiguous reference (see `Options.ambiguous`) prevents a rename or fix
 pub const ambiguous_message = "this reference also refers to other declarations in other instantiations of its generic function or `inline` prong, iterations of its loop, or build configurations";
@@ -115,7 +123,7 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
         .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
         else => false,
     };
-    var finder: Finder = .{ .r = r, .def = def, .is_field = is_field, .name = name, .out = &out, .ambiguous = opts.ambiguous, .uncertain = opts.uncertain, .incomplete = opts.incomplete };
+    var finder: Finder = .{ .r = r, .def = def, .is_field = is_field, .name = name, .out = &out, .ambiguous = opts.ambiguous, .uncertain = opts.uncertain, .incomplete = opts.incomplete, .zon_import = opts.zon_import };
     switch (def) {
         .local => |l| {
             if (opts.only_file) |f| if (f != l.file) return out.items;
@@ -525,6 +533,7 @@ const Finder = struct {
     ambiguous: ?*?Reference,
     uncertain: ?*?Reference,
     incomplete: ?*?Reference,
+    zon_import: ?*?Reference,
     /// Files that can reach the file containing the definition through an `@import` chain (`.item`
     /// definitions). In other files, only code in generic functions may reference the definition
     importing: std.AutoHashMapUnmanaged(FileId, void) = .empty,
@@ -550,13 +559,24 @@ const Finder = struct {
         // In a file that does not import the file containing the definition, code outside generic
         // functions can neither reference the definition by name nor obtain its containing type.
         // The root expression of a `.zon` file is an exception when it has a result type, which
-        // comes from the files that import it (see `sema.ZonResultType`); without one, nothing in
-        // it refers to a declaration
+        // comes from the files that import it (see `sema.ZonImports`); without one, nothing in it
+        // refers to a declaration, unless the sites give result types that cannot be named
+        var zon_untyped = false;
         if (f.def == .item and !f.importing.contains(file)) {
             if ((try r.itemTree(file)).items[item_index].kind == .zon) {
-                if (try r.ctx.get(database.sema.ZonResultType, file) == null) return;
+                const imports = try r.ctx.get(database.sema.ZonImports, file);
+                if (imports.result_type == null) {
+                    if (imports.unresolved and f.is_field) try f.noteZonImport(file, try r.itemOffset(file, item_index) orelse return, body);
+                    return;
+                }
+                zon_untyped = imports.untyped;
             } else if (try seed.genericRoot(r, file, item_index) == null) return;
         }
+        const refs_before = f.out.items.len;
+        // Uses of the field at sites without a result type do not go through `def`
+        defer if (zon_untyped and f.out.items.len > refs_before) if (f.zon_import) |slot| if (slot.* == null) {
+            slot.* = f.out.items[refs_before];
+        };
         const base = try r.itemOffset(file, item_index) orelse return;
         var res: ?*const infer.Result = null;
         var written: ?[]const bool = null;
@@ -607,6 +627,26 @@ const Finder = struct {
                 else => {},
             }
         }
+    }
+
+    /// Records the first field name or enum literal in the root expression of a `.zon` file (at
+    /// `base`) that has the name of `def`
+    fn noteZonImport(f: *Finder, file: FileId, base: u32, body: *const Body) resolve.Error!void {
+        const slot = f.zon_import orelse return;
+        if (slot.* != null) return;
+        var first: ?Reference = null;
+        for (body.exprs, 0..) |e, i| {
+            const range: ?Body.Range = switch (e) {
+                .enum_literal => |n| if (std.mem.eql(u8, n, f.name)) body.expr_ranges[i] else null,
+                .init => |x| for (x.fields) |fi| {
+                    if (fi.name != null and std.mem.eql(u8, fi.name.?, f.name)) break fi.name_range;
+                } else null,
+                else => null,
+            };
+            const at = range orelse continue;
+            if (first == null or base + at.start < first.?.start) first = .{ .file = file, .start = base + at.start, .end = base + at.end };
+        }
+        slot.* = first;
     }
 
     fn inferred(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32) resolve.Error!*const infer.Result {

@@ -433,22 +433,28 @@ pub const ZonValue = struct {
     }
 };
 
-/// The result type of the root expression of a `.zon` file, taken from the `@import` call sites
-/// with a result type in the files of the module graph that import it directly (see
-/// `infer.Result.zon_imports`; build scripts and files outside the modules are not searched).
-/// Import sites without a result type do not constrain the value and are not counted; when all the
-/// other import sites have the same type, free of abstract parameters and unknown parts, the result
-/// is that type. Types that differ only in the optionals and single-item pointers around the value
-/// (`T`, `*const T`, `?T`) parse the value the same way (see `zonValueType`), and the result is the
-/// type of the value; for other differences it is null (no guessing). Read by the inference of the
-/// root expression of a `.zon` file and by the schema check of `build.zig.zon` (`manifest.active`)
-pub const ZonResultType = struct {
+/// How the files that may import a `.zon` file import it: the `@import` call sites in the files of
+/// the module graph that import it directly (see `infer.Result.zon_imports`; build scripts and files
+/// outside the modules are not searched).
+pub const ZonImports = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = FileId;
-    pub const Value = ?Index;
+    pub const Value = struct {
+        /// The one type the sites with a result type give, free of abstract parameters and unknown
+        /// parts. Types that differ only in the optionals and single-item pointers around the value
+        /// (`T`, `*const T`, `?T`) parse the value the same way (see `zonValueType`), and the result
+        /// is the type of the value. Sites without a result type do not constrain the value.
+        result_type: ?Index = null,
+        /// Some sites give a result type, but no single one can be named: they differ, or one is
+        /// abstract or unknown (no guessing)
+        unresolved: bool = false,
+        /// Some sites have no result type: there, the fields of the value are the fields of its own
+        /// anonymous type
+        untyped: bool = false,
+    };
 
     pub fn cycleFallback(_: Key) Value {
-        return null;
+        return .{};
     }
 
     pub fn compute(ctx: *Db.Ctx, file: Key) engine.Error!Value {
@@ -463,7 +469,8 @@ pub const ZonResultType = struct {
             if (entry.module != database.ModuleGraph.std_module) try importers.put(r.arena, entry.file, {});
         };
         for (try ctx.get(database.inputs.WorkspaceFiles, {})) |f| try importers.put(r.arena, f, {});
-        var result: ?Index = null;
+        var out: Value = .{};
+        const ip = ctx.db.env.ip;
         for (importers.keys()) |importer| {
             // Only Zig source files can `@import` (the root of a module can also be a `.zon` or
             // another data file)
@@ -475,23 +482,27 @@ pub const ZonResultType = struct {
                 if (try r.resolveImport(importer, spec) == file) break true;
             } else false;
             if (!imports) continue;
-            const ip = ctx.db.env.ip;
             for (try importOwners(&r, importer, file)) |owner| {
                 const res = try ctx.get(Infer, .{ .owner = owner, .mode = .full });
                 for (res.zon_imports) |site| {
                     if (site.file != file) continue;
-                    if (!@import("value.zig").isConcrete(ip, site.ty)) return null;
-                    if (result) |t| if (t != site.ty) {
-                        const value_type = zonValueType(ip, t);
-                        if (value_type != zonValueType(ip, site.ty)) return null;
-                        result = value_type;
+                    const ty = site.ty orelse {
+                        out.untyped = true;
                         continue;
                     };
-                    result = site.ty;
+                    if (!@import("value.zig").isConcrete(ip, ty)) {
+                        out.unresolved = true;
+                    } else if (out.result_type) |t| {
+                        if (t != ty) {
+                            const value_type = zonValueType(ip, t);
+                            if (value_type == zonValueType(ip, ty)) out.result_type = value_type else out.unresolved = true;
+                        }
+                    } else out.result_type = ty;
                 }
             }
         }
-        return result;
+        if (out.unresolved) out.result_type = null;
+        return out;
     }
 
     /// The type a ZON value is parsed as for the result type `t`: the compiler (`LowerZon`) parses
@@ -525,6 +536,24 @@ pub const ZonResultType = struct {
             while (it.nextNode()) |c| try stack.append(r.arena, c);
         }
         return owners.keys();
+    }
+};
+
+/// The result type of the root expression of a `.zon` file (see `ZonImports.Value.result_type`), read
+/// by the inference of that root expression and by the schema check of `build.zig.zon`
+/// (`manifest.active`). Separate from `ZonImports` so that these do not depend on how the other
+/// import sites look.
+pub const ZonResultType = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = FileId;
+    pub const Value = ?Index;
+
+    pub fn cycleFallback(_: Key) Value {
+        return null;
+    }
+
+    pub fn compute(ctx: *Db.Ctx, file: Key) engine.Error!Value {
+        return (try ctx.get(ZonImports, file)).result_type;
     }
 };
 

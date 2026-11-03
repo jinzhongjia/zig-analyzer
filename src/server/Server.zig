@@ -4284,7 +4284,7 @@ fn maybeResetSema(server: *Server, start: SemaUsage) void {
 const sema_reset_keys = 200_000;
 
 /// Queries cleared by a whole-generation reclaim
-const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.sema.ZonValue, database.sema.ZonResultType, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
+const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.sema.ZonValue, database.sema.ZonImports, database.sema.ZonResultType, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
 
 fn semaKeys(server: *Server) usize {
     var n: usize = 0;
@@ -6183,7 +6183,8 @@ fn checkedErrorRename(server: *Server, r: *Resolver, arena: Allocator, file: Vfs
 /// looks the declaration up by name in the root source file (see `rename.stdRootLookup`), the
 /// search scope is still incomplete (see `scopeIncomplete`), a reference is ambiguous in a generic
 /// function, goes through a member access of unknown type, or depends on instances that grow
-/// without bound, or a file that mentions the name has syntax errors.
+/// without bound, is in a `.zon` file whose import sites disagree (`search.Options.zon_import`), or
+/// a file that mentions the name has syntax errors.
 fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, symbol: za.ide_db.search.Symbol, old: []const u8, new: []const u8) !Outcome([]const za.ide_db.search.Reference) {
     if (symbol == .def) if (try ide.rename.stdRootLookup(r, symbol.def)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
     if (try server.scopeIncompleteFor(r, symbol)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s}", .{ old, new, reason }) };
@@ -6191,14 +6192,17 @@ fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, symbol: za.
     var ambiguous: ?za.ide_db.search.Reference = null;
     var uncertain: ?za.ide_db.search.Reference = null;
     var incomplete: ?za.ide_db.search.Reference = null;
+    var zon_import: ?za.ide_db.search.Reference = null;
     var syntax_error: ?Vfs.FileId = null;
     const refs = try za.ide_db.search.symbolReferences(r, symbol, .{
         .scope = scope,
         .ambiguous = &ambiguous,
         .uncertain = &uncertain,
         .incomplete = &incomplete,
+        .zon_import = &zon_import,
         .syntax_error = &syntax_error,
     });
+    if (zon_import) |z| return .{ .failed = try server.renameProblem(r, arena, old, new, z.file, z.start, za.ide_db.search.zon_import_message) };
     if (syntax_error) |file| return .{ .failed = try server.renameProblem(r, arena, old, new, file, null, "the file has syntax errors, so references in it may be missed") };
     if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, old, new, a.file, a.start, za.ide_db.search.ambiguous_message) };
     if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, if (symbol == .error_name)

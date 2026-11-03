@@ -78,8 +78,8 @@ pub const Result = struct {
     /// outer `comptime var`s modified by the loop body: the next iteration starts from them
     iteration_vars: []const IterationVar = &.{},
     /// The target and result type of each reachable `@import` call that has a result type and
-    /// targets a `.zon` file: the root expression of the `.zon` file is inferred with it (see
-    /// `queries.ZonResultType`)
+    /// targets a `.zon` file, or null at a site without one: the root expression of the `.zon` file
+    /// is inferred with the result type (see `queries.ZonImports`)
     zon_imports: []const ZonImport = &.{},
     /// References (names, member accesses, enum literals) and builtin calls whose value is changed
     /// by their result type coercion, with their own value before it: `a` of type `u8` in `take(a)`
@@ -96,7 +96,7 @@ pub const Result = struct {
         /// it, never a declaration, since decl literals need a result type
         tags_only: bool = false,
     };
-    pub const ZonImport = struct { file: FileId, ty: Index };
+    pub const ZonImport = struct { file: FileId, ty: ?Index };
     pub const IterationVar = struct { binding: Body.BindingId, val: ?Index };
     pub const ParamCoercion = struct { param: u32, ty: Index };
 
@@ -1606,10 +1606,10 @@ const Inferrer = struct {
             const tv = try queries.importValue(inf.r, target);
             // With a result type, the compiler parses ZON according to the result type: for values
             // other than scalars, only the result type is taken (see `zon.isScalar`)
-            if (inf.r.isZon(target)) if (expected) |want| {
-                if (inf.dead == 0) try inf.zon_imports.append(inf.scratch, .{ .file = target, .ty = want });
-                if (want != .unknown and want != tv.ty and !zon.isScalar(tv.ty)) return .{ .ty = want };
-            };
+            if (inf.r.isZon(target)) {
+                if (inf.dead == 0) try inf.zon_imports.append(inf.scratch, .{ .file = target, .ty = expected });
+                if (expected) |want| if (want != .unknown and want != tv.ty and !zon.isScalar(tv.ty)) return .{ .ty = want };
+            }
             return tv;
         }
         if (eq(u8, name, "@This")) {
