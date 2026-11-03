@@ -508,7 +508,7 @@ The benchmark starts the server as a child process and talks to it the way an ed
 
 The exit code is 1 when a check below fails its pass criterion or when the semantic token deltas do not add up to a full result; `BENCH_SESSION` has no automatic verdict. Missed latency targets do not affect the exit code, because they apply to the benchmark project and §2.3 lists the known gaps.
 
-The answers to 20 hover, goto, and completion requests each, sent right after the first file is opened, are compared with the answers once the project is loaded, and the output counts those given before the first load ended as `same`, `incomplete` (null, or fewer completion labels), or `different`. This is reported without a verdict: name resolution is incomplete during loading (§4.8); with `sema.wait_for_project` no answer arrives before the load ends.
+The answers to 20 hover, goto, and completion requests each, sent right after the first file is opened, are compared with the answers once the project is loaded, and the output counts those given before the first load ended as `same`, `incomplete` (null, or fewer completion labels), or `different`. This is reported without a verdict: name resolution is incomplete during loading (§4.8); with `sema.wait_for_project` no answer arrives before the load ends. A run in which no project is loaded reports neither this nor `BENCH_SAVE`, whose timing waits for a `zig build`.
 
 | Variable | Check | Pass criterion |
 |---|---|---|

@@ -8,12 +8,12 @@
 //! Request positions are sampled evenly over the identifiers of a file (at most `samples` per
 //! file); completion uses the position after a `.`.
 //!
-//! Environment variables:
 //! The exit code is 1 when a check enabled below fails its pass criterion in docs/design.md, or
 //! when the server's semantic token deltas do not add up to its full result. Latency targets are
 //! marked `met` / `MISSED` in the output and do not affect the exit code: they apply to the
 //! benchmark project, and missing them on a very large file is a known gap.
 //!
+//! Environment variables:
 //! - `BENCH_CONFIG`: the configuration (JSON) to answer `workspace/configuration` with, e.g.
 //!   `{"build":{"args":["-Dno-bin"]}}`
 //! - `BENCH_SAVE=1`: measure save → build finished, and compare the published errors with the
@@ -1247,7 +1247,10 @@ fn atBase(n: usize, base: usize) bool {
 fn compareWithBuild(c: *Client, root: []const u8) !void {
     const a = c.arena.allocator();
     const io = c.io;
-    if (std.mem.eql(u8, c.build_title, "zig build (generated files)")) return;
+    if (std.mem.eql(u8, c.build_title, "zig build (generated files)")) {
+        std.debug.print("  warning: not compared with zig build: the last build only made generated files\n", .{});
+        return;
+    }
     if (Io.Dir.cwd().statFile(io, try std.fs.path.join(a, &.{ root, "zig-analyzer.zon" }), .{})) |_| {
         std.debug.print("  warning: not compared with zig build: the project has a zig-analyzer.zon\n", .{});
         return;
@@ -1384,6 +1387,10 @@ fn compareEarly(a: Allocator, method: []const u8, before: json.Value, after: jso
 /// answers given while loading compare
 fn checkEarlyAnswers(c: *Client, uri: []const u8, rel: []const u8, early: []const EarlyAnswer) !void {
     const a = c.arena.allocator();
+    if (c.load_tokens.items.len == 0) {
+        std.debug.print("  while loading: not compared, no project was loaded\n", .{});
+        return;
+    }
     var counts: [@typeInfo(EarlyDifference).@"enum".field_names.len]usize = @splat(0);
     var during_load: usize = 0;
     var shown: usize = 0;
@@ -1757,7 +1764,10 @@ pub fn main(init: std.process.Init) !u8 {
             // file on disk (not reported by AstGen, only by the compiler), wait for the diagnostic
             // to appear after saving, then restore the original file and wait for the diagnostic to
             // clear. Rewrites a file in the project and restores it at the end
-            if (init.environ_map.get("BENCH_SAVE") != null) {
+            const compare_saves = init.environ_map.get("BENCH_SAVE") != null;
+            // Only a project's save starts a `zig build`, which the timing waits for
+            if (compare_saves and c.load_tokens.items.len == 0) std.debug.print("  warning: save not measured: no project was loaded\n", .{});
+            if (compare_saves and c.load_tokens.items.len != 0) {
                 const bad = try std.mem.concat(a, u8, &.{ text, "\ncomptime {\n    _ = @as(u8, 300);\n}\n" });
                 var save_times: [5]f64 = undefined;
                 var restore_times: [5]f64 = undefined;
