@@ -242,24 +242,59 @@ fn anonFieldTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]con
     };
     if (a.rel < a.body.range(fa.lhs).end) return &.{};
     const name = fa.field orelse return &.{};
+    var out: std.ArrayList(Target) = .empty;
+    // The type of a value from a `.zon` file names the literal, however the value got here: through
+    // a parameter of a generic function or an item of a tuple being iterated, once per instance
+    // or iteration
+    try zonFieldTarget(r, a, fa.lhs, name, &out);
+    if (out.items.len == 0) for (try context.allSeeded(r, a)) |seeded| try zonFieldTarget(r, seeded, fa.lhs, name, &out);
     // The type is unknown in a loop inferred per iteration
-    var ty = a.exprType(fa.lhs).ty;
-    switch (a.ip.key(ty)) {
-        .ptr_type => |p| if (p.size == .one) {
-            ty = p.child;
-        },
-        else => {},
-    }
-    if (ty != .unknown and a.ip.key(ty) != .anon_struct_type) return &.{};
+    const ty = pointee(a, fa.lhs);
+    if (ty != .unknown and a.ip.key(ty) != .anon_struct_type) return out.items;
     var literals: std.ArrayList(AnonLiteral) = .empty;
     try anonLiterals(r, .{ .file = file, .item = a.item, .body = a.body, .e = fa.lhs }, &literals, 0);
-    var out: std.ArrayList(Target) = .empty;
     for (literals.items) |lit| {
         const field = lit.field(name) orelse continue;
         const node = try r.itemNode(lit.file, lit.item) orelse continue;
         try appendNew(r, &out, .{ .file = lit.file, .start = node.offset + field.name_range.start, .end = node.offset + field.name_range.end });
     }
     return out.items;
+}
+
+/// The type of `e`, through a single-item pointer
+fn pointee(a: context.At, e: Body.ExprId) InternPool.Index {
+    const ty = a.exprType(e).ty;
+    return switch (a.ip.key(ty)) {
+        .ptr_type => |p| if (p.size == .one) p.child else ty,
+        else => ty,
+    };
+}
+
+/// Appends to `out` the name of the field `name` in the `.zon` file literal that the type of `lhs`
+/// comes from, if any
+fn zonFieldTarget(r: *Resolver, a: context.At, lhs: Body.ExprId, name: []const u8, out: *std.ArrayList(Target)) resolve.Error!void {
+    const origin = switch (a.ip.key(pointee(a, lhs))) {
+        .anon_struct_type => |s| s.origin orelse return,
+        else => return,
+    };
+    const tree = try r.itemTree(origin.file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.kind == .zon) break @intCast(i);
+    } else return;
+    const node = try r.itemNode(origin.file, item) orelse return;
+    const b = try r.body(origin.file, item);
+    var e = b.value orelse return;
+    for (origin.path) |i| e = switch (b.expr(e)) {
+        .init => |x| if (i < x.fields.len) x.fields[i].value else return,
+        else => return,
+    };
+    const fields = switch (b.expr(e)) {
+        .init => |x| x.fields,
+        else => return,
+    };
+    for (fields) |fi| if (fi.name != null and std.mem.eql(u8, fi.name.?, name)) {
+        return appendNew(r, out, .{ .file = origin.file, .start = node.offset + fi.name_range.start, .end = node.offset + fi.name_range.end });
+    };
 }
 
 /// An expression in the body of a member

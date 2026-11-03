@@ -2262,6 +2262,109 @@ test "imported zon files are values with member completion and hover" {
     }
 }
 
+test "goto from fields of imported zon values to the names in the zon file" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const pos_text =
+        \\.{
+        \\    .x = 1,
+        \\    .inner = .{ .z = 1.5 },
+        \\    .same = .{ .v = 1 },
+        \\    .other = .{ .v = 1 },
+        \\    .list = .{ .{ .item = 1 }, .{ .item = 2 } },
+        \\}
+        \\
+    ;
+    const twin_text = ".{ .x = 1 }\n";
+    const pos = (try w.add("/p/pos.zon", pos_text)).file;
+    const twin_a = (try w.add("/p/twin_a.zon", twin_text)).file;
+    const twin_b = (try w.add("/p/twin_b.zon", twin_text)).file;
+    const text =
+        \\const pos = @import("pos.zon");
+        \\const twin_a = @import("twin_a.zon");
+        \\const twin_b = @import("twin_b.zon");
+        \\const alias = pos;
+        \\const same = pos.same;
+        \\fn read(v: anytype) comptime_int {
+        \\    return v.x;
+        \\}
+        \\fn run() void {
+        \\    const copy = pos;
+        \\    const inner = pos.inner;
+        \\    const ptr = &pos;
+        \\    _ = .{ pos.x, @import("pos.zon").x, alias.x, copy.x, ptr.x };
+        \\    _ = .{ pos.inner, inner.z, same.v, pos.other.v, pos.list[1].item };
+        \\    _ = .{ twin_a.x, twin_b.x, read(pos), read(twin_b) };
+        \\    inline for (pos.list) |entry| _ = entry.item;
+        \\}
+        \\
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const x_in_pos: u32 = @intCast(std.mem.indexOf(u8, pos_text, "x =").?);
+    const x_in_twin: u32 = @intCast(std.mem.indexOf(u8, twin_text, "x =").?);
+    const cases = [_]struct { use: []const u8, file: FileId, start: u32 }{
+        .{ .use = "pos.x", .file = pos, .start = x_in_pos },
+        .{ .use = "@import(\"pos.zon\").x", .file = pos, .start = x_in_pos },
+        .{ .use = "alias.x", .file = pos, .start = x_in_pos },
+        .{ .use = "copy.x", .file = pos, .start = x_in_pos },
+        .{ .use = "ptr.x", .file = pos, .start = x_in_pos },
+        .{ .use = "pos.inner", .file = pos, .start = @intCast(std.mem.indexOf(u8, pos_text, "inner =").?) },
+        .{ .use = "inner.z", .file = pos, .start = @intCast(std.mem.indexOf(u8, pos_text, "z =").?) },
+        // Literals with the same contents in one file, or in two, are different types
+        .{ .use = "same.v", .file = pos, .start = @intCast(std.mem.indexOf(u8, pos_text, "v = 1").?) },
+        .{ .use = "pos.other.v", .file = pos, .start = @intCast(std.mem.lastIndexOf(u8, pos_text, "v = 1").?) },
+        .{ .use = "twin_a.x", .file = twin_a, .start = x_in_twin },
+        .{ .use = "twin_b.x", .file = twin_b, .start = x_in_twin },
+        .{ .use = "[1].item", .file = pos, .start = @intCast(std.mem.indexOf(u8, pos_text, "item = 2").?) },
+    };
+    for (cases) |c| {
+        const name_at = std.mem.indexOf(u8, text, c.use).? + c.use.len - 1;
+        const t = try definition.definition(&r, file, @intCast(name_at)) orelse {
+            std.debug.print("`{s}`: no target\n", .{c.use});
+            return error.NoTarget;
+        };
+        testing.expectEqual(c.file, t.file) catch |err| {
+            std.debug.print("`{s}`: wrong file\n", .{c.use});
+            return err;
+        };
+        testing.expectEqual(c.start, t.start) catch |err| {
+            std.debug.print("`{s}`: wrong position\n", .{c.use});
+            return err;
+        };
+    }
+    // Every instance of a generic function, and every item of a tuple being iterated
+    try testing.expectEqualSlices(definition.Target, &.{
+        .{ .file = pos, .start = x_in_pos, .end = x_in_pos + 1 },
+        .{ .file = twin_b, .start = x_in_twin, .end = x_in_twin + 1 },
+    }, try definition.definitionTargets(&r, file, @intCast(std.mem.indexOf(u8, text, "v.x").? + 2)));
+    const first_item: u32 = @intCast(std.mem.indexOf(u8, pos_text, "item = 1").?);
+    const second_item: u32 = @intCast(std.mem.indexOf(u8, pos_text, "item = 2").?);
+    try testing.expectEqualSlices(definition.Target, &.{
+        .{ .file = pos, .start = first_item, .end = first_item + 4 },
+        .{ .file = pos, .start = second_item, .end = second_item + 4 },
+    }, try definition.definitionTargets(&r, file, @intCast(std.mem.indexOf(u8, text, "entry.item").? + 6)));
+}
+
+test "goto from an imported build.zig.zon to its field" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const manifest_text = ".{ .name = .demo, .version = \"1.2.3\" }\n";
+    const manifest_file = (try w.add("/p/build.zig.zon", manifest_text)).file;
+    const text = "const version = @import(\"build.zig.zon\").version;\n";
+    const file = (try w.add("/p/build.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const t = (try definition.definition(&r, file, @intCast(std.mem.lastIndexOf(u8, text, "version").?))).?;
+    try testing.expectEqual(manifest_file, t.file);
+    try testing.expectEqual(std.mem.indexOf(u8, manifest_text, "version").?, t.start);
+}
+
 test "zon imports with a result type take the result type" {
     var w: World = undefined;
     try w.init();
