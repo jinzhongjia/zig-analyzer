@@ -379,7 +379,8 @@ test "columns are UTF-16 when multi-byte characters precede the error" {
 }
 
 /// Writes zigw, a script wrapping the user's zig, into the project directory: commands other
-/// than `env` first wait 2 seconds. Returns the initialization options that use it.
+/// than `env` first wait 2 seconds. Returns the initialization options that use it. Slows down
+/// single-file compiles only: projects run the zig that `zig env` reports (see `createGatedProject`).
 fn slowZig(h: *Harness, project: *fixture.Project) !std.json.Value {
     const zig = project.env.zig_exe;
     const script = try std.fmt.allocPrint(h.arena.allocator(),
@@ -393,86 +394,255 @@ fn slowZig(h: *Harness, project: *fixture.Project) !std.json.Value {
     return jsonValue(h, try std.fmt.allocPrint(h.arena.allocator(), "{{\"zig\": {{\"path\": \"{s}/zigw\"}}}}", .{project.root}));
 }
 
-const loading_files = [_]fixture.File{
-    .{ .path = "build.zig", .text = simple_build },
-    .{ .path = "main.zig", .text = loading_main },
+/// `build()` blocks reading the FIFO `gate` until the test writes to it, so the project stays loading
+/// for as long as the test needs. `@import("foo")` only resolves once the build graph is known.
+const gated_build =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    _ = std.Io.Dir.cwd().readFileAlloc(b.graph.io, "gate", b.allocator, .limited(16)) catch unreachable;
+    \\    const foo = b.createModule(.{ .root_source_file = b.path("foo.zig"), .target = b.graph.host, .optimize = .Debug });
+    \\    const root = b.createModule(.{ .root_source_file = b.path("main.zig"), .target = b.graph.host, .optimize = .Debug });
+    \\    root.addImport("foo", foo);
+    \\    b.installArtifact(b.addExecutable(.{ .name = "main", .root_module = root }));
+    \\}
+    \\
+;
+const gated_main = "const foo = @import(\"foo\");\npub fn main() void {\n    _ = foo.answer;\n}\n";
+const gated_files = [_]fixture.File{
+    .{ .path = "build.zig", .text = gated_build },
+    .{ .path = "main.zig", .text = gated_main },
+    .{ .path = "foo.zig", .text = "pub const answer: u32 = 42;\n" },
+    .{ .path = "other.zig", .text = "pub const other = 1;\n" },
 };
-const loading_main = "const std = @import(\"std\");\npub fn main() void {\n    _ = std;\n}\n";
 const loading_note = "The project is still loading";
+const wait_options = "{\"sema\": {\"wait_for_project\": true}}";
 
-/// Hover on the `std` declaration of `loading_main`: the text of the answer
-fn hoverStd(h: *Harness, uri: []const u8) ![]const u8 {
-    const resp = try h.request("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
+fn createFifo(project: *fixture.Project, name: []const u8) !void {
+    const fifo = try project.path(testing.allocator, name);
+    defer testing.allocator.free(fifo);
+    const run = try std.process.run(testing.allocator, testing.io, .{ .argv = &.{ "mkfifo", fifo } });
+    defer testing.allocator.free(run.stdout);
+    defer testing.allocator.free(run.stderr);
+    try testing.expect(run.term == .exited and run.term.exited == 0);
+}
+
+fn createGatedProject() !fixture.Project {
+    var project = try fixture.Project.create(&gated_files);
+    errdefer project.deinit();
+    try createFifo(&project, "gate");
+    return project;
+}
+
+/// Lets `build()` continue; blocks until it has opened the FIFO
+fn openGate(h: *Harness, project: *fixture.Project) !void {
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(h.arena.allocator(), "gate"), .data = "x" });
+}
+
+fn sendHover(h: *Harness, uri: []const u8, line: u32, character: u32) !i64 {
+    return h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } });
+}
+
+/// The text of a hover answer
+fn hoverValue(resp: std.json.Value) []const u8 {
     return resp.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+}
+
+/// The text of a hover answered during the load. The writes of startup may cancel a read in
+/// progress, as they may for a client, which asks again; the gate keeps the load from ending.
+fn hoverDuringLoad(h: *Harness, uri: []const u8, line: u32, character: u32) ![]const u8 {
+    while (true) {
+        const resp = try h.response(try sendHover(h, uri, line, character));
+        if (resp.object.get("error")) |e| {
+            try testing.expectEqual(-32801, e.object.get("code").?.integer);
+            continue;
+        }
+        return hoverValue(resp);
+    }
+}
+
+/// Whether the response to `id` has arrived
+fn answered(h: *Harness, id: i64) bool {
+    for (h.received.items) |msg| {
+        if (msg.object.get("method") == null) if (msg.object.get("id")) |i| if (i == .integer and i.integer == id) return true;
+    }
+    return false;
+}
+
+/// A syntax request gets its response during the load (the writes of startup may cancel it, which
+/// is a response too), and the request `id` has not got one by then
+fn expectHeld(h: *Harness, uri: []const u8, id: i64) !void {
+    _ = try h.request("textDocument/documentSymbol", .{ .textDocument = .{ .uri = uri } });
+    try testing.expect(!answered(h, id));
 }
 
 test "a hover answered while the project loads says so, one answered after does not" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    var project = try fixture.Project.create(&loading_files);
+    var project = try createGatedProject();
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
     defer h.finish();
-    try initializeWith(&h, project.root, false, try slowZig(&h, &project));
-    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), loading_main);
-    try testing.expect(std.mem.indexOf(u8, try hoverStd(&h, uri), loading_note) != null);
+    try initialize(&h, project.root, false);
+    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), gated_main);
+    try testing.expect(std.mem.indexOf(u8, try hoverDuringLoad(&h, uri, 0, 6), loading_note) != null);
+    try openGate(&h, &project);
     try waitIdle(&h);
-    const loaded = try hoverStd(&h, uri);
+    const loaded = hoverValue(try h.response(try sendHover(&h, uri, 2, 12)));
     try testing.expect(std.mem.indexOf(u8, loaded, loading_note) == null);
-    try testing.expect(std.mem.indexOf(u8, loaded, "const std: type") != null);
+    try testing.expect(std.mem.indexOf(u8, loaded, "answer: u32") != null);
     try shutdown(&h);
-}
-
-/// `slowZig` with `sema.wait_for_project` enabled
-fn waitingOptions(h: *Harness, project: *fixture.Project) !std.json.Value {
-    var options = try slowZig(h, project);
-    try options.object.put(h.arena.allocator(), "sema", try jsonValue(h, "{\"wait_for_project\": true}"));
-    return options;
 }
 
 test "wait_for_project: a request sent while the project loads gets the complete answer" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    var project = try fixture.Project.create(&loading_files);
+    var project = try createGatedProject();
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
     defer h.finish();
-    try initializeWith(&h, project.root, false, try waitingOptions(&h, &project));
-    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), loading_main);
-    const text = try hoverStd(&h, uri);
+    try initializeWith(&h, project.root, false, try jsonValue(&h, wait_options));
+    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), gated_main);
+    const held = try sendHover(&h, uri, 2, 12);
+    try expectHeld(&h, uri, held);
+    try openGate(&h, &project);
+    const text = hoverValue(try h.response(held));
     try testing.expect(std.mem.indexOf(u8, text, loading_note) == null);
-    try testing.expect(std.mem.indexOf(u8, text, "const std: type") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "answer: u32") != null);
+    try shutdown(&h);
+}
+
+test "wait_for_project: a restart during the first load does not end the wait" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try createGatedProject();
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // `build()` also says when it has reached the gate, through a second FIFO: rewriting build.zig
+    // earlier would only change what the first instance compiles
+    const gate_line = "    _ = std.Io.Dir.cwd().readFileAlloc(b.graph.io, \"gate\", b.allocator, .limited(16)) catch unreachable;\n";
+    const reached_line = "    std.Io.Dir.cwd().writeFile(b.graph.io, .{ .sub_path = \"reached\", .data = \"x\" }) catch unreachable;\n";
+    try createFifo(&project, "reached");
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "build.zig", .data = try std.mem.replaceOwned(u8, a, gated_build, gate_line, reached_line ++ gate_line) });
+    try initializeWith(&h, project.root, false, try jsonValue(&h, wait_options));
+    const uri = try open(&h, try project.path(a, "main.zig"), gated_main);
+    const held = try sendHover(&h, uri, 2, 12);
+    _ = try std.Io.Dir.cwd().readFileAlloc(testing.io, try project.path(a, "reached"), a, .limited(16));
+    try expectHeld(&h, uri, held);
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "build.zig", .data = try std.mem.replaceOwned(u8, a, gated_build, gate_line, "") });
+    const text = hoverValue(try h.response(held));
+    try testing.expect(std.mem.indexOf(u8, text, "answer: u32") != null);
     try shutdown(&h);
 }
 
 test "wait_for_project: canceling or shutting down ends the wait" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    var project = try fixture.Project.create(&loading_files);
+    var project = try createGatedProject();
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
     defer h.finish();
-    try initializeWith(&h, project.root, false, try waitingOptions(&h, &project));
-    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), loading_main);
-    const at = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } };
-    const canceled = try h.send("textDocument/hover", at);
+    try initializeWith(&h, project.root, true, try jsonValue(&h, wait_options));
+    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), gated_main);
+    // The end of startup wakes held requests too, right after the load begins: cancel once only
+    // the cancellation can
+    while (true) {
+        const message = try h.next();
+        const method = message.object.get("method") orelse continue;
+        if (!std.mem.eql(u8, method.string, "$/progress")) continue;
+        const title = message.object.get("params").?.object.get("value").?.object.get("title") orelse continue;
+        if (std.mem.startsWith(u8, title.string, "Loading project")) break;
+    }
+    const canceled = try sendHover(&h, uri, 2, 12);
+    try expectHeld(&h, uri, canceled);
     try h.notify("$/cancelRequest", .{ .id = canceled });
     try testing.expect((try h.response(canceled)).object.get("error") != null);
-    const held = try h.send("textDocument/hover", at);
+    const held = try sendHover(&h, uri, 2, 12);
+    try expectHeld(&h, uri, held);
     try shutdown(&h);
     _ = try h.response(held);
 }
 
 test "wait_for_project: requests do not wait forever when zig cannot be run" {
-    var project = try fixture.Project.create(&loading_files);
+    var project = try fixture.Project.create(&.{.{ .path = "main.zig", .text = gated_main }});
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
     defer h.finish();
-    const options = try jsonValue(&h, "{\"zig\": {\"path\": \"/nonexistent/zig\"}, \"sema\": {\"wait_for_project\": true}}");
-    try initializeWith(&h, project.root, false, options);
-    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), loading_main);
-    _ = try hoverStd(&h, uri);
+    try initializeWith(&h, project.root, false, try jsonValue(&h, "{\"zig\": {\"path\": \"/nonexistent/zig\"}, \"sema\": {\"wait_for_project\": true}}"));
+    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), gated_main);
+    // Either outcome ends the wait: writes at the end of startup may cancel the read
+    _ = try h.response(try sendHover(&h, uri, 0, 6));
+    try shutdown(&h);
+}
+
+test "wait_for_project: held until the pulled configuration says so, then until the load ends" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try createGatedProject();
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = .{ .workspace = .{ .configuration = true } } });
+    h.hold_requests = true;
+    try h.notify("initialized", Empty{});
+    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), gated_main);
+    const held = try sendHover(&h, uri, 2, 12);
+    try expectHeld(&h, uri, held);
+    var config_id: ?std.json.Value = null;
+    for (h.received.items) |msg| {
+        const method = msg.object.get("method") orelse continue;
+        if (std.mem.eql(u8, method.string, "workspace/configuration")) config_id = msg.object.get("id");
+    }
+    h.hold_requests = false;
+    try h.write(.{ .jsonrpc = "2.0", .id = config_id.?, .result = &[_]std.json.Value{try jsonValue(&h, wait_options)} });
+    try expectHeld(&h, uri, held);
+    try openGate(&h, &project);
+    const text = hoverValue(try h.response(held));
+    try testing.expect(std.mem.indexOf(u8, text, loading_note) == null);
+    try testing.expect(std.mem.indexOf(u8, text, "answer: u32") != null);
+    try shutdown(&h);
+}
+
+test "the first requests are held only until the pulled configuration arrives when not waiting" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try createGatedProject();
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = .{ .workspace = .{ .configuration = true } } });
+    // The harness answers the configuration request with an empty configuration
+    try h.notify("initialized", Empty{});
+    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), gated_main);
+    try testing.expect(std.mem.indexOf(u8, try hoverDuringLoad(&h, uri, 0, 6), loading_note) != null);
+    try shutdown(&h);
+}
+
+test "wait_for_project: a held request survives changes to other documents, not to its own" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try createGatedProject();
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initializeWith(&h, project.root, false, try jsonValue(&h, wait_options));
+    const uri = try open(&h, try project.path(h.arena.allocator(), "main.zig"), gated_main);
+    const held = try sendHover(&h, uri, 2, 12);
+    try expectHeld(&h, uri, held);
+    const other_uri = try open(&h, try project.path(h.arena.allocator(), "other.zig"), "pub const other = 1;\n");
+    const edited = try sendHover(&h, other_uri, 0, 10);
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = other_uri, .version = 2 }, .contentChanges = &.{.{ .text = "pub const other = 2;\n" }} });
+    try expectHeld(&h, uri, held);
+    try testing.expect(!answered(&h, edited));
+    try openGate(&h, &project);
+    const text = hoverValue(try h.response(held));
+    try testing.expect(std.mem.indexOf(u8, text, "answer: u32") != null);
+    const resp = try h.response(edited);
+    try testing.expectEqual(-32801, resp.object.get("error").?.object.get("code").?.integer);
     try shutdown(&h);
 }
 

@@ -121,7 +121,8 @@ completion_argument_placeholders: bool = true,
 /// (hover, completion, inlay hints, ...)
 callsite_seeding: bool = true,
 /// Hold requests that use name resolution and types back until the projects have loaded, instead
-/// of answering at once with what is known so far
+/// of answering at once with what is known so far. Only a change to the text of a held request's
+/// own document answers it early, with `ContentModified`
 wait_for_project: bool = false,
 /// When the InternPool exceeds this many MB, and twice the most that one request has added, type
 /// information is reclaimed as a whole generation (then inferred again on demand); 0 means never
