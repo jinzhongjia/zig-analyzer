@@ -4651,6 +4651,38 @@ test "@import of a zon file is its value in inference and comptime evaluation" {
     }
 }
 
+test "types of zon values are the same only for the same literal of the same file" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.add("/p/a.zon", ".{ .x = 1, .l = .{ .y = 1 }, .m = .{ .y = 1 } }");
+    _ = try w.add("/p/b.zon", ".{ .x = 1, .l = .{ .y = 1 }, .m = .{ .y = 1 } }");
+    const src =
+        \\const a = @import("a.zon");
+        \\const again = @import("a.zon");
+        \\const b = @import("b.zon");
+        \\const lit = .{ .y = 1 };
+        \\const same_file = @TypeOf(a) == @TypeOf(again);
+        \\const same_field = @TypeOf(a.l) == @TypeOf(again.l);
+        \\const other_file = @TypeOf(a) == @TypeOf(b);
+        \\const other_field = @TypeOf(a.l) == @TypeOf(a.m);
+        \\const literal = @TypeOf(a.l) == @TypeOf(lit);
+    ;
+    const file = (try w.add("/p/main.zig", src)).file;
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "same_file", "bool = true" },
+        .{ "same_field", "bool = true" },
+        .{ "other_file", "bool = false" },
+        .{ "other_field", "bool = false" },
+        .{ "literal", "bool = false" },
+    }) |c| {
+        testing.expectEqualStrings(c[1], try typeAt(&w, file, src, c[0], 0)) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "the root expression of a zon file is inferred and inf and nan are floats" {
     var w: World = undefined;
     try w.init();

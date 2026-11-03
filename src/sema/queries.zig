@@ -429,7 +429,7 @@ pub const ZonValue = struct {
             return .unknown;
         }
         const source = try ctx.get(database.syntax.SourceText, file);
-        return zon.lower(ctx.db.gpa, ctx.db.env.ip, source.text);
+        return zon.lower(ctx.db.gpa, ctx.db.env.ip, file, source.text);
     }
 };
 
