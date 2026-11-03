@@ -978,6 +978,18 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 return if (memo.evicted) .unknown else .{ .value = memo.value };
             }
 
+            /// The revision in which input `Q` of `key` last got a different value (0: never set).
+            /// No dependency is recorded.
+            pub fn inputChangedAt(ctx: *Ctx, comptime Q: type, key: Q.Key) Revision {
+                comptime assert(Q.kind == .input);
+                const db = ctx.db;
+                const table = &db.tables[comptime queryIndex(Q)];
+                table.mutex.lockUncancelable(db.io);
+                defer table.mutex.unlock(db.io);
+                const index = table.keys.getIndex(key) orelse return 0;
+                return table.slots.items[index].changed_at;
+            }
+
             /// Long-running computes should call this periodically.
             pub fn checkCanceled(ctx: *const Ctx) error{Canceled}!void {
                 if (ctx.stale) return error.Canceled;

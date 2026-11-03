@@ -433,6 +433,7 @@ fn finishLoading(ws: *Workspace) void {
         if (ws.load_done) return;
         ws.load_done = true;
     }
+    ws.server.wakeProjectWaiters();
     ws.server.reconcileSingle();
 }
 

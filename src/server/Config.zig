@@ -14,7 +14,7 @@
 //!       "semantic_tokens": { "mode": "full", "global_var": false },
 //!       "imports": { "derived": "with_import", "sort": "path" },
 //!       "completion": { "auto_import": true, "max_auto_imports": 128, "snippets": true, "argument_placeholders": true },
-//!       "sema": { "callsite_seeding": true },
+//!       "sema": { "callsite_seeding": true, "wait_for_project": false },
 //!       "cache": { "capacity": 64, "queries": { "Infer": { "count": 16384, "mb": 48 } } },
 //!       "workspace_symbol": { "dependencies": false, "limit": 256 },
 //!       "naming": { "enable": false, "ignore": ["SDL_*"], "exclude": ["src/c/*"], "rules": { "field": false } },
@@ -120,6 +120,10 @@ completion_argument_placeholders: bool = true,
 /// Inside a generic function body without concrete types, infer from the instances at call sites
 /// (hover, completion, inlay hints, ...)
 callsite_seeding: bool = true,
+/// Hold requests that use name resolution and types back until the projects have loaded, instead
+/// of answering at once with what is known so far. Only a change to the text of a held request's
+/// own document answers it early, with `ContentModified`
+wait_for_project: bool = false,
 /// When the InternPool exceeds this many MB, and twice the most that one request has added, type
 /// information is reclaimed as a whole generation (then inferred again on demand); 0 means never
 /// reclaim
@@ -255,6 +259,7 @@ const settings = [_]Setting{
     .{ .section = "completion", .key = "snippets", .field = "completion_snippets" },
     .{ .section = "completion", .key = "argument_placeholders", .field = "completion_argument_placeholders" },
     .{ .section = "sema", .key = "callsite_seeding", .field = "callsite_seeding" },
+    .{ .section = "sema", .key = "wait_for_project", .field = "wait_for_project" },
     .{ .section = "sema", .key = "max_intern_pool_mb", .field = "max_intern_pool_mb" },
     .{ .section = "cache", .key = "capacity", .field = "cache_capacity" },
     .{ .section = "cache", .key = "queries", .field = "cache_queries" },

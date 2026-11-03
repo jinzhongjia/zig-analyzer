@@ -3485,8 +3485,8 @@ const Inferrer = struct {
     }
 
     /// Peer type resolution (matches the compiler's strategies for error sets and error unions, C
-    /// pointers, numbers, enum literals, optionals, pointers, arrays and vectors); unknown when
-    /// the types cannot be unified
+    /// pointers, numbers, enum literals, optionals, pointers, arrays, vectors and tuples); unknown
+    /// when the types cannot be unified
     pub fn peer(inf: *Inferrer, types: []const Index) Error!Index {
         const ip = inf.ip;
         var result: ?Index = null;
@@ -3572,6 +3572,10 @@ const Inferrer = struct {
                 result = p;
                 continue;
             }
+            if (ip.key(cur) == .tuple_type and ip.key(t) == .tuple_type) {
+                result = try inf.peerTuple(cur, t) orelse return .unknown;
+                continue;
+            }
             if (try inf.peerArrayLike(cur, t)) |p| {
                 result = p;
                 continue;
@@ -3589,6 +3593,24 @@ const Inferrer = struct {
             else => return if (isErrorSet(ip, t)) ip.get(.{ .error_union_type = .{ .err = t, .payload = .null_type } }) else ip.optionalOf(t),
         };
         return t;
+    }
+
+    /// Peer of two tuples (matches the compiler's `tuple` strategy): field by field, and a comptime
+    /// field stays one only when both tuples hold the same value in it; null when the number of
+    /// fields differs or a field has no peer
+    fn peerTuple(inf: *Inferrer, a: Index, b: Index) Error!?Index {
+        const x = inf.ip.key(a).tuple_type;
+        const y = inf.ip.key(b).tuple_type;
+        if (x.types.len != y.types.len) return null;
+        const types = try inf.scratch.alloc(Index, x.types.len);
+        const values = try inf.scratch.alloc(Index, x.types.len);
+        for (types, values, 0..) |*ty, *v, i| {
+            ty.* = try inf.peer(&.{ x.types[i], y.types[i] });
+            if (ty.* == .unknown) return null;
+            const value_x = InternPool.fieldValue(x.values, i);
+            v.* = if (value_x == InternPool.fieldValue(y.values, i)) value_x else .runtime;
+        }
+        return try inf.ip.get(.{ .tuple_type = .{ .types = types, .values = InternPool.fieldValues(values) } });
     }
 
     /// Peer of two types where at least one is an error set or an error union (matches the
