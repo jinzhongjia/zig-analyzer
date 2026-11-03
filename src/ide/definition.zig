@@ -249,7 +249,13 @@ fn anonFieldTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]con
     try zonFieldTarget(r, a, fa.lhs, name, &out);
     if (out.items.len == 0) for (try context.allSeeded(r, a)) |seeded| try zonFieldTarget(r, seeded, fa.lhs, name, &out);
     // The type is unknown in a loop inferred per iteration
-    const ty = pointee(a, fa.lhs);
+    var ty = a.exprType(fa.lhs).ty;
+    switch (a.ip.key(ty)) {
+        .ptr_type => |p| if (p.size == .one) {
+            ty = p.child;
+        },
+        else => {},
+    }
     if (ty != .unknown and a.ip.key(ty) != .anon_struct_type) return out.items;
     var literals: std.ArrayList(AnonLiteral) = .empty;
     try anonLiterals(r, .{ .file = file, .item = a.item, .body = a.body, .e = fa.lhs }, &literals, 0);
@@ -261,40 +267,68 @@ fn anonFieldTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error![]con
     return out.items;
 }
 
-/// The type of `e`, through a single-item pointer
-fn pointee(a: context.At, e: Body.ExprId) InternPool.Index {
-    const ty = a.exprType(e).ty;
-    return switch (a.ip.key(ty)) {
-        .ptr_type => |p| if (p.size == .one) p.child else ty,
-        else => ty,
-    };
-}
-
 /// Appends to `out` the name of the field `name` in the `.zon` file literal that the type of `lhs`
 /// comes from, if any
 fn zonFieldTarget(r: *Resolver, a: context.At, lhs: Body.ExprId, name: []const u8, out: *std.ArrayList(Target)) resolve.Error!void {
-    const origin = switch (a.ip.key(pointee(a, lhs))) {
-        .anon_struct_type => |s| s.origin orelse return,
-        else => return,
+    const literal = search.zonLiteralOfType(a.ip, a.exprType(lhs).ty) orelse return;
+    const site = try search.zonFieldSite(r, .{ .literal = literal, .name = name }) orelse return;
+    try appendNew(r, out, .{ .file = site.file, .start = site.start, .end = site.end });
+}
+
+/// The field of a `.zon` file at the cursor: a field access on a value from the file, or, in the
+/// file itself, the name of a field. When the file has a result type, the declaration the field
+/// refers to
+fn zonFieldAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?search.Symbol {
+    const tok = try tokenAt(r, file, offset) orelse return null;
+    if (tok.kind != .identifier) return null;
+    const a = try context.at(r, file, tok.offset, false) orelse return null;
+    const e = a.body.exprAt(a.rel) orelse return null;
+    const field: search.ZonField = switch (a.body.expr(e)) {
+        .field_access => |fa| blk: {
+            if (a.rel < a.body.range(fa.lhs).end) return null;
+            const literals = try search.zonLiteralsOf(r, file, a.item, a.body, a.res, fa.lhs, a.rel);
+            if (literals.len == 0) return null;
+            break :blk .{ .literal = literals[0], .name = fa.field orelse return null };
+        },
+        .init => |x| blk: {
+            const fi = for (x.fields) |fi| {
+                if (fi.name != null and a.rel >= fi.name_range.start and a.rel < fi.name_range.end) break fi;
+            } else return null;
+            const literals = if (r.isZon(file))
+                try r.arena.dupe(InternPool.ZonLiteral, &.{.{ .file = file, .path = try zonPath(r, a.body, e) orelse return null }})
+            else
+                try search.zonLiteralsOf(r, file, a.item, a.body, a.res, e, a.rel);
+            if (literals.len == 0) return null;
+            break :blk .{ .literal = literals[0], .name = fi.name.? };
+        },
+        else => return null,
     };
-    const tree = try r.itemTree(origin.file);
-    const item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.kind == .zon) break @intCast(i);
-    } else return;
-    const node = try r.itemNode(origin.file, item) orelse return;
-    const b = try r.body(origin.file, item);
-    var e = b.value orelse return;
-    for (origin.path) |i| e = switch (b.expr(e)) {
-        .init => |x| if (i < x.fields.len) x.fields[i].value else return,
-        else => return,
-    };
-    const fields = switch (b.expr(e)) {
-        .init => |x| x.fields,
-        else => return,
-    };
-    for (fields) |fi| if (fi.name != null and std.mem.eql(u8, fi.name.?, name)) {
-        return appendNew(r, out, .{ .file = origin.file, .start = node.offset + fi.name_range.start, .end = node.offset + fi.name_range.end });
-    };
+    const site = try search.zonFieldSite(r, field) orelse return null;
+    if (try search.typedZonField(r, site)) |def| return .{ .def = def };
+    return .{ .zon_field = field };
+}
+
+/// The field and element indices from the root value of a `.zon` file down to the initializer `e`;
+/// null when `e` is not reached only through initializers
+fn zonPath(r: *Resolver, b: *const Body, e: Body.ExprId) resolve.Error!?[]const u32 {
+    var path: std.ArrayList(u32) = .empty;
+    var cur = b.value orelse return null;
+    while (cur != e) {
+        const range = b.range(e);
+        const x = switch (b.expr(cur)) {
+            .init => |x| x,
+            else => return null,
+        };
+        const next = for (x.fields, 0..) |fi, i| {
+            const child = b.range(fi.value);
+            if (child.start <= range.start and range.end <= child.end) {
+                try path.append(r.arena, @intCast(i));
+                break fi.value;
+            }
+        } else return null;
+        cur = next;
+    }
+    return path.items;
 }
 
 /// An expression in the body of a member
@@ -989,12 +1023,12 @@ pub fn errorNameAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?[]con
 }
 
 /// What references, document highlight and rename work on at the cursor: a label, an error name,
-/// or a declaration or local name (`defAt`)
+/// a declaration or local name (`defAt`), or a field of a `.zon` file (`zonFieldAt`)
 pub fn symbolAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?search.Symbol {
     if (try labelAt(r, file, offset)) |l| return .{ .label = l };
     if (try errorNameAt(r, file, offset)) |name| return .{ .error_name = .{ .file = file, .name = name } };
     if (try defAt(r, file, offset)) |def| return .{ .def = def };
-    return null;
+    return zonFieldAt(r, file, offset);
 }
 
 fn target(r: *Resolver, def: Def) resolve.Error!?Target {

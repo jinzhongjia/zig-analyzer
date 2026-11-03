@@ -448,9 +448,6 @@ pub const ZonImports = struct {
         /// Some sites give a result type, but no single one can be named: they differ, or one is
         /// abstract or unknown (no guessing)
         unresolved: bool = false,
-        /// Some sites have no result type: there, the fields of the value are the fields of its own
-        /// anonymous type
-        untyped: bool = false,
     };
 
     pub fn cycleFallback(_: Key) Value {
@@ -486,10 +483,7 @@ pub const ZonImports = struct {
                 const res = try ctx.get(Infer, .{ .owner = owner, .mode = .full });
                 for (res.zon_imports) |site| {
                     if (site.file != file) continue;
-                    const ty = site.ty orelse {
-                        out.untyped = true;
-                        continue;
-                    };
+                    const ty = site.ty;
                     if (!@import("value.zig").isConcrete(ip, ty)) {
                         out.unresolved = true;
                     } else if (out.result_type) |t| {

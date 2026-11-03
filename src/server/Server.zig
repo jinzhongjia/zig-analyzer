@@ -5974,7 +5974,7 @@ fn ownFileOnly(r: *Resolver, symbol: za.ide_db.search.Symbol) !bool {
     return switch (symbol) {
         .def => |def| !try za.ide_db.search.visibleOutsideFile(r, def),
         .label => true,
-        .error_name => false,
+        .error_name, .zon_field => false,
     };
 }
 
@@ -6032,6 +6032,10 @@ fn renameRefusal(server: *Server, r: *Resolver, symbol: za.ide_db.search.Symbol)
         },
         .label => |l| l.file,
         .error_name => |e| e.file,
+        .zon_field => |z| blk: {
+            if (try ide.manifest.active(r, z.literal.file)) return "cannot rename a field of build.zig.zon: its names are defined by the package format";
+            break :blk z.literal.file;
+        },
     };
     if (try za.ide_db.search.symbolName(r, symbol) == null) return "cannot rename: there is no name here";
     const rules = try server.originRules(r.arena);
@@ -6075,6 +6079,7 @@ fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameP
         .def => |def| try server.checkedRename(r, arena, def, old, params.newName),
         .label => |l| try server.checkedLabelRename(r, arena, l, old, params.newName),
         .error_name => |e| try server.checkedErrorRename(r, arena, e.file, old, params.newName),
+        .zon_field => |z| try server.checkedZonFieldRename(r, arena, z, old, params.newName),
     };
     const checked = switch (outcome) {
         .ok => |checked| checked,
@@ -6151,6 +6156,24 @@ fn checkedLabelRename(server: *Server, r: *Resolver, arena: Allocator, label: za
     return .{ .ok = .{ .refs = refs, .text = text } };
 }
 
+/// The references of a field of a `.zon` file and the source text of its new name (see
+/// `checkedRename`). AstGen confirms the `.zon` file (a field name must be unique in its literal), and
+/// strings may name the field (`@field`, `@hasField`).
+fn checkedZonFieldRename(server: *Server, r: *Resolver, arena: Allocator, field: za.ide_db.search.ZonField, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
+    const refs = switch (try server.renameReferences(r, arena, .{ .zon_field = field }, old, new)) {
+        .ok => |refs| refs,
+        .failed => |reason| return .{ .failed = reason },
+    };
+    const text = try identifierText(arena, new, true);
+    const file = field.literal.file;
+    var edits: std.ArrayList(ide.rename.Edit) = .empty;
+    for (refs) |ref| if (ref.file == file) try edits.append(arena, .{ .start = ref.start, .end = ref.end, .text = text });
+    if (try ide.rename.verifyAstGen(r, file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    const files = try za.ide_db.search.importers(r, file, try server.searchScope(r));
+    if (try ide.rename.stringReference(r, files, old)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    return .{ .ok = .{ .refs = refs, .text = text } };
+}
+
 /// The uses of the error `old`, found in `file`, and the source text of its new name (see
 /// `checkedRename`). Error names are global, so the uses in all files compiled together with
 /// `file` are renamed: each must be confirmed and editable (see `renameReferences`), no file that
@@ -6183,7 +6206,8 @@ fn checkedErrorRename(server: *Server, r: *Resolver, arena: Allocator, file: Vfs
 /// looks the declaration up by name in the root source file (see `rename.stdRootLookup`), the
 /// search scope is still incomplete (see `scopeIncomplete`), a reference is ambiguous in a generic
 /// function, goes through a member access of unknown type, or depends on instances that grow
-/// without bound, is in a `.zon` file whose import sites disagree (`search.Options.zon_import`), or
+/// without bound, is in a `.zon` file whose import sites give result types that cannot be named
+/// (`search.Options.zon_import`), or
 /// a file that mentions the name has syntax errors.
 fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, symbol: za.ide_db.search.Symbol, old: []const u8, new: []const u8) !Outcome([]const za.ide_db.search.Reference) {
     if (symbol == .def) if (try ide.rename.stdRootLookup(r, symbol.def)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };

@@ -591,33 +591,54 @@ test "rename reaches typed .zon files imported from files outside any build grap
     try h.notify("exit", {});
 }
 
-/// The result of renaming the field `x` of `S` to `count`, with `main.zig` opened and `cfg.zon`
-/// closed: the edits, or the error message when the rename is refused
-fn renameZonField(h: *Harness, main_body: []const u8, zon: []const u8) ![]const u8 {
-    const files = [_]fixture.File{
-        .{ .path = "main.zig", .text = main_body },
-        .{ .path = "cfg.zon", .text = zon },
-    };
-    var project = try fixture.Project.create(&files);
+/// The result of renaming to `count` what `needle` starts at in `path`, with `main.zig` opened and
+/// the other files closed: the edits, or the error message when the rename is refused
+fn renameIn(h: *Harness, files: []const fixture.File, path: []const u8, needle: []const u8) ![]const u8 {
+    return renameTo(h, files, path, needle, "count");
+}
+
+fn renameTo(h: *Harness, files: []const fixture.File, path: []const u8, needle: []const u8, new_name: []const u8) ![]const u8 {
+    var project = try fixture.Project.create(files);
     defer project.deinit();
     const a = h.arena.allocator();
     _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
     try h.notify("initialized", Empty{});
+    var text: []const u8 = "";
+    var opened: []const u8 = "";
+    for (files) |f| {
+        if (std.mem.eql(u8, f.path, path)) text = f.text;
+        if (std.mem.eql(u8, f.path, "main.zig")) opened = f.text;
+    }
     const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
-    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = main_body } });
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = opened } });
     _ = try h.request("zig-analyzer/waitIdle", {});
-    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = main_uri }, .position = position(main_body, "x: u32"), .newName = "count" });
+    const uri = try za.base.uri.fromPath(a, try project.path(a, path));
+    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uri }, .position = position(text, needle), .newName = new_name });
     const result = if (renamed.object.get("error")) |e| e.object.get("message").?.string else try renameEdits(h, renamed);
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
     return result;
 }
 
-test "rename refuses fields of .zon files whose import sites do not all give the same result type" {
-    const refused = "cannot rename `x` to `count`: this `.zon` file is imported with different or generic result types, or also without one, so its uses cannot all be confirmed (cfg.zon:1:5)";
+test "rename reaches the uses of a typed .zon file at import sites without a result type" {
+    const main_body = "const S = struct { x: u32 };\nconst cfg: S = @import(\"cfg.zon\");\nconst raw = @import(\"cfg.zon\");\npub fn main() void {\n    _ = .{ cfg.x, raw.x };\n}\n";
+    const files = [_]fixture.File{ .{ .path = "main.zig", .text = main_body }, .{ .path = "cfg.zon", .text = ".{ .x = 1 }\n" } };
+    // `raw.x` was left behind and the build failed with "no field named 'x'". All three name one field
+    for ([_]struct { []const u8, []const u8 }{ .{ "main.zig", "x: u32" }, .{ "main.zig", "x, raw" }, .{ "main.zig", "x }" }, .{ "cfg.zon", "x = 1" } }) |c| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        testing.expectEqualStrings("cfg.zon:0:4 main.zig:0:19 main.zig:4:15 main.zig:4:22", try renameIn(&h, &files, c[0], c[1])) catch |err| {
+            std.debug.print("rename at `{s}` in {s}\n", .{ c[1], c[0] });
+            return err;
+        };
+    }
+}
+
+test "rename refuses fields of .zon files whose import sites give result types that cannot be named" {
+    const refused = "cannot rename `x` to `count`: this `.zon` file is imported with different or generic result types, so its uses cannot all be confirmed (cfg.zon:1:5)";
     const cases = [_]struct { name: []const u8, body: []const u8 }{
-        // Each of these left `.x` or `raw.x` behind, and the build failed
-        .{ .name = "also imported without a result type", .body = "const S = struct { x: u32 };\nconst cfg: S = @import(\"cfg.zon\");\nconst raw = @import(\"cfg.zon\");\npub fn main() void {\n    _ = .{ cfg.x, raw.x };\n}\n" },
+        // Each of these left `.x` behind, and the build failed
         .{ .name = "different result types", .body = "const S = struct { x: u32 };\nconst T = struct { x: u8 };\nconst a: S = @import(\"cfg.zon\");\nconst b: T = @import(\"cfg.zon\");\npub fn main() void {\n    _ = .{ a.x, b.x };\n}\n" },
         .{ .name = "a generic result type", .body = "const S = struct { x: u32 };\nfn load(comptime T: type) T {\n    return @import(\"cfg.zon\");\n}\npub fn main() void {\n    _ = load(S).x;\n}\n" },
     };
@@ -625,8 +646,8 @@ test "rename refuses fields of .zon files whose import sites do not all give the
         var h: Harness = undefined;
         try h.start();
         defer h.finish();
-        const got = try renameZonField(&h, c.body, ".{ .x = 1 }\n");
-        testing.expectEqualStrings(refused, got) catch |err| {
+        const files = [_]fixture.File{ .{ .path = "main.zig", .text = c.body }, .{ .path = "cfg.zon", .text = ".{ .x = 1 }\n" } };
+        testing.expectEqualStrings(refused, try renameIn(&h, &files, "main.zig", "x: u32")) catch |err| {
             std.debug.print("case: {s}\n", .{c.name});
             return err;
         };
@@ -654,8 +675,146 @@ test "rename leaves .zon files alone when their fields cannot refer to the renam
         var h: Harness = undefined;
         try h.start();
         defer h.finish();
-        const got = try renameZonField(&h, c.body, c.zon);
-        testing.expectEqualStrings(c.edits, got) catch |err| {
+        const files = [_]fixture.File{ .{ .path = "main.zig", .text = c.body }, .{ .path = "cfg.zon", .text = c.zon } };
+        testing.expectEqualStrings(c.edits, try renameIn(&h, &files, "main.zig", "x: u32")) catch |err| {
+            std.debug.print("case: {s}\n", .{c.name});
+            return err;
+        };
+    }
+}
+
+const zon_field_main =
+    \\const raw = @import("cfg.zon");
+    \\const twin = @import("twin.zon");
+    \\const T = @TypeOf(raw);
+    \\const typed: T = .{ .x = 1, .y = .{ .x = 2 } };
+    \\fn read(v: anytype) comptime_int {
+    \\    return v.x;
+    \\}
+    \\pub fn main() void {
+    \\    const copy = raw;
+    \\    const lit = .{ .x = 1 };
+    \\    _ = .{ raw.x, copy.x, read(raw), typed.x, raw.y.x, twin.x, lit.x };
+    \\}
+    \\const strings = @import("strings.zon");
+    \\
+;
+const zon_field_files = [_]fixture.File{
+    .{ .path = "main.zig", .text = zon_field_main },
+    .{ .path = "cfg.zon", .text = ".{ .x = 1, .y = .{ .x = 2 } }\n" },
+    // The same contents as `cfg.zon` and `lit`: each literal has a type of its own
+    .{ .path = "twin.zon", .text = ".{ .x = 1, .y = .{ .x = 2 } }\n" },
+    // Another `.zon` file with the name, holding a value that kept a rename from being confirmed
+    .{ .path = "strings.zon", .text = ".{ .x = \"text\" }\n" },
+};
+
+test "references and rename of a field of an untyped .zon file reach its uses and no others" {
+    const edits = "cfg.zon:0:4 main.zig:10:15 main.zig:10:23 main.zig:10:43 main.zig:3:21 main.zig:5:13";
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "main.zig", "x, copy" },
+        .{ "main.zig", "x, read" },
+        .{ "main.zig", "x, raw.y" },
+        .{ "main.zig", "x = 1, .y" },
+        .{ "main.zig", "x;" },
+        .{ "cfg.zon", "x = 1" },
+    }) |c| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        testing.expectEqualStrings(edits, try renameIn(&h, &zon_field_files, c[0], c[1])) catch |err| {
+            std.debug.print("rename at `{s}` in {s}\n", .{ c[1], c[0] });
+            return err;
+        };
+    }
+    // The field of a nested literal is another field, with the same name
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try testing.expectEqualStrings("cfg.zon:0:20 main.zig:10:52 main.zig:3:37", try renameIn(&h, &zon_field_files, "main.zig", "x, twin"));
+}
+
+test "references and document highlight of a field of an untyped .zon file" {
+    var project = try fixture.Project.create(&zon_field_files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = main_uri, .languageId = "zig", .version = 1, .text = zon_field_main } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = main_uri }, .position = position(zon_field_main, "x, copy"), .context = .{ .includeDeclaration = true } });
+    var out: std.ArrayList([]const u8) = .empty;
+    for (refs.object.get("result").?.array.items) |item| try out.append(a, try loc(&h, item.object.get("uri").?.string, item.object.get("range").?));
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    try testing.expectEqualStrings("cfg.zon:0:4 main.zig:10:15 main.zig:10:23 main.zig:10:43 main.zig:3:21 main.zig:5:13", try join(&h, out.items));
+    // In the importer: the five uses, not the declaration in the `.zon` file
+    const highlights = try h.request("textDocument/documentHighlight", .{ .textDocument = .{ .uri = main_uri }, .position = position(zon_field_main, "x, copy") });
+    try testing.expectEqual(5, highlights.object.get("result").?.array.items.len);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "rename of a field of an untyped .zon file is refused when it cannot be completed" {
+    const cfg = ".{ .x = 1, .y = 2 }\n";
+    const cases = [_]struct { name: []const u8, files: []const fixture.File, path: []const u8, needle: []const u8, new: []const u8, message: []const u8 }{
+        .{
+            .name = "a string may name it",
+            .files = &.{
+                .{ .path = "main.zig", .text = "const raw = @import(\"cfg.zon\");\nconst a = @field(raw, \"x\");\nconst b = raw.x;\n" },
+                .{ .path = "cfg.zon", .text = cfg },
+            },
+            .path = "main.zig",
+            .needle = "x;",
+            .new = "count",
+            .message = "cannot rename `x` to `count`: `x` appears in a string literal, which may refer to it by name (as `@field` and serialization do) and would not be updated (main.zig:2:23)",
+        },
+        .{
+            .name = "the new name is taken in the literal",
+            .files = &.{
+                .{ .path = "main.zig", .text = "const raw = @import(\"cfg.zon\");\nconst b = raw.x;\n" },
+                .{ .path = "cfg.zon", .text = cfg },
+            },
+            .path = "main.zig",
+            .needle = "x;",
+            .new = "y",
+            .message = "cannot rename `x` to `y`: duplicate struct field name (cfg.zon:1:5)",
+        },
+        .{
+            .name = "a use also refers to another file",
+            .files = &.{
+                .{ .path = "main.zig", .text = "const raw = @import(\"cfg.zon\");\nconst other = @import(\"other.zon\");\nfn read(v: anytype) comptime_int {\n    return v.x;\n}\nconst a = read(raw);\nconst b = read(other);\nconst c = raw.x;\n" },
+                .{ .path = "cfg.zon", .text = cfg },
+                .{ .path = "other.zon", .text = cfg },
+            },
+            .path = "main.zig",
+            .needle = "x;\n",
+            .new = "count",
+            .message = "cannot rename `x` to `count`: " ++ za.ide_db.search.ambiguous_message ++ " (main.zig:4:12)",
+        },
+        .{
+            .name = "the names of a manifest are fixed",
+            .files = &.{
+                .{ .path = "main.zig", .text = "const version = @import(\"build.zig.zon\").version;\n" },
+                .{ .path = "build.zig.zon", .text = ".{ .name = .demo, .version = \"1.0.0\" }\n" },
+            },
+            .path = "main.zig",
+            .needle = "version;",
+            .new = "count",
+            .message = "cannot rename a field of build.zig.zon: its names are defined by the package format",
+        },
+    };
+    for (cases) |c| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        testing.expectEqualStrings(c.message, try renameTo(&h, c.files, c.path, c.needle, c.new)) catch |err| {
             std.debug.print("case: {s}\n", .{c.name});
             return err;
         };
