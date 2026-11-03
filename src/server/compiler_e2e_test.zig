@@ -296,6 +296,46 @@ fn change(h: *Harness, uri: []const u8, version: i64, text: []const u8) !void {
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .text = text }} });
 }
 
+test "open .zon files outside every module directory get live diagnostics, unlike Zig files there" {
+    const build_text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("src/main.zig"),
+        \\        .target = b.standardTargetOptions(.{}),
+        \\    }) });
+        \\    b.installArtifact(exe);
+        \\}
+        \\
+    ;
+    const bad_zon = ".{ .a = 1, .a = 2 }\n";
+    const bad_zig = "const a = ;\n";
+    const bad_config = ".{ .nope = 1 }\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = build_text },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "other/data.zon", .text = bad_zon },
+        .{ .path = "other/script.zig", .text = bad_zig },
+        .{ .path = "zig-analyzer.zon", .text = bad_config },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, project.root, false);
+    _ = try open(&h, try project.path(a, "other/data.zon"), bad_zon);
+    _ = try open(&h, try project.path(a, "other/script.zig"), bad_zig);
+    _ = try open(&h, try project.path(a, "zig-analyzer.zon"), bad_config);
+    try waitIdle(&h);
+    const diags = try h.diagnostics();
+    try expectDiagnostics(diags, "data.zon", &.{"zig ast-check: duplicate struct field name"});
+    try expectDiagnostics(diags, "script.zig", &.{});
+    try expectDiagnostics(diags, "zig-analyzer.zon", &.{"zig-analyzer: unexpected field 'nope'; the file is ignored"});
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "build scripts: live diagnostics in build.zig, build.zig.zon and files build.zig imports, changes to them reconfigure" {
     var project = try fixture.Project.create(&.{
         .{ .path = "build.zig", .text = scripts_build },

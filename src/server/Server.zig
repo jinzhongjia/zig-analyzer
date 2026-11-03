@@ -4910,7 +4910,9 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     // Live diagnostics: the file is loaded, and it belongs to no project or one of its projects
     // wants them (see `Workspace.liveEligible`)
     var live_result: ?*live.Result = null;
-    if (text != null and server.liveEligible(file)) live_result = try ctx.get(live.AstCheck, file);
+    // An open `.zon` file always: what makes it valid ZON does not depend on any build
+    const is_zon = live.modeOf(server.vfs.path(file)) == .zon;
+    if (text != null and (server.liveEligible(file) or (is_zon and server.isOpen(server.vfs.path(file))))) live_result = try ctx.get(live.AstCheck, file);
 
     // Compiler diagnostics: errors in an imported file are
     // reported by the project or root file that compiles it
@@ -4935,6 +4937,9 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
         diags = try server.appendNaming(ctx, arena, file, t, settings, diags);
     };
     if (text) |t| diags = try server.appendUnloadedProjectHint(arena, file, t, diags);
+    if (text) |t| if (is_zon and std.mem.eql(u8, std.fs.path.basename(server.vfs.path(file)), Config.project_file)) {
+        diags = try server.appendProjectConfigProblems(arena, t, diags);
+    };
     return .{ .uri = document_uri, .diagnostics = diags };
 }
 
@@ -5019,6 +5024,27 @@ test "computeDiagnostics: notes of combined results keep the coordinates of thei
     try std.testing.expectEqual(0, related[0].location.range.start.character);
     try std.testing.expectEqual(6, related[0].location.range.end.line);
     try std.testing.expectEqual(21, related[0].location.range.end.character);
+}
+
+/// The problems `zig-analyzer.zon` has beyond its syntax, which is reported as for any `.zon` file
+fn appendProjectConfigProblems(server: *Server, arena: Allocator, text: []const u8, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+    if (diags.len > 0) return diags;
+    const problems = try Config.projectProblems(server.gpa, arena, text);
+    const out = try arena.alloc(types.Diagnostic, problems.len);
+    const lines = try offsets.LineIndex.init(arena, text);
+    for (problems, out) |p, *o| {
+        const start: u32 = @min(p.start orelse 0, @as(u32, @intCast(text.len)));
+        var end = start;
+        while (end < text.len and (std.ascii.isAlphanumeric(text[end]) or text[end] == '_' or text[end] == '.')) end += 1;
+        if (end == start and end < text.len) end += 1;
+        o.* = .{
+            .range = lines.range(start, end, server.encoding),
+            .severity = if (p.fatal) .Error else .Warning,
+            .source = "zig-analyzer",
+            .message = .{ .string = if (p.fatal) try std.fmt.allocPrint(arena, "{s}; the file is ignored", .{p.message}) else p.message },
+        };
+    }
+    return out;
 }
 
 /// An open file that belongs to a project that is not loaded (see `FileContext.unloaded_project`):
