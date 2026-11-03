@@ -2593,6 +2593,41 @@ test "zon files complete only what the compiler parses, not declarations" {
     try testing.expectEqualStrings("debug info default make", try completionAt(&w, try w.add("/p/main.zig", decls ++ "const level: Level = .<|>;\n")));
 }
 
+test "references find the fields of a zon file whose import sites give several result types" {
+    const zon_text = ".{ .x = 1, .e = .red, .other = 2 }\n";
+    // Each case: the importing file, the name to search from, and the uses in `cfg.zon`
+    const cases = [_]struct { []const u8, []const u8, []const []const u8 }{
+        .{ "const S = struct { x: u32, e: E };\nconst E = enum { red };\nconst T = struct { x: u8 };\nconst a: S = @import(\"cfg.zon\");\nconst b: T = @import(\"cfg.zon\");\n", "x: u32", &.{"x ="} },
+        .{ "const S = struct { x: u32 };\nconst T = struct { x: u8 };\nconst a: S = @import(\"cfg.zon\");\nconst b: T = @import(\"cfg.zon\");\n", "x: u8", &.{"x ="} },
+        // An enum member, reached under one of the types
+        .{ "const E = enum { red };\nconst S = struct { x: u32, e: E };\nconst T = struct { x: u8 };\nconst a: S = @import(\"cfg.zon\");\nconst b: T = @import(\"cfg.zon\");\n", "red", &.{"red"} },
+        // A generic result type: under each instance of the function
+        .{ "const S = struct { x: u32 };\nfn load(comptime T: type) T {\n    return @import(\"cfg.zon\");\n}\nconst a = load(S);\n", "x: u32", &.{"x ="} },
+        // A field that none of the types has at that position is not a use
+        .{ "const F = struct { x: u8 };\nconst S = struct { y: u32 };\nconst T = struct { z: u8 };\nconst a: S = @import(\"cfg.zon\");\nconst b: T = @import(\"cfg.zon\");\nconst f: F = .{ .x = 1 };\n", "x: u8", &.{} },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const a = w.arena.allocator();
+        const main = (try w.fixture(try std.mem.concat(a, u8, &.{ "//- /p/main.zig module:app\n", c[0] }))).file("/p/main.zig");
+        const zon_file = (try w.add("/p/cfg.zon", zon_text)).file;
+        var ctx = w.db.beginRead(a);
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const def = try definition.defAt(&r, main, @intCast(std.mem.indexOf(u8, c[0], c[1]).?)) orelse return error.NoDefinition;
+        var found: std.ArrayList(u32) = .empty;
+        for (try search.findReferences(&r, def, .{ .scope = &.{ main, zon_file } })) |ref| if (ref.file == zon_file) try found.append(a, ref.start);
+        var expected: std.ArrayList(u32) = .empty;
+        for (c[2]) |needle| try expected.append(a, @intCast(std.mem.indexOf(u8, zon_text, needle).?));
+        testing.expectEqualSlices(u32, expected.items, found.items) catch |err| {
+            std.debug.print("search from `{s}` in:\n{s}\n", .{ c[1], c[0] });
+            return err;
+        };
+    }
+}
+
 test "zon files have no result type unless their typed imports agree" {
     const cases = [_]struct { []const u8, []const u8 }{
         // No import site; only an import without a result type

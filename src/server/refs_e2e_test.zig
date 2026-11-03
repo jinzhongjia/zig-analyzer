@@ -656,6 +656,14 @@ test "rename refuses fields of .zon files whose import sites give result types t
 
 test "rename leaves .zon files alone when their fields cannot refer to the renamed field" {
     const cases = [_]struct { name: []const u8, body: []const u8, zon: []const u8, edits: []const u8 }{
+        // The sites disagree, and the `.zon` file has the name, but under neither type is it this
+        // field: renaming a field of another struct was refused
+        .{
+            .name = "different result types with the name elsewhere",
+            .body = "const S = struct { x: u32 };\nconst A = struct { x: u8 };\nconst B = struct { x: u16 };\nconst a: A = @import(\"cfg.zon\");\nconst b: B = @import(\"cfg.zon\");\nconst s: S = .{ .x = 1 };\n",
+            .zon = ".{ .x = 1 }\n",
+            .edits = "main.zig:0:19 main.zig:5:17",
+        },
         // No import site gives a result type: the field in the `.zon` file is its own definition
         .{
             .name = "only imported without a result type",

@@ -30,6 +30,7 @@ const FileId = Vfs.FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 const seed = @import("seed.zig");
 const InternPool = @import("../sema/InternPool.zig");
+const value = @import("../sema/value.zig");
 
 pub const Reference = struct {
     file: FileId,
@@ -246,6 +247,32 @@ pub fn typedZonField(r: *Resolver, site: ZonFieldSite) resolve.Error!?Def {
     const res = try r.ctx.get(sema.Infer, .{ .owner = try r.ownerKey(site.file, site.item), .mode = .full });
     for (res.field_refs) |fr| if (fr.init == site.init and fr.index == site.index) return keyDef(r, fr.member);
     return null;
+}
+
+/// The result types the import sites of a `.zon` file give it, under each instance where a site is in
+/// a generic function. `complete` is false when a site's type could not be determined, or there may
+/// be instances that are not listed.
+fn zonSiteTypes(r: *Resolver, file: FileId) resolve.Error!struct { types: []const InternPool.Index, complete: bool } {
+    const ip = r.ctx.db.env.ip;
+    var types: std.AutoArrayHashMapUnmanaged(InternPool.Index, void) = .empty;
+    var complete = true;
+    for (try database.sema.ZonImports.owners(r, file)) |owner| {
+        var results: std.ArrayList(*const infer.Result) = .empty;
+        try results.append(r.arena, try r.ctx.get(sema.Infer, .{ .owner = owner.key, .mode = .full }));
+        const all = try seed.allInstances(r, owner.file, owner.item);
+        if (!all.complete) complete = false;
+        for (all.insts) |inst| try results.append(r.arena, try r.ctx.get(sema.Infer, .{ .owner = owner.key, .mode = .full, .inst = inst }));
+        for (results.items, 0..) |res, i| for (res.zon_imports) |site| {
+            if (site.file != file) continue;
+            if (value.isConcrete(ip, site.ty)) {
+                try types.put(r.arena, site.ty, {});
+            } else if (i > 0 or all.insts.len == 0) {
+                // The abstract inference of a generic function leaves the type to its instances
+                complete = false;
+            }
+        };
+    }
+    return .{ .types = types.keys(), .complete = complete };
 }
 
 /// The `.zon` file literal of the type `ty`, through a single-item pointer
@@ -695,7 +722,7 @@ const Finder = struct {
             if ((try r.itemTree(file)).items[item_index].kind == .zon) {
                 const imports = try r.ctx.get(database.sema.ZonImports, file);
                 if (imports.result_type == null) {
-                    if (imports.unresolved and f.is_field) try f.noteZonImport(file, try r.itemOffset(file, item_index) orelse return, body);
+                    if (imports.unresolved and f.is_field) try f.zonFieldsUnderSites(file, item_index, body);
                     return;
                 }
             } else if (try seed.genericRoot(r, file, item_index) == null) return;
@@ -815,28 +842,62 @@ const Finder = struct {
         for (try zonLiteralsOf(f.r, file, item_index, body, res, e, rel)) |literal| {
             const site = try zonFieldSite(f.r, .{ .literal = literal, .name = f.name }) orelse continue;
             if (try typedZonField(f.r, site)) |d| if (deepEql(d, f.def)) return true;
+            if ((try f.r.ctx.get(database.sema.ZonImports, site.file)).unresolved) {
+                const owner = try f.r.ownerKey(site.file, site.item);
+                if (try f.underSites(owner, (try zonSiteTypes(f.r, site.file)).types, .{ .e = site.init, .field = site.index })) return true;
+            }
         }
         return false;
     }
 
-    /// Records the first field name or enum literal in the root expression of a `.zon` file (at
-    /// `base`) that has the name of `def`
-    fn noteZonImport(f: *Finder, file: FileId, base: u32, body: *const Body) resolve.Error!void {
-        const slot = f.zon_import orelse return;
-        if (slot.* != null) return;
-        var first: ?Reference = null;
+    /// The uses of `def` in the root expression of a `.zon` file whose import sites give several
+    /// result types: the names that refer to it under one of those types. Each is also recorded in
+    /// `zon_import`, since renaming it would break the sites of the other types, and so is any name
+    /// like it when a site's type could not be determined.
+    fn zonFieldsUnderSites(f: *Finder, file: FileId, item_index: u32, body: *const Body) resolve.Error!void {
+        const r = f.r;
+        const base = try r.itemOffset(file, item_index) orelse return;
+        const sites = try zonSiteTypes(r, file);
+        const owner = try r.ownerKey(file, item_index);
         for (body.exprs, 0..) |e, i| {
-            const range: ?Body.Range = switch (e) {
-                .enum_literal => |n| if (std.mem.eql(u8, n, f.name)) body.expr_ranges[i] else null,
-                .init => |x| for (x.fields) |fi| {
-                    if (fi.name != null and std.mem.eql(u8, fi.name.?, f.name)) break fi.name_range;
-                } else null,
-                else => null,
-            };
-            const at = range orelse continue;
-            if (first == null or base + at.start < first.?.start) first = .{ .file = file, .start = base + at.start, .end = base + at.end };
+            const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
+            switch (e) {
+                .enum_literal => |n| if (std.mem.eql(u8, n, f.name)) {
+                    const range = body.expr_ranges[i];
+                    const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
+                    if (try f.underSites(owner, sites.types, .{ .e = id })) {
+                        try f.addLastToken(file, at.end, false);
+                        f.noteZonImport(at);
+                    } else if (!sites.complete) f.noteZonImport(at);
+                },
+                .init => |x| for (x.fields, 0..) |fi, k| {
+                    const n = fi.name orelse continue;
+                    if (!std.mem.eql(u8, n, f.name)) continue;
+                    const at: Reference = .{ .file = file, .start = base + fi.name_range.start, .end = base + fi.name_range.end };
+                    if (try f.underSites(owner, sites.types, .{ .e = id, .field = k })) {
+                        try f.add(file, at.start, at.end);
+                        f.noteZonImport(at);
+                    } else if (!sites.complete) f.noteZonImport(at);
+                },
+                else => {},
+            }
         }
-        slot.* = first;
+    }
+
+    /// Whether `l` in the root expression `owner` of a `.zon` file is `def` under one of `types`
+    fn underSites(f: *Finder, owner: hir.OwnerKey, types: []const InternPool.Index, l: Lookup) resolve.Error!bool {
+        for (types) |ty| {
+            const res = try f.r.ctx.get(sema.Infer, .{ .owner = owner, .mode = .full, .zon_type = ty });
+            const m = l.member(res) orelse continue;
+            if (try keyDef(f.r, m)) |d| if (deepEql(d, f.def)) return true;
+        }
+        return false;
+    }
+
+    fn noteZonImport(f: *Finder, at: Reference) void {
+        if (f.zon_import) |slot| if (slot.* == null) {
+            slot.* = at;
+        };
     }
 
     fn inferred(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32) resolve.Error!*const infer.Result {
