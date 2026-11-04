@@ -557,12 +557,18 @@ pub fn typeLayout(ip: *InternPool, t: Index) ?Layout {
             else => if (scalarAbiOf(ip, s)) |l| .{ .size = l.size, .alignment = l.alignment, .bits = l.bits } else null,
         },
         .error_set_type, .inferred_error_set => errorLayout(ip),
-        .ptr_type => |p| if (pointer_bits == 0)
-            null
-        else if (p.size == .slice)
-            .{ .size = 2 * ptr_bytes, .alignment = ptr_bytes, .bits = null }
-        else
-            .{ .size = ptr_bytes, .alignment = ptr_bytes, .bits = pointer_bits },
+        .ptr_type => |p| if (pointer_bits == 0) null else blk: {
+            // `Type.ptrAbiAlignment`: the byte size in Zig 0.17.0 (1 for a size that is not a power
+            // of 2), and the alignment of the integer of the same width from 0.17.1 on
+            const alignment = switch (ip.dialect()) {
+                .zig_0_17_0 => if (std.math.isPowerOfTwo(ptr_bytes)) ptr_bytes else 1,
+                .zig_0_17_1 => (intLayout(ip, @intCast(pointer_bits)) orelse return null).alignment,
+            };
+            break :blk if (p.size == .slice)
+                .{ .size = 2 * ptr_bytes, .alignment = alignment, .bits = null }
+            else
+                .{ .size = ptr_bytes, .alignment = alignment, .bits = pointer_bits };
+        },
         .optional_type => |c| optionalLayout(ip, c, typeLayout(ip, c) orelse return null),
         .array_type => |a| arrayLayout(typeLayout(ip, a.child) orelse return null, a, hasBitRepr(ip, a.child)),
         .error_union_type => |eu| errorUnionLayout(ip, typeLayout(ip, eu.payload) orelse return null),
@@ -610,11 +616,17 @@ fn vectorLayout(ip: *InternPool, len: u32, child: Index) ?Layout {
     const alignment: u64, const bytes: u64 = switch (abi) {
         .unknown => unreachable,
         .llvm, .llvm_aarch64 => blk: {
+            if (elem_bits == 0) break :blk .{ 1, 0 };
             const bytes = (bits + 7) / 8;
-            if (elem_bits == 0) break :blk .{ 1, bytes };
-            // aarch64: no larger than the stack alignment
-            const capped = if (abi == .llvm_aarch64) @min(bytes, 16) else bytes;
-            break :blk .{ std.math.ceilPowerOfTwo(u64, capped) catch return null, bytes };
+            const rounded = std.math.ceilPowerOfTwo(u64, bytes) catch return null;
+            // aarch64: the alignment is no larger than the stack alignment. The size is the byte
+            // size rounded up to a power of 2 also where the alignment is smaller; in Zig 0.17.0
+            // it is only padded to the alignment.
+            const size = switch (ip.dialect()) {
+                .zig_0_17_0 => bytes,
+                .zig_0_17_1 => rounded,
+            };
+            break :blk .{ if (abi == .llvm_aarch64) @min(rounded, 16) else rounded, size };
         },
         .x86_64, .x86_64_avx, .x86_64_avx512 => blk: {
             const avx = abi != .x86_64;

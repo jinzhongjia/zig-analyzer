@@ -1786,6 +1786,40 @@ test "string conversion in a file formatted by zig fmt keeps it formatted" {
     }
 }
 
+test "string conversion follows the formatter of the user's zig" {
+    // Formatted for 0.17.1, not for 0.17.0: only the literal is replaced when 0.17.0 would reformat
+    // unrelated lines, which using the zig zig-analyzer was built with got wrong for the other one
+    const format = @import("format.zig");
+    const unrelated = "const a = .{\n    1,\n\n    2, //\n    3,\n};\n";
+    const source = unrelated ++ "const t = .{ <|>\"s\", 42 };\n";
+    for ([_]struct { format.Renderer, []const u8 }{
+        .{ .zig_0_17_0, unrelated ++ "const t = .{\n    \\\\s\n, 42 };\n" },
+        .{ .zig_0_17_1, unrelated ++ "const t = .{\n    \\\\s\n    ,\n    42,\n};\n" },
+    }) |case| {
+        const renderer, const expected = case;
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        {
+            w.db.beginWrite();
+            defer w.db.endWrite();
+            try w.db.set(format.ZigFmtRenderer, {}, renderer, .high);
+        }
+        const added = try w.add("/p/main.zig", source);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        const clean = (try ctx.get(@import("../database.zig").syntax.SourceText, added.file)).text;
+        const actions = try code_actions.codeActions(&r, added.file, added.cursor, added.cursor);
+        const got = for (actions) |a| {
+            if (!std.mem.startsWith(u8, a.title, "convert to a multiline")) continue;
+            const e = a.edits[0];
+            break try std.mem.concat(w.arena.allocator(), u8, &.{ clean[0..e.start], e.text, clean[e.end..] });
+        } else return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(expected, got);
+    }
+}
+
 test "multiline conversion preserves whitespace and selects the whole literal" {
     for ([_][]const u8{
         "const text =\n    \\\\<|> a  \n    \\\\b\\\\\"\n    \\\\\n;",

@@ -12,6 +12,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const FileId = @import("../base/Vfs.zig").FileId;
 const AstId = @import("../syntax/ItemTree.zig").AstId;
+const Dialect = @import("../syntax/Parse.zig").Dialect;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 const SpinMutex = @import("../util/SpinMutex.zig");
 
@@ -593,6 +594,10 @@ pub fn errorBits(ip: *const InternPool) ?u16 {
     return ip.currentTarget().error_bits;
 }
 
+pub fn dialect(ip: *const InternPool) Dialect {
+    return ip.currentTarget().dialect;
+}
+
 /// May only be called in a write transaction
 pub fn setTarget(ip: *InternPool, t: Target) void {
     ip.target = t;
@@ -626,6 +631,9 @@ pub const Target = struct {
     /// Bit width of error codes, set by the compilation's error limit (`errorBitsOf`); null when
     /// the compilations the parameters are common to disagree
     error_bits: ?u16 = errorBitsOf(null),
+    /// The user's zig version decides the layouts of vectors whose alignment is capped and of
+    /// pointers on targets with a smaller maximum integer alignment
+    dialect: Dialect = .latest,
 };
 
 /// Bit width of error codes for the error limit of a compilation (`--error-limit`, the compiler's
@@ -741,9 +749,10 @@ pub const ScalarAbi = struct {
 /// the compiler backend, the architecture and the CPU features
 pub const VectorAbi = enum(u8) {
     unknown,
-    /// The alignment is the byte size rounded up to a power of 2 (LLVM and other backends)
+    /// The size and alignment are the byte size rounded up to a power of 2 (LLVM and other backends)
     llvm,
-    /// Like `llvm`, but no larger than the stack alignment of 16 (aarch64)
+    /// Like `llvm`, but the alignment is no larger than the stack alignment of 16 (aarch64); in Zig
+    /// 0.17.0 the size is then the byte size padded to the alignment
     llvm_aarch64,
     /// The self-hosted x86_64 backend: the alignment is at least 16; with AVX / AVX-512,
     /// vectors larger than 16 / 32 bytes are aligned to 32 / 64

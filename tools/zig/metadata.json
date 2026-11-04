@@ -1,13 +1,13 @@
 {
-  "version": "0.17.0",
-  "source_archive": "https://ziglang.org/download/0.17.0/zig-0.17.0.tar.xz",
-  "source_archive_sha256": "b6c7f1728f043700d6529bac980800792f824256a9d2f1839b3d62beed0b8abd",
+  "version": "0.17.1",
+  "source_archive": "https://ziglang.org/download/0.17.1/zig-0.17.1.tar.xz",
+  "source_archive_sha256": "1e89bf06610b769a8c77676c6c8d54b093a0db60f4891f2f91014829012f0e24",
   "langref_path": "doc/langref.html.in",
-  "langref_sha256": "553503ea235fd96a3643e382b58c6240e60ce535e2bab0cce1e5c7cdd6f43c63",
+  "langref_sha256": "a281a246ad55a492b0fae90e288e8fb0121ddfd2cf6a598761f23a0e422dfdb1",
   "builtin_registry_path": "lib/std/zig/BuiltinFn.zig",
   "builtin_registry_sha256": "42062ec69edfac554be1add745ce70cb1e1323ff762bbe4b6c0e4a3d69533dcc",
   "build_zig_zon_path": "doc/build.zig.zon.md",
   "build_zig_zon_sha256": "fb7e6da18d7eba76f2b79ed009c622ce19a5da3407fd592c4bb977a7de72dfcf",
-  "documentation_url": "https://ziglang.org/documentation/0.17.0/",
+  "documentation_url": "https://ziglang.org/documentation/0.17.1/",
   "license": "MIT"
 }

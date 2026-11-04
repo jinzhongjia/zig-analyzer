@@ -15,7 +15,7 @@
 - **格式化**：与 `zig fmt` 结果一致，支持 `.zig` 和 `.zon`。
 - **ZON 文件**：所有 `.zon` 文件都有高亮、格式化和错误诊断；提供大纲；为带结果类型导入的文件和 `build.zig.zon` 提供补全、跳转和内联提示；`zig-analyzer.zon` 提供配置补全和配置说明。
 - **结构**：折叠范围和选择范围。
-- **命名检查**（需手动开启）：依据 Zig 风格指南的 [Names](https://ziglang.org/documentation/0.17.0/#Names) 一节给出提示，并提供安全的重命名修复。
+- **命名检查**（需手动开启）：依据 Zig 风格指南的 [Names](https://ziglang.org/documentation/0.17.1/#Names) 一节给出提示，并提供安全的重命名修复。
 
 ## Neovim 配置
 
@@ -38,7 +38,7 @@ vim.lsp.enable('zig_analyzer')
 
 ## 开发
 
-需要 Zig **0.17.0**。
+需要 Zig **0.17.0** 或 **0.17.1**。
 
 ```sh
 zig build -Doptimize=ReleaseSafe  # 构建 zig-out/bin/zig-analyzer

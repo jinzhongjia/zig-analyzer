@@ -268,8 +268,11 @@ fn atListEnd(p: *Parser) bool {
 
 fn param(p: *Parser) Error!void {
     const m = try p.start();
+    const documented = p.at(.doc_comment);
     while (p.at(.doc_comment)) try p.bump();
-    if (try p.eat(.ellipsis3)) {
+    if (p.at(.ellipsis3)) {
+        if (documented and !p.variadic_doc_comments) try p.err("expected parameter type");
+        try p.bump();
         _ = try m.complete(p, .param);
         return;
     }

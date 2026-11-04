@@ -73,4 +73,4 @@ Only an enum's names and the tags of a union without a payload are offered, also
 
 ## Builtins (completion, hover, and signature help)
 
-Signatures and descriptions are generated from the official language reference of the pinned Zig version; hover also keeps the inference result. `zig build gen` produces `src/ide/builtin_data.zig` and `src/ide/manifest_data.zig` offline, verifying the input hashes recorded in `tools/zig/metadata.json`; at run time only the static tables are read. Builtins the sources do not document say so, without invented signatures.
+Signatures and descriptions are generated from the official language reference of the pinned Zig version, and name the user's supported version in their links and notes (the texts of the supported versions are otherwise identical); hover also keeps the inference result. `zig build gen` produces `src/ide/builtin_data.zig` and `src/ide/manifest_data.zig` offline, verifying the input hashes recorded in `tools/zig/metadata.json`; at run time only the static tables are read. Builtins the sources do not document say so, without invented signatures.

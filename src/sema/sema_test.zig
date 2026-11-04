@@ -1798,6 +1798,128 @@ test "vector layouts follow the backend and CPU features" {
     });
 }
 
+test "LLVM vector sizes are powers of two even where the alignment is capped" {
+    // Expected values are the results of zig 0.17.1 on aarch64-linux and x86_64-linux with
+    // -OReleaseFast; a size of 48 was reported for `s33`, aligned to 16 from 33 bytes
+    const src =
+        \\const s3 = @sizeOf(@Vector(3, u8));
+        \\const s17 = @sizeOf(@Vector(17, u8));
+        \\const s33 = @sizeOf(@Vector(33, u8));
+        \\const s65 = @sizeOf(@Vector(65, u8));
+        \\const a33 = @alignOf(@Vector(33, u8));
+        \\const s5u64 = @sizeOf(@Vector(5, u64));
+        \\const s0 = @sizeOf(@Vector(0, u8));
+    ;
+    try expectTypesTargeted(.{ .vector_abi = .llvm_aarch64 }, src, &.{
+        .{ "s3", "comptime_int = 4" },
+        .{ "s17", "comptime_int = 32" },
+        .{ "s33", "comptime_int = 64" },
+        .{ "s65", "comptime_int = 128" },
+        .{ "a33", "comptime_int = 16" },
+        .{ "s5u64", "comptime_int = 64" },
+        .{ "s0", "comptime_int = 0" },
+    });
+    try expectTypesTargeted(.{ .vector_abi = .llvm }, src, &.{
+        .{ "s33", "comptime_int = 64" },
+        .{ "a33", "comptime_int = 64" },
+        .{ "s0", "comptime_int = 0" },
+    });
+}
+
+test "vector sizes follow the user's zig where the alignment is capped" {
+    // Expected values are the results of `zig build-obj -OReleaseFast` of each version
+    const src =
+        \\const S = struct { v: @Vector(33, u8), b: u8 };
+        \\const s3 = @sizeOf(@Vector(3, u8));
+        \\const s17 = @sizeOf(@Vector(17, u8));
+        \\const s32 = @sizeOf(@Vector(32, u8));
+        \\const s33 = @sizeOf(@Vector(33, u8));
+        \\const s65 = @sizeOf(@Vector(65, u8));
+        \\const a33 = @alignOf(@Vector(33, u8));
+        \\const s5u64 = @sizeOf(@Vector(5, u64));
+        \\const s0 = @sizeOf(@Vector(0, u8));
+        \\const s_struct = @sizeOf(S);
+    ;
+    try expectTypesTargeted(.{ .vector_abi = .llvm_aarch64, .dialect = .zig_0_17_0 }, src, &.{
+        .{ "s3", "comptime_int = 4" },
+        .{ "s17", "comptime_int = 32" },
+        .{ "s32", "comptime_int = 32" },
+        .{ "s33", "comptime_int = 48" },
+        .{ "s65", "comptime_int = 80" },
+        .{ "a33", "comptime_int = 16" },
+        .{ "s5u64", "comptime_int = 48" },
+        .{ "s0", "comptime_int = 0" },
+        .{ "s_struct", "comptime_int = 64" },
+    });
+    try expectTypesTargeted(.{ .vector_abi = .llvm_aarch64, .dialect = .zig_0_17_1 }, src, &.{
+        .{ "s3", "comptime_int = 4" },
+        .{ "s17", "comptime_int = 32" },
+        .{ "s32", "comptime_int = 32" },
+        .{ "s33", "comptime_int = 64" },
+        .{ "s65", "comptime_int = 128" },
+        .{ "a33", "comptime_int = 16" },
+        .{ "s5u64", "comptime_int = 64" },
+        .{ "s0", "comptime_int = 0" },
+        .{ "s_struct", "comptime_int = 80" },
+    });
+    // Without a capped alignment the versions agree
+    for ([_]@import("../syntax/Parse.zig").Dialect{ .zig_0_17_0, .zig_0_17_1 }) |dialect| {
+        try expectTypesTargeted(.{ .vector_abi = .llvm, .dialect = dialect }, src, &.{
+            .{ "s33", "comptime_int = 64" },
+            .{ "s65", "comptime_int = 128" },
+            .{ "a33", "comptime_int = 64" },
+            .{ "s5u64", "comptime_int = 64" },
+            .{ "s_struct", "comptime_int = 128" },
+        });
+    }
+}
+
+test "pointer layouts follow the target and the user's zig" {
+    // Expected values are the results of `zig build-obj` of each version; only AVR differs, where
+    // the maximum integer alignment is below the size of a pointer
+    const src =
+        \\const S = struct { a: u8, p: *u8 };
+        \\const E = struct { a: u8, s: []u8 };
+        \\const a_ptr = @alignOf(*u8);
+        \\const s_ptr = @sizeOf(*u8);
+        \\const a_slice = @alignOf([]u8);
+        \\const s_slice = @sizeOf([]u8);
+        \\const a_opt = @alignOf(?*u8);
+        \\const s_s = @sizeOf(S);
+        \\const a_s = @alignOf(S);
+        \\const s_e = @sizeOf(E);
+    ;
+    const Dialect = @import("../syntax/Parse.zig").Dialect;
+    for ([_]struct { []const u8, Dialect, u64, u64, u64, u64 }{
+        .{ "avr-freestanding-none", .zig_0_17_0, 2, 2, 4, 6 },
+        .{ "avr-freestanding-none", .zig_0_17_1, 1, 2, 3, 5 },
+        .{ "msp430-freestanding-none", .zig_0_17_0, 2, 2, 4, 6 },
+        .{ "msp430-freestanding-none", .zig_0_17_1, 2, 2, 4, 6 },
+        .{ "m68k-linux-musl", .zig_0_17_0, 4, 4, 8, 12 },
+        .{ "m68k-linux-musl", .zig_0_17_1, 4, 4, 8, 12 },
+        .{ "wasm32-freestanding-none", .zig_0_17_0, 4, 4, 8, 12 },
+        .{ "wasm32-freestanding-none", .zig_0_17_1, 4, 4, 8, 12 },
+        .{ "x86_64-linux-musl", .zig_0_17_0, 8, 8, 16, 24 },
+        .{ "x86_64-linux-musl", .zig_0_17_1, 8, 8, 16, 24 },
+    }) |case| {
+        const triple, const dialect, const alignment, const size, const s_size, const e_size = case;
+        var target = try targetOf(triple, null);
+        target.dialect = dialect;
+        var buf: [5][32]u8 = undefined;
+        const a = try std.fmt.bufPrint(&buf[0], "comptime_int = {d}", .{alignment});
+        try expectTypesTargeted(target, src, &.{
+            .{ "a_ptr", a },
+            .{ "s_ptr", try std.fmt.bufPrint(&buf[1], "comptime_int = {d}", .{size}) },
+            .{ "a_slice", a },
+            .{ "s_slice", try std.fmt.bufPrint(&buf[2], "comptime_int = {d}", .{2 * size}) },
+            .{ "a_opt", a },
+            .{ "s_s", try std.fmt.bufPrint(&buf[3], "comptime_int = {d}", .{s_size}) },
+            .{ "a_s", a },
+            .{ "s_e", try std.fmt.bufPrint(&buf[4], "comptime_int = {d}", .{e_size}) },
+        });
+    }
+}
+
 /// Target parameters for `arch_os_abi` and the CPU (as with the compiler's `-target` / `-mcpu`):
 /// pointer bit width and layout rules of scalar types
 fn targetOf(arch_os_abi: []const u8, cpu: ?[]const u8) !InternPool.Target {

@@ -112,7 +112,7 @@ Only `Canceled` and `OutOfMemory` propagate within the engine. Query results are
 
 ## Syntax layer (`syntax/`)
 
-`std.zig.Ast` is used only for formatting and AstGen diagnostics, not as the IDE syntax tree: its recovery from half-written expressions such as `foo.` is coarse-grained, it does not preserve trivia structure, and its node indices shift globally, which makes local reparse impossible.
+`std.zig.Ast` is used only for formatting (rendered by the version-specific copies in `src/ide/render/`) and AstGen diagnostics, not as the IDE syntax tree: its recovery from half-written expressions such as `foo.` is coarse-grained, it does not preserve trivia structure, and its node indices shift globally, which makes local reparse impossible.
 
 - **Red-green CST**: hand-written recursive descent following the official PEG grammar that never fails. Where no structure can be recovered, an `ERROR` node is produced; concatenating the tree's text always yields the source.
 - **Local reparse**: an edit inside a brace-balanced `block` / `container_decl` reparses only that node. The result must equal a full parse (ensured by corpus and random-edit tests).
@@ -295,9 +295,12 @@ At startup `zig env` gives the lib, std, and global cache directories; when it f
 
 ### Version coupling
 
-The `Configuration` format and in-process AstGen come from the standard library zig-analyzer is compiled with. The build graph file has no version number and is read as raw structs, so it is read only when the user's zig version matches exactly, and its lengths and indices are validated first.
+The `Configuration` format and in-process AstGen come from the standard library zig-analyzer is compiled with. zig-analyzer builds with Zig 0.17.0 and 0.17.1, and works with either as the user's zig whichever one built it. The build graph file has no version number and is read as raw structs, so it is read only from these versions, whose formats are compatible (`ZigEnv.supported_versions`), and its lengths and indices are validated first.
 
-- When versions differ, the build system is not started for roots with `build.zig`: no compiler diagnostics or named imports, only `zig ast-check` live diagnostics, and no single-file compiles there. The user is told at startup.
+- When the user's zig is another of these versions, in-process AstGen would not match it, so live diagnostics use `zig ast-check`; everything else works as usual.
+- `Parse.Dialect`, from the user's zig, selects the rules that differ, with versions other than 0.17.0 following the latest. The CST parser (the `SyntaxDialect` input): only 0.17.0 accepts doc comments on `...`. Type layouts (`InternPool.Target`): in 0.17.0 the size of a `@Vector` whose alignment is capped (aarch64) is its byte size padded to the alignment rather than rounded up to a power of two, and a pointer is aligned to its size even where the maximum integer alignment is smaller (AVR, spork8). The layouts of scalar types come from `std.Target` of the Zig that zig-analyzer was built with and do not follow the user's zig: with different versions they can disagree with the compiler on uncommon targets (C types and floats on sparc, xtensa, spirv64, amdgcn, avr and ez80, and types containing them). Builtin documentation: the links and notes name the user's version; the texts of the two versions are otherwise identical, so there is one generated table. Naming diagnostics link to the style guide of the user's version.
+- Formatting uses the renderer of the user's zig, in process, and the parser of the standard library zig-analyzer is compiled with (see `docs/features/formatting.md`).
+- With any other version, the build system is not started for roots with `build.zig`: no compiler diagnostics or named imports, only `zig ast-check` live diagnostics, and no single-file compiles there. The user is told at startup.
 - Other files still compile in single-file mode; the `ErrorBundle` is validated as in `docs/diagnostics.md`, never read out of bounds, though contents may be garbled.
 - Release versions follow Zig versions. The reported version comes from `git describe --tags`, falling back to `build.zig.zon`; `build.zig` is marked not cacheable because git's answer is outside the configure cache.
 
