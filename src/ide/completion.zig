@@ -30,6 +30,7 @@ const database = @import("../database.zig");
 const ModuleGraph = @import("../names/ModuleGraph.zig");
 const builtins = @import("builtins.zig");
 const manifest = @import("manifest.zig");
+const project_config = @import("project_config.zig");
 const imports = @import("../ide_db/imports.zig");
 const tree_mod = @import("../syntax/tree.zig");
 const SyntaxNode = tree_mod.SyntaxNode;
@@ -319,6 +320,11 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     const literal = try commentOrString(r, file, offset);
     if (literal == .comment) return .{ .context = .ignored };
     if (literal == .quoted) return quotedName(r, file, offset, cursor_owner);
+    if (literal == .none and !paths_only) if (try project_config.valueCompletions(r, file, text, offset, (try r.ctx.get(database.syntax.ParseFile, file)).rootNode())) |values| {
+        out.member_mode = true;
+        for (values.names) |v| try out.add(.{ .label = v, .kind = if (values.tags) .enum_member else .constant });
+        return .{ .items = out.items.items, .context = if (values.tags) .enum_literal else .ignored };
+    };
     // The following contexts are mostly error nodes in the syntax tree (such as a lone `@` or an
     // unterminated string), so they are recognized directly from the source text
     if (literal == .none and !paths_only) if (builtinStart(text, offset)) |start| {
@@ -395,6 +401,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
             const x = b.expr(init).init;
             const ty = if (x.ty == null) a.literalExpected(init) orelse {
                 for (try manifest.fieldCompletions(r, file, b, init)) |f| try out.add(.{ .label = f.name, .kind = .field, .doc = f.doc });
+                for (try project_config.fieldCompletions(r, file, b, init)) |f| try out.add(.{ .label = f.name, .kind = .field, .doc = f.doc });
                 return .{ .items = out.items.items, .context = .init_field };
             } else a.exprType(init).ty;
             if (fieldsType(r.ctx.db.env.ip, ty)) |t| {
@@ -404,7 +411,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         }
         const want = a.literalExpected(e) orelse return .{ .context = .enum_literal, .at = a };
         const operand = literalOperand(b, e);
-        const mode: DeclLiterals = if (a.literalTagsOnly(e)) .none else if (isTryOperand(b, operand)) .@"try" else .value;
+        const mode: DeclLiterals = if (r.isZon(file)) .zon else if (a.literalTagsOnly(e)) .none else if (isTryOperand(b, operand)) .@"try" else .value;
         try expectedMembers(r, &out, if (mode == .value) try literalResultType(r, a, operand, want) else want, mode, file);
         return .{ .items = out.items.items, .context = .enum_literal, .at = a };
     };
@@ -894,6 +901,9 @@ const DeclLiterals = enum {
     /// The operand of `try` (`try .|`, `try .f|()`): only functions returning an error union whose
     /// payload coerces to the type (see `producesType`); tags are not error unions
     @"try",
+    /// None, in a `.zon` file: the compiler parses only the names of an enum and the tags of a union
+    /// without a payload as enum literals, also through a pointer, which it parses as the pointee
+    zon,
 };
 
 /// After `.`: enum members and union fields of the expected type, and the declarations selected
@@ -913,7 +923,7 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: Decl
         } else break,
         else => break,
     };
-    const tags = decl_literals != .@"try" and !through_ptr;
+    const tags = decl_literals == .zon or (decl_literals != .@"try" and !through_ptr);
     // A union result type takes only the tags of a tagged union whose field type has one possible
     // value (`.none`), the only tags that coerce to it (see `onePossibleValue`); for a peer type
     // (switch prongs, comparisons), all the tags
@@ -957,7 +967,7 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: Decl
                 else => {},
             },
             .@"const", .@"fn" => {
-                if (decl_literals == .none or (ns.file != from and !it.flags.is_pub)) continue;
+                if (decl_literals == .none or decl_literals == .zon or (ns.file != from and !it.flags.is_pub)) continue;
                 const decl_ty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = inst })).ty;
                 if (!producesType(ip, decl_ty, ty, it.kind == .@"fn", decl_literals == .@"try")) continue;
                 const is_fn = it.kind == .@"fn";

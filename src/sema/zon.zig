@@ -13,6 +13,7 @@ const InternPool = @import("InternPool.zig");
 const Index = InternPool.Index;
 const TypedValue = InternPool.TypedValue;
 const value = @import("value.zig");
+const FileId = @import("../base/Vfs.zig").FileId;
 
 const log = std.log.scoped(.zon);
 
@@ -20,17 +21,17 @@ const log = std.log.scoped(.zon);
 /// values); deeper values are treated as unknown
 const max_depth = 256;
 
-/// Value of ZON text without a result type. Unknown when there are syntax errors or errors
+/// Value of the ZON text of `file` without a result type. Unknown when there are syntax errors or errors
 /// reported by ZonGen (such as duplicate field names); without a result type the compiler reports
 /// errors for `inf` and `nan`, so values containing them are unknown too.
-pub fn lower(gpa: Allocator, ip: *InternPool, text: []const u8) Allocator.Error!TypedValue {
+pub fn lower(gpa: Allocator, ip: *InternPool, file: FileId, text: []const u8) Allocator.Error!TypedValue {
     const source = try gpa.dupeSentinel(u8, text, 0);
     defer gpa.free(source);
     const zoir = try generate(gpa, source) orelse return .unknown;
     defer zoir.deinit(gpa);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    var l: Lowering = .{ .ip = ip, .zoir = &zoir, .arena = arena.allocator() };
+    var l: Lowering = .{ .ip = ip, .zoir = &zoir, .arena = arena.allocator(), .file = file };
     return l.node(.root, 0);
 }
 
@@ -81,6 +82,9 @@ const Lowering = struct {
     ip: *InternPool,
     zoir: *const Zoir,
     arena: Allocator,
+    file: FileId,
+    /// The field or element index at each level down to the node being lowered
+    path: std.ArrayList(u32) = .empty,
 
     fn node(l: *Lowering, n: Zoir.Node.Index, depth: u32) Allocator.Error!TypedValue {
         const ip = l.ip;
@@ -124,6 +128,8 @@ const Lowering = struct {
         const values = try l.arena.alloc(Index, elems.len);
         var known = true;
         for (types, values, 0..) |*t, *v, i| {
+            try l.path.append(l.arena, @intCast(i));
+            defer _ = l.path.pop();
             const field = try l.node(elems.at(@intCast(i)), depth + 1);
             if (field.ty == .unknown) return .unknown;
             t.* = field.ty;
@@ -133,18 +139,19 @@ const Lowering = struct {
         const ty = if (names) |ns| blk: {
             const strs = try l.arena.alloc([]const u8, ns.len);
             for (ns, strs) |name, *s| s.* = name.get(l.zoir);
-            break :blk try ip.get(.{ .anon_struct_type = .{ .names = strs, .types = types, .values = values } });
+            break :blk try ip.get(.{ .anon_struct_type = .{ .names = strs, .types = types, .values = values, .origin = .{ .file = l.file, .path = l.path.items } } });
         } else try ip.get(.{ .tuple_type = .{ .types = types, .values = values } });
         return .{ .ty = ty, .val = if (known) try value.aggregate(ip, l.arena, ty, values) else null };
     }
 };
 
 const testing = std.testing;
+const test_file: FileId = @fromBackingInt(@intCast(0));
 
 test "ZON text lowers to the value without a result type" {
     var ip: InternPool = try .init(testing.allocator, testing.io);
     defer ip.deinit();
-    const tv = try lower(testing.allocator, &ip, ".{ .x = -1, .list = .{ 'a', 2.5, .{} }, .name = \"hi\", .on = true, .none = null, .mode = .fast }");
+    const tv = try lower(testing.allocator, &ip, test_file, ".{ .x = -1, .list = .{ 'a', 2.5, .{} }, .name = \"hi\", .on = true, .none = null, .mode = .fast }");
     try testing.expect(tv.val != null);
     const s = ip.key(tv.ty).anon_struct_type;
     try testing.expectEqual(6, s.names.len);
@@ -168,7 +175,7 @@ test "ZON text the compiler rejects without a result type has no value" {
     defer ip.deinit();
     // Syntax errors, duplicate field names, inf / nan without a result type
     for ([_][]const u8{ ".{ .x = 1, ", ".{ .x = 1, .x = 2 }", ".{ .f = inf }", "-inf", "nan" }) |text| {
-        try testing.expectEqual(Index.unknown, (try lower(testing.allocator, &ip, text)).ty);
+        try testing.expectEqual(Index.unknown, (try lower(testing.allocator, &ip, test_file, text)).ty);
     }
 }
 
@@ -181,7 +188,7 @@ test "ZON values nested beyond the limit are unknown" {
         for (0..c[0]) |_| try text.appendSlice(testing.allocator, ".{");
         try text.append(testing.allocator, '1');
         try text.appendNTimes(testing.allocator, '}', c[0]);
-        const tv = try lower(testing.allocator, &ip, text.items);
+        const tv = try lower(testing.allocator, &ip, test_file, text.items);
         try testing.expectEqual(c[1], tv.val != null);
         if (!c[1]) try testing.expectEqual(Index.unknown, tv.ty);
     }

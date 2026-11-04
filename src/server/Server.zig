@@ -4284,7 +4284,7 @@ fn maybeResetSema(server: *Server, start: SemaUsage) void {
 const sema_reset_keys = 200_000;
 
 /// Queries cleared by a whole-generation reclaim
-const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.sema.ZonValue, database.sema.ZonResultType, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
+const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.sema.ZonValue, database.sema.ZonImports, database.sema.ZonResultType, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
 
 fn semaKeys(server: *Server) usize {
     var n: usize = 0;
@@ -4910,7 +4910,9 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     // Live diagnostics: the file is loaded, and it belongs to no project or one of its projects
     // wants them (see `Workspace.liveEligible`)
     var live_result: ?*live.Result = null;
-    if (text != null and server.liveEligible(file)) live_result = try ctx.get(live.AstCheck, file);
+    // An open `.zon` file always: what makes it valid ZON does not depend on any build
+    const is_zon = live.modeOf(server.vfs.path(file)) == .zon;
+    if (text != null and (server.liveEligible(file) or (is_zon and server.isOpen(server.vfs.path(file))))) live_result = try ctx.get(live.AstCheck, file);
 
     // Compiler diagnostics: errors in an imported file are
     // reported by the project or root file that compiles it
@@ -4935,6 +4937,9 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
         diags = try server.appendNaming(ctx, arena, file, t, settings, diags);
     };
     if (text) |t| diags = try server.appendUnloadedProjectHint(arena, file, t, diags);
+    if (text) |t| if (is_zon and std.mem.eql(u8, std.fs.path.basename(server.vfs.path(file)), Config.project_file)) {
+        diags = try server.appendProjectConfigProblems(arena, t, diags);
+    };
     return .{ .uri = document_uri, .diagnostics = diags };
 }
 
@@ -5019,6 +5024,27 @@ test "computeDiagnostics: notes of combined results keep the coordinates of thei
     try std.testing.expectEqual(0, related[0].location.range.start.character);
     try std.testing.expectEqual(6, related[0].location.range.end.line);
     try std.testing.expectEqual(21, related[0].location.range.end.character);
+}
+
+/// The problems `zig-analyzer.zon` has beyond its syntax, which is reported as for any `.zon` file
+fn appendProjectConfigProblems(server: *Server, arena: Allocator, text: []const u8, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+    if (diags.len > 0) return diags;
+    const problems = try Config.projectProblems(server.gpa, arena, text);
+    const out = try arena.alloc(types.Diagnostic, problems.len);
+    const lines = try offsets.LineIndex.init(arena, text);
+    for (problems, out) |p, *o| {
+        const start: u32 = @min(p.start orelse 0, @as(u32, @intCast(text.len)));
+        var end = start;
+        while (end < text.len and (std.ascii.isAlphanumeric(text[end]) or text[end] == '_' or text[end] == '.')) end += 1;
+        if (end == start and end < text.len) end += 1;
+        o.* = .{
+            .range = lines.range(start, end, server.encoding),
+            .severity = if (p.fatal) .Error else .Warning,
+            .source = "zig-analyzer",
+            .message = .{ .string = if (p.fatal) try std.fmt.allocPrint(arena, "{s}; the file is ignored", .{p.message}) else p.message },
+        };
+    }
+    return out;
 }
 
 /// An open file that belongs to a project that is not loaded (see `FileContext.unloaded_project`):
@@ -5974,7 +6000,7 @@ fn ownFileOnly(r: *Resolver, symbol: za.ide_db.search.Symbol) !bool {
     return switch (symbol) {
         .def => |def| !try za.ide_db.search.visibleOutsideFile(r, def),
         .label => true,
-        .error_name => false,
+        .error_name, .zon_field => false,
     };
 }
 
@@ -6032,6 +6058,10 @@ fn renameRefusal(server: *Server, r: *Resolver, symbol: za.ide_db.search.Symbol)
         },
         .label => |l| l.file,
         .error_name => |e| e.file,
+        .zon_field => |z| blk: {
+            if (try ide.manifest.active(r, z.literal.file)) return "cannot rename a field of build.zig.zon: its names are defined by the package format";
+            break :blk z.literal.file;
+        },
     };
     if (try za.ide_db.search.symbolName(r, symbol) == null) return "cannot rename: there is no name here";
     const rules = try server.originRules(r.arena);
@@ -6075,6 +6105,7 @@ fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameP
         .def => |def| try server.checkedRename(r, arena, def, old, params.newName),
         .label => |l| try server.checkedLabelRename(r, arena, l, old, params.newName),
         .error_name => |e| try server.checkedErrorRename(r, arena, e.file, old, params.newName),
+        .zon_field => |z| try server.checkedZonFieldRename(r, arena, z, old, params.newName),
     };
     const checked = switch (outcome) {
         .ok => |checked| checked,
@@ -6151,6 +6182,24 @@ fn checkedLabelRename(server: *Server, r: *Resolver, arena: Allocator, label: za
     return .{ .ok = .{ .refs = refs, .text = text } };
 }
 
+/// The references of a field of a `.zon` file and the source text of its new name (see
+/// `checkedRename`). AstGen confirms the `.zon` file (a field name must be unique in its literal), and
+/// strings may name the field (`@field`, `@hasField`).
+fn checkedZonFieldRename(server: *Server, r: *Resolver, arena: Allocator, field: za.ide_db.search.ZonField, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
+    const refs = switch (try server.renameReferences(r, arena, .{ .zon_field = field }, old, new)) {
+        .ok => |refs| refs,
+        .failed => |reason| return .{ .failed = reason },
+    };
+    const text = try identifierText(arena, new, true);
+    const file = field.literal.file;
+    var edits: std.ArrayList(ide.rename.Edit) = .empty;
+    for (refs) |ref| if (ref.file == file) try edits.append(arena, .{ .start = ref.start, .end = ref.end, .text = text });
+    if (try ide.rename.verifyAstGen(r, file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    const files = try za.ide_db.search.importers(r, file, try server.searchScope(r));
+    if (try ide.rename.stringReference(r, files, old)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
+    return .{ .ok = .{ .refs = refs, .text = text } };
+}
+
 /// The uses of the error `old`, found in `file`, and the source text of its new name (see
 /// `checkedRename`). Error names are global, so the uses in all files compiled together with
 /// `file` are renamed: each must be confirmed and editable (see `renameReferences`), no file that
@@ -6183,7 +6232,9 @@ fn checkedErrorRename(server: *Server, r: *Resolver, arena: Allocator, file: Vfs
 /// looks the declaration up by name in the root source file (see `rename.stdRootLookup`), the
 /// search scope is still incomplete (see `scopeIncomplete`), a reference is ambiguous in a generic
 /// function, goes through a member access of unknown type, or depends on instances that grow
-/// without bound, or a file that mentions the name has syntax errors.
+/// without bound, is in a `.zon` file whose import sites give result types that cannot be named
+/// (`search.Options.zon_import`), or
+/// a file that mentions the name has syntax errors.
 fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, symbol: za.ide_db.search.Symbol, old: []const u8, new: []const u8) !Outcome([]const za.ide_db.search.Reference) {
     if (symbol == .def) if (try ide.rename.stdRootLookup(r, symbol.def)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
     if (try server.scopeIncompleteFor(r, symbol)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s}", .{ old, new, reason }) };
@@ -6191,14 +6242,17 @@ fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, symbol: za.
     var ambiguous: ?za.ide_db.search.Reference = null;
     var uncertain: ?za.ide_db.search.Reference = null;
     var incomplete: ?za.ide_db.search.Reference = null;
+    var zon_import: ?za.ide_db.search.Reference = null;
     var syntax_error: ?Vfs.FileId = null;
     const refs = try za.ide_db.search.symbolReferences(r, symbol, .{
         .scope = scope,
         .ambiguous = &ambiguous,
         .uncertain = &uncertain,
         .incomplete = &incomplete,
+        .zon_import = &zon_import,
         .syntax_error = &syntax_error,
     });
+    if (zon_import) |z| return .{ .failed = try server.renameProblem(r, arena, old, new, z.file, z.start, za.ide_db.search.zon_import_message) };
     if (syntax_error) |file| return .{ .failed = try server.renameProblem(r, arena, old, new, file, null, "the file has syntax errors, so references in it may be missed") };
     if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, old, new, a.file, a.start, za.ide_db.search.ambiguous_message) };
     if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, if (symbol == .error_name)

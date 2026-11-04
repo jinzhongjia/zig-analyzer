@@ -201,10 +201,10 @@ Bidirectional inference mirrors Zig's result type semantics, with peer type reso
 
 ### `.zon` files
 
-- `@import` of a `.zon` file yields its value (`ZonValue`), processed by the official parser and ZonGen; with errors it is `unknown`, without guessing at half-edited content. Without a result type, values are as in the compiler: anonymous structs, tuples, `comptime_int`, and so on.
+- `@import` of a `.zon` file yields its value (`ZonValue`), processed by the official parser and ZonGen; with errors it is `unknown`, without guessing at half-edited content. Without a result type, values are as in the compiler: anonymous structs, tuples, `comptime_int`, and so on. As in the compiler, each struct literal of a `.zon` file has a type of its own: the type records the file and the path of field and element indices to the literal, so literals with the same contents are different types, and two imports of a file give the same type.
 - With a result type, scalars are coerced and anything else takes only the type, with the value `unknown`, since the compiler parses the text according to that type.
-- Editing a `.zon` file infers its root with the result type of its import sites (`ZonResultType`). When all import sites with a result type agree, ignoring optionals and single-item pointers around the value, that type is used; when they differ or depend on a generic parameter, there is none, without guessing. Completion, goto, references, and inlay hints then behave as for the same typed literal in a `.zig` file.
-- The dependency chain is `.zon` root → `ZonResultType` → importers' inference → `ZonValue`, which reads only text, so there is no cycle.
+- Editing a `.zon` file infers its root with the result type of its import sites (`ZonImports`, read through `ZonResultType`). When all import sites with a result type agree, ignoring optionals and single-item pointers around the value, that type is used; when they differ or depend on a generic parameter, there is none, without guessing. Completion, goto, references, and inlay hints then behave as for the same typed literal in a `.zig` file.
+- The dependency chain is `.zon` root → `ZonResultType` → `ZonImports` → importers' inference → `ZonValue`, which reads only text, so there is no cycle.
 
 ### comptime interpreter
 

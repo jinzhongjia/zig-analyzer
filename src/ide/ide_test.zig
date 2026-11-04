@@ -2262,6 +2262,109 @@ test "imported zon files are values with member completion and hover" {
     }
 }
 
+test "goto from fields of imported zon values to the names in the zon file" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const pos_text =
+        \\.{
+        \\    .x = 1,
+        \\    .inner = .{ .z = 1.5 },
+        \\    .same = .{ .v = 1 },
+        \\    .other = .{ .v = 1 },
+        \\    .list = .{ .{ .item = 1 }, .{ .item = 2 } },
+        \\}
+        \\
+    ;
+    const twin_text = ".{ .x = 1 }\n";
+    const pos = (try w.add("/p/pos.zon", pos_text)).file;
+    const twin_a = (try w.add("/p/twin_a.zon", twin_text)).file;
+    const twin_b = (try w.add("/p/twin_b.zon", twin_text)).file;
+    const text =
+        \\const pos = @import("pos.zon");
+        \\const twin_a = @import("twin_a.zon");
+        \\const twin_b = @import("twin_b.zon");
+        \\const alias = pos;
+        \\const same = pos.same;
+        \\fn read(v: anytype) comptime_int {
+        \\    return v.x;
+        \\}
+        \\fn run() void {
+        \\    const copy = pos;
+        \\    const inner = pos.inner;
+        \\    const ptr = &pos;
+        \\    _ = .{ pos.x, @import("pos.zon").x, alias.x, copy.x, ptr.x };
+        \\    _ = .{ pos.inner, inner.z, same.v, pos.other.v, pos.list[1].item };
+        \\    _ = .{ twin_a.x, twin_b.x, read(pos), read(twin_b) };
+        \\    inline for (pos.list) |entry| _ = entry.item;
+        \\}
+        \\
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const x_in_pos: u32 = @intCast(std.mem.indexOf(u8, pos_text, "x =").?);
+    const x_in_twin: u32 = @intCast(std.mem.indexOf(u8, twin_text, "x =").?);
+    const cases = [_]struct { use: []const u8, file: FileId, start: u32 }{
+        .{ .use = "pos.x", .file = pos, .start = x_in_pos },
+        .{ .use = "@import(\"pos.zon\").x", .file = pos, .start = x_in_pos },
+        .{ .use = "alias.x", .file = pos, .start = x_in_pos },
+        .{ .use = "copy.x", .file = pos, .start = x_in_pos },
+        .{ .use = "ptr.x", .file = pos, .start = x_in_pos },
+        .{ .use = "pos.inner", .file = pos, .start = @intCast(std.mem.indexOf(u8, pos_text, "inner =").?) },
+        .{ .use = "inner.z", .file = pos, .start = @intCast(std.mem.indexOf(u8, pos_text, "z =").?) },
+        // Literals with the same contents in one file, or in two, are different types
+        .{ .use = "same.v", .file = pos, .start = @intCast(std.mem.indexOf(u8, pos_text, "v = 1").?) },
+        .{ .use = "pos.other.v", .file = pos, .start = @intCast(std.mem.lastIndexOf(u8, pos_text, "v = 1").?) },
+        .{ .use = "twin_a.x", .file = twin_a, .start = x_in_twin },
+        .{ .use = "twin_b.x", .file = twin_b, .start = x_in_twin },
+        .{ .use = "[1].item", .file = pos, .start = @intCast(std.mem.indexOf(u8, pos_text, "item = 2").?) },
+    };
+    for (cases) |c| {
+        const name_at = std.mem.indexOf(u8, text, c.use).? + c.use.len - 1;
+        const t = try definition.definition(&r, file, @intCast(name_at)) orelse {
+            std.debug.print("`{s}`: no target\n", .{c.use});
+            return error.NoTarget;
+        };
+        testing.expectEqual(c.file, t.file) catch |err| {
+            std.debug.print("`{s}`: wrong file\n", .{c.use});
+            return err;
+        };
+        testing.expectEqual(c.start, t.start) catch |err| {
+            std.debug.print("`{s}`: wrong position\n", .{c.use});
+            return err;
+        };
+    }
+    // Every instance of a generic function, and every item of a tuple being iterated
+    try testing.expectEqualSlices(definition.Target, &.{
+        .{ .file = pos, .start = x_in_pos, .end = x_in_pos + 1 },
+        .{ .file = twin_b, .start = x_in_twin, .end = x_in_twin + 1 },
+    }, try definition.definitionTargets(&r, file, @intCast(std.mem.indexOf(u8, text, "v.x").? + 2)));
+    const first_item: u32 = @intCast(std.mem.indexOf(u8, pos_text, "item = 1").?);
+    const second_item: u32 = @intCast(std.mem.indexOf(u8, pos_text, "item = 2").?);
+    try testing.expectEqualSlices(definition.Target, &.{
+        .{ .file = pos, .start = first_item, .end = first_item + 4 },
+        .{ .file = pos, .start = second_item, .end = second_item + 4 },
+    }, try definition.definitionTargets(&r, file, @intCast(std.mem.indexOf(u8, text, "entry.item").? + 6)));
+}
+
+test "goto from an imported build.zig.zon to its field" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const manifest_text = ".{ .name = .demo, .version = \"1.2.3\" }\n";
+    const manifest_file = (try w.add("/p/build.zig.zon", manifest_text)).file;
+    const text = "const version = @import(\"build.zig.zon\").version;\n";
+    const file = (try w.add("/p/build.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const t = (try definition.definition(&r, file, @intCast(std.mem.lastIndexOf(u8, text, "version").?))).?;
+    try testing.expectEqual(manifest_file, t.file);
+    try testing.expectEqual(std.mem.indexOf(u8, manifest_text, "version").?, t.start);
+}
+
 test "zon imports with a result type take the result type" {
     var w: World = undefined;
     try w.init();
@@ -2454,6 +2557,77 @@ test "references do not look into zon files without a result type" {
     try testing.expectEqual(null, uncertain);
 }
 
+test "zon files complete only what the compiler parses, not declarations" {
+    // `.default` is a decl literal in a `.zig` file; the compiler rejects it in ZON, where only an
+    // enum's names and the tags of a union without a payload are enum literals
+    const decls =
+        \\const Level = enum { debug, info, pub const default: Level = .info; pub fn make() Level { return .info; } };
+        \\const Inner = struct { n: u8 = 0, pub const zero: Inner = .{}; pub fn init() Inner { return .{}; } };
+        \\const Tag = union(enum) { a: u8, b: void, pub const none: Tag = .b; };
+        \\const Cfg = struct { level: Level = .info, inner: Inner = .{}, tag: Tag = .b, opt: ?Level = null, ptr: *const Level = &.info, arr: [1]Level = .{.info}, pub const shared: Cfg = .{}; };
+        \\
+    ;
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ ".{ .level = .<|> }", "debug info" },
+        .{ ".{ .opt = .<|> }", "debug info" },
+        .{ ".{ .ptr = .<|> }", "debug info" },
+        .{ ".{ .arr = .{ .<|> } }", "debug info" },
+        .{ ".{ .tag = .<|> }", "b" },
+        .{ ".{ .inner = .<|> }", "" },
+        .{ ".<|>", "" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        _ = try w.fixture("//- /p/main.zig module:app\n" ++ decls ++ "const cfg: Cfg = @import(\"cfg.zon\");\n");
+        testing.expectEqualStrings(c[1], try completionAt(&w, try w.add("/p/cfg.zon", c[0]))) catch |err| {
+            std.debug.print("`{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+    // The same literals in a `.zig` file still offer declarations
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    try testing.expectEqualStrings("debug info default make", try completionAt(&w, try w.add("/p/main.zig", decls ++ "const level: Level = .<|>;\n")));
+}
+
+test "references find the fields of a zon file whose import sites give several result types" {
+    const zon_text = ".{ .x = 1, .e = .red, .other = 2 }\n";
+    // Each case: the importing file, the name to search from, and the uses in `cfg.zon`
+    const cases = [_]struct { []const u8, []const u8, []const []const u8 }{
+        .{ "const S = struct { x: u32, e: E };\nconst E = enum { red };\nconst T = struct { x: u8 };\nconst a: S = @import(\"cfg.zon\");\nconst b: T = @import(\"cfg.zon\");\n", "x: u32", &.{"x ="} },
+        .{ "const S = struct { x: u32 };\nconst T = struct { x: u8 };\nconst a: S = @import(\"cfg.zon\");\nconst b: T = @import(\"cfg.zon\");\n", "x: u8", &.{"x ="} },
+        // An enum member, reached under one of the types
+        .{ "const E = enum { red };\nconst S = struct { x: u32, e: E };\nconst T = struct { x: u8 };\nconst a: S = @import(\"cfg.zon\");\nconst b: T = @import(\"cfg.zon\");\n", "red", &.{"red"} },
+        // A generic result type: under each instance of the function
+        .{ "const S = struct { x: u32 };\nfn load(comptime T: type) T {\n    return @import(\"cfg.zon\");\n}\nconst a = load(S);\n", "x: u32", &.{"x ="} },
+        // A field that none of the types has at that position is not a use
+        .{ "const F = struct { x: u8 };\nconst S = struct { y: u32 };\nconst T = struct { z: u8 };\nconst a: S = @import(\"cfg.zon\");\nconst b: T = @import(\"cfg.zon\");\nconst f: F = .{ .x = 1 };\n", "x: u8", &.{} },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const a = w.arena.allocator();
+        const main = (try w.fixture(try std.mem.concat(a, u8, &.{ "//- /p/main.zig module:app\n", c[0] }))).file("/p/main.zig");
+        const zon_file = (try w.add("/p/cfg.zon", zon_text)).file;
+        var ctx = w.db.beginRead(a);
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const def = try definition.defAt(&r, main, @intCast(std.mem.indexOf(u8, c[0], c[1]).?)) orelse return error.NoDefinition;
+        var found: std.ArrayList(u32) = .empty;
+        for (try search.findReferences(&r, def, .{ .scope = &.{ main, zon_file } })) |ref| if (ref.file == zon_file) try found.append(a, ref.start);
+        var expected: std.ArrayList(u32) = .empty;
+        for (c[2]) |needle| try expected.append(a, @intCast(std.mem.indexOf(u8, zon_text, needle).?));
+        testing.expectEqualSlices(u32, expected.items, found.items) catch |err| {
+            std.debug.print("search from `{s}` in:\n{s}\n", .{ c[1], c[0] });
+            return err;
+        };
+    }
+}
+
 test "zon files have no result type unless their typed imports agree" {
     const cases = [_]struct { []const u8, []const u8 }{
         // No import site; only an import without a result type
@@ -2552,6 +2726,97 @@ test "zon result types follow the importers across files and edits" {
     }
 }
 
+test "zig-analyzer.zon settings are completed from the schema" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ ".{ .<|> }", "build diagnostics imports naming" },
+        // Settings already given are not listed again
+        .{ ".{ .build = .{}, .<|> }", "diagnostics imports naming" },
+        .{ ".{ .build = .{ .<|> } }", "args" },
+        .{ ".{ .diagnostics = .{ .steps = .{}, .<|> } }", "compiler" },
+        .{ ".{ .naming = .{ .rules = .{ .type = false, .<|> } } }", "type_function function namespace value field" },
+        // Values: the names of an enum, and booleans
+        .{ ".{ .imports = .{ .derived = .<|> } }", "with_import separate" },
+        .{ ".{ .imports = .{ .sort = .na<|> } }", "path name" },
+        .{ ".{\n    .imports = .{\n        .sort =\n            .<|>\n    },\n}", "path name" },
+        .{ ".{ .naming = .{ .enable = <|> } }", "true false" },
+        .{ ".{ .naming = .{ .rules = .{ .field = t<|> } } }", "true false" },
+        // Neither applies, or the position is outside the schema
+        .{ ".{ .imports = .{ .sort = <|> } }", "" },
+        .{ ".{ .naming = .{ .enable = .<|> } }", "" },
+        .{ ".{ .build = .{ .args = .{ .<|> } } }", "" },
+        .{ ".{ .unknown = .{ .<|> } }", "" },
+        .{ ".{ .unknown = .<|> }", "" },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const at = try w.add("/p/zig-analyzer.zon", c[0]);
+        testing.expectEqualStrings(c[1], try completionAt(&w, at)) catch |err| {
+            std.debug.print("zig-analyzer.zon: `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+    // Other `.zon` files are not affected
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    try testing.expectEqualStrings("", try completionAt(&w, try w.add("/p/other.zon", ".{ .<|> }")));
+    try testing.expectEqualStrings("", try completionAt(&w, try w.add("/p/more.zon", ".{ .imports = .{ .sort = .<|> } }")));
+}
+
+test "zig-analyzer.zon settings have the descriptions of the default settings" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\.{
+        \\    .imports = .{ .sort = .name },
+        \\    .naming = .{ .enable = true, .rules = .{ .field = false } },
+        \\    .build = .{ .nope = 1 },
+        \\    .log = .{ .level = .debug },
+        \\}
+        \\
+    ;
+    const file = (try w.add("/p/zig-analyzer.zon", text)).file;
+    const other = (try w.add("/p/other.zon", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "imports", "How top-level imports are arranged" },
+        .{ "sort", "Order within a group: .path by what is imported" },
+        .{ "enable", "Hint names that do not follow the Names section" },
+        .{ "rules", "Turn individual rules on or off" },
+        .{ "field", "Fields and enum members, by the type of the field.\n\nDefault: `true`" },
+        // Values, and what the file cannot set
+        .{ "name }", null },
+        .{ "true", null },
+        .{ "nope", null },
+        .{ "log", null },
+        .{ "level", null },
+    };
+    for (cases) |c| {
+        const offset: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).?);
+        const info = try hover.hover(&r, file, offset, &.{});
+        const got = if (info) |i| i.text else "";
+        if (c[1]) |want| {
+            testing.expect(std.mem.startsWith(u8, got, want)) catch |err| {
+                std.debug.print("hover at `{s}`: {s}\n", .{ c[0], got });
+                return err;
+            };
+            try testing.expectEqual(null, try hover.hover(&r, other, offset, &.{}));
+        } else {
+            testing.expect(std.mem.indexOf(u8, got, "\n\nDefault") == null and !std.mem.startsWith(u8, got, "How")) catch |err| {
+                std.debug.print("hover at `{s}`: {s}\n", .{ c[0], got });
+                return err;
+            };
+        }
+    }
+    const with_default = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "sort").?), &.{})).?.text;
+    try testing.expect(std.mem.endsWith(u8, with_default, "\n\nDefault: `.path`"));
+}
+
 test "build.zig.zon fields are completed from the schema" {
     const cases = [_]struct { []const u8, []const u8 }{
         .{ ".{ .<|> }", "name fingerprint version minimum_zig_version dependencies paths" },
@@ -2561,7 +2826,9 @@ test "build.zig.zon fields are completed from the schema" {
         // name
         .{ ".{ .dependencies = .{ .foo = .{ .<|> } } }", "url hash path lazy" },
         .{ ".{ .dependencies = .{ .foo = .{ .url = \"https://example.com/foo.tar.gz\", .<|> } } }", "hash lazy" },
-        .{ ".{ .dependencies = .{ .@\"foo-bar\" = .{ .path = \"libs/foo\", .<|> } } }", "hash lazy" },
+        // A path-based dependency has no hash, and a hash belongs to a fetched one
+        .{ ".{ .dependencies = .{ .@\"foo-bar\" = .{ .path = \"libs/foo\", .<|> } } }", "lazy" },
+        .{ ".{ .dependencies = .{ .foo = .{ .hash = \"abc\", .<|> } } }", "url lazy" },
         // Dependency names, elements of `.paths`, field values, and objects outside the schema
         .{ ".{ .dependencies = .{ .<|> } }", "" },
         .{ ".{ .paths = .{ .<|> } }", "" },

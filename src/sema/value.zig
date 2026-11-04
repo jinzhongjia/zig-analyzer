@@ -921,6 +921,11 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
         .anon_struct_type => |x| blk: {
             const y = kb.anon_struct_type;
             if (!eqlNames(x.names, y.names)) break :blk false;
+            if (x.origin != null or y.origin != null) {
+                const from = x.origin orelse break :blk false;
+                const to = y.origin orelse break :blk false;
+                if (from.file != to.file or !std.mem.eql(u32, from.path, to.path)) break :blk false;
+            }
             break :blk all(&.{ eqlTypeLists(ip, x.types, y.types), eqlFieldValues(ip, x.values, y.values, x.types.len) });
         },
         // Types constructed at the same location with the same contents are the same (the instance

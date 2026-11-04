@@ -79,7 +79,7 @@ pub const Result = struct {
     iteration_vars: []const IterationVar = &.{},
     /// The target and result type of each reachable `@import` call that has a result type and
     /// targets a `.zon` file: the root expression of the `.zon` file is inferred with it (see
-    /// `queries.ZonResultType`)
+    /// `queries.ZonImports`)
     zon_imports: []const ZonImport = &.{},
     /// References (names, member accesses, enum literals) and builtin calls whose value is changed
     /// by their result type coercion, with their own value before it: `a` of type `u8` in `take(a)`
@@ -137,7 +137,7 @@ pub const Mode = enum {
 /// switch prong takes the value of the `index`-th prong item (see `queries.InferKey.loop`)
 pub const LoopSeed = struct { binding: u32, index: u32 };
 
-pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_seed: ?LoopSeed) Error!Result {
+pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_seed: ?LoopSeed, zon_type: ?Index) Error!Result {
     const gpa = ctx.db.gpa;
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
@@ -167,6 +167,7 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
         .scratch = scratch.allocator(),
         .inst = split.inst,
         .loop_seed = split.seed orelse loop_seed,
+        .zon_type = zon_type,
     };
     @memset(inf.exprs, .unknown);
     @memset(inf.bindings, .unknown);
@@ -322,6 +323,8 @@ const Inferrer = struct {
     /// The owner is the root expression of a `.zon` file: values are converted to the result type
     /// by the rules of ZON (see `zonExpected`)
     zon: bool = false,
+    /// See `queries.InferKey.zon_type`
+    zon_type: ?Index = null,
     /// Values of the returns actually reached
     returns: std.ArrayList(TypedValue) = .empty,
     /// Greater than 0 inside a comptime context (type expressions, array lengths, comptime
@@ -375,7 +378,7 @@ const Inferrer = struct {
             // the result type
             .zon => if (mode == .full) if (b.value) |v| {
                 inf.zon = true;
-                _ = try inf.infer(v, try inf.r.ctx.get(queries.ZonResultType, inf.file));
+                _ = try inf.infer(v, inf.zon_type orelse try inf.r.ctx.get(queries.ZonResultType, inf.file));
             },
         }
         // Clauses are not part of the expression tree: infer them with the clause's result type

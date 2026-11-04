@@ -96,8 +96,9 @@ fn objectOf(b: *const Body, init: Body.ExprId) ?Object {
 }
 
 /// The field names to complete in the initializer expression `init` (in the Body `b` of the ZON
-/// root expression): the schema fields not given yet. The `url` and `path` of a dependency are
-/// mutually exclusive (the compiler rejects both), so once one is given the other is not offered
+/// root expression): the schema fields not given yet. A dependency is either fetched (`url`, `hash`)
+/// or at a `path` (the compiler rejects both, a path-based dependency is not hashed), so once one
+/// kind is given the other is not offered
 pub fn fieldCompletions(r: *Resolver, file: FileId, b: *const Body, init: Body.ExprId) resolve.Error![]const Field {
     if (!try active(r, file)) return &.{};
     const object = objectOf(b, init) orelse return &.{};
@@ -106,8 +107,8 @@ pub fn fieldCompletions(r: *Resolver, file: FileId, b: *const Body, init: Body.E
     for (object.fields()) |f| {
         if (hasField(given, f.name)) continue;
         if (object == .dependency) {
-            if (eql(f.name, "url") and hasField(given, "path")) continue;
-            if (eql(f.name, "path") and hasField(given, "url")) continue;
+            if ((eql(f.name, "url") or eql(f.name, "hash")) and hasField(given, "path")) continue;
+            if (eql(f.name, "path") and (hasField(given, "url") or hasField(given, "hash"))) continue;
         }
         try out.append(r.arena, f);
     }
@@ -147,7 +148,7 @@ fn listSlots(r: *Resolver, nodes: []const SyntaxNode) resolve.Error!?Slots {
 }
 
 /// The position in the root value of the value or field name that holds `tok`
-fn tokenSlots(r: *Resolver, file: FileId, tok: SyntaxToken) resolve.Error!?Slots {
+pub fn tokenSlots(r: *Resolver, file: FileId, tok: SyntaxToken) resolve.Error!?Slots {
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const nodes = try root.coveringPath(r.arena, tok.offset);
     if (nodes.len < 2) return null;

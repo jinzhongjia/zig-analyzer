@@ -1959,6 +1959,55 @@ test "a document whose languageId is zon is analyzed as ZON whatever its URI" {
     try h.notify("exit", {});
 }
 
+test "open .zon files get syntax diagnostics, and zig-analyzer.zon also its settings" {
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const cases = [_]struct { name: []const u8, text: []const u8, diags: []const []const u8 }{
+        .{ .name = "data.zon", .text = ".{ .a = 1, .a = 2 }\n", .diags = &.{"1 zig ast-check: duplicate struct field name"} },
+        .{ .name = "fine.zon", .text = ".{ .nope = 1 }\n", .diags = &.{} },
+        .{ .name = "zig-analyzer.zon", .text = ".{ .build = .{ .args = .{}, }, }\n", .diags = &.{} },
+        // The syntax comes first: nothing is said about settings that may not be what was meant
+        .{ .name = "zig-analyzer.zon", .text = ".{ .nope = 1, .nope = 2 }\n", .diags = &.{"1 zig ast-check: duplicate struct field name"} },
+        .{ .name = "zig-analyzer.zon", .text = ".{\n    .nope = 1,\n}\n", .diags = &.{"2 zig-analyzer: unexpected field 'nope'; the file is ignored"} },
+        .{ .name = "zig-analyzer.zon", .text = ".{ .imports = .{ .sort = 1 } }\n", .diags = &.{"1 zig-analyzer: expected optional enum literal; the file is ignored"} },
+        .{ .name = "zig-analyzer.zon", .text = ".{\n    .log = .{ .level = .debug },\n}\n", .diags = &.{"2 zig-analyzer: `log.level` cannot be set in zig-analyzer.zon"} },
+    };
+    for (cases) |c| {
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const a = h.arena.allocator();
+        _ = try h.request("initialize", .{ .capabilities = struct {}{} });
+        try h.notify("initialized", struct {}{});
+        const path = try std.fs.path.join(a, &.{ root, c.name });
+        const document_uri = try za.base.uri.fromPath(a, path);
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = document_uri, .languageId = "zon", .version = 1, .text = c.text } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        var last: []const std.json.Value = &.{};
+        for (try h.notifications("textDocument/publishDiagnostics")) |n| {
+            const params = n.object.get("params").?.object;
+            if (std.mem.eql(u8, params.get("uri").?.string, document_uri)) last = params.get("diagnostics").?.array.items;
+        }
+        var got: std.ArrayList([]const u8) = .empty;
+        for (last) |d| {
+            const o = d.object;
+            try got.append(a, try std.fmt.allocPrint(a, "{d} {s}: {s}", .{ o.get("range").?.object.get("start").?.object.get("line").?.integer + 1, o.get("source").?.string, o.get("message").?.string }));
+        }
+        testing.expectEqualStrings(try std.mem.join(a, "|", c.diags), try std.mem.join(a, "|", got.items)) catch |err| {
+            std.debug.print("{s}: `{s}`\n", .{ c.name, c.text });
+            return err;
+        };
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}
+
 test "case-variant URIs of one file: each keeps its text and gets the diagnostics until the last closes" {
     // On a case-insensitive volume `main.zig` and `Main.zig` are one file. Closing one of its
     // documents reverted the other to the disk contents, its edits then applied to them, and

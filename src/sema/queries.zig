@@ -53,6 +53,9 @@ pub const InferKey = struct {
     /// iteration (used when IDE features pick an instance for the loop body); when null, the loop
     /// variable is abstract
     loop: ?infer.LoopSeed = null,
+    /// The root expression of a `.zon` file is inferred with this result type instead of the one of
+    /// its import sites (`ZonResultType`): for a file whose sites give several (see `zonSiteTypes`)
+    zon_type: ?Index = null,
 };
 
 pub const DeclKey = struct {
@@ -83,7 +86,7 @@ pub const Infer = struct {
         const gpa = ctx.db.gpa;
         const result = try gpa.create(infer.Result);
         errdefer gpa.destroy(result);
-        result.* = try infer.run(ctx, key.owner, key.mode, key.inst, key.loop);
+        result.* = try infer.run(ctx, key.owner, key.mode, key.inst, key.loop, key.zon_type);
         return result;
     }
 
@@ -429,41 +432,70 @@ pub const ZonValue = struct {
             return .unknown;
         }
         const source = try ctx.get(database.syntax.SourceText, file);
-        return zon.lower(ctx.db.gpa, ctx.db.env.ip, source.text);
+        return zon.lower(ctx.db.gpa, ctx.db.env.ip, file, source.text);
     }
 };
 
-/// The result type of the root expression of a `.zon` file, taken from the `@import` call sites
-/// with a result type in the files of the module graph that import it directly (see
-/// `infer.Result.zon_imports`; build scripts and files outside the modules are not searched).
-/// Import sites without a result type do not constrain the value and are not counted; when all the
-/// other import sites have the same type, free of abstract parameters and unknown parts, the result
-/// is that type. Types that differ only in the optionals and single-item pointers around the value
-/// (`T`, `*const T`, `?T`) parse the value the same way (see `zonValueType`), and the result is the
-/// type of the value; for other differences it is null (no guessing). Read by the inference of the
-/// root expression of a `.zon` file and by the schema check of `build.zig.zon` (`manifest.active`)
-pub const ZonResultType = struct {
+/// How the files that may import a `.zon` file import it: the `@import` call sites in the files of
+/// the module graph that import it directly (see `infer.Result.zon_imports`; build scripts and files
+/// outside the modules are not searched).
+pub const ZonImports = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = FileId;
-    pub const Value = ?Index;
+    pub const Value = struct {
+        /// The one type the sites with a result type give, free of abstract parameters and unknown
+        /// parts. Types that differ only in the optionals and single-item pointers around the value
+        /// (`T`, `*const T`, `?T`) parse the value the same way (see `zonValueType`), and the result
+        /// is the type of the value. Sites without a result type do not constrain the value.
+        result_type: ?Index = null,
+        /// Some sites give a result type, but no single one can be named: they differ, or one is
+        /// abstract or unknown (no guessing)
+        unresolved: bool = false,
+    };
 
     pub fn cycleFallback(_: Key) Value {
-        return null;
+        return .{};
     }
 
     pub fn compute(ctx: *Db.Ctx, file: Key) engine.Error!Value {
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-        // The files that may import it: the project files (excluding the standard library) and the
-        // user's source files under the workspace roots, which include files in no build graph
-        // (single-file mode, build scripts)
+        var out: Value = .{};
+        const ip = ctx.db.env.ip;
+        for (try owners(&r, file)) |owner| {
+            const res = try ctx.get(Infer, .{ .owner = owner.key, .mode = .full });
+            for (res.zon_imports) |site| {
+                if (site.file != file) continue;
+                const ty = site.ty;
+                if (!@import("value.zig").isConcrete(ip, ty)) {
+                    out.unresolved = true;
+                } else if (out.result_type) |t| {
+                    if (t != ty) {
+                        const value_type = zonValueType(ip, t);
+                        if (value_type == zonValueType(ip, ty)) out.result_type = value_type else out.unresolved = true;
+                    }
+                } else out.result_type = ty;
+            }
+        }
+        if (out.unresolved) out.result_type = null;
+        return out;
+    }
+
+    pub const Owner = struct { file: FileId, item: u32, key: hir.OwnerKey };
+
+    /// The members that contain an `@import` call importing the `.zon` file. The files that may
+    /// import it are the project files (excluding the standard library) and the user's source files
+    /// under the workspace roots, which include files in no build graph (single-file mode, build
+    /// scripts).
+    pub fn owners(r: *Resolver, file: FileId) resolve.Error![]const Owner {
+        const ctx = r.ctx;
         var importers: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
         if (try ctx.get(database.ModuleGraph.Input, {})) |graph| for (graph.files) |entry| {
             if (entry.module != database.ModuleGraph.std_module) try importers.put(r.arena, entry.file, {});
         };
         for (try ctx.get(database.inputs.WorkspaceFiles, {})) |f| try importers.put(r.arena, f, {});
-        var result: ?Index = null;
+        var out: std.ArrayList(Owner) = .empty;
         for (importers.keys()) |importer| {
             // Only Zig source files can `@import` (the root of a module can also be a `.zon` or
             // another data file)
@@ -475,23 +507,9 @@ pub const ZonResultType = struct {
                 if (try r.resolveImport(importer, spec) == file) break true;
             } else false;
             if (!imports) continue;
-            const ip = ctx.db.env.ip;
-            for (try importOwners(&r, importer, file)) |owner| {
-                const res = try ctx.get(Infer, .{ .owner = owner, .mode = .full });
-                for (res.zon_imports) |site| {
-                    if (site.file != file) continue;
-                    if (!@import("value.zig").isConcrete(ip, site.ty)) return null;
-                    if (result) |t| if (t != site.ty) {
-                        const value_type = zonValueType(ip, t);
-                        if (value_type != zonValueType(ip, site.ty)) return null;
-                        result = value_type;
-                        continue;
-                    };
-                    result = site.ty;
-                }
-            }
+            try out.appendSlice(r.arena, try importOwners(r, importer, file));
         }
-        return result;
+        return out.items;
     }
 
     /// The type a ZON value is parsed as for the result type `t`: the compiler (`LowerZon`) parses
@@ -507,8 +525,9 @@ pub const ZonResultType = struct {
     }
 
     /// The members of `importer` that contain an `@import` call importing `target` (deduplicated)
-    fn importOwners(r: *Resolver, importer: FileId, target: FileId) resolve.Error![]const hir.OwnerKey {
-        var owners: std.AutoArrayHashMapUnmanaged(hir.OwnerKey, void) = .empty;
+    fn importOwners(r: *Resolver, importer: FileId, target: FileId) resolve.Error![]const Owner {
+        var owners_of: std.ArrayList(Owner) = .empty;
+        var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
         var stack: std.ArrayList(ast.SyntaxNode) = .empty;
         try stack.append(r.arena, (try r.ctx.get(database.syntax.ParseFile, importer)).rootNode());
         while (stack.pop()) |node| {
@@ -517,14 +536,34 @@ pub const ZonResultType = struct {
                 if (args.next()) |arg| if (arg.firstToken()) |t| if (t.kind == .string_literal) {
                     const spec = std.zig.string_literal.parseAlloc(r.arena, t.text) catch continue;
                     if (try r.resolveImport(importer, spec) == target) {
-                        if (try r.ownerAt(importer, node.offset, false)) |item| try owners.put(r.arena, try r.ownerKey(importer, item), {});
+                        if (try r.ownerAt(importer, node.offset, false)) |item| if (!(try seen.getOrPut(r.arena, item)).found_existing) {
+                            try owners_of.append(r.arena, .{ .file = importer, .item = item, .key = try r.ownerKey(importer, item) });
+                        };
                     }
                 };
             };
             var it = node.children();
             while (it.nextNode()) |c| try stack.append(r.arena, c);
         }
-        return owners.keys();
+        return owners_of.items;
+    }
+};
+
+/// The result type of the root expression of a `.zon` file (see `ZonImports.Value.result_type`), read
+/// by the inference of that root expression and by the schema check of `build.zig.zon`
+/// (`manifest.active`). Separate from `ZonImports` so that these do not depend on how the other
+/// import sites look.
+pub const ZonResultType = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = FileId;
+    pub const Value = ?Index;
+
+    pub fn cycleFallback(_: Key) Value {
+        return null;
+    }
+
+    pub fn compute(ctx: *Db.Ctx, file: Key) engine.Error!Value {
+        return (try ctx.get(ZonImports, file)).result_type;
     }
 };
 

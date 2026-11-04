@@ -19,6 +19,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     mod.addOptions("build_options", build_options);
+    mod.addAnonymousImport("default_config", .{ .root_source_file = b.path("zig-analyzer.default.zon") });
     if (tracy) |dir| {
         mod.addCSourceFile(.{
             .file = .{ .cwd_relative = b.pathJoin(&.{ dir, "public", "TracyClient.cpp" }) },
@@ -273,6 +274,7 @@ fn analyzerTests(
         .omit_frame_pointer = false,
     });
     module.addOptions("build_options", options);
+    module.addAnonymousImport("default_config", .{ .root_source_file = b.path("zig-analyzer.default.zon") });
     const tests = b.addTest(.{
         .root_module = module,
         .test_runner = .{ .path = runner, .mode = .server },

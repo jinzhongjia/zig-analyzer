@@ -32,6 +32,7 @@
     //       .builtin_path = "/home/me/builtin.zig",
     //   },
 
+    // How projects are built.
     .build = .{
         // Load projects through the build system protocol (`zig build --listen=-`); false handles
         // every file in single-file mode (editor only):
@@ -41,6 +42,7 @@
         .args = .{},
     },
 
+    // Which diagnostics are computed, and how.
     .diagnostics = .{
         // Build steps for compiler diagnostics. Empty: `check` if the project has it, otherwise the
         // default step.
@@ -172,6 +174,7 @@
     //       .limit = 256,
     //   },
 
+    // The naming check.
     .naming = .{
         // Hint names that do not follow the Names section of the Zig style guide, with rename
         // fixes. Only open files of your own code are checked.

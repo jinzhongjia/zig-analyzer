@@ -40,6 +40,7 @@ const json = std.json;
 const Allocator = std.mem.Allocator;
 const ImportOptions = @import("../ide_db/organize_imports.zig").Options;
 const syntax_queries = @import("../syntax/queries.zig");
+const syntax_ast = @import("../syntax/ast.zig");
 
 const Config = @This();
 
@@ -284,6 +285,68 @@ fn isProjectSetting(comptime field: []const u8) bool {
     return false;
 }
 
+/// The value of an entry of the project configuration file
+pub const SchemaValue = union(enum) {
+    /// A section or a setting with fields of its own
+    fields: []const SchemaField,
+    /// The names of an enum, written as enum literals
+    tags: []const []const u8,
+    bool,
+    string,
+    strings,
+    other,
+};
+
+pub const SchemaField = struct { name: []const u8, value: SchemaValue };
+
+fn schemaValue(comptime T: type) SchemaValue {
+    if (T == []const u8) return .string;
+    if (T == []const []const u8) return .strings;
+    return switch (@typeInfo(T)) {
+        .bool => .bool,
+        .optional => |o| schemaValue(o.child),
+        .@"enum" => |e| blk: {
+            var names: []const []const u8 = &.{};
+            for (e.field_names) |name| names = names ++ .{@as([]const u8, name)};
+            break :blk .{ .tags = names };
+        },
+        .@"struct" => |info| blk: {
+            var fields: []const SchemaField = &.{};
+            for (info.field_names) |name| fields = fields ++ .{SchemaField{ .name = name, .value = schemaValue(@FieldType(T, name)) }};
+            break :blk .{ .fields = fields };
+        },
+        else => .other,
+    };
+}
+
+/// What the project configuration file can set: its sections and their settings
+pub const project_schema: []const SchemaField = blk: {
+    @setEvalBranchQuota(8000);
+    var sections: []const SchemaField = &.{};
+    for (settings) |first| {
+        if (!isProjectSetting(first.field)) continue;
+        for (sections) |done| {
+            if (std.mem.eql(u8, done.name, first.section)) break;
+        } else {
+            var keys: []const SchemaField = &.{};
+            for (settings) |s| if (isProjectSetting(s.field) and std.mem.eql(u8, s.section, first.section)) {
+                keys = keys ++ .{SchemaField{ .name = s.key, .value = schemaValue(@FieldType(Config, s.field)) }};
+            };
+            sections = sections ++ .{SchemaField{ .name = first.section, .value = .{ .fields = keys } }};
+        }
+    }
+    break :blk sections;
+};
+
+/// A problem in the project configuration file
+pub const ProjectProblem = struct {
+    /// Byte offset in the file; null when it cannot be located
+    start: ?u32,
+    message: []const u8,
+    /// The whole file is ignored; otherwise only the setting is
+    fatal: bool,
+};
+
 pub fn deinit(c: *Config, gpa: Allocator) void {
     var arena = c.arena.promote(gpa);
     arena.deinit();
@@ -346,12 +409,36 @@ fn isSection(name: []const u8) bool {
 pub fn parseProject(gpa: Allocator, text: []const u8) Allocator.Error!Config {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
+    const a = arena.allocator();
     var c: Config = .{};
+    var problems: std.ArrayList(ProjectProblem) = .empty;
+    try readProject(gpa, a, text, &c, &problems);
     var warnings: std.ArrayList([]const u8) = .empty;
-    try readProject(gpa, arena.allocator(), text, &c, &warnings);
+    for (problems.items) |p| {
+        if (!p.fatal) {
+            try warnings.append(a, p.message);
+        } else {
+            // The file is reported as a whole: its first error tells why it is ignored
+            const at = p.start orelse 0;
+            const before = text[0..@min(at, text.len)];
+            const line = std.mem.count(u8, before, "\n");
+            const column = before.len - (if (std.mem.lastIndexOfScalar(u8, before, '\n')) |i| i + 1 else 0);
+            try warnings.append(a, try std.fmt.allocPrint(a, "{d}:{d}: {s}; the file is ignored", .{ line + 1, column + 1, p.message }));
+            break;
+        }
+    }
     c.warnings = warnings.items;
     c.arena = arena.state;
     return c;
+}
+
+/// The problems in the contents of the project configuration file, allocated in `a` (see
+/// `parseProject`)
+pub fn projectProblems(gpa: Allocator, a: Allocator, text: []const u8) Allocator.Error![]const ProjectProblem {
+    var c: Config = .{};
+    var problems: std.ArrayList(ProjectProblem) = .empty;
+    try readProject(gpa, a, text, &c, &problems);
+    return problems.items;
 }
 
 /// Structure of the project configuration file: the sections and settings are the same as in
@@ -391,19 +478,19 @@ const ProjectFile = blk: {
 };
 
 /// Body of `parseProject`: the settings are written into `c` and problems are recorded in
-/// `warnings`, all allocated in `a`
-fn readProject(gpa: Allocator, a: Allocator, text: []const u8, c: *Config, warnings: *std.ArrayList([]const u8)) Allocator.Error!void {
+/// `problems`, all allocated in `a`
+fn readProject(gpa: Allocator, a: Allocator, text: []const u8, c: *Config, problems: *std.ArrayList(ProjectProblem)) Allocator.Error!void {
     var diag: std.zon.parse.Diagnostics = undefined;
+    const source = try a.dupeSentinel(u8, text, 0);
     const file = std.zon.parse.fromSlice(ProjectFile, .{
         .gpa = gpa,
         .arena = a,
-        .source = try a.dupeSentinel(u8, text, 0),
+        .source = source,
         .diagnostics = &diag,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseZon => {
-            const e = diag.errors[0];
-            try warnings.append(a, try std.fmt.allocPrint(a, "{d}:{d}: {s}; the file is ignored", .{ e.loc.line + 1, e.loc.column + 1, e.msg }));
+            for (diag.errors) |e| try problems.append(a, .{ .start = @intCast(e.loc.line_start + e.loc.column), .message = e.msg, .fatal = true });
             return;
         },
     };
@@ -412,9 +499,32 @@ fn readProject(gpa: Allocator, a: Allocator, text: []const u8, c: *Config, warni
             @field(c, s.field) = v;
             c.present.set(si);
         } else {
-            try warnings.append(a, try std.fmt.allocPrint(a, "`{s}.{s}` cannot be set in " ++ project_file, .{ s.section, s.key }));
+            try problems.append(a, .{
+                .start = try settingOffset(a, source, s.section, s.key),
+                .message = try std.fmt.allocPrint(a, "`{s}.{s}` cannot be set in " ++ project_file, .{ s.section, s.key }),
+                .fatal = false,
+            });
         }
     };
+}
+
+/// Where the setting is written in a project configuration file that parses
+fn settingOffset(a: Allocator, source: [:0]const u8, section: []const u8, key: []const u8) Allocator.Error!?u32 {
+    var tree = try std.zig.Ast.parse(a, source, .{ .mode = .zon });
+    defer tree.deinit(a);
+    const outer = zonField(&tree, tree.rootDecls()[0], section) orelse return null;
+    const inner = zonField(&tree, outer, key) orelse return null;
+    return tree.tokenStart(tree.firstToken(inner) - 2);
+}
+
+/// The value of the field `name` in the initializer `node`
+fn zonField(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index, name: []const u8) ?std.zig.Ast.Node.Index {
+    var buf: [2]std.zig.Ast.Node.Index = undefined;
+    const init = tree.fullStructInit(&buf, node) orelse return null;
+    for (init.ast.fields) |field| {
+        if (std.mem.eql(u8, syntax_ast.identName(tree.tokenSlice(tree.firstToken(field) - 2)), name)) return field;
+    }
+    return null;
 }
 
 /// Overrides with the settings that appear in the project configuration (`project` comes from

@@ -59,7 +59,15 @@ The completion list carries no signatures, because they need inference: a signat
 
 ## Fields and paths of `build.zig.zon`
 
-When no import site gives a result type, completion uses the built-in schema (`ide/manifest.zig`); with one, it works as for other `.zon` files. Fields not given yet are completed; a dependency's `url` and `path` are mutually exclusive, as in the compiler.
+When no import site gives a result type, completion uses the built-in schema (`ide/manifest.zig`); with one, it works as for other `.zon` files. Fields not given yet are completed; a dependency is either fetched (`url`, `hash`) or at a `path`, so one kind is not offered once the other is given, as in the compiler.
+
+## Settings of `zig-analyzer.zon`
+
+When no import site gives a result type, `ide/project_config.zig` handles the file: what can be set comes from `Config.project_schema`, derived from the settings and their types. Completion offers the settings at the cursor that are not given yet, the names of an enum after `.`, and `true` and `false`; settings only the editor can set are not offered. Hover shows the comment above the setting in `zig-analyzer.default.zon`, which is embedded in the binary, and its default when that is a single value, so the text users read in that file is the only copy; a test requires every setting to have one.
+
+## Enum literals in `.zon` files
+
+Only an enum's names and the tags of a union without a payload are offered, also through a pointer, which ZON parses as the pointee. Declarations are not: the compiler rejects decl literals in ZON.
 
 `.paths` and a dependency's `.path` complete relative to the build root, without `.`-prefixed entries, `zig-out`, and `zig-pkg`. Positions come from the syntax tree, so unclosed strings work too. Goto on such a path opens the file without interning it.
 

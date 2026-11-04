@@ -17,6 +17,7 @@ const Body = @import("../hir/Body.zig");
 const seed = @import("../ide_db/seed.zig");
 const builtins = @import("builtins.zig");
 const manifest = @import("manifest.zig");
+const project_config = @import("project_config.zig");
 
 pub const Info = struct {
     /// markdown
@@ -42,6 +43,7 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32, roots: []const []const u8)
         return .{ .text = out.written(), .start = tok.offset, .end = tok.range().end };
     }
     if (try manifest.fieldDoc(r, file, tok)) |doc| return .{ .text = doc, .start = tok.offset, .end = tok.range().end };
+    if (try project_config.fieldDoc(r, file, tok)) |doc| return .{ .text = doc, .start = tok.offset, .end = tok.range().end };
     return semanticHover(r, file, offset, tok, roots);
 }
 

@@ -30,6 +30,7 @@ const FileId = Vfs.FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 const seed = @import("seed.zig");
 const InternPool = @import("../sema/InternPool.zig");
+const value = @import("../sema/value.zig");
 
 pub const Reference = struct {
     file: FileId,
@@ -93,7 +94,14 @@ pub const Options = struct {
     /// while the instances are incomplete (truncated because instantiation grows without bound; see
     /// `seed.AllInstances`): it may or may not be a reference in the other instances
     incomplete: ?*?Reference = null,
+    /// When not null, records the first name in a `.zon` file whose import sites give result types
+    /// that cannot be named (see `sema.ZonImports`): the name may refer to the field under some of
+    /// them and not under others, and renaming would break them; see `zon_import_message`
+    zon_import: ?*?Reference = null,
 };
+
+/// Why a reference recorded in `Options.zon_import` prevents a rename
+pub const zon_import_message = "this `.zon` file is imported with different or generic result types, so its uses cannot all be confirmed";
 
 /// Why an ambiguous reference (see `Options.ambiguous`) prevents a rename or fix
 pub const ambiguous_message = "this reference also refers to other declarations in other instantiations of its generic function or `inline` prong, iterations of its loop, or build configurations";
@@ -115,7 +123,7 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
         .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
         else => false,
     };
-    var finder: Finder = .{ .r = r, .def = def, .is_field = is_field, .name = name, .out = &out, .ambiguous = opts.ambiguous, .uncertain = opts.uncertain, .incomplete = opts.incomplete };
+    var finder: Finder = .{ .r = r, .def = def, .is_field = is_field, .name = name, .out = &out, .ambiguous = opts.ambiguous, .uncertain = opts.uncertain, .incomplete = opts.incomplete, .zon_import = opts.zon_import };
     switch (def) {
         .local => |l| {
             if (opts.only_file) |f| if (f != l.file) return out.items;
@@ -187,7 +195,162 @@ pub const Symbol = union(enum) {
     /// and the member `X` of an error set type are one error in a compilation, whichever error set
     /// they are written in, so the files compiled together with `file` are searched
     error_name: struct { file: FileId, name: []const u8 },
+    zon_field: ZonField,
 };
+
+/// A field of a struct literal in a `.zon` file, the definition of the name when the file has no
+/// result type. As in the compiler, each literal has a type of its own, which identifies it
+/// wherever the value goes (see `InternPool.ZonLiteral`)
+pub const ZonField = struct {
+    literal: InternPool.ZonLiteral,
+    name: []const u8,
+};
+
+/// Where a `ZonField` is written
+pub const ZonFieldSite = struct {
+    file: FileId,
+    item: u32,
+    /// The initializer expression of the literal, and the index of the field in it
+    init: Body.ExprId,
+    index: u32,
+    start: u32,
+    end: u32,
+};
+
+/// The name of `field` in its `.zon` file; null when the literal has no such field
+pub fn zonFieldSite(r: *Resolver, field: ZonField) resolve.Error!?ZonFieldSite {
+    const file = field.literal.file;
+    const tree = try r.itemTree(file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.kind == .zon) break @intCast(i);
+    } else return null;
+    const base = try r.itemOffset(file, item) orelse return null;
+    const b = try r.body(file, item);
+    var e = b.value orelse return null;
+    for (field.literal.path) |i| e = switch (b.expr(e)) {
+        .init => |x| if (i < x.fields.len) x.fields[i].value else return null,
+        else => return null,
+    };
+    const fields = switch (b.expr(e)) {
+        .init => |x| x.fields,
+        else => return null,
+    };
+    for (fields, 0..) |fi, k| if (fi.name != null and std.mem.eql(u8, fi.name.?, field.name)) {
+        return .{ .file = file, .item = item, .init = e, .index = @intCast(k), .start = base + fi.name_range.start, .end = base + fi.name_range.end };
+    };
+    return null;
+}
+
+/// The declaration that the field at `site` refers to, when its file has a result type
+pub fn typedZonField(r: *Resolver, site: ZonFieldSite) resolve.Error!?Def {
+    if ((try r.ctx.get(database.sema.ZonImports, site.file)).result_type == null) return null;
+    const res = try r.ctx.get(sema.Infer, .{ .owner = try r.ownerKey(site.file, site.item), .mode = .full });
+    for (res.field_refs) |fr| if (fr.init == site.init and fr.index == site.index) return keyDef(r, fr.member);
+    return null;
+}
+
+/// The result types the import sites of a `.zon` file give it, under each instance where a site is in
+/// a generic function. `complete` is false when a site's type could not be determined, or there may
+/// be instances that are not listed.
+fn zonSiteTypes(r: *Resolver, file: FileId) resolve.Error!struct { types: []const InternPool.Index, complete: bool } {
+    const ip = r.ctx.db.env.ip;
+    var types: std.AutoArrayHashMapUnmanaged(InternPool.Index, void) = .empty;
+    var complete = true;
+    for (try database.sema.ZonImports.owners(r, file)) |owner| {
+        var results: std.ArrayList(*const infer.Result) = .empty;
+        try results.append(r.arena, try r.ctx.get(sema.Infer, .{ .owner = owner.key, .mode = .full }));
+        const all = try seed.allInstances(r, owner.file, owner.item);
+        if (!all.complete) complete = false;
+        for (all.insts) |inst| try results.append(r.arena, try r.ctx.get(sema.Infer, .{ .owner = owner.key, .mode = .full, .inst = inst }));
+        for (results.items, 0..) |res, i| for (res.zon_imports) |site| {
+            if (site.file != file) continue;
+            if (value.isConcrete(ip, site.ty)) {
+                try types.put(r.arena, site.ty, {});
+            } else if (i > 0 or all.insts.len == 0) {
+                // The abstract inference of a generic function leaves the type to its instances
+                complete = false;
+            }
+        };
+    }
+    return .{ .types = types.keys(), .complete = complete };
+}
+
+/// The `.zon` file literal of the type `ty`, through a single-item pointer
+pub fn zonLiteralOfType(ip: *InternPool, ty: InternPool.Index) ?InternPool.ZonLiteral {
+    const t = switch (ip.key(ty)) {
+        .ptr_type => |p| if (p.size == .one) p.child else ty,
+        else => ty,
+    };
+    return switch (ip.key(t)) {
+        .anon_struct_type => |s| s.origin,
+        else => null,
+    };
+}
+
+/// The `.zon` file literals that the value of `e` (at `rel` in the member) has the type of: from the
+/// abstract inference `res`, or under each call-site instance and iteration when that does not
+/// determine the type, each literal once. A written or expected type counts for an initializer
+pub fn zonLiteralsOf(r: *Resolver, file: FileId, item: u32, body: *const Body, res: *const infer.Result, e: Body.ExprId, rel: u32) resolve.Error![]const InternPool.ZonLiteral {
+    const ip = r.ctx.db.env.ip;
+    var out: std.ArrayList(InternPool.ZonLiteral) = .empty;
+    const add = struct {
+        fn add(rr: *Resolver, list: *std.ArrayList(InternPool.ZonLiteral), pool: *InternPool, b: *const Body, from: *const infer.Result, x: Body.ExprId) resolve.Error!void {
+            const i = @backingInt(x);
+            if (i >= from.exprs.len) return;
+            var ty = from.exprs[i].ty;
+            if (b.expr(x) == .init) {
+                const init = b.expr(x).init;
+                if (init.ty) |te| {
+                    if (@backingInt(te) < from.exprs.len) ty = from.exprs[@backingInt(te)].asType() orelse return;
+                } else for (from.literal_expected) |le| if (le.expr == x) {
+                    ty = le.ty;
+                };
+            }
+            const literal = zonLiteralOfType(pool, ty) orelse return;
+            for (list.items) |o| if (o.file == literal.file and std.mem.eql(u32, o.path, literal.path)) return;
+            try list.append(rr.arena, literal);
+        }
+    }.add;
+    try add(r, &out, ip, body, res, e);
+    const i = @backingInt(e);
+    if (out.items.len == 0 and (i >= res.exprs.len or seed.wanted(ip, res.exprs[i]))) {
+        for (try seed.allSeeds(r, file, item, body, res, rel)) |s| try add(r, &out, ip, body, s.res, e);
+    }
+    return out.items;
+}
+
+/// All references to the field: the name in the `.zon` file, field accesses on values of the type
+/// of its literal, and the field names of initializers of that type. Found in the files that can
+/// reach the `.zon` file and the files those reach, like the members of a file (see
+/// `findReferences`): a value travels through generic code without an import.
+fn zonFieldReferences(r: *Resolver, field: ZonField, opts: Options) resolve.Error![]Reference {
+    var out: std.ArrayList(Reference) = .empty;
+    const site = try zonFieldSite(r, field) orelse return &.{};
+    const decl: Reference = .{ .file = site.file, .start = site.start, .end = site.end, .is_decl = true };
+    if (opts.only_file == null or opts.only_file.? == site.file) try out.append(r.arena, decl);
+    if ((try r.ctx.get(database.sema.ZonImports, site.file)).unresolved) if (opts.zon_import) |slot| if (slot.* == null) {
+        slot.* = decl;
+    };
+    try noteSyntaxError(r, opts.syntax_error, site.file);
+    const reach = if (opts.only_file) |f|
+        (if (f == site.file or try reaches(r, f, site.file)) try r.arena.dupe(FileId, &.{f}) else &.{})
+    else
+        try importers(r, site.file, opts.scope);
+    const files = if (opts.only_file) |f| try r.arena.dupe(FileId, &.{f}) else try candidateFiles(r, reach, opts.scope);
+    // The name of `Finder.def` is what this looks for; its other uses are not reached from here
+    var finder: Finder = .{ .r = r, .def = .{ .file = site.file }, .is_field = true, .name = field.name, .out = &out, .ambiguous = opts.ambiguous, .uncertain = opts.uncertain, .incomplete = opts.incomplete, .zon_import = opts.zon_import };
+    for (files) |f| {
+        if (f == site.file) continue;
+        const index = try r.ctx.get(FileIndex.Query, f);
+        if (!index.contains(field.name)) continue;
+        // Nothing in another `.zon` file refers to the field unless the file is parsed as this type
+        if (r.isZon(f) and (try r.ctx.get(database.sema.ZonImports, f)).result_type == null) continue;
+        try noteSyntaxError(r, opts.syntax_error, f);
+        const tree = try r.itemTree(f);
+        for (0..tree.items.len) |i| try finder.zonFieldUses(f, @intCast(i), field.literal);
+    }
+    return sortUnique(out.items);
+}
 
 /// Name of the symbol (see `defName`)
 pub fn symbolName(r: *Resolver, symbol: Symbol) resolve.Error!?[]const u8 {
@@ -195,6 +358,7 @@ pub fn symbolName(r: *Resolver, symbol: Symbol) resolve.Error!?[]const u8 {
         .def => |def| defName(r, def),
         .label => |l| labelName(try r.body(l.file, l.item), l.expr),
         .error_name => |e| e.name,
+        .zon_field => |z| z.name,
     };
 }
 
@@ -214,6 +378,7 @@ pub fn symbolReferences(r: *Resolver, symbol: Symbol, opts: Options) resolve.Err
             return labelReferences(r, l);
         },
         .error_name => |e| return findErrorReferences(r, e.name, e.file, opts),
+        .zon_field => |z| return zonFieldReferences(r, z, opts),
     }
 }
 
@@ -525,6 +690,7 @@ const Finder = struct {
     ambiguous: ?*?Reference,
     uncertain: ?*?Reference,
     incomplete: ?*?Reference,
+    zon_import: ?*?Reference,
     /// Files that can reach the file containing the definition through an `@import` chain (`.item`
     /// definitions). In other files, only code in generic functions may reference the definition
     importing: std.AutoHashMapUnmanaged(FileId, void) = .empty,
@@ -550,11 +716,15 @@ const Finder = struct {
         // In a file that does not import the file containing the definition, code outside generic
         // functions can neither reference the definition by name nor obtain its containing type.
         // The root expression of a `.zon` file is an exception when it has a result type, which
-        // comes from the files that import it (see `sema.ZonResultType`); without one, nothing in
-        // it refers to a declaration
+        // comes from the files that import it (see `sema.ZonImports`); without one, nothing in it
+        // refers to a declaration, unless the sites give result types that cannot be named
         if (f.def == .item and !f.importing.contains(file)) {
             if ((try r.itemTree(file)).items[item_index].kind == .zon) {
-                if (try r.ctx.get(database.sema.ZonResultType, file) == null) return;
+                const imports = try r.ctx.get(database.sema.ZonImports, file);
+                if (imports.result_type == null) {
+                    if (imports.unresolved and f.is_field) try f.zonFieldsUnderSites(file, item_index, body);
+                    return;
+                }
             } else if (try seed.genericRoot(r, file, item_index) == null) return;
         }
         const base = try r.itemOffset(file, item_index) orelse return;
@@ -579,6 +749,7 @@ const Finder = struct {
                     const ns_def = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns| try r.memberDef(ns, f.name) else null;
                     var current: Target = if (ns_def) |d| try f.matches(file, d, at) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
                     if (current == .unknown) current = try f.importedMember(file, item_index, body, fa.lhs, at);
+                    if (current != .hit and f.is_field and try f.zonFieldIsDef(file, item_index, body, try f.inferred(&res, file, item_index), fa.lhs, range.start)) current = .hit;
                     const target = if (current == .unknown) current else try f.configurations(file, item_index, body, fa.lhs, current == .hit, at);
                     switch (target) {
                         .hit => try f.addLastToken(file, base + range.end, try isWritten(r, &written, body, id)),
@@ -598,7 +769,9 @@ const Finder = struct {
                     const n = fi.name orelse continue;
                     if (!std.mem.eql(u8, n, f.name)) continue;
                     const at: Reference = .{ .file = file, .start = base + fi.name_range.start, .end = base + fi.name_range.end };
-                    switch (try f.refersTo(&res, file, item_index, .{ .e = id, .field = k }, at)) {
+                    var current = try f.refersTo(&res, file, item_index, .{ .e = id, .field = k }, at);
+                    if (current != .hit and try f.zonFieldIsDef(file, item_index, body, try f.inferred(&res, file, item_index), id, range.start)) current = .hit;
+                    switch (current) {
                         .hit => try f.add(file, at.start, at.end),
                         .miss => {},
                         .unknown => try f.noteUncertainLiteral(&res, file, item_index, id, at),
@@ -607,6 +780,124 @@ const Finder = struct {
                 else => {},
             }
         }
+    }
+
+    /// Adds the uses in a member of the field named `f.name` of the `.zon` file literal `literal`
+    fn zonFieldUses(f: *Finder, file: FileId, item_index: u32, literal: InternPool.ZonLiteral) resolve.Error!void {
+        const r = f.r;
+        if (!try r.mayMention(file, item_index, f.name)) return;
+        const body = try r.body(file, item_index);
+        if (!mentions(body, f.name)) return;
+        const base = try r.itemOffset(file, item_index) orelse return;
+        var res: ?*const infer.Result = null;
+        var written: ?[]const bool = null;
+        for (body.exprs, 0..) |e, i| {
+            const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
+            const range = body.expr_ranges[i];
+            switch (e) {
+                .field_access => |fa| if (fa.field != null and std.mem.eql(u8, fa.field.?, f.name)) {
+                    const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
+                    const literals = try zonLiteralsOf(r, file, item_index, body, try f.inferred(&res, file, item_index), fa.lhs, range.start);
+                    switch (f.literalMatch(literals, literal, at)) {
+                        .hit => try f.addLastToken(file, base + range.end, try isWritten(r, &written, body, id)),
+                        .miss => {},
+                        .unknown => try f.noteUncertain(&res, file, item_index, fa.lhs, at),
+                    }
+                },
+                .init => |x| for (x.fields) |fi| {
+                    const n = fi.name orelse continue;
+                    if (!std.mem.eql(u8, n, f.name)) continue;
+                    const at: Reference = .{ .file = file, .start = base + fi.name_range.start, .end = base + fi.name_range.end };
+                    const literals = try zonLiteralsOf(r, file, item_index, body, try f.inferred(&res, file, item_index), id, range.start);
+                    switch (f.literalMatch(literals, literal, at)) {
+                        .hit => try f.add(file, at.start, at.end),
+                        .miss => {},
+                        .unknown => try f.noteUncertainLiteral(&res, file, item_index, id, at),
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Whether `literals`, the literals a use may refer to, include `literal`; when they also include
+    /// others, the use is recorded as ambiguous (`at`)
+    fn literalMatch(f: *Finder, literals: []const InternPool.ZonLiteral, literal: InternPool.ZonLiteral, at: Reference) Target {
+        if (literals.len == 0) return .unknown;
+        var hit = false;
+        var miss = false;
+        for (literals) |l| {
+            if (l.file == literal.file and std.mem.eql(u32, l.path, literal.path)) hit = true else miss = true;
+        }
+        if (hit and miss) if (f.ambiguous) |a| if (a.* == null) {
+            a.* = at;
+        };
+        return if (hit) .hit else .miss;
+    }
+
+    /// Whether the field named like `def` of the `.zon` file literal that `e` has the type of is
+    /// `def`, which it is when the file has a result type: the value is used through its own
+    /// anonymous type at import sites without a result type, and renaming must follow
+    fn zonFieldIsDef(f: *Finder, file: FileId, item_index: u32, body: *const Body, res: *const infer.Result, e: Body.ExprId, rel: u32) resolve.Error!bool {
+        for (try zonLiteralsOf(f.r, file, item_index, body, res, e, rel)) |literal| {
+            const site = try zonFieldSite(f.r, .{ .literal = literal, .name = f.name }) orelse continue;
+            if (try typedZonField(f.r, site)) |d| if (deepEql(d, f.def)) return true;
+            if ((try f.r.ctx.get(database.sema.ZonImports, site.file)).unresolved) {
+                const owner = try f.r.ownerKey(site.file, site.item);
+                if (try f.underSites(owner, (try zonSiteTypes(f.r, site.file)).types, .{ .e = site.init, .field = site.index })) return true;
+            }
+        }
+        return false;
+    }
+
+    /// The uses of `def` in the root expression of a `.zon` file whose import sites give several
+    /// result types: the names that refer to it under one of those types. Each is also recorded in
+    /// `zon_import`, since renaming it would break the sites of the other types, and so is any name
+    /// like it when a site's type could not be determined.
+    fn zonFieldsUnderSites(f: *Finder, file: FileId, item_index: u32, body: *const Body) resolve.Error!void {
+        const r = f.r;
+        const base = try r.itemOffset(file, item_index) orelse return;
+        const sites = try zonSiteTypes(r, file);
+        const owner = try r.ownerKey(file, item_index);
+        for (body.exprs, 0..) |e, i| {
+            const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
+            switch (e) {
+                .enum_literal => |n| if (std.mem.eql(u8, n, f.name)) {
+                    const range = body.expr_ranges[i];
+                    const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
+                    if (try f.underSites(owner, sites.types, .{ .e = id })) {
+                        try f.addLastToken(file, at.end, false);
+                        f.noteZonImport(at);
+                    } else if (!sites.complete) f.noteZonImport(at);
+                },
+                .init => |x| for (x.fields, 0..) |fi, k| {
+                    const n = fi.name orelse continue;
+                    if (!std.mem.eql(u8, n, f.name)) continue;
+                    const at: Reference = .{ .file = file, .start = base + fi.name_range.start, .end = base + fi.name_range.end };
+                    if (try f.underSites(owner, sites.types, .{ .e = id, .field = k })) {
+                        try f.add(file, at.start, at.end);
+                        f.noteZonImport(at);
+                    } else if (!sites.complete) f.noteZonImport(at);
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Whether `l` in the root expression `owner` of a `.zon` file is `def` under one of `types`
+    fn underSites(f: *Finder, owner: hir.OwnerKey, types: []const InternPool.Index, l: Lookup) resolve.Error!bool {
+        for (types) |ty| {
+            const res = try f.r.ctx.get(sema.Infer, .{ .owner = owner, .mode = .full, .zon_type = ty });
+            const m = l.member(res) orelse continue;
+            if (try keyDef(f.r, m)) |d| if (deepEql(d, f.def)) return true;
+        }
+        return false;
+    }
+
+    fn noteZonImport(f: *Finder, at: Reference) void {
+        if (f.zon_import) |slot| if (slot.* == null) {
+            slot.* = at;
+        };
     }
 
     fn inferred(f: *Finder, res: *?*const infer.Result, file: FileId, item_index: u32) resolve.Error!*const infer.Result {

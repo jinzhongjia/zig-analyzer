@@ -25,7 +25,7 @@ Published for the files that can be compiled with a project:
 - files under the directory of a module's root file, so files not imported yet get their syntax and AstGen errors while they are written;
 - the build scripts.
 
-Other files under the root directory, outside every module directory, get none.
+Other files under the root directory, outside every module directory, get none, except open `.zon` files: whether a file is valid ZON does not depend on any build. `zig-analyzer.zon` also gets the problems in its settings once its syntax is valid: an unknown setting or a wrong type is an error (the whole file is ignored), and a setting only the editor can set is a warning (only that setting is ignored).
 
 The official parser and AstGen recurse per level, so deep files run on a dedicated thread with a stack sized by the estimated depth. Past 409600 levels (102400 on 32-bit), 4 times what `zig ast-check` handles on 64-bit, a file gets no live diagnostics.
 
