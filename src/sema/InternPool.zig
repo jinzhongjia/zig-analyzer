@@ -741,9 +741,9 @@ pub const ScalarAbi = struct {
 /// the compiler backend, the architecture and the CPU features
 pub const VectorAbi = enum(u8) {
     unknown,
-    /// The alignment is the byte size rounded up to a power of 2 (LLVM and other backends)
+    /// The size and alignment are the byte size rounded up to a power of 2 (LLVM and other backends)
     llvm,
-    /// Like `llvm`, but no larger than the stack alignment of 16 (aarch64)
+    /// Like `llvm`, but the alignment is no larger than the stack alignment of 16 (aarch64)
     llvm_aarch64,
     /// The self-hosted x86_64 backend: the alignment is at least 16; with AVX / AVX-512,
     /// vectors larger than 16 / 32 bytes are aligned to 32 / 64

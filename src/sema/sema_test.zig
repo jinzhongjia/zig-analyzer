@@ -1798,6 +1798,64 @@ test "vector layouts follow the backend and CPU features" {
     });
 }
 
+test "LLVM vector sizes are powers of two even where the alignment is capped" {
+    // Expected values are the results of zig 0.17.1 on aarch64-linux and x86_64-linux with
+    // -OReleaseFast; a size of 48 was reported for `s33`, aligned to 16 from 33 bytes
+    const src =
+        \\const s3 = @sizeOf(@Vector(3, u8));
+        \\const s17 = @sizeOf(@Vector(17, u8));
+        \\const s33 = @sizeOf(@Vector(33, u8));
+        \\const s65 = @sizeOf(@Vector(65, u8));
+        \\const a33 = @alignOf(@Vector(33, u8));
+        \\const s5u64 = @sizeOf(@Vector(5, u64));
+        \\const s0 = @sizeOf(@Vector(0, u8));
+    ;
+    try expectTypesTargeted(.{ .vector_abi = .llvm_aarch64 }, src, &.{
+        .{ "s3", "comptime_int = 4" },
+        .{ "s17", "comptime_int = 32" },
+        .{ "s33", "comptime_int = 64" },
+        .{ "s65", "comptime_int = 128" },
+        .{ "a33", "comptime_int = 16" },
+        .{ "s5u64", "comptime_int = 64" },
+        .{ "s0", "comptime_int = 0" },
+    });
+    try expectTypesTargeted(.{ .vector_abi = .llvm }, src, &.{
+        .{ "s33", "comptime_int = 64" },
+        .{ "a33", "comptime_int = 64" },
+        .{ "s0", "comptime_int = 0" },
+    });
+}
+
+test "pointers are aligned as the integer of their width" {
+    // Expected values are the results of zig 0.17.1; on AVR a pointer alignment of 2 was reported
+    const src =
+        \\const a_ptr = @alignOf(*u8);
+        \\const s_ptr = @sizeOf(*u8);
+        \\const a_slice = @alignOf([]u8);
+        \\const s_slice = @sizeOf([]u8);
+        \\const a_opt = @alignOf(?*u8);
+    ;
+    for ([_]struct { []const u8, u64, u64 }{
+        .{ "avr-freestanding-none", 1, 2 },
+        .{ "msp430-freestanding-none", 2, 2 },
+        .{ "m68k-linux-musl", 4, 4 },
+        .{ "x86-linux-musl", 4, 4 },
+        .{ "wasm32-freestanding-none", 4, 4 },
+        .{ "aarch64-linux-musl", 8, 8 },
+    }) |case| {
+        const triple, const alignment, const size = case;
+        var buf: [5][32]u8 = undefined;
+        const a = try std.fmt.bufPrint(&buf[0], "comptime_int = {d}", .{alignment});
+        try expectTypesTargeted(try targetOf(triple, null), src, &.{
+            .{ "a_ptr", a },
+            .{ "s_ptr", try std.fmt.bufPrint(&buf[1], "comptime_int = {d}", .{size}) },
+            .{ "a_slice", a },
+            .{ "s_slice", try std.fmt.bufPrint(&buf[2], "comptime_int = {d}", .{2 * size}) },
+            .{ "a_opt", a },
+        });
+    }
+}
+
 /// Target parameters for `arch_os_abi` and the CPU (as with the compiler's `-target` / `-mcpu`):
 /// pointer bit width and layout rules of scalar types
 fn targetOf(arch_os_abi: []const u8, cpu: ?[]const u8) !InternPool.Target {
