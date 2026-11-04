@@ -112,7 +112,7 @@ Only `Canceled` and `OutOfMemory` propagate within the engine. Query results are
 
 ## Syntax layer (`syntax/`)
 
-`std.zig.Ast` is used only for formatting and AstGen diagnostics, not as the IDE syntax tree: its recovery from half-written expressions such as `foo.` is coarse-grained, it does not preserve trivia structure, and its node indices shift globally, which makes local reparse impossible.
+`std.zig.Ast` is used only for formatting (rendered by the version-specific copies in `src/ide/render/`) and AstGen diagnostics, not as the IDE syntax tree: its recovery from half-written expressions such as `foo.` is coarse-grained, it does not preserve trivia structure, and its node indices shift globally, which makes local reparse impossible.
 
 - **Red-green CST**: hand-written recursive descent following the official PEG grammar that never fails. Where no structure can be recovered, an `ERROR` node is produced; concatenating the tree's text always yields the source.
 - **Local reparse**: an edit inside a brace-balanced `block` / `container_decl` reparses only that node. The result must equal a full parse (ensured by corpus and random-edit tests).
@@ -299,7 +299,8 @@ The `Configuration` format and in-process AstGen come from the standard library 
 
 - When the user's zig is another of these versions, in-process AstGen would not match it, so live diagnostics use `zig ast-check`; everything else works as usual.
 - The CST parser follows the user's zig (`Parse.Dialect`, the `SyntaxDialect` input): only 0.17.0 accepts doc comments on `...`.
-- The built-in documentation and the layouts where 0.17.0 differs (`@Vector` larger than 32 bytes on aarch64 whose byte size is not a power of two, pointer alignment on AVR) follow Zig 0.17.1 for both. Formatting uses the standard library zig-analyzer is compiled with.
+- The built-in documentation and the layouts where 0.17.0 differs (`@Vector` larger than 32 bytes on aarch64 whose byte size is not a power of two, pointer alignment on AVR) follow Zig 0.17.1 for both.
+- Formatting uses the renderer of the user's zig, in process, and the parser of the standard library zig-analyzer is compiled with (see `docs/features/formatting.md`).
 - With any other version, the build system is not started for roots with `build.zig`: no compiler diagnostics or named imports, only `zig ast-check` live diagnostics, and no single-file compiles there. The user is told at startup.
 - Other files still compile in single-file mode; the `ErrorBundle` is validated as in `docs/diagnostics.md`, never read out of bounds, though contents may be garbled.
 - Release versions follow Zig versions. The reported version comes from `git describe --tags`, falling back to `build.zig.zon`; `build.zig` is marked not cacheable because git's answer is outside the configure cache.

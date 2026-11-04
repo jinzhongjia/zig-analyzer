@@ -21,7 +21,7 @@ const ZigEnv = @This();
 /// adds the `deployed_*` bases before `libc_runtimes`. None of these bases resolves to a known
 /// path, so reading one as another changes nothing, and a base the reader's standard library does
 /// not have fails validation.
-const supported_versions = [_][]const u8{ "0.17.0", "0.17.1" };
+pub const supported_versions = [_][]const u8{ "0.17.0", "0.17.1" };
 
 comptime {
     if (!isSupported(builtin.zig_version_string))

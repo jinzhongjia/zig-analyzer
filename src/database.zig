@@ -19,6 +19,7 @@ pub const ide_db = struct {
 pub const ide = struct {
     pub const naming = @import("ide/naming.zig");
     pub const completion = @import("ide/completion.zig");
+    pub const format = @import("ide/format.zig");
 };
 
 const Vfs = @import("base/Vfs.zig");
@@ -43,6 +44,7 @@ pub const Db = engine.Engine(*const Env, &.{
     inputs.WorkspaceFiles,
     live.LiveBackend,
     syntax.SyntaxDialect,
+    ide.format.ZigFmtRenderer,
     syntax.SourceText,
     syntax.ParseFile,
     syntax.FileItemTree,

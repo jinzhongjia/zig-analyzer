@@ -1760,6 +1760,26 @@ test "doc comments on the variadic marker are a syntax error by the version of t
     try shutdown(&h);
 }
 
+test "formatting follows the version of the user's zig" {
+    var project = try fixture.Project.create(&fixture.basic);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initialize(&h, project.root, false);
+    const a = h.arena.allocator();
+    const path = try project.path(a, "src/lib.zig");
+    // Formatted by 0.17.1, while 0.17.0 removes the blank line
+    const text = "const a = .{\n    1,\n\n    2, //\n    3,\n};\n";
+    const uri = try open(&h, path, text);
+    try waitIdle(&h);
+    const response = try h.request("textDocument/formatting", .{ .textDocument = .{ .uri = uri }, .options = .{ .tabSize = 4, .insertSpaces = true } });
+    const edits = response.object.get("result").?.array.items;
+    const expected: usize = if (std.mem.eql(u8, project.env.version, "0.17.0")) 1 else 0;
+    try testing.expectEqual(expected, edits.len);
+    try shutdown(&h);
+}
+
 test "zig version mismatch: no build system is started, live diagnostics run zig ast-check outside the read transaction" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var project = try fixture.Project.create(&fixture.basic);

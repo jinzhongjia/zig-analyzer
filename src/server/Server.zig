@@ -723,7 +723,7 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                     server.sendResponse(id, result);
                 },
                 .read, .semantic, .syntax => {
-                    const inputs: ?Db.Inputs = if (h[1] == .syntax) comptime Db.inputSet(&.{ FileText, database.syntax.SyntaxDialect }) else null;
+                    const inputs: ?Db.Inputs = if (h[1] == .syntax) comptime Db.inputSet(&.{ FileText, database.syntax.SyntaxDialect, ide.format.ZigFmtRenderer }) else null;
                     const pending = server.addPending(a, id, inputs) catch |err| {
                         defer server.destroyArena(arena);
                         server.sendError(id, jsonrpc.error_codes.internal_error, "out of memory");
@@ -3077,6 +3077,12 @@ fn startup(server: *Server) Io.Cancelable!void {
         defer server.db.endWrite();
         server.db.set(database.syntax.SyntaxDialect, {}, dialect, .high) catch {};
     }
+    const renderer: ide.format.Renderer = .of(env.version);
+    if (renderer != ide.format.Renderer.built) {
+        server.db.beginWriteOf(comptime Db.inputSet(&.{ide.format.ZigFmtRenderer}), .unordered);
+        defer server.db.endWrite();
+        server.db.set(ide.format.ZigFmtRenderer, {}, renderer, .high) catch {};
+    }
     if (!env.matchesBuiltin()) {
         // The in-process AstGen may not match the user's zig: live diagnostics use the user's
         // zig ast-check instead
@@ -5305,7 +5311,7 @@ fn formatting(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.Doc
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const lines = try fileLines(ctx, arena, file);
     const mode = za.syntax.Parse.modeOf(server.vfs.path(file));
-    return ide.format.format(arena, lines, mode, server.encoding);
+    return ide.format.format(arena, lines, mode, server.encoding, try ctx.get(ide.format.ZigFmtRenderer, {}));
 }
 
 fn documentSymbol(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentSymbolParams) HandlerError!types.ResultType("textDocument/documentSymbol") {
