@@ -37,7 +37,7 @@ Offered on AstGen's `unused capture` or `unused switch tag capture`, as "remove 
 
 ## Naming checks
 
-These follow the Names section of the Zig 0.17.0 style guide, are off by default, and are enabled by `naming.enable`.
+These follow the Names section of the Zig 0.17.1 style guide, are off by default, and are enabled by `naming.enable`.
 
 - **Classification**: style follows what a declaration actually represents, not its keyword: types and functions returning `type` are TitleCase, other callables camelCase, and namespaces and other values snake_case. Only abstract-instance results are used, so one call site's instance is never generalized.
 - **Skipped**: whatever is unknown or instance-dependent, or where a style is not decidable: extern and export declarations, `@compileError` stubs, root declarations std looks up by name, same-name re-exports, `@"..."` names, and names with an ambiguous word split. Dependency libraries, generated code, and `naming.exclude` are not checked.

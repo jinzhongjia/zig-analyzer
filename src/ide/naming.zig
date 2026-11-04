@@ -1,4 +1,4 @@
-//! Naming conventions: following the Names section of the Zig 0.17.0 style guide, the style of a
+//! Naming conventions: following the Names section of the Zig 0.17.1 style guide, the style of a
 //! name is determined by what the declaration actually represents, not by the `fn` / `const` /
 //! `var` keyword:
 //! - Types and type aliases: TitleCase
@@ -37,7 +37,7 @@ const queries = @import("../sema/queries.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
 /// Link to the description of the rules (the `codeDescription` of diagnostics)
-pub const guide_url = "https://ziglang.org/documentation/0.17.0/#Names";
+pub const guide_url = "https://ziglang.org/documentation/0.17.1/#Names";
 
 pub const Style = enum {
     title_case,
@@ -247,7 +247,7 @@ const Collector = struct {
 };
 
 /// Declarations that the standard library looks up by name in the root file (`@hasDecl(root,
-/// "...")` in Zig 0.17.0): renaming one silently stops the standard library from using it.
+/// "...")` in Zig 0.17.1): renaming one silently stops the standard library from using it.
 /// Checked in every file, as which file is the root of a compilation is not known here.
 fn isRootHook(name: []const u8) bool {
     const hooks = [_][]const u8{

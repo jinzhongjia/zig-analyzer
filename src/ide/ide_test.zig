@@ -7080,7 +7080,7 @@ test "builtin hover combines official documentation and inferred values" {
         var r = resolver(&w, &ctx);
         const info = try hover.hover(&r, added.file, added.cursor, &.{}) orelse return error.NoHover;
         try testing.expect(std.mem.indexOf(u8, info.text, case.signature) != null);
-        try testing.expect(std.mem.indexOf(u8, info.text, "https://ziglang.org/documentation/0.17.0/") != null);
+        try testing.expect(std.mem.indexOf(u8, info.text, "https://ziglang.org/documentation/0.17.1/") != null);
         if (case.value) |value| try testing.expect(std.mem.indexOf(u8, info.text, value) != null);
         if (std.mem.indexOf(u8, case.signature, "@sizeOf") != null)
             try testing.expect(std.mem.indexOf(u8, info.text, "number of bytes") != null);
@@ -7109,7 +7109,7 @@ test "builtin completion exposes official details and undocumented source notes"
         if (std.mem.eql(u8, item.label, "@Frame")) {
             gap_found = true;
             try testing.expect(item.detail == null);
-            try testing.expect(std.mem.indexOf(u8, item.doc.?, "0.17.0") != null);
+            try testing.expect(std.mem.indexOf(u8, item.doc.?, "0.17.1") != null);
         }
     }
     try testing.expect(size_found and gap_found);
@@ -7202,7 +7202,7 @@ test "builtin hover source gaps and argument names remain distinct" {
         var r = resolver(&w, &ctx);
         const info = try hover.hover(&r, added.file, added.cursor, &.{}) orelse return error.NoHover;
         if (case.gap) {
-            try testing.expect(std.mem.indexOf(u8, info.text, "0.17.0") != null);
+            try testing.expect(std.mem.indexOf(u8, info.text, "0.17.1") != null);
             try testing.expect(std.mem.indexOf(u8, info.text, "@Frame(") == null);
         } else {
             try testing.expect(std.mem.indexOf(u8, info.text, "https://ziglang.org/documentation/") == null);
