@@ -1739,6 +1739,27 @@ fn mismatchedZig(h: *Harness, project: *fixture.Project) !std.json.Value {
     return jsonValue(h, try std.fmt.allocPrint(h.arena.allocator(), "{{\"zig\": {{\"path\": \"{s}/zigw\"}}}}", .{project.root}));
 }
 
+test "doc comments on the variadic marker are a syntax error by the version of the user's zig" {
+    var project = try fixture.Project.create(&fixture.basic);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initialize(&h, project.root, false);
+    const path = try project.path(h.arena.allocator(), "src/lib.zig");
+    _ = try open(&h, path, "extern fn f(\n    /// doc\n    ...,\n) void;\n");
+    try waitIdle(&h);
+    {
+        const file = (try h.server.vfs.lookup(path)).?;
+        var ctx = h.server.db.beginRead(testing.allocator);
+        defer ctx.end();
+        const parse = try ctx.get(@import("../database.zig").syntax.ParseFile, file);
+        const expected: usize = if (std.mem.eql(u8, project.env.version, "0.17.0")) 0 else 1;
+        try testing.expectEqual(expected, parse.errors.len);
+    }
+    try shutdown(&h);
+}
+
 test "zig version mismatch: no build system is started, live diagnostics run zig ast-check outside the read transaction" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var project = try fixture.Project.create(&fixture.basic);

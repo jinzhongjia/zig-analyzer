@@ -40,6 +40,8 @@ pub const Parser = struct {
     tokens: []const lexer.Token,
     /// Indices of the non-trivia tokens in `tokens`
     significant: []const u32,
+    /// Doc comments on the variadic marker `...` are accepted (see `Parse.Dialect`)
+    variadic_doc_comments: bool = false,
     pos: u32 = 0,
     events: std.ArrayList(Event) = .empty,
     errors: std.ArrayList(Error) = .empty,

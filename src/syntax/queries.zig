@@ -58,6 +58,15 @@ pub const parse_lru = 64;
 /// the count limit
 pub const parse_lru_bytes = 128 * 1024 * 1024;
 
+/// The syntax rules files are parsed by; set when the zig version is confirmed after startup, and
+/// all files are parsed again when it changes
+pub const SyntaxDialect = struct {
+    pub const kind: engine.Kind = .input;
+    pub const Key = void;
+    pub const Value = Parse.Dialect;
+    pub const default: Value = .latest;
+};
+
 pub const ParseFile = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
@@ -71,15 +80,16 @@ pub const ParseFile = struct {
         return @sizeOf(Parse) + v.chain_bytes;
     }
 
-    /// Picks the parse mode by path (`.zon` is ZON). When there is a previous result, attempts a
-    /// local reparse (the mode is kept and the result is the same as a full parse; see
-    /// `Parse.reparse`)
+    /// Picks the parse mode by path (`.zon` is ZON). When there is a previous result of the same
+    /// dialect, attempts a local reparse (the mode is kept and the result is the same as a full
+    /// parse; see `Parse.reparse`)
     pub fn computeIncremental(ctx: anytype, file: Key, prev: ?Value) engine.Error!Value {
         const text = (try ctx.get(SourceText, file)).text;
-        if (prev) |old| return Parse.reparse(ctx.db.gpa, old, text);
+        const dialect = try ctx.get(SyntaxDialect, {});
+        if (prev) |old| if (old.dialect == dialect) return Parse.reparse(ctx.db.gpa, old, text);
         // The test Db without a Vfs only has Zig files
         const mode: Parse.Mode = if (comptime @TypeOf(ctx.db.env) == void) .zig else Parse.modeOf(ctx.db.env.vfs.path(file));
-        return Parse.create(ctx.db.gpa, text, mode);
+        return Parse.createIn(ctx.db.gpa, text, mode, dialect);
     }
 
     pub fn eql(a: Value, b: Value) bool {

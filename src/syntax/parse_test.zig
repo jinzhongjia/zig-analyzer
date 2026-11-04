@@ -301,6 +301,39 @@ test "recovery: unwinding deep unclosed nesting and long else-if chains" {
     try expectLossless(src.items);
 }
 
+test "doc comments on the variadic marker follow the dialect" {
+    // `zig ast-check` of 0.17.1 rejects them, and that of 0.17.0 accepts them
+    const source = "extern fn f(\n    /// doc\n    ...,\n) void;\n";
+    try expectNoErrors("extern fn f(a: u8, ...) void;\n");
+    try expectLossless(source);
+    const accepted = try Parse.createIn(testing.allocator, source, .zig, .zig_0_17_0);
+    defer accepted.destroy();
+    try testing.expectEqual(0, accepted.errors.len);
+    const rejected = try Parse.createIn(testing.allocator, source, .zig, .zig_0_17_1);
+    defer rejected.destroy();
+    try testing.expectEqual(1, rejected.errors.len);
+    try testing.expectEqual(std.mem.indexOf(u8, source, "...").?, rejected.errors[0].offset);
+    try testing.expectEqual(.zig_0_17_0, Parse.Dialect.of("0.17.0"));
+    try testing.expectEqual(.zig_0_17_1, Parse.Dialect.of("0.17.1"));
+    try testing.expectEqual(Parse.Dialect.latest, Parse.Dialect.of("0.18.0-dev.1+abc"));
+}
+
+test "incremental reparse keeps the dialect" {
+    const old_text = "const S = struct {\n    extern fn f(\n        /// doc\n        ...,\n    ) void;\n    const a = 1;\n};\nconst b = 2;\n";
+    const new_text = "const S = struct {\n    extern fn f(\n        /// doc\n        ...,\n    ) void;\n    const a = 2;\n};\nconst b = 2;\n";
+    for ([_]struct { Parse.Dialect, usize }{ .{ .zig_0_17_0, 0 }, .{ .zig_0_17_1, 1 } }) |case| {
+        const dialect, const errors = case;
+        const old = try Parse.createIn(testing.allocator, old_text, .zig, dialect);
+        defer old.destroy();
+        const inc = try Parse.reparse(testing.allocator, old, new_text);
+        defer inc.destroy();
+        const full = try Parse.createIn(testing.allocator, new_text, .zig, dialect);
+        defer full.destroy();
+        try testing.expect(inc.sameAs(full));
+        try testing.expectEqual(errors, inc.errors.len);
+    }
+}
+
 test "recovery: errdefer takes no capture, like defer" {
     // An `errdefer |e|` capture was accepted without an error and bound `e`
     for ([_][]const u8{ "defer", "errdefer" }) |keyword| {

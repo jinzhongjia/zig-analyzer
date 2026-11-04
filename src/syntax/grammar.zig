@@ -268,10 +268,11 @@ fn atListEnd(p: *Parser) bool {
 
 fn param(p: *Parser) Error!void {
     const m = try p.start();
+    const documented = p.at(.doc_comment);
     while (p.at(.doc_comment)) try p.bump();
-    // Zig 0.17.1 rejects doc comments on the variadic marker and 0.17.0 accepts them: accepted
-    // here, since the live diagnostics of the user's zig report the error
-    if (try p.eat(.ellipsis3)) {
+    if (p.at(.ellipsis3)) {
+        if (documented and !p.variadic_doc_comments) try p.err("expected parameter type");
+        try p.bump();
         _ = try m.complete(p, .param);
         return;
     }

@@ -723,7 +723,7 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                     server.sendResponse(id, result);
                 },
                 .read, .semantic, .syntax => {
-                    const inputs: ?Db.Inputs = if (h[1] == .syntax) comptime Db.inputSet(&.{FileText}) else null;
+                    const inputs: ?Db.Inputs = if (h[1] == .syntax) comptime Db.inputSet(&.{ FileText, database.syntax.SyntaxDialect }) else null;
                     const pending = server.addPending(a, id, inputs) catch |err| {
                         defer server.destroyArena(arena);
                         server.sendError(id, jsonrpc.error_codes.internal_error, "out of memory");
@@ -3071,6 +3071,12 @@ fn startup(server: *Server) Io.Cancelable!void {
     log.info("zig {s} ({s})", .{ detected.version, detected.zig_exe });
     _ = try server.applyZigPaths();
     const env = server.zigEnv() orelse return;
+    const dialect: za.syntax.Parse.Dialect = .of(env.version);
+    if (dialect != za.syntax.Parse.Dialect.latest) {
+        server.db.beginWriteOf(comptime Db.inputSet(&.{database.syntax.SyntaxDialect}), .unordered);
+        defer server.db.endWrite();
+        server.db.set(database.syntax.SyntaxDialect, {}, dialect, .high) catch {};
+    }
     if (!env.matchesBuiltin()) {
         // The in-process AstGen may not match the user's zig: live diagnostics use the user's
         // zig ast-check instead

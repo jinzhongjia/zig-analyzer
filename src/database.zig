@@ -42,6 +42,7 @@ pub const Db = engine.Engine(*const Env, &.{
     inputs.FileText,
     inputs.WorkspaceFiles,
     live.LiveBackend,
+    syntax.SyntaxDialect,
     syntax.SourceText,
     syntax.ParseFile,
     syntax.FileItemTree,
