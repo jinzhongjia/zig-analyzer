@@ -33,22 +33,37 @@
     //   },
 
     // How projects are built.
+    // Example:
+    //   .build = .{
+    //       .args = .{"-Dtarget=aarch64-linux"},
+    //   },
     .build = .{
         // Load projects through the build system protocol (`zig build --listen=-`); false handles
         // every file in single-file mode (editor only):
         //   .enable = true,
 
-        // Extra arguments passed to `zig build`, e.g. .{"-Dtarget=aarch64-linux"}.
+        // Extra arguments passed to `zig build`.
+        // Example:
+        //   .args = .{ "-Dtarget=aarch64-linux", "-Doptimize=ReleaseSafe" },
         .args = .{},
     },
 
     // Which diagnostics are computed, and how.
+    // Example:
+    //   .diagnostics = .{
+    //       .steps = .{"check"},
+    //       .compiler = true,
+    //   },
     .diagnostics = .{
         // Build steps for compiler diagnostics. Empty: `check` if the project has it, otherwise the
         // default step.
+        // Example:
+        //   .steps = .{ "check", "test" },
         .steps = .{},
         // Run the compiler on save for diagnostics; false gives only live diagnostics (syntax and
         // AstGen) while typing.
+        // Example:
+        //   .compiler = false,
         .compiler = true,
 
         // Mark code that is not compiled in the current build configuration (branches comptime
@@ -123,13 +138,24 @@
     // How top-level imports are arranged, by "Organize imports" (`source.organizeImports`) and when
     // auto-import adds one. Imports are grouped std / builtin / root, modules, then files, with a
     // blank line between groups.
+    // Example:
+    //   .imports = .{
+    //       .derived = .separate,
+    //       .sort = .name,
+    //   },
     .imports = .{
-        // Where declarations derived from an import (`const Allocator = std.mem.Allocator;`) go:
-        // .with_import right after the import they come from; .separate in a last group of their
-        // own.
+        // Where declarations derived from an import (`const Allocator = std.mem.Allocator;`) go.
+        //   .with_import: Right after the import they come from.
+        //   .separate: In a last group of their own.
+        // Example:
+        //   .derived = .separate,
         .derived = .with_import,
-        // Order within a group: .path by what is imported (module name, file path with nearer
-        // files first, the full access path of derived declarations); .name by declaration name.
+        // Order within a group.
+        //   .path: By what is imported: module name, file path with nearer files first, the full
+        //     access path of derived declarations.
+        //   .name: By declaration name.
+        // Example:
+        //   .sort = .name,
         .sort = .path,
     },
 
@@ -175,28 +201,58 @@
     //   },
 
     // The naming check.
+    // Example:
+    //   .naming = .{
+    //       .enable = true,
+    //       .ignore = .{"SDL_*"},
+    //       .exclude = .{"vendor/*"},
+    //       .rules = .{ .field = false },
+    //   },
     .naming = .{
         // Hint names that do not follow the Names section of the Zig style guide, with rename
         // fixes. Only open files of your own code are checked.
+        // Example:
+        //   .enable = true,
         .enable = false,
-        // Names to skip; `*` matches any sequence of characters, e.g. .{"SDL_*"}.
+        // Names to skip; `*` matches any sequence of characters.
+        // Example:
+        //   .ignore = .{ "SDL_*", "c_*" },
         .ignore = .{},
         // Files to skip: `/`-separated paths relative to the project root (to the workspace root
         // in editor settings); `*` matches any sequence of characters, including `/`.
+        // Example:
+        //   .exclude = .{ "vendor/*", "src/generated/*.zig" },
         .exclude = .{},
         // Turn individual rules on or off; each matches the diagnostic code `naming.<rule>`.
+        // Example:
+        //   .rules = .{
+        //       .function = false,
+        //       .field = false,
+        //   },
         .rules = .{
             // Types and type aliases: TitleCase.
+            // Example:
+            //   .type = false,
             .type = true,
             // Callables that return `type`: TitleCase.
+            // Example:
+            //   .type_function = false,
             .type_function = true,
             // Other callables (functions, function aliases, function pointers): camelCase.
+            // Example:
+            //   .function = false,
             .function = true,
             // Namespaces (files with no top-level fields): snake_case.
+            // Example:
+            //   .namespace = false,
             .namespace = true,
             // Other values: snake_case.
+            // Example:
+            //   .value = false,
             .value = true,
             // Fields and enum members, by the type of the field.
+            // Example:
+            //   .field = false,
             .field = true,
         },
     },

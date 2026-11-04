@@ -322,7 +322,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     if (literal == .quoted) return quotedName(r, file, offset, cursor_owner);
     if (literal == .none and !paths_only) if (try project_config.valueCompletions(r, file, text, offset, (try r.ctx.get(database.syntax.ParseFile, file)).rootNode())) |values| {
         out.member_mode = true;
-        for (values.names) |v| try out.add(.{ .label = v, .kind = if (values.tags) .enum_member else .constant });
+        for (values.values) |v| try out.add(.{ .label = v.name, .kind = if (values.tags) .enum_member else .constant, .doc = v.doc });
         return .{ .items = out.items.items, .context = if (values.tags) .enum_literal else .ignored };
     };
     // The following contexts are mostly error nodes in the syntax tree (such as a lone `@` or an
