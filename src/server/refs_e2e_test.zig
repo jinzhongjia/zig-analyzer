@@ -478,11 +478,10 @@ test "rename reaches build scripts and their helpers" {
     try h.notify("exit", {});
 }
 
-/// The error message of a request sent while the project loads: a read interrupted by a write
-/// transaction of the load itself (the module graph update after the zig environment query, the
-/// workspace scan) is answered with ContentModified, which asks for a retry; the request is sent
-/// again, and since the load is still blocked, the refusal that explains why the results are not
-/// available comes back at once. Fails when the request is answered instead.
+/// The error message of a request sent while the project loads: a write transaction ordered after
+/// the request answers it with ContentModified, which asks for a retry; the request is sent again,
+/// and since the load is still blocked, the refusal that explains why the results are not available
+/// comes back at once. Fails when the request is answered instead.
 fn loadingError(h: *Harness, method: []const u8, params: anytype) ![]const u8 {
     // A load whose writes keep interrupting the request fails the test instead of looping forever
     for (0..50) |_| {

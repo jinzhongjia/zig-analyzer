@@ -83,7 +83,7 @@ Each thread keeps an active query stack; a cycle calls the query's `cycleFallbac
 
 ### Cancellation
 
-- `pending_write` counts write transactions waiting for the exclusive lock. While it is nonzero, read queries return `error.Canceled` on entry to `get`, canceled computations write no memos, and read requests are answered with `ContentModified`. A write transaction decrements it only after acquiring the lock, so overlapping writes do not clear each other's registration.
+- `pending_write` counts write transactions waiting for the exclusive lock. While it is nonzero, read queries return `error.Canceled` on entry to `get`, canceled computations write no memos, and read requests stop (see "Read requests"). A write transaction decrements it only after acquiring the lock, so overlapping writes do not clear each other's registration.
 - A write may declare the inputs it changes (`beginWriteOf`), and a read the inputs its results may depend on (`Mark`): a write cancels only the reads it may affect, and the others finish first.
 
 ### Concurrent reads
@@ -317,7 +317,7 @@ With `sema.wait_for_project`, they are held until the load ends and every answer
 
 ### Read requests
 
-Reads run concurrently on snapshots and are canceled by `$/cancelRequest` and writes. A request is answered on the state when it was received: when its task starts reading after a later write, it gets `ContentModified`. The server's own updates (module graph, file list, live backend) are not ordered with requests, and requests depending only on text are canceled only by text writes.
+Reads run concurrently on snapshots and are canceled by `$/cancelRequest` and writes. A request is answered on the state when it was received: when a later write interrupts it or its task starts reading after one, it gets `ContentModified`. The server's own updates (module graph, file list, live backend, files loaded from disk) are not ordered with requests: a request they interrupt runs again on the new state, as the text it refers to has not changed, so loading a project does not fail requests. Requests depending only on text are canceled only by text writes.
 
 ### Diagnostic publishing
 

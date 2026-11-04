@@ -4,8 +4,9 @@
 //!   `beginWrite` cancels in-flight read queries, then modifies inputs.
 //! - Read requests run concurrently in `group`, each holding a read transaction on the state at
 //!   the time the request was received; a request interrupted by a write transaction, or whose
-//!   read transaction begins after a write transaction that began since then, is answered with
-//!   `ContentModified`, and one canceled by `$/cancelRequest` with `RequestCancelled`.
+//!   read transaction begins after a write transaction ordered after it, is answered with
+//!   `ContentModified`, and one canceled by `$/cancelRequest` with `RequestCancelled`. A request
+//!   interrupted only by a write the server made on its own runs again on the new state.
 
 const std = @import("std");
 const Io = std.Io;
@@ -800,14 +801,33 @@ fn BackgroundTask(comptime func: anytype) type {
     };
 }
 
+/// A handler failed with `err`: answers the request and returns true, or returns false when the
+/// handler must run again. A read interrupted only by a write the server made on its own
+/// (`Db.WriteOrder.unordered`) runs again on the new state: the text the request refers to has not
+/// changed, so the client has nothing to act on. When a write ordered after the request caused the
+/// interruption, the next read transaction would be stale, and `ContentModified` is answered there.
+fn answerFailure(server: *Server, ctx: *const Db.Ctx, pending: *const Pending, err: anyerror) bool {
+    const by_client = pending.cancel.load(.acquire);
+    if (err == error.Canceled and !by_client and !ctx.stale and !server.isShuttingDown()) return false;
+    server.sendHandlerError(pending.id, err, by_client);
+    return true;
+}
+
 fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
     const Params = LastParam(@TypeOf(func));
     return struct {
         fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
             defer server.finishRequest(arena, pending);
             pending.sema_start = server.semaUsage();
-            const a = arena.allocator();
             server.testGate(method, .before_read, pending);
+            while (!attempt(server, pending, params)) {}
+        }
+
+        /// Returns whether the request was answered (see `answerFailure`)
+        fn attempt(server: *Server, pending: *Pending, params: Params) bool {
+            var attempt_arena: std.heap.ArenaAllocator = .init(server.gpa);
+            defer attempt_arena.deinit();
+            const a = attempt_arena.allocator();
             var ctx = server.db.beginReadAt(a, pending.since);
             ctx.cancel = &pending.cancel;
             defer ctx.end();
@@ -822,13 +842,12 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
             const t0 = Io.Clock.awake.now(server.io);
             defer server.reportIfSlow(&ctx, method, t0, &trace);
 
-            const result = func(server, &ctx, a, params) catch |err| {
-                return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
-            };
+            const result = func(server, &ctx, a, params) catch |err| return server.answerFailure(&ctx, pending, err);
             // The handler may have swallowed `Canceled` with a fallback value (such as
             // `catch null` in type rendering), and then the result is incomplete
-            ctx.checkCanceled() catch |err| return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
+            ctx.checkCanceled() catch |err| return server.answerFailure(&ctx, pending, err);
             server.sendResponse(pending.id, result);
+            return true;
         }
     };
 }
@@ -840,7 +859,6 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
         fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
             defer server.finishRequest(arena, pending);
             pending.sema_start = server.semaUsage();
-            const a = arena.allocator();
             const waited_for_projects = server.waitForProjects(pending);
             if (comptime std.mem.eql(u8, method, "workspace/symbol")) {
                 // After a wait, reads the state at its end: the request has no position that
@@ -849,6 +867,14 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
                 if (server.waitSymbolIndex(pending) or waited_for_projects) pending.since = server.db.mark(pending.since.inputs);
             }
             server.testGate(method, .before_read, pending);
+            while (!attempt(server, pending, params, waited_for_projects)) {}
+        }
+
+        /// Returns whether the request was answered (see `answerFailure`)
+        fn attempt(server: *Server, pending: *Pending, params: Params, waited_for_projects: bool) bool {
+            var attempt_arena: std.heap.ArenaAllocator = .init(server.gpa);
+            defer attempt_arena.deinit();
+            const a = attempt_arena.allocator();
             var ctx = server.db.beginReadAt(a, pending.since);
             ctx.cancel = &pending.cancel;
             defer ctx.end();
@@ -869,15 +895,14 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             const t0 = Io.Clock.awake.now(server.io);
             defer server.reportIfSlow(&ctx, method, t0, &trace);
             var r: Resolver = .{ .ctx = &ctx, .arena = a };
-            const result = func(server, &r, a, params) catch |err| {
-                return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
-            };
+            const result = func(server, &r, a, params) catch |err| return server.answerFailure(&ctx, pending, err);
             // As in ReadTask: a handler that swallowed `Canceled` has an incomplete result
-            ctx.checkCanceled() catch |err| return server.sendHandlerError(pending.id, err, pending.cancel.load(.acquire));
+            ctx.checkCanceled() catch |err| return server.answerFailure(&ctx, pending, err);
             if (comptime isOutcome(@TypeOf(result))) switch (result) {
                 .ok => |v| server.sendResponse(pending.id, v),
                 .failed => |message| server.sendError(pending.id, jsonrpc.error_codes.request_failed, message),
             } else server.sendResponse(pending.id, result);
+            return true;
         }
     };
 }
@@ -1136,7 +1161,7 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     }
     // Do not open a write transaction when neither the module graph nor the targets have changed:
     // every build that finishes gets here, and a write transaction cancels in-flight computations
-    // and requests (the requests fail with ContentModified)
+    // and makes in-flight requests start over
     if (try server.moduleGraphUnchanged(graph, t, targets)) return;
     // Beginning a write transaction under graph_mutex is safe: no read transaction waits for it.
     // Requests that read only text cannot change with the module graph: they are not canceled.

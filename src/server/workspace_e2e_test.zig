@@ -1065,8 +1065,8 @@ fn visibleInstance(h: *Harness) *Workspace {
     return h.server.workspaces.items[0];
 }
 
-/// File name of the goto result ("null" without a result; "error" when the request is interrupted
-/// by a write transaction and answered with ContentModified)
+/// File name of the goto result ("null" without a result; "error" when a write transaction ordered
+/// after the request answers it with ContentModified)
 fn gotoFile(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8) ![]const u8 {
     const resp = try h.request("textDocument/definition", .{ .textDocument = .{ .uri = uri }, .position = position(text, needle) });
     const result = resp.object.get("result") orelse return "error";
