@@ -5271,6 +5271,7 @@ fn appendNaming(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileI
     const found = try ide.naming.findings(&r, file, null);
     if (found.len == 0) return diags;
     const lines = try offsets.LineIndex.init(arena, text);
+    const guide_url = ide.naming.guideUrl(try ctx.get(database.syntax.SyntaxDialect, {}));
     var out: std.ArrayList(types.Diagnostic) = .empty;
     try out.appendSlice(arena, diags);
     for (found) |f| {
@@ -5279,7 +5280,7 @@ fn appendNaming(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileI
             .range = lines.range(f.start, f.end, server.encoding),
             .severity = .Hint,
             .code = .{ .string = f.rule.code() },
-            .codeDescription = .{ .href = ide.naming.guide_url },
+            .codeDescription = .{ .href = guide_url },
             .source = "zig-analyzer",
             .message = .{ .string = try ide.naming.message(arena, f) },
         });

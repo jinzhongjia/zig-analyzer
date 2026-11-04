@@ -166,11 +166,12 @@ test "naming hints are opt-in and follow settings and edits" {
         \\6:10 naming.value `localValue` should be snake_case: `local_value`
         \\
     , try namingHints(&h, "main.zig"));
-    // Low-severity hints with a link to the official rules
+    // Low-severity hints with a link to the official rules of the user's zig
+    const guide_url = try std.fmt.allocPrint(a, "https://ziglang.org/documentation/{s}/#Names", .{project.env.version});
     for ((try h.notifications("textDocument/publishDiagnostics"))[0..]) |m| {
         for (m.object.get("params").?.object.get("diagnostics").?.array.items) |d| {
             try testing.expectEqual(4, d.object.get("severity").?.integer);
-            try testing.expectEqualStrings(za.ide.naming.guide_url, d.object.get("codeDescription").?.object.get("href").?.string);
+            try testing.expectEqualStrings(guide_url, d.object.get("codeDescription").?.object.get("href").?.string);
         }
     }
 

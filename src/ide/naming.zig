@@ -1,4 +1,4 @@
-//! Naming conventions: following the Names section of the Zig 0.17.1 style guide, the style of a
+//! Naming conventions: following the Names section of the Zig 0.17 style guide, the style of a
 //! name is determined by what the declaration actually represents, not by the `fn` / `const` /
 //! `var` keyword:
 //! - Types and type aliases: TitleCase
@@ -36,8 +36,14 @@ const TypedValue = InternPool.TypedValue;
 const queries = @import("../sema/queries.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 
-/// Link to the description of the rules (the `codeDescription` of diagnostics)
-pub const guide_url = "https://ziglang.org/documentation/0.17.1/#Names";
+/// Link to the description of the rules in the documentation of the user's zig version (the
+/// `codeDescription` of diagnostics)
+pub fn guideUrl(dialect: database.syntax.SyntaxDialect.Value) []const u8 {
+    return switch (dialect) {
+        .zig_0_17_0 => "https://ziglang.org/documentation/0.17.0/#Names",
+        .zig_0_17_1 => "https://ziglang.org/documentation/0.17.1/#Names",
+    };
+}
 
 pub const Style = enum {
     title_case,
