@@ -14,9 +14,9 @@
 .{
     // The Zig installation (editor only):
     //   .zig = .{
-    //       // Path to the `zig` executable. Default: looked up in PATH. It must be the Zig version
-    //       // zig-analyzer was built with (0.17.0); otherwise projects with build.zig are not
-    //       // loaded. Takes effect after restarting zig-analyzer.
+    //       // Path to the `zig` executable. Default: looked up in PATH. It must be Zig 0.17.0 or
+    //       // 0.17.1; otherwise projects with build.zig are not loaded. Takes effect after
+    //       // restarting zig-analyzer.
     //       .path = "/usr/local/bin/zig",
     //       // The paths below override what `zig env` reports. A path that is missing or invalid
     //       // is reported, and the detected one is used instead. Relative paths are resolved

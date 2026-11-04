@@ -3,7 +3,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub const pinned_version = "0.17.0";
+pub const pinned_version = "0.17.1";
 
 pub const Metadata = struct {
     version: []const u8,

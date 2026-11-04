@@ -27,9 +27,25 @@ pub fn modeOf(path: []const u8) Mode {
     return if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
 }
 
+/// The rules that differ between the supported Zig versions: syntax here, type layouts in
+/// `InternPool.Target`, and the versions named in builtin documentation in `builtins.documentation`
+pub const Dialect = enum {
+    /// Accepts doc comments on the variadic marker `...`
+    zig_0_17_0,
+    zig_0_17_1,
+
+    pub const latest: Dialect = .zig_0_17_1;
+
+    /// The dialect of a zig version; any other version than those above follows the latest
+    pub fn of(version: []const u8) Dialect {
+        return if (std.mem.eql(u8, version, "0.17.0")) .zig_0_17_0 else .latest;
+    }
+};
+
 arena: std.heap.ArenaAllocator,
 gpa: Allocator,
 mode: Mode,
+dialect: Dialect,
 source: [:0]const u8,
 root: *const green.GreenNode,
 errors: []const parser.Error,
@@ -43,6 +59,10 @@ chain_bytes: usize,
 full_bytes: usize,
 
 pub fn create(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Parse {
+    return createIn(gpa, text, mode, .latest);
+}
+
+pub fn createIn(gpa: Allocator, text: []const u8, mode: Mode, dialect: Dialect) Allocator.Error!*Parse {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -51,8 +71,8 @@ pub fn create(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Par
     const tokens = try lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
     const events = switch (mode) {
-        .zig => try runParser(gpa, source, tokens, grammar.sourceFile),
-        .zon => try runParser(gpa, source, tokens, grammar.zonFile),
+        .zig => try runParser(gpa, source, tokens, dialect, grammar.sourceFile),
+        .zon => try runParser(gpa, source, tokens, dialect, grammar.zonFile),
     };
     defer gpa.free(events.events);
     defer gpa.free(events.errors);
@@ -69,6 +89,7 @@ pub fn create(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Par
         .arena = undefined,
         .gpa = gpa,
         .mode = mode,
+        .dialect = dialect,
         .source = source,
         .root = root,
         .errors = errors,
@@ -100,21 +121,21 @@ pub fn rootNode(self: *const Parse) tree.SyntaxNode {
     return .{ .green = self.root, .offset = 0 };
 }
 
-/// Parses new text based on `old`, in the same mode: when a local reparse is possible, reparses
-/// only the affected block; otherwise does a full parse.
-/// The result is exactly the same as `create(gpa, text, old.mode)`. A ZON file holds a single
-/// expression and is usually small, so it is always parsed in full
+/// Parses new text based on `old`, in the same mode and dialect: when a local reparse is possible,
+/// reparses only the affected block; otherwise does a full parse.
+/// The result is exactly the same as `createIn(gpa, text, old.mode, old.dialect)`. A ZON file holds
+/// a single expression and is usually small, so it is always parsed in full
 pub fn reparse(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!*Parse {
-    if (old.mode == .zon) return create(gpa, text, .zon);
+    if (old.mode == .zon) return createIn(gpa, text, .zon, old.dialect);
     if (try reparseBlock(gpa, old, text)) |p| return p;
     if (try reparseTopLevel(gpa, old, text)) |p| return p;
-    return create(gpa, text, old.mode);
+    return createIn(gpa, text, old.mode, old.dialect);
 }
 
-/// Whether two parse results have exactly the same mode, syntax tree and errors (used to verify
-/// that incremental results match full ones)
+/// Whether two parse results have exactly the same mode, dialect, syntax tree and errors (used to
+/// verify that incremental results match full ones)
 pub fn sameAs(a: *const Parse, b: *const Parse) bool {
-    if (a.mode != b.mode or !greenEql(a.root, b.root)) return false;
+    if (a.mode != b.mode or a.dialect != b.dialect or !greenEql(a.root, b.root)) return false;
     if (a.errors.len != b.errors.len) return false;
     for (a.errors, b.errors) |x, y| {
         if (x.offset != y.offset or !std.mem.eql(u8, x.message, y.message)) return false;
@@ -148,13 +169,19 @@ const Events = struct {
     errors: []parser.Error,
 };
 
-fn runParser(gpa: Allocator, source: []const u8, tokens: []const lexer.Token, comptime entry: anytype) Allocator.Error!Events {
+fn runParser(gpa: Allocator, source: []const u8, tokens: []const lexer.Token, dialect: Dialect, comptime entry: anytype) Allocator.Error!Events {
     var significant: std.ArrayList(u32) = .empty;
     defer significant.deinit(gpa);
     for (tokens, 0..) |t, i| {
         if (!kind_mod.isTrivia(t.kind)) try significant.append(gpa, @intCast(i));
     }
-    var p: parser.Parser = .{ .gpa = gpa, .source = source, .tokens = tokens, .significant = significant.items };
+    var p: parser.Parser = .{
+        .gpa = gpa,
+        .source = source,
+        .tokens = tokens,
+        .significant = significant.items,
+        .variadic_doc_comments = dialect == .zig_0_17_0,
+    };
     defer p.deinit();
     try entry(&p);
     if (!p.atEof()) {
@@ -212,8 +239,8 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
     }
 
     const events = switch (target.kind()) {
-        .block => try runParser(gpa, sub_source, tokens, entryBlock),
-        .container_decl => try runParser(gpa, sub_source, tokens, entryContainer),
+        .block => try runParser(gpa, sub_source, tokens, old.dialect, entryBlock),
+        .container_decl => try runParser(gpa, sub_source, tokens, old.dialect, entryContainer),
         else => unreachable,
     };
     defer gpa.free(events.events);
@@ -266,6 +293,7 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
         .arena = undefined,
         .gpa = gpa,
         .mode = old.mode,
+        .dialect = old.dialect,
         .source = try a.dupeSentinel(u8, text, 0),
         .root = new_node,
         .errors = errors.items,
@@ -326,7 +354,7 @@ pub fn reparseTopLevel(gpa: Allocator, old: *Parse, text: []const u8) Allocator.
         arena.deinit();
         return null;
     };
-    const events = try runParser(gpa, sub_source, tokens, grammar.sourceFile);
+    const events = try runParser(gpa, sub_source, tokens, old.dialect, grammar.sourceFile);
     defer gpa.free(events.events);
     defer gpa.free(events.errors);
 
@@ -351,6 +379,7 @@ pub fn reparseTopLevel(gpa: Allocator, old: *Parse, text: []const u8) Allocator.
         .arena = undefined,
         .gpa = gpa,
         .mode = old.mode,
+        .dialect = old.dialect,
         .source = try a.dupeSentinel(u8, text, 0),
         .root = new_root,
         .errors = errors.items,

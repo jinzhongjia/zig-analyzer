@@ -7102,10 +7102,46 @@ test "builtin hover combines official documentation and inferred values" {
         var r = resolver(&w, &ctx);
         const info = try hover.hover(&r, added.file, added.cursor, &.{}) orelse return error.NoHover;
         try testing.expect(std.mem.indexOf(u8, info.text, case.signature) != null);
-        try testing.expect(std.mem.indexOf(u8, info.text, "https://ziglang.org/documentation/0.17.0/") != null);
+        try testing.expect(std.mem.indexOf(u8, info.text, "https://ziglang.org/documentation/0.17.1/") != null);
         if (case.value) |value| try testing.expect(std.mem.indexOf(u8, info.text, value) != null);
         if (std.mem.indexOf(u8, case.signature, "@sizeOf") != null)
             try testing.expect(std.mem.indexOf(u8, info.text, "number of bytes") != null);
+    }
+}
+
+test "builtin documentation names the version of the user's zig" {
+    const signature = @import("signature_help.zig");
+    for ([_]struct { database.syntax.SyntaxDialect.Value, []const u8, []const u8 }{
+        .{ .zig_0_17_0, "documentation/0.17.0/#sizeOf", "0.17.1" },
+        .{ .zig_0_17_1, "documentation/0.17.1/#sizeOf", "0.17.0" },
+    }) |case| {
+        const dialect, const link, const other = case;
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        {
+            w.db.beginWrite();
+            defer w.db.endWrite();
+            try w.db.set(database.syntax.SyntaxDialect, {}, dialect, .high);
+        }
+        const hovered = try w.add("/p/hover.zig", "const n = @si<|>zeOf(u8);");
+        const called = try w.add("/p/call.zig", "const n = @sizeOf(<|>u8);");
+        const completed = try w.add("/p/complete.zig", "const n = @si<|>zeOf;");
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        var docs: std.ArrayList([]const u8) = .empty;
+        const a = w.arena.allocator();
+        try docs.append(a, (try hover.hover(&r, hovered.file, hovered.cursor, &.{}) orelse return error.NoHover).text);
+        try docs.append(a, (try signature.signatureHelp(&r, called.file, called.cursor) orelse return error.NoSignature).doc.?);
+        for ((try completion.complete(&r, completed.file, completed.cursor, .{ .auto_import = false })).items) |item| {
+            if (std.mem.eql(u8, item.label, "@sizeOf")) try docs.append(a, item.doc.?);
+        }
+        try testing.expectEqual(3, docs.items.len);
+        for (docs.items) |doc| {
+            try testing.expect(std.mem.indexOf(u8, doc, link) != null);
+            try testing.expect(std.mem.indexOf(u8, doc, other) == null);
+        }
     }
 }
 
@@ -7131,7 +7167,7 @@ test "builtin completion exposes official details and undocumented source notes"
         if (std.mem.eql(u8, item.label, "@Frame")) {
             gap_found = true;
             try testing.expect(item.detail == null);
-            try testing.expect(std.mem.indexOf(u8, item.doc.?, "0.17.0") != null);
+            try testing.expect(std.mem.indexOf(u8, item.doc.?, "0.17.1") != null);
         }
     }
     try testing.expect(size_found and gap_found);
@@ -7224,7 +7260,7 @@ test "builtin hover source gaps and argument names remain distinct" {
         var r = resolver(&w, &ctx);
         const info = try hover.hover(&r, added.file, added.cursor, &.{}) orelse return error.NoHover;
         if (case.gap) {
-            try testing.expect(std.mem.indexOf(u8, info.text, "0.17.0") != null);
+            try testing.expect(std.mem.indexOf(u8, info.text, "0.17.1") != null);
             try testing.expect(std.mem.indexOf(u8, info.text, "@Frame(") == null);
         } else {
             try testing.expect(std.mem.indexOf(u8, info.text, "https://ziglang.org/documentation/") == null);

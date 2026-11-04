@@ -561,11 +561,11 @@ test "variadic signatures and compiler arity must agree" {
 test "Markdown renders templates examples entities nested lists and tables" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var m: Markdown = .{ .a = arena.allocator(), .base = "https://ziglang.org/documentation/0.17.0/", .version = pinned_version, .example_url = "https://ziglang.org/documentation/0.17.0/#call" };
+    var m: Markdown = .{ .a = arena.allocator(), .base = "https://ziglang.org/documentation/0.17.1/", .version = pinned_version, .example_url = "https://ziglang.org/documentation/0.17.1/#call" };
     const rendered = try m.render("<p>A &amp; B &#x3c; C {#link|integer|Integers#}.</p><ul><li>outer<ul><li><code>x|y</code></li></ul></li></ul>{#code|lang.CallModifier struct.zig#}{#syntax_block|zig|example#}\nconst a = 1;\n{#end_syntax_block#}<table><tr><th>A</th><th>B</th></tr><tr><td><code>x|y</code></td><td>&quot;ok&quot;</td></tr></table>{#see_also|@as||Type Coercion#}");
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "A & B < C [integer](https://ziglang.org/documentation/0.17.0/#Integers)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "A & B < C [integer](https://ziglang.org/documentation/0.17.1/#Integers)") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "- outer\n  - `x|y`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "[lang.CallModifier struct.zig](https://ziglang.org/documentation/0.17.0/#call)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[lang.CallModifier struct.zig](https://ziglang.org/documentation/0.17.1/#call)") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "```zig\nconst a = 1;\n```") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "| --- | --- |\n| `x\\|y` | \"ok\" |") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "{#") == null);
@@ -575,7 +575,7 @@ test "Markdown renders templates examples entities nested lists and tables" {
 test "Markdown rejects unsupported source markup rather than leaking templates" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var m: Markdown = .{ .a = arena.allocator(), .base = "https://ziglang.org/documentation/0.17.0/", .version = pinned_version };
+    var m: Markdown = .{ .a = arena.allocator(), .base = "https://ziglang.org/documentation/0.17.1/", .version = pinned_version };
     try std.testing.expectError(error.InvalidOfficialSource, m.render("{#unknown|value#}"));
     try std.testing.expectError(error.InvalidOfficialSource, decodeEntities(arena.allocator(), "&unknown;"));
     try std.testing.expectError(error.InvalidOfficialSource, m.render("<pre>{#syntax#}unterminated</pre>"));
@@ -586,7 +586,7 @@ test "official source pin rejects compiler version and content drift" {
     defer arena.deinit();
     const metadata: Metadata = .{
         .version = pinned_version,
-        .source_archive = "https://ziglang.org/download/0.17.0/zig-0.17.0.tar.xz",
+        .source_archive = "https://ziglang.org/download/0.17.1/zig-0.17.1.tar.xz",
         .source_archive_sha256 = "b6c7f1728f043700d6529bac980800792f824256a9d2f1839b3d62beed0b8abd",
         .langref_path = "doc/langref.html.in",
         .langref_sha256 = "553503ea235fd96a3643e382b58c6240e60ce535e2bab0cce1e5c7cdd6f43c63",
@@ -594,7 +594,7 @@ test "official source pin rejects compiler version and content drift" {
         .builtin_registry_sha256 = "42062ec69edfac554be1add745ce70cb1e1323ff762bbe4b6c0e4a3d69533dcc",
         .build_zig_zon_path = "doc/build.zig.zon.md",
         .build_zig_zon_sha256 = "fb7e6da18d7eba76f2b79ed009c622ce19a5da3407fd592c4bb977a7de72dfcf",
-        .documentation_url = "https://ziglang.org/documentation/0.17.0/",
+        .documentation_url = "https://ziglang.org/documentation/0.17.1/",
         .license = "MIT",
     };
     try validateMetadata(arena.allocator(), metadata, pinned_version);
@@ -618,6 +618,6 @@ test "official reference keeps generic signature arity and renders concrete sour
     try std.testing.expectEqualStrings("value: @Int(.unsigned, @bitSizeOf(anyerror))", error_doc.signature.parameters[0]);
     try std.testing.expect(std.mem.indexOf(u8, docs.get("@SpirvType").?.documentation, "| --- | --- | --- |") != null);
     try std.testing.expect(std.mem.indexOf(u8, docs.get("@cmpxchgWeak").?.documentation, "```zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, docs.get("@call").?.documentation, "[lang.CallModifier struct.zig](https://ziglang.org/documentation/0.17.0/#call)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs.get("@call").?.documentation, "[lang.CallModifier struct.zig](https://ziglang.org/documentation/0.17.1/#call)") != null);
     try std.testing.expect(docs.get("@Frame") == null);
 }

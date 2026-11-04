@@ -6,7 +6,7 @@
 //! - In-process AstGen matches the compiler only when the user's zig is exactly the same version
 //!   as the standard library zig-analyzer was compiled with;
 //! - The binary format of the build system protocol's `Configuration` is defined by the standard
-//!   library and cannot be loaded when the versions differ.
+//!   library and can be loaded only from the versions in `supported_versions`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -15,6 +15,23 @@ const Allocator = std.mem.Allocator;
 const Environ = std.process.Environ;
 
 const ZigEnv = @This();
+
+/// The zig versions zig-analyzer can be built with and whose build graphs it reads. Their build
+/// system protocol is the same; their `Configuration` differs only in `LazyPath.Base`, where 0.17.1
+/// adds the `deployed_*` bases before `libc_runtimes`. None of these bases resolves to a known
+/// path, so reading one as another changes nothing, and a base the reader's standard library does
+/// not have fails validation.
+pub const supported_versions = [_][]const u8{ "0.17.0", "0.17.1" };
+
+comptime {
+    if (!isSupported(builtin.zig_version_string))
+        @compileError("zig " ++ builtin.zig_version_string ++ " is not supported: add it to supported_versions once its build graph format and protocol are checked");
+}
+
+fn isSupported(version: []const u8) bool {
+    for (supported_versions) |v| if (std.mem.eql(u8, v, version)) return true;
+    return false;
+}
 
 arena: std.heap.ArenaAllocator.State,
 zig_exe: []const u8,
@@ -44,6 +61,11 @@ pub fn childEnviron(env: *const ZigEnv) ?*const Environ.Map {
 /// (including pre-release and build number)
 pub fn matchesBuiltin(env: *const ZigEnv) bool {
     return std.mem.eql(u8, env.version, builtin.zig_version_string);
+}
+
+/// The build graphs of the user's zig can be read
+pub fn readsBuildGraph(env: *const ZigEnv) bool {
+    return isSupported(env.version);
 }
 
 pub const QueryError = error{ ZigNotFound, ZigEnvFailed } || Allocator.Error || Io.Cancelable;
@@ -368,6 +390,19 @@ test "query local zig (skipped when zig is not in PATH)" {
     };
     defer env.deinit(std.testing.allocator);
     try std.testing.expect(env.std_dir.len > 0);
-    // This repository's CI and development environments both run the same zig as at compile time
-    try std.testing.expect(env.matchesBuiltin());
+    // This repository's CI and development environments run a supported zig
+    try std.testing.expect(env.readsBuildGraph());
+}
+
+test "build graphs are read only from the supported versions" {
+    for ([_]struct { []const u8, bool }{
+        .{ "0.17.0", true },
+        .{ "0.17.1", true },
+        .{ "0.17.2", false },
+        .{ "0.18.0-dev.1+abc", false },
+    }) |case| {
+        const version, const expected = case;
+        const env: ZigEnv = .{ .arena = .{}, .zig_exe = "zig", .lib_dir = "", .std_dir = "", .global_cache_dir = "", .version = version };
+        try std.testing.expectEqual(expected, env.readsBuildGraph());
+    }
 }

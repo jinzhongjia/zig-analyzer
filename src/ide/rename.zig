@@ -187,7 +187,7 @@ pub fn stringReference(r: *Resolver, files: []const FileId, name: []const u8) re
     return null;
 }
 
-/// Declarations of the root source file that the standard library of Zig 0.17.0 looks up by name
+/// Declarations of the root source file that the standard library of Zig 0.17.1 looks up by name
 /// through `@import("root")` (`root.main`, `@hasDecl(root, "std_options")`,
 /// `@hasDecl(root.debug, "SelfInfo")`), as paths of names from the top level of the root file
 const std_root_lookups = [_][]const []const u8{

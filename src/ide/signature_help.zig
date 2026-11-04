@@ -36,7 +36,7 @@ pub fn signatureHelp(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Sig
             .params = entry.parameters,
             .ranges = ranges,
             .active = if (entry.parameters.len == 0) 0 else @min(active, @as(u32, @intCast(entry.parameters.len - 1))),
-            .doc = entry.documentation,
+            .doc = try builtins.documentation(r.arena, entry, try r.ctx.get(database.syntax.SyntaxDialect, {})),
         };
     }
 

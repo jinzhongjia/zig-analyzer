@@ -112,7 +112,7 @@ The exit code is 1 when a check below fails its pass criterion or when semantic 
 
 Answers sent right after the first file opens are compared with those once the project is loaded and counted as `same`, `incomplete`, or `different`, without a verdict, since name resolution is incomplete during loading.
 
-`textDocument/formatting` is cross-checked against `zig fmt` (identical character for character).
+`textDocument/formatting` is cross-checked against `zig fmt` of the user's version (identical character for character, apart from the parser differences in `docs/features/formatting.md`).
 
 Batch validation: for each library, dependencies are fetched with `zig build --fetch`, then the benchmark runs with `BENCH_QUICK=1 BENCH_CHECK=40 BENCH_COMPLETE=40 BENCH_REFS=20` on the root-project file with the most member accesses. See `docs/test-list.md`.
 

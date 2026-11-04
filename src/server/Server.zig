@@ -724,7 +724,7 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                     server.sendResponse(id, result);
                 },
                 .read, .semantic, .syntax => {
-                    const inputs: ?Db.Inputs = if (h[1] == .syntax) comptime Db.inputSet(&.{FileText}) else null;
+                    const inputs: ?Db.Inputs = if (h[1] == .syntax) comptime Db.inputSet(&.{ FileText, database.syntax.SyntaxDialect, ide.format.ZigFmtRenderer }) else null;
                     const pending = server.addPending(a, id, inputs) catch |err| {
                         defer server.destroyArena(arena);
                         server.sendError(id, jsonrpc.error_codes.internal_error, "out of memory");
@@ -1150,7 +1150,9 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     var graph_value: ModuleGraph.Input.Value = graph;
     var graph_owned = true;
     defer if (graph_owned) ModuleGraph.Input.deinit(&graph_value, server.gpa);
-    const t = try server.targetAbi(graph);
+    const dialect: za.syntax.Parse.Dialect = if (server.zigEnv()) |env| .of(env.version) else .latest;
+    var t = try server.targetAbi(graph);
+    t.dialect = dialect;
     // Each compilation uses the target of its builtin (the root module's); when that is unknown,
     // the parameters common to all compilations. The error limit is the compilation's own.
     const targets = try server.gpa.alloc(za.sema.InternPool.Target, graph.compiles.len);
@@ -1158,6 +1160,7 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     for (graph.compiles, targets) |c, *ct| {
         ct.* = if (c.builtin) |file| try server.builtinTarget(file) else t;
         ct.error_bits = za.sema.InternPool.errorBitsOf(c.error_limit);
+        ct.dialect = dialect;
     }
     // Do not open a write transaction when neither the module graph nor the targets have changed:
     // every build that finishes gets here, and a write transaction cancels in-flight computations
@@ -3054,7 +3057,7 @@ fn startProjects(server: *Server) void {
 
 // ── Projects and background tasks ────────────────────────────────────
 
-/// Message shown when the user's zig differs from the version zig-analyzer was built with
+/// Message shown when the user's zig is a version whose build graphs cannot be read
 /// (arguments: the user's version, the build-time version, the build-time version, the user's
 /// version). The build graph file has no version number and is read byte for byte into structs, so
 /// a mismatched format causes out-of-bounds reads; projects with build.zig are therefore not loaded
@@ -3096,13 +3099,27 @@ fn startup(server: *Server) Io.Cancelable!void {
     log.info("zig {s} ({s})", .{ detected.version, detected.zig_exe });
     _ = try server.applyZigPaths();
     const env = server.zigEnv() orelse return;
+    const dialect: za.syntax.Parse.Dialect = .of(env.version);
+    if (dialect != za.syntax.Parse.Dialect.latest) {
+        server.db.beginWriteOf(comptime Db.inputSet(&.{database.syntax.SyntaxDialect}), .unordered);
+        defer server.db.endWrite();
+        server.db.set(database.syntax.SyntaxDialect, {}, dialect, .high) catch {};
+    }
+    const renderer: ide.format.Renderer = .of(env.version);
+    if (renderer != ide.format.Renderer.built) {
+        server.db.beginWriteOf(comptime Db.inputSet(&.{ide.format.ZigFmtRenderer}), .unordered);
+        defer server.db.endWrite();
+        server.db.set(ide.format.ZigFmtRenderer, {}, renderer, .high) catch {};
+    }
     if (!env.matchesBuiltin()) {
         // The in-process AstGen may not match the user's zig: live diagnostics use the user's
         // zig ast-check instead
-        const built = @import("builtin").zig_version_string;
-        const message = std.fmt.allocPrint(server.gpa, version_mismatch_message, .{ env.version, built, built, env.version }) catch null;
-        defer if (message) |m| server.gpa.free(m);
-        server.showWarningOnce(message orelse "zig version differs from the one zig-analyzer was built with");
+        if (!env.readsBuildGraph()) {
+            const built = @import("builtin").zig_version_string;
+            const message = std.fmt.allocPrint(server.gpa, version_mismatch_message, .{ env.version, built, built, env.version }) catch null;
+            defer if (message) |m| server.gpa.free(m);
+            server.showWarningOnce(message orelse "zig version differs from the one zig-analyzer was built with");
+        }
         const exe = server.gpa.dupe(u8, env.zig_exe) catch return;
         server.db.beginWriteOf(comptime Db.inputSet(&.{live.LiveBackend}), .unordered);
         defer server.db.endWrite();
@@ -3663,13 +3680,13 @@ fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
 /// Starts the project for a root directory; does nothing if the root directory already has a
 /// project (startup and workspace folder changes may happen concurrently), or when it is no longer
 /// a root directory with a build.zig (the folder was removed, or its build.zig deleted, after the
-/// caller looked it up). Does not start when the user's zig differs from the version zig-analyzer
-/// was built with: the build graph format is defined by the standard library and cannot be read.
+/// caller looked it up). Does not start when the user's zig is a version whose build graphs cannot
+/// be read: the build graph format is defined by the standard library.
 /// Such projects get only live diagnostics (zig ast-check) and are not compiled in single-file
 /// mode (files that use named modules would report missing modules).
 pub fn startWorkspace(server: *Server, root: []const u8) void {
     if (server.isShuttingDown() or !server.buildFlags().build) return;
-    if (server.zigEnv()) |env| if (!env.matchesBuiltin()) return;
+    if (server.zigEnv()) |env| if (!env.readsBuildGraph()) return;
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
@@ -5279,6 +5296,7 @@ fn appendNaming(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileI
     const found = try ide.naming.findings(&r, file, null);
     if (found.len == 0) return diags;
     const lines = try offsets.LineIndex.init(arena, text);
+    const guide_url = ide.naming.guideUrl(try ctx.get(database.syntax.SyntaxDialect, {}));
     var out: std.ArrayList(types.Diagnostic) = .empty;
     try out.appendSlice(arena, diags);
     for (found) |f| {
@@ -5287,7 +5305,7 @@ fn appendNaming(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileI
             .range = lines.range(f.start, f.end, server.encoding),
             .severity = .Hint,
             .code = .{ .string = f.rule.code() },
-            .codeDescription = .{ .href = ide.naming.guide_url },
+            .codeDescription = .{ .href = guide_url },
             .source = "zig-analyzer",
             .message = .{ .string = try ide.naming.message(arena, f) },
         });
@@ -5322,7 +5340,7 @@ fn formatting(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.Doc
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const lines = try fileLines(ctx, arena, file);
     const mode = za.syntax.Parse.modeOf(server.vfs.path(file));
-    return ide.format.format(arena, lines, mode, server.encoding);
+    return ide.format.format(arena, lines, mode, server.encoding, try ctx.get(ide.format.ZigFmtRenderer, {}));
 }
 
 fn documentSymbol(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentSymbolParams) HandlerError!types.ResultType("textDocument/documentSymbol") {

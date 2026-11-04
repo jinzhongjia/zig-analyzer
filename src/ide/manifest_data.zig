@@ -2,7 +2,7 @@
 //! Do not edit by hand.
 //! Copyright and license: see tools/zig/LICENSE; pinned sources: see tools/zig/metadata.json.
 const Field = @import("manifest.zig").Field;
-pub const version = "0.17.0";
+pub const version = "0.17.1";
 pub const build_zig_zon_sha256 = "fb7e6da18d7eba76f2b79ed009c622ce19a5da3407fd592c4bb977a7de72dfcf";
 pub const top_level = [_]Field{
     .{ .name = "name", .doc = "Enum literal. Required.\n\nThis is the default name used by packages depending on this one. For example,\nwhen a user runs `zig fetch --save <url>`, this field is used as the key in the\n`dependencies` table. Although the user can choose a different name, most users\nwill stick with this provided value.\n\nIt is redundant to include \"zig\" in this name because it is already within the\nZig package namespace.\n\nMust be a valid bare Zig identifier (don't `@` me), limited to 32 bytes.\n\nTogether with `fingerprint`, this represents a globally unique package identifier." },

@@ -25,7 +25,7 @@ const SemanticCount = struct {
     }
 };
 
-const Db = engine.Engine(void, &.{ FileText, q.SourceText, q.ParseFile, q.FileItemTree, q.FileAstIdMap, q.ItemSummaries, q.ItemNames, q.ContainerRels, ItemCount, SemanticCount });
+const Db = engine.Engine(void, &.{ FileText, q.SyntaxDialect, q.SourceText, q.ParseFile, q.FileItemTree, q.FileAstIdMap, q.ItemSummaries, q.ItemNames, q.ContainerRels, ItemCount, SemanticCount });
 
 fn setText(db: *Db, file: Vfs.FileId, text: []const u8) !void {
     db.beginWrite();
@@ -72,6 +72,26 @@ test "ParseFile bytes include the incremental chain" {
     try testing.expect(inc.base != null);
     try testing.expect(inc.chain_bytes > inc.arena.queryCapacity());
     try testing.expectEqual(@sizeOf(Parse) + inc.chain_bytes, q.ParseFile.bytes(inc));
+}
+
+test "changing the dialect parses files again by its rules" {
+    var db: Db = .init(testing.io, testing.allocator, {});
+    defer db.deinit();
+    const file: Vfs.FileId = @fromBackingInt(@intCast(0));
+    try setText(&db, file, "extern fn f(\n    /// doc\n    ...,\n) void;\n");
+    for ([_]struct { @import("Parse.zig").Dialect, usize }{ .{ .latest, 1 }, .{ .zig_0_17_0, 0 }, .{ .zig_0_17_1, 1 } }) |case| {
+        const dialect, const errors = case;
+        {
+            db.beginWrite();
+            defer db.endWrite();
+            try db.set(q.SyntaxDialect, {}, dialect, .high);
+        }
+        var ctx = db.beginRead(testing.allocator);
+        defer ctx.end();
+        const parse = try ctx.get(q.ParseFile, file);
+        try testing.expectEqual(dialect, parse.dialect);
+        try testing.expectEqual(errors, parse.errors.len);
+    }
 }
 
 test "FileAstIdMap bytes include the retained parse" {

@@ -334,7 +334,8 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         // `.zon` files have no builtin calls
         if (std.mem.endsWith(u8, r.ctx.db.env.vfs.path(file), ".zon")) return .{ .context = .ignored };
         const range: Item.Range = .{ .start = start, .end = identEnd(text, offset) };
-        for (builtins.entries) |entry| try out.add(.{ .label = entry.name, .kind = .builtin, .replace = range, .detail = entry.signature, .doc = entry.documentation });
+        const dialect = try r.ctx.get(database.syntax.SyntaxDialect, {});
+        for (builtins.entries) |*entry| try out.add(.{ .label = entry.name, .kind = .builtin, .replace = range, .detail = entry.signature, .doc = try builtins.documentation(r.arena, entry, dialect) });
         return .{ .items = out.items.items, .context = .builtin };
     };
     if (importString(text, offset)) |start| {
