@@ -1125,7 +1125,9 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     var graph_value: ModuleGraph.Input.Value = graph;
     var graph_owned = true;
     defer if (graph_owned) ModuleGraph.Input.deinit(&graph_value, server.gpa);
-    const t = try server.targetAbi(graph);
+    const dialect: za.syntax.Parse.Dialect = if (server.zigEnv()) |env| .of(env.version) else .latest;
+    var t = try server.targetAbi(graph);
+    t.dialect = dialect;
     // Each compilation uses the target of its builtin (the root module's); when that is unknown,
     // the parameters common to all compilations. The error limit is the compilation's own.
     const targets = try server.gpa.alloc(za.sema.InternPool.Target, graph.compiles.len);
@@ -1133,6 +1135,7 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     for (graph.compiles, targets) |c, *ct| {
         ct.* = if (c.builtin) |file| try server.builtinTarget(file) else t;
         ct.error_bits = za.sema.InternPool.errorBitsOf(c.error_limit);
+        ct.dialect = dialect;
     }
     // Do not open a write transaction when neither the module graph nor the targets have changed:
     // every build that finishes gets here, and a write transaction cancels in-flight computations
