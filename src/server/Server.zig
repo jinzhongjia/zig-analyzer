@@ -3029,7 +3029,7 @@ fn startProjects(server: *Server) void {
 
 // ── Projects and background tasks ────────────────────────────────────
 
-/// Message shown when the user's zig differs from the version zig-analyzer was built with
+/// Message shown when the user's zig is a version whose build graphs cannot be read
 /// (arguments: the user's version, the build-time version, the build-time version, the user's
 /// version). The build graph file has no version number and is read byte for byte into structs, so
 /// a mismatched format causes out-of-bounds reads; projects with build.zig are therefore not loaded
@@ -3074,10 +3074,12 @@ fn startup(server: *Server) Io.Cancelable!void {
     if (!env.matchesBuiltin()) {
         // The in-process AstGen may not match the user's zig: live diagnostics use the user's
         // zig ast-check instead
-        const built = @import("builtin").zig_version_string;
-        const message = std.fmt.allocPrint(server.gpa, version_mismatch_message, .{ env.version, built, built, env.version }) catch null;
-        defer if (message) |m| server.gpa.free(m);
-        server.showWarningOnce(message orelse "zig version differs from the one zig-analyzer was built with");
+        if (!env.readsBuildGraph()) {
+            const built = @import("builtin").zig_version_string;
+            const message = std.fmt.allocPrint(server.gpa, version_mismatch_message, .{ env.version, built, built, env.version }) catch null;
+            defer if (message) |m| server.gpa.free(m);
+            server.showWarningOnce(message orelse "zig version differs from the one zig-analyzer was built with");
+        }
         const exe = server.gpa.dupe(u8, env.zig_exe) catch return;
         server.db.beginWriteOf(comptime Db.inputSet(&.{live.LiveBackend}), .unordered);
         defer server.db.endWrite();
@@ -3638,13 +3640,13 @@ fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
 /// Starts the project for a root directory; does nothing if the root directory already has a
 /// project (startup and workspace folder changes may happen concurrently), or when it is no longer
 /// a root directory with a build.zig (the folder was removed, or its build.zig deleted, after the
-/// caller looked it up). Does not start when the user's zig differs from the version zig-analyzer
-/// was built with: the build graph format is defined by the standard library and cannot be read.
+/// caller looked it up). Does not start when the user's zig is a version whose build graphs cannot
+/// be read: the build graph format is defined by the standard library.
 /// Such projects get only live diagnostics (zig ast-check) and are not compiled in single-file
 /// mode (files that use named modules would report missing modules).
 pub fn startWorkspace(server: *Server, root: []const u8) void {
     if (server.isShuttingDown() or !server.buildFlags().build) return;
-    if (server.zigEnv()) |env| if (!env.matchesBuiltin()) return;
+    if (server.zigEnv()) |env| if (!env.readsBuildGraph()) return;
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);

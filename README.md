@@ -15,7 +15,7 @@ A language server (LSP) for Zig, built on an incremental query engine.
 - **Formatting**: identical to `zig fmt`, for `.zig` and `.zon`.
 - **ZON files**: highlighting, formatting, and error diagnostics in any `.zon` file; outline; completion, goto, and inlay hints for files imported with a result type and for `build.zig.zon`; completion and option descriptions in `zig-analyzer.zon`.
 - **Structure**: folding ranges and selection ranges.
-- **Naming checks** (opt-in): hints based on the [Names](https://ziglang.org/documentation/0.17.0/#Names) section of the Zig style guide, with safe rename fixes.
+- **Naming checks** (opt-in): hints based on the [Names](https://ziglang.org/documentation/0.17.1/#Names) section of the Zig style guide, with safe rename fixes.
 
 ## Neovim setup
 
@@ -38,7 +38,7 @@ vim.lsp.enable('zig_analyzer')
 
 ## Development
 
-Requires Zig **0.17.0**.
+Requires Zig **0.17.0** or **0.17.1**.
 
 ```sh
 zig build -Doptimize=ReleaseSafe  # build zig-out/bin/zig-analyzer

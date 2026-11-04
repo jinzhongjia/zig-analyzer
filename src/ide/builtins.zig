@@ -29,8 +29,6 @@ pub fn get(name: []const u8) ?*const Entry {
 
 comptime {
     @setEvalBranchQuota(20000);
-    if (!std.mem.eql(u8, @import("builtin").zig_version_string, version))
-        @compileError("builtin metadata version differs from compiler; update official inputs and run zig build gen");
     const registry = std.zig.BuiltinFn.list;
     if (registry.keys().len != entries.len)
         @compileError("builtin metadata coverage differs from compiler; run zig build gen");

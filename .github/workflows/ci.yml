@@ -10,22 +10,23 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ZIG_VERSION: 0.17.0
+  ZIG_VERSION: 0.17.1
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }}, Zig ${{ matrix.zig }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        zig: [0.17.0, 0.17.1]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: ${{ env.ZIG_VERSION }}
+          version: ${{ matrix.zig }}
       - name: All tests (Debug)
         run: zig build test-all --summary all
       - name: All tests (ReleaseSafe)

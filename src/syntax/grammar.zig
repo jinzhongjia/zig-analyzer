@@ -269,6 +269,8 @@ fn atListEnd(p: *Parser) bool {
 fn param(p: *Parser) Error!void {
     const m = try p.start();
     while (p.at(.doc_comment)) try p.bump();
+    // Zig 0.17.1 rejects doc comments on the variadic marker and 0.17.0 accepts them: accepted
+    // here, since the live diagnostics of the user's zig report the error
     if (try p.eat(.ellipsis3)) {
         _ = try m.complete(p, .param);
         return;

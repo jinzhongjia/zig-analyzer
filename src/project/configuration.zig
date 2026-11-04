@@ -2,8 +2,7 @@
 //! `ProjectModel`.
 //!
 //! The binary format of the build graph is defined by the standard library and can be loaded only
-//! when the user's zig is the same version as the one zig-analyzer was compiled with
-//! (see `ZigEnv.matchesBuiltin`).
+//! from the zig versions whose format is compatible with it (see `ZigEnv.readsBuildGraph`).
 
 const std = @import("std");
 const Io = std.Io;

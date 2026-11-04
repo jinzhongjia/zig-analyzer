@@ -23,7 +23,7 @@ pub const Project = struct {
             else => |e| return e,
         };
         errdefer env.deinit(testing.allocator);
-        if (!env.matchesBuiltin()) return error.SkipZigTest;
+        if (!env.readsBuildGraph()) return error.SkipZigTest;
 
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
