@@ -1780,6 +1780,29 @@ test "formatting follows the version of the user's zig" {
     try shutdown(&h);
 }
 
+test "builtin documentation and layouts follow the version of the user's zig" {
+    var project = try fixture.Project.create(&fixture.basic);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initialize(&h, project.root, false);
+    const a = h.arena.allocator();
+    const uri = try open(&h, try project.path(a, "src/lib.zig"), "const n = @sizeOf(u8);\n");
+    try waitIdle(&h);
+    const response = try h.request("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 12 } });
+    const text = response.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    const link = try std.fmt.allocPrint(a, "https://ziglang.org/documentation/{s}/", .{project.env.version});
+    try testing.expect(std.mem.indexOf(u8, text, link) != null);
+    const dialect: za.syntax.Parse.Dialect = .of(project.env.version);
+    {
+        var ctx = h.server.db.beginRead(testing.allocator);
+        defer ctx.end();
+        try testing.expectEqual(dialect, (try ctx.get(za.sema.queries.TargetAbi, {})).dialect);
+    }
+    try shutdown(&h);
+}
+
 test "zig version mismatch: no build system is started, live diagnostics run zig ast-check outside the read transaction" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var project = try fixture.Project.create(&fixture.basic);

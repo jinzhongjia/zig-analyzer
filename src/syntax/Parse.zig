@@ -27,7 +27,8 @@ pub fn modeOf(path: []const u8) Mode {
     return if (std.mem.endsWith(u8, path, ".zon")) .zon else .zig;
 }
 
-/// Syntax rules that differ between the supported Zig versions
+/// The rules that differ between the supported Zig versions: syntax here, type layouts in
+/// `InternPool.Target`, and the versions named in builtin documentation in `builtins.documentation`
 pub const Dialect = enum {
     /// Accepts doc comments on the variadic marker `...`
     zig_0_17_0,
