@@ -99,8 +99,8 @@ fn position(text: []const u8, needle: []const u8) struct { line: u32, character:
     return .{ .line = @intCast(std.mem.count(u8, text[0..offset], "\n")), .character = @intCast(offset - line_start) };
 }
 
-/// Result of `method` at the end of `needle` in `uri`. A write transaction of background work
-/// (indexing) answers a request with ContentModified: it is asked again once the server is idle.
+/// Result of `method` at the end of `needle` in `uri`. A write transaction ordered after the request
+/// answers it with ContentModified: it is asked again once the server is idle.
 fn requestAt(h: *Harness, method: []const u8, uri: []const u8, text: []const u8, needle: []const u8, new_name: ?[]const u8) !std.json.Value {
     for (0..50) |_| {
         const resp = if (new_name) |n|

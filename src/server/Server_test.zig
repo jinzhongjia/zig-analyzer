@@ -383,8 +383,8 @@ test "files under a build.zig outside the workspace belong to a project that is 
     const Empty = struct {};
     _ = try h.request("initialize", .{ .capabilities = Empty{} });
     try h.notify("initialized", Empty{});
-    // Wait for startup to finish: the write transaction that updates the module graph after the
-    // zig environment query cancels in-flight requests (answered with ContentModified)
+    // Wait for startup to finish, so that the requests below read the module graph that follows
+    // the zig environment query
     _ = try h.request("zig-analyzer/waitIdle", {});
     const cases = [_]struct { []const []const u8, []const u8 }{
         .{ &.{ "proj", "src", "main.zig" }, "unloaded_project" },
@@ -440,8 +440,8 @@ test "responses for deeply nested code stay within the JSON nesting limit" {
     try h.notify("initialized", Empty{});
     const document_uri = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "deep.zig" }));
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = document_uri, .languageId = "zig", .version = 1, .text = text.items } });
-    // Wait for startup to finish: the write transaction that updates the module graph after the
-    // zig environment query cancels in-flight requests (answered with ContentModified)
+    // Wait for startup to finish, so that the requests below read the module graph that follows
+    // the zig environment query
     _ = try h.request("zig-analyzer/waitIdle", {});
     const symbols = try h.request("textDocument/documentSymbol", .{ .textDocument = .{ .uri = document_uri } });
     try testing.expect(symbols.object.get("result").? == .array);
@@ -1151,6 +1151,90 @@ test "a module graph update does not cancel the outline, folding and selection r
         try testing.expect(response.object.get("error") == null);
         try testing.expectEqualStrings(expected, try std.json.Stringify.valueAlloc(a, response.object.get("result").?, .{}));
     }
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "a request interrupted by an update the server made on its own is answered, not refused" {
+    // Guards against the module graph update during project loading answering requests with
+    // ContentModified, which editors show as an empty completion list
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-7";
+    const text =
+        \\const alpha_value: u32 = 1;
+        \\pub fn main() void {
+        \\    _ = alpha_value;
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    var gate: Server.TestGate = .{ .method = "textDocument/hover", .point = .in_read };
+    h.server.test_gate = &gate;
+    defer h.server.test_gate = null;
+    defer gate.release.set(testing.io);
+    const hover = try h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
+    try gate.entered.wait(testing.io);
+    // Another default builtin.zig changes the module graph, as a zig environment query does
+    {
+        h.server.env_mutex.lockUncancelable(testing.io);
+        defer h.server.env_mutex.unlock(testing.io);
+        if (h.server.default_builtin) |p| testing.allocator.free(p);
+        h.server.default_builtin = try testing.allocator.dupe(u8, "/zig-analyzer-test/builtin-retry.zig");
+    }
+    const update = try std.Thread.spawn(.{}, Server.updateModuleGraph, .{&h.server});
+    defer update.join();
+    // The update waits for the held request, whose reads are canceled from here on
+    while (h.server.db.pending_write.load(.acquire) == 0) std.Thread.yield() catch {};
+    gate.release.set(testing.io);
+
+    const response = try h.response(hover);
+    try testing.expect(response.object.get("error") == null);
+    const contents = response.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try testing.expect(std.mem.indexOf(u8, contents, "alpha_value") != null);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "a request interrupted by a later edit is answered with ContentModified" {
+    // Guards against a request running again on text the client did not send it for
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-8";
+    const text =
+        \\const alpha_value: u32 = 1;
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    var gate: Server.TestGate = .{ .method = "textDocument/hover", .point = .in_read };
+    h.server.test_gate = &gate;
+    defer h.server.test_gate = null;
+    defer gate.release.set(testing.io);
+    const hover = try h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
+    try gate.entered.wait(testing.io);
+    const insert = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } };
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .range = insert, .text = "const beta_flag: bool = true;\n" }} });
+    // The change waits for the held request, whose reads are canceled from here on
+    while (h.server.db.pending_write.load(.acquire) == 0) std.Thread.yield() catch {};
+    gate.release.set(testing.io);
+
+    try testing.expectEqual(-32801, errorCode(try h.response(hover)));
 
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});

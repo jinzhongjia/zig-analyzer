@@ -2785,12 +2785,12 @@ test "zig-analyzer.zon settings have the descriptions of the default settings" {
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, ?[]const u8 }{
         .{ "imports", "How top-level imports are arranged" },
-        .{ "sort", "Order within a group: .path by what is imported" },
+        .{ "sort", "Order within a group.\n\n- `.path`: By what is imported" },
+        .{ "name }", "By declaration name." },
         .{ "enable", "Hint names that do not follow the Names section" },
         .{ "rules", "Turn individual rules on or off" },
         .{ "field", "Fields and enum members, by the type of the field.\n\nDefault: `true`" },
-        // Values, and what the file cannot set
-        .{ "name }", null },
+        // Values without a description, and what the file cannot set
         .{ "true", null },
         .{ "nope", null },
         .{ "log", null },
@@ -2805,7 +2805,7 @@ test "zig-analyzer.zon settings have the descriptions of the default settings" {
                 std.debug.print("hover at `{s}`: {s}\n", .{ c[0], got });
                 return err;
             };
-            try testing.expectEqual(null, try hover.hover(&r, other, offset, &.{}));
+            if (try hover.hover(&r, other, offset, &.{})) |i| try testing.expect(!std.mem.startsWith(u8, i.text, want));
         } else {
             testing.expect(std.mem.indexOf(u8, got, "\n\nDefault") == null and !std.mem.startsWith(u8, got, "How")) catch |err| {
                 std.debug.print("hover at `{s}`: {s}\n", .{ c[0], got });
@@ -2814,7 +2814,29 @@ test "zig-analyzer.zon settings have the descriptions of the default settings" {
         }
     }
     const with_default = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "sort").?), &.{})).?.text;
-    try testing.expect(std.mem.endsWith(u8, with_default, "\n\nDefault: `.path`"));
+    try testing.expect(std.mem.indexOf(u8, with_default, "\n\nDefault: `.path`\n\nExample:\n\n```zig\n.sort = .name,\n```") != null);
+}
+
+test "zig-analyzer.zon completions have the descriptions of the default settings" {
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ ".{ .<|> }", "build", "```zig\n.build = .{\n    .args = " },
+        .{ ".{ .imports = .{ .sort = .<|> } }", "name", "By declaration name." },
+        .{ ".{ .imports = .{ .derived = .<|> } }", "separate", "In a last group of their own." },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const at = try w.add("/p/zig-analyzer.zon", c[0]);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const items = (try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items;
+        const item = for (items) |it| {
+            if (std.mem.eql(u8, it.label, c[1])) break it;
+        } else return error.NoItem;
+        try testing.expect(std.mem.indexOf(u8, item.doc.?, c[2]) != null);
+    }
 }
 
 test "build.zig.zon fields are completed from the schema" {

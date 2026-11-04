@@ -63,7 +63,7 @@ When no import site gives a result type, completion uses the built-in schema (`i
 
 ## Settings of `zig-analyzer.zon`
 
-When no import site gives a result type, `ide/project_config.zig` handles the file: what can be set comes from `Config.project_schema`, derived from the settings and their types. Completion offers the settings at the cursor that are not given yet, the names of an enum after `.`, and `true` and `false`; settings only the editor can set are not offered. Hover shows the comment above the setting in `zig-analyzer.default.zon`, which is embedded in the binary, and its default when that is a single value, so the text users read in that file is the only copy; a test requires every setting to have one.
+When no import site gives a result type, `ide/project_config.zig` handles the file: what can be set comes from `Config.project_schema`, derived from the settings and their types. Completion offers the settings at the cursor that are not given yet, the names of an enum after `.`, and `true` and `false`; settings only the editor can set are not offered. Completion and hover show the comment above the setting in `zig-analyzer.default.zon`, which is embedded in the binary, so the text users read in that file is the only copy: its description, the description of each value of an enum, its default when that is a single value, and an example. Enum values have their own description, in completion and on hover. A test requires every setting to have a description and an example, every enum value to have a description, and every example to be accepted by the project configuration parser.
 
 ## Enum literals in `.zon` files
 
