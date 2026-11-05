@@ -16,7 +16,7 @@ Benchmark project: the Zig 0.17.0 compiler source (540k lines + standard library
 | | keystroke → hover (continuous typing) | — | `Sema.zig` p50 97 ms; other projects 5-21 ms | — |
 | | keystroke → name completion (typing words in a method) | — | `Sema.zig`: auto-import on p50 72-84 ms, p95 160-181 ms; off p50 43-45 ms, p95 67-73 ms (see below) | — |
 | | save → compiler diagnostics (`check` step) | < 1 s | small projects about 120 ms; Zig compiler 5.2 s | ⚠️ limited by the compiler |
-| | resident memory (long session) | does not grow over the session | Zig compiler source: 1.1-1.4 GB from round 120 on (Linux, see below) | ⚠️ worker stacks |
+| | resident memory (long session) | does not grow over the session | Zig compiler source: 2.5-2.8 GB from round 120 on (Linux, see below) | ⚠️ the heap grows |
 | Cold start | process start → `initialize` | < 100 ms | 1-9 ms | ✅ |
 | | open file → syntax features | < 200 ms | 53 ms (`Sema.zig`) | ✅ |
 | | open file → hover / goto / completion | < 3 s | project loading 1.5-4.4 s; hover is available before loading finishes (with incomplete name resolution, which the hover states; see Requests during project loading in `docs/design.md`) | ✅ |
@@ -24,9 +24,11 @@ Benchmark project: the Zig 0.17.0 compiler source (540k lines + standard library
 
 Resident memory over a long session on the Zig compiler source:
 
-- Zig compiler source, 240 rounds on Linux: 1.1-1.4 GB from round 120 on, heap about 520 MB. The allocator's memory stays flat (0.43 GB of pages for 0.18 GB of live small blocks, and 0.36 GB of large allocations); the rest, mostly worker stacks (0.57 GB at round 240), grows in steps as deeper recursions touch more of them.
-- macOS, 160 rounds: RSS 2.9-3.1 GB from round 120 on, heap 2.1 GB at round 160, of which 2.0 GB are large allocations. Peak RSS 3.9-5.0 GB across runs, with at most 1.5 GB assigned to size classes: the hover that computes the largest instance closure (all instances of `Writer.printValue`) infers about 900,000 results in one read transaction, which holds at most 512 MB of them. The memory is returned to the system afterwards.
-- Windows, 40 rounds: working set 0.87 GB with 0.98 GB committed at round 40.
+- Linux, 160 rounds: RSS 2.5-2.8 GB from round 120 on, heap 2.1 GB at round 160, of which 1.8 GB are large allocations. Peak RSS 4.6 GB, with at most 1.55 GB assigned to size classes.
+- macOS, 160 rounds: RSS 2.9-3.1 GB from round 120 on, heap 2.1 GB at round 160, of which 2.0 GB are large allocations. Peak RSS 3.9-5.0 GB across runs, with at most 1.5 GB assigned to size classes.
+- Windows, 160 rounds: working set 2.9 GB and heap 2.1 GB at round 160. Peak working set 4.7-4.8 GB and peak commit 5.4-5.5 GB, with at most 1.55 GB assigned to size classes.
+
+The heap grows over the session on all three; from round 120 to 160 on Linux it grows from 1.9 to 2.1 GB, mostly in large allocations, while the recorded dependencies grow from 105 to 126 million. The peak comes from the hover that computes the largest instance closure (all instances of `Writer.printValue`): it infers about 900,000 results in one read transaction, which holds at most 512 MB of them. The memory is returned to the system afterwards.
 
 ## Real projects
 
