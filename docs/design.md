@@ -101,7 +101,7 @@ Release builds use `PagedAllocator`, one heap shared by all threads: cached valu
 
 - Blocks up to 32 KiB come from 64 KiB pages carved from 4 MiB segments; each page holds one size class. Larger allocations are mapped directly.
 - A size class allocates from the page that most recently got room, reusing blocks likely still cached; pages with less than an eighth of their blocks in use get new blocks only when no other page has room, which lets the rest become empty.
-- Empty pages go to a pool shared by all classes, which keeps 256 committed and returns the others to the system. The analyzer has transient peaks of 10-12 GB, so memory that is never returned would stay near the peak; the cost is the system time of faulting pages in again.
+- Empty pages go to a pool shared by all classes, which keeps 256 committed and returns the others to the system. The analyzer has transient peaks of several GB, so memory that is never returned would stay near the peak; the cost is the system time of faulting pages in again.
 - Returning pages differs per platform: `madvise(MADV_DONTNEED)` on Linux; a new mapping on macOS, where `madvise` leaves the resident size unchanged; decommit on Windows.
 - On Linux, segments are excluded from transparent huge pages: with THP `always`, touching a page would back the whole 2 MiB around it.
 
