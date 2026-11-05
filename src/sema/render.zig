@@ -212,6 +212,9 @@ const ContainerNames = struct {
             .container_type => |c| if (!c.kind.isStruct()) return null,
             .anon_struct_type => |s| return s.names,
             .reified_type => |rt| if (rt.kind != .@"struct") return null,
+            // A struct value coerced to an optional or an error union keeps its elements
+            .optional_type => |child| return n.fieldNames(child),
+            .error_union_type => |eu| return n.fieldNames(eu.payload),
             else => return null,
         }
         const fields = @import("eval.zig").fieldNames(n.r, t) catch return null;
