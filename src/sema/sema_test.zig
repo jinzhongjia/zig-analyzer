@@ -540,6 +540,32 @@ test "pointer casts keep the value only when the elements are unchanged" {
 }
 
 
+test "the sentinel element of an array" {
+    try expectTypes(
+        \\const read = blk: {
+        \\    const buf: [2:0]u8 = "ab".*;
+        \\    break :blk buf[2];
+        \\};
+        \\const same = blk: {
+        \\    var buf: [2:0]u8 = "ab".*;
+        \\    buf[2] = 0;
+        \\    break :blk buf;
+        \\};
+        \\const other = blk: {
+        \\    var buf: [2:0]u8 = "ab".*;
+        \\    buf[2] = 1;
+        \\    break :blk buf;
+        \\};
+        \\fn g() void { _ = .{ read, same, other }; }
+    , &.{
+        .{ "read", "u8 = 0" },
+        .{ "same", "[2:0]u8 = \"ab\"" },
+        // Storing a value other than the sentinel is a compile error
+        .{ "other", "[2:0]u8" },
+    });
+}
+
+
 test "names of containers defined in bodies" {
     try expectTypes(
         \\fn Box(comptime T: type) type { return struct { v: T }; }

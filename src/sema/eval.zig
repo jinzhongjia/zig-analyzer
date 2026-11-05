@@ -944,9 +944,20 @@ const Evaluator = struct {
         };
     }
 
+    /// The sentinel when `i` is its index in an array of type `t`
+    fn sentinelElem(ev: *Evaluator, t: Index, i: usize) ?Val {
+        const a = switch (ev.ip.key(t)) {
+            .array_type => |a| a,
+            else => return null,
+        };
+        const s = a.sentinel orelse return null;
+        return if (i == a.len) Val.of(a.child, s) else null;
+    }
+
     /// Element `i`; unknown when the value is unknown
     fn elemAt(ev: *Evaluator, v: Val, i: usize) EvalError!Val {
         const ty = ev.elemTypeOf(v.ty, i);
+        if (v.v != .ref) if (ev.sentinelElem(v.ty, i)) |s| return s;
         switch (v.v) {
             .unknown => return .{ .ty = ty },
             .undef => return .{ .ty = ty, .v = .undef },
@@ -1022,7 +1033,14 @@ const Evaluator = struct {
             return;
         }
         var cell = ref.cell;
-        for (ref.path) |i| {
+        for (ref.path, 0..) |i, depth| {
+            // The sentinel of an array (`buf[buf.len] = 0` in std.fmt.comptimePrint) is part of
+            // the type: storing the same value changes nothing, storing another is an error
+            if (depth == ref.path.len - 1) if (ev.sentinelElem(cell.ty, i)) |s| {
+                const x = try ev.freeze(try ev.coerce(v, s.ty)) orelse return error.Abort;
+                if (try eqlValues(ev.r, x, s.v.ip) != true) return error.Abort;
+                return;
+            };
             const agg = try ev.mutableAgg(cell);
             if (i >= agg.elems.len) return error.Abort;
             cell = &agg.elems[i];
