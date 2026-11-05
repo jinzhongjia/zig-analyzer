@@ -35,7 +35,9 @@ targets: []const Target = &.{},
 /// Storage for the slices in Keys
 arena: std.heap.ArenaAllocator,
 items: Items = .{},
-map: std.HashMapUnmanaged(Key, Index, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
+/// Finds the Index of a Key. Its entries refer to `items` rather than holding the Keys, which would
+/// be stored twice, and the hash in an entry spares reading the Key when the table grows.
+map: std.HashMapUnmanaged(MapEntry, void, MapContext, std.hash_map.default_max_load_percentage) = .empty,
 
 /// The Key of each Index, in chunks of doubling size that are never moved or freed while the pool
 /// is in use: a thread that has obtained an Index (from `get`, or from a query result published
@@ -474,21 +476,33 @@ pub const TypedValue = struct {
     }
 };
 
-const KeyContext = struct {
-    pub fn hash(_: KeyContext, k: Key) u64 {
-        var h: std.hash.Wyhash = .init(0);
-        switch (k) {
-            .error_set_type => |es| {
-                std.hash.autoHash(&h, std.meta.activeTag(k));
-                es.hash(&h);
-            },
-            // Name lists are slices of slices: pointers must be followed at every level
-            else => std.hash.autoHashStrat(&h, k, .DeepRecursive),
-        }
-        return h.final();
+fn keyHash(k: Key) u32 {
+    var h: std.hash.Wyhash = .init(0);
+    switch (k) {
+        .error_set_type => |es| {
+            std.hash.autoHash(&h, std.meta.activeTag(k));
+            es.hash(&h);
+        },
+        // Name lists are slices of slices: pointers must be followed at every level
+        else => std.hash.autoHashStrat(&h, k, .DeepRecursive),
     }
-    pub fn eql(_: KeyContext, a: Key, b: Key) bool {
-        return keyEql(a, b);
+    return @truncate(h.final());
+}
+
+const MapEntry = struct { index: Index, hash: u32 };
+
+/// The table takes a slot from the low bits of a hash and a fingerprint from the high bits: both
+/// come from the 32 bits an entry stores
+fn tableHash(hash: u32) u64 {
+    return @as(u64, hash) << 32 | hash;
+}
+
+const MapContext = struct {
+    pub fn hash(_: MapContext, e: MapEntry) u64 {
+        return tableHash(e.hash);
+    }
+    pub fn eql(_: MapContext, a: MapEntry, b: MapEntry) bool {
+        return a.index == b.index;
     }
 };
 
@@ -565,7 +579,7 @@ pub fn reset(ip: *InternPool) Allocator.Error!void {
 pub fn bytes(ip: *InternPool) usize {
     ip.mutex.lockUncancelable(ip.io);
     defer ip.mutex.unlock(ip.io);
-    return ip.items.capacity() * @sizeOf(Key) + ip.map.capacity() * (@sizeOf(Key) + @sizeOf(Index) + 1) + ip.arena.queryCapacity();
+    return ip.items.capacity() * @sizeOf(Key) + ip.map.capacity() * (@sizeOf(MapEntry) + 1) + ip.arena.queryCapacity();
 }
 
 /// The target parameters value computations on this thread use: those of the compilation the
@@ -787,25 +801,27 @@ pub fn get(ip: *InternPool, key_in: Key) Allocator.Error!Index {
     var k = key_in;
     if (k == .ptr_type and k.ptr_type.size == .c) k.ptr_type.attrs.is_allowzero = false;
     // Hashed before taking the lock: only probing the table is serialized
-    const hashed: Prehashed = .{ .h = KeyContext.hash(.{}, k) };
+    const hash = keyHash(k);
+    const lookup: Lookup = .{ .key_hash = hash, .items = &ip.items };
     ip.mutex.lockUncancelable(ip.io);
     defer ip.mutex.unlock(ip.io);
-    if (ip.map.getAdapted(k, hashed)) |i| return i;
+    if (ip.map.getKeyAdapted(k, lookup)) |e| return e.index;
     const owned = try ip.own(k);
     const index: Index = @fromBackingInt(try ip.items.append(ip.gpa, owned));
     errdefer ip.items.len -= 1;
-    try ip.map.putNoClobber(ip.gpa, owned, index);
+    try ip.map.putNoClobber(ip.gpa, .{ .index = index, .hash = hash }, {});
     return index;
 }
 
-/// Lookup context carrying a hash already computed with `KeyContext`
-const Prehashed = struct {
-    h: u64,
-    pub fn hash(c: Prehashed, _: Key) u64 {
-        return c.h;
+/// Looks up a Key in `map`, with the hash already computed
+const Lookup = struct {
+    key_hash: u32,
+    items: *const Items,
+    pub fn hash(c: Lookup, _: Key) u64 {
+        return tableHash(c.key_hash);
     }
-    pub fn eql(_: Prehashed, a: Key, b: Key) bool {
-        return keyEql(a, b);
+    pub fn eql(c: Lookup, k: Key, e: MapEntry) bool {
+        return e.hash == c.key_hash and keyEql(k, c.items.at(@backingInt(e.index)).*);
     }
 };
 
