@@ -380,10 +380,26 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             };
         }
 
+        /// A value that left the memos, boxed so that it can be freed without its type
+        const Discarded = struct {
+            ptr: *anyopaque,
+            free: *const fn (*anyopaque, Allocator) void,
+
+            fn of(comptime Q: type, box: *Q.Value) Discarded {
+                return .{ .ptr = @ptrCast(box), .free = struct {
+                    fn free(ptr: *anyopaque, gpa: Allocator) void {
+                        const v: *Q.Value = @ptrCast(@alignCast(ptr));
+                        Q.deinit(v, gpa);
+                        gpa.destroy(v);
+                    }
+                }.free };
+            }
+        };
+
         /// Old values whose release is deferred (read transactions may still hold pointers to them)
         const Garbage = union(enum) {
             deps: []const DepKey,
-            value: struct { ptr: *anyopaque, free: *const fn (*anyopaque, Allocator) void },
+            value: Discarded,
         };
 
         pub fn init(io: Io, gpa: Allocator, env: Env) Db {
@@ -897,6 +913,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 /// Stack index of the bottom-most query of the cycle this frame is in (not set by
                 /// `markIncomplete`)
                 cycle_head: ?u32 = null,
+                /// Results in a cycle that this query read. They are in no memo and no value points
+                /// into them (see `get`), so only this compute can hold them: they are freed when
+                /// it returns. A read that computes large cycles repeatedly would otherwise keep
+                /// every result until its read transaction ends.
+                discarded: std.ArrayList(Discarded) = .empty,
                 /// Time spent in other queries executed within this frame (for the self time)
                 child_ns: u64 = 0,
             };
@@ -1002,7 +1023,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             }
 
             /// Reads the value of a query and records it as a dependency of the query currently
-            /// being computed. The returned value is valid until this read transaction ends.
+            /// being computed. The returned value is valid until the compute that read it returns,
+            /// or, outside any compute, until this read transaction ends. A value may keep pointers
+            /// only into values of queries that are never in a cycle: those that read no query
+            /// declaring `cycleFallback`, directly or indirectly.
             ///
             /// When the nested computation of a top-level read (one not inside the computation of
             /// another query) is interrupted by the stack depth limit, the query at the
@@ -1071,6 +1095,26 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     }
                 }
                 return false;
+            }
+
+            /// Gives up a result in a cycle: it stays valid for the reader, which is the query on
+            /// top of the stack or, on an empty stack, the read transaction itself
+            fn discardForReader(ctx: *Ctx, comptime Q: type, value: *Q.Value) Allocator.Error!void {
+                const db = ctx.db;
+                if (ctx.stack.items.len == 0) return db.discard(Q, value);
+                if (!@hasDecl(Q, "deinit")) return;
+                const reader = &ctx.stack.items[ctx.stack.items.len - 1];
+                try reader.discarded.ensureUnusedCapacity(db.gpa, 1);
+                const box = try db.gpa.create(Q.Value);
+                box.* = value.*;
+                reader.discarded.appendAssumeCapacity(.of(Q, box));
+            }
+
+            /// Frees what the popped `frame` read and gave up (see `Frame.discarded`)
+            fn freeDiscarded(ctx: *Ctx, frame: *Frame) void {
+                const gpa = ctx.db.gpa;
+                for (frame.discarded.items) |d| d.free(d.ptr, gpa);
+                frame.discarded.deinit(gpa);
             }
 
             fn getInner(ctx: *Ctx, comptime Q: type, key: Q.Key) Error!Q.Value {
@@ -1558,6 +1602,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 } else Q.compute(ctx, key);
                 var value = computed catch |err| {
                     var frame = ctx.popFrame();
+                    defer ctx.freeDiscarded(&frame);
                     ctx.finishTiming(qi, &frame, t0, trace_index, true);
                     frame.deps.deinit(ctx.db.gpa);
                     return err;
@@ -1569,6 +1614,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 // acquires the exclusive lock), so a single check here is enough to detect it.
                 if (ctx.checkCanceled()) |_| {} else |err| {
                     var frame = ctx.popFrame();
+                    defer ctx.freeDiscarded(&frame);
                     ctx.finishTiming(qi, &frame, t0, trace_index, true);
                     frame.deps.deinit(db.gpa);
                     // Never published, the new value has no other references: free it directly
@@ -1576,6 +1622,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     return err;
                 }
                 var frame = ctx.popFrame();
+                defer ctx.freeDiscarded(&frame);
                 ctx.finishTiming(qi, &frame, t0, trace_index, false);
 
                 const table = &db.tables[qi];
@@ -1595,11 +1642,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     return .{ .value = old.value, .changed_at = old.changed_at, .durability = old.durability, .executed = true };
                 };
                 // A result in a cycle depends on the cycle head and is not written to a memo. The
-                // value is returned for the caller to use and put on the garbage list, to be freed
-                // after the read transaction ends.
+                // value is returned for the caller to use and freed when the caller is done with
+                // it (see `Frame.discarded`).
                 if (frame.in_cycle) {
                     defer frame.deps.deinit(db.gpa);
-                    db.discard(Q, &value) catch |err| {
+                    ctx.discardForReader(Q, &value) catch |err| {
                         deinitValue(Q, &value, db.gpa);
                         return err;
                     };
@@ -1737,13 +1784,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         fn discardBoxed(db: *Db, comptime Q: type, box: ?*Q.Value, value: *Q.Value) void {
             if (!@hasDecl(Q, "deinit")) return;
             box.?.* = value.*;
-            db.garbage.appendAssumeCapacity(.{ .value = .{ .ptr = @ptrCast(box.?), .free = struct {
-                fn free(ptr: *anyopaque, gpa: Allocator) void {
-                    const v: *Q.Value = @ptrCast(@alignCast(ptr));
-                    Q.deinit(v, gpa);
-                    gpa.destroy(v);
-                }
-            }.free } });
+            db.garbage.appendAssumeCapacity(.{ .value = .of(Q, box.?) });
         }
     };
 }

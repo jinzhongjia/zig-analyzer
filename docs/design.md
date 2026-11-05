@@ -78,6 +78,7 @@ A memo that passes verification takes the current lowest durability of its depen
 Each thread keeps an active query stack; a cycle calls the query's `cycleFallback`.
 
 - A result in a cycle is not written to a memo, and its reader does not record it as a dependency: the dependencies it read go to the nearest frame not in a cycle. Memos therefore form no cycles among themselves, and early cutoff on a member's old memo cannot mask a change seen by the cycle's entry.
+- Such a result is freed when the query that read it returns, or at the end of the read transaction when read outside any query. A value may point only into values of queries that are never in a cycle (those that read no query declaring `cycleFallback`, such as the syntax queries and `FileDecls`), so nothing else can hold it, and a read that computes a cycle repeatedly does not accumulate its results.
 - During verification, a memo whose dependencies lead through a cycle back to a query on the stack is unverifiable until that query is popped: reading it recomputes it, and verifying other memos treats it as changed.
 - When nested computations exceed the native stack limit (48 MiB on 64 MiB worker stacks, 4 MiB elsewhere), they fall back the same way, and no query on the stack writes a memo. The interrupted read computes from the bottom of the stack and retries, so deep chains complete in segments; at most 16 segments per top-level read, so infinite recursion terminates.
 

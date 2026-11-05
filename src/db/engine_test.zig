@@ -120,6 +120,56 @@ const CycleB = struct {
     }
 };
 
+/// Values freed by `OwnedCycleA` and `OwnedCycleB`
+var owned_cycle_frees: usize = 0;
+
+// Cycle with values that own memory: OwnedCycleA(k) = OwnedCycleB(k) ++ "a",
+// OwnedCycleB(k) = OwnedCycleA(k) ++ "b"
+const OwnedCycleA = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = []const u8;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return std.mem.concat(ctx.db.gpa, u8, &.{ try ctx.get(OwnedCycleB, key), "a" });
+    }
+    pub fn cycleFallback(_: Key) Value {
+        return &.{};
+    }
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(u8, a, b);
+    }
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        owned_cycle_frees += 1;
+        gpa.free(v.*);
+    }
+};
+
+const OwnedCycleB = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = []const u8;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return std.mem.concat(ctx.db.gpa, u8, &.{ try ctx.get(OwnedCycleA, key), "b" });
+    }
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(u8, a, b);
+    }
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        owned_cycle_frees += 1;
+        gpa.free(v.*);
+    }
+};
+
+/// Reads a result of the cycle above, which is not written to a memo
+const OwnedCycleLen = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = usize;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return (try ctx.get(OwnedCycleA, key)).len;
+    }
+};
+
 /// Recursive chain: Depth(k) = Depth(k - 1) + 1
 const Depth = struct {
     pub const kind: db.Kind = .derived;
@@ -419,7 +469,7 @@ fn crossStarted(which: usize) void {
     while (!cross_started[1 - which].load(.acquire)) std.Thread.yield() catch {};
 }
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Gated, CrossA, CrossB, FixA, FixB });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Gated, CrossA, CrossB, FixA, FixB, OwnedCycleA, OwnedCycleB, OwnedCycleLen });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions(Q);
@@ -684,6 +734,49 @@ test "cycle: uses cycleFallback without writing memo" {
     try testing.expectEqual(-99, try read(&d, CycleA, 1));
     try testing.expectEqual(-99, try read(&d, CycleA, 1));
     try testing.expectEqual(2, executions(&d, CycleA));
+}
+
+test "cycle: a result is freed when the query that read it returns, not when the transaction ends" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    owned_cycle_frees = 0;
+    var ctx = d.beginRead(testing.allocator);
+    defer ctx.end();
+    try testing.expectEqual(2, try ctx.get(OwnedCycleLen, 1));
+    try testing.expectEqual(2, owned_cycle_frees);
+}
+
+test "cycle: a result read outside any query stays valid until the transaction ends" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    owned_cycle_frees = 0;
+    {
+        var ctx = d.beginRead(testing.allocator);
+        defer ctx.end();
+        const value = try ctx.get(OwnedCycleA, 1);
+        try testing.expectEqual(1, owned_cycle_frees);
+        try testing.expectEqualStrings("ba", value);
+    }
+    d.beginWrite();
+    d.endWrite();
+    try testing.expectEqual(2, owned_cycle_frees);
+}
+
+test "cycle: results are freed once when allocations fail" {
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = i });
+        var d: Db = .init(testing.io, failing.allocator(), {});
+        defer d.deinit();
+        var ctx = d.beginRead(testing.allocator);
+        defer ctx.end();
+        const len = ctx.get(OwnedCycleLen, 1) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        try testing.expectEqual(2, len);
+        break;
+    }
 }
 
 test "fixpoint: the cycle head is complete and memoized" {
