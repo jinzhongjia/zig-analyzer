@@ -122,9 +122,9 @@ Batch validation: for each library, dependencies are fetched with `zig build --f
 
 | Scope | Result |
 |---|---|
-| Batch validation of 97 Zig 0.17.0 libraries (zls, zigimg, libvaxis, zine, microzig, Cubyz, flow, raylib, etc.; 2026-10-19) | All have a build graph; crashes / timeouts 0; declaration mismatches 0 (median resolution rate 90.8%, median 100% excluding identifiers without a declaration position); reference and rename errors 0; median completion recall 100%, 95 / 97 ≥ 95%; median hover p50 0.2 ms, max 1.0 ms; median resident memory 93 MB, max 308 MB |
+| Batch validation of 97 Zig 0.17.0 libraries (zls, zigimg, libvaxis, zine, microzig, Cubyz, flow, raylib, etc.; 2026-11-05) | All have a build graph; crashes / timeouts 0; declaration mismatches 0 (median resolution rate 90.9%, median 100% excluding identifiers without a declaration position); reference false positives 2 (in known-folders), no other reference or rename errors; median completion recall 100%, 96 / 97 ≥ 95%; median hover p50 0.3 ms, max 0.9 ms; median resident memory 107 MB, max 598 MB |
 | Corpus cross-check (10305 files, 264.6 MB, 2026-10-16) | All pass; no inconsistency between incremental and full parses under 120k random edits |
 | Compiler diagnostics cross-check (2026-10-16) | 15 / 15 identical |
 | Formatting cross-check (2026-10-16) | 372 / 372 files identical |
 
-The 2 libraries with recall below 95%: in strand, the members not completed are in comptime reflection code under several layers of generics (such as the result of `descriptor.options(T)`); in morse, `shakedown`, imported by the test code, is added by a test step that does not exist in the default configuration, and is not in the build graph.
+The library with recall below 95% is morse: `shakedown`, imported by the test code, is added by a test step that does not exist in the default configuration, and is not in the build graph. The 2 reference false positives are in known-folders: the references of `DefaultSystem.getenv` include two `system.getenv` calls in a function with the parameters `comptime System: type, system: *System`, and declaration at those calls does not lead back to it.
