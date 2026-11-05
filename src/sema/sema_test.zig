@@ -513,6 +513,33 @@ test "a condition computed by a function selects the branch of a version check" 
     });
 }
 
+test "pointer casts keep the value only when the elements are unchanged" {
+    // Relabeling `*const [2][1]u8` as `*const [2]u8` showed array elements as bytes.
+    try expectTypes(
+        \\const nested: [2][1]u8 = .{ "a".*, "b".* };
+        \\const flat: *const [2]u8 = @ptrCast(&nested);
+        \\const bytes: [2]u8 = "ab".*;
+        \\const many: [*]const u8 = @ptrCast(&bytes);
+        \\const first = many[0];
+        \\const signed: *const [2]i8 = @ptrCast(&bytes);
+        \\const zero: u8 = 0;
+        \\const erased: ?*const anyopaque = @ptrCast(&zero);
+        \\const back: ?*const u8 = @ptrCast(@alignCast(erased));
+        \\const wrong: ?*const u16 = @ptrCast(@alignCast(erased));
+        \\const none: ?*const anyopaque = null;
+        \\const none_back: ?*const u8 = @ptrCast(none);
+        \\fn g() void { _ = .{ flat, first, signed, back, wrong, none_back }; }
+    , &.{
+        .{ "flat", "*const [2]u8" },
+        .{ "first", "u8 = 97" },
+        .{ "signed", "*const [2]i8" },
+        .{ "back", "?*const u8 = &0" },
+        .{ "wrong", "?*const u16" },
+        .{ "none_back", "?*const u8 = null" },
+    });
+}
+
+
 test "names of containers defined in bodies" {
     try expectTypes(
         \\fn Box(comptime T: type) type { return struct { v: T }; }

@@ -3008,7 +3008,9 @@ const Evaluator = struct {
             // `@ptrCast(@alignCast(p))`), pass it through unchanged
             const pointer_cast = eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast");
             if (want == null and pointer_cast) return vals[0];
-            return ev.cast(name, vals[0], want orelse return error.Abort);
+            const t = want orelse return error.Abort;
+            if (pointer_cast and !try ev.keepsPointee(vals[0], t)) return .{ .ty = t };
+            return ev.cast(name, vals[0], t);
         }
         if (eq(u8, name, "@intFromBool")) {
             if (vals.len != 1) return error.Abort;
@@ -3276,6 +3278,57 @@ const Evaluator = struct {
         const eq = std.mem.eql;
         if (i == 0 and (eq(u8, name, "@as") or eq(u8, name, "@typeInfo") or eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf") or eq(u8, name, "@offsetOf") or eq(u8, name, "@bitOffsetOf") or eq(u8, name, "@mulAdd"))) return .type_type;
         return null;
+    }
+
+    /// Whether pointer `v` cast to type `to` points to the same elements: values are not
+    /// reinterpreted in memory, so a cast that changes the element type (`*const [2][1]u8` to
+    /// `*const [2]u8` in std.mem.asBytes) gives an unknown value. A cast to `*anyopaque` keeps
+    /// the value, which cannot be read through it; a cast back from it keeps the value when the
+    /// pointed-to value has the target type (`sentinel_ptr` of `@typeInfo`).
+    fn keepsPointee(ev: *Evaluator, v: Val, to: Index) EvalError!bool {
+        const ip = ev.ip;
+        const x_v = try ev.ipOf(v);
+        if (x_v == .null_value) return true;
+        const a = pointerType(ip, v.ty) orelse return false;
+        const b = pointerType(ip, to) orelse return false;
+        if (b.child == .anyopaque_type) return true;
+        if (a.child == .anyopaque_type) {
+            if (b.size != .one) return false;
+            const pv = switch (ip.key(x_v orelse return false)) {
+                .ptr_value => |pv| pv,
+                else => return false,
+            };
+            return value.eqlTypes(ip, value.typeOfValue(ip, pv.pointee), b.child) == true;
+        }
+        const x = castPointee(ip, a);
+        const y = castPointee(ip, b);
+        // Pointers to arrays, slices and many-pointers are represented by the elements, other
+        // single-item pointers by the pointed-to value
+        if (x.single != y.single) return false;
+        if (x.len != null and y.len != null and x.len.? != y.len.?) return false;
+        return value.eqlTypes(ip, x.elem, y.elem) == true;
+    }
+
+    /// The pointer type of a pointer or an optional pointer
+    fn pointerType(ip: *InternPool, t: Index) ?@FieldType(InternPool.Key, "ptr_type") {
+        return switch (ip.key(t)) {
+            .ptr_type => |p| p,
+            .optional_type => |c| switch (ip.key(c)) {
+                .ptr_type => |p| p,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    const Pointee = struct { elem: Index, len: ?u64, single: bool };
+
+    fn castPointee(ip: *InternPool, p: @FieldType(InternPool.Key, "ptr_type")) Pointee {
+        if (p.size != .one) return .{ .elem = p.child, .len = null, .single = false };
+        return switch (ip.key(p.child)) {
+            .array_type => |arr| .{ .elem = arr.child, .len = arr.len, .single = false },
+            else => .{ .elem = p.child, .len = null, .single = true },
+        };
     }
 
     fn cast(ev: *Evaluator, name: []const u8, v: Val, t: Index) EvalError!Val {
