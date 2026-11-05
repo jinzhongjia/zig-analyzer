@@ -32,6 +32,12 @@
 //! cycle are still not written. Exceeding the stack depth limit is not a cycle, and its fallback
 //! value cannot stand in for the complete result, so `depthFallback` must be declared.
 //!
+//! A query that declares `lru_bytes` may also declare `pub const lru_read_bytes: usize = N`: when
+//! the retained values exceed N bytes during read transactions, the least recently used values
+//! that no compute and no read outside a compute holds are evicted without waiting for the
+//! transactions to end. One read transaction can otherwise retain every value it computes. Such a
+//! query cannot declare `computeIncremental`, and `Ctx.memoized` cannot read it.
+//!
 //! A derived query may instead declare `computeIncremental(ctx, key, prev: ?Value)`: when
 //! recomputing, the engine passes in the previous value (null on the first computation). The
 //! result must be exactly the same as computing from scratch; prev is only used for speed, and
@@ -339,6 +345,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 live: usize = 0,
                 /// Bytes of the retained values (counted only for queries that declare `lru_bytes`)
                 live_bytes: usize = 0,
+                /// A read transaction evicts only above this many bytes (see `claimReadEviction`)
+                read_eviction_floor: usize = 0,
 
                 const Slot = switch (Q.kind) {
                     .input => struct {
@@ -353,6 +361,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                         owner: ?*Ctx = null,
                         /// Other read transactions wait for `owner` to release it
                         waited: bool = false,
+                        /// Reads that hold the value (counted only for queries that declare
+                        /// `lru_read_bytes`): it is not evicted during read transactions
+                        pins: u32 = 0,
                     },
                 };
 
@@ -630,6 +641,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         fn evictTable(comptime Q: type, table: *Table(Q), gpa: Allocator, count: usize, bytes: usize) void {
             const target_count = threeQuarters(count);
             const target_bytes = threeQuarters(bytes);
+            table.read_eviction_floor = 0;
             const Entry = struct { tick: u64, slot: u32 };
             // On out-of-memory, fall back to evicting everything
             const entries = gpa.alloc(Entry, table.live) catch {
@@ -651,6 +663,74 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 if (table.live <= target_count and table.live_bytes <= target_bytes) break;
                 evictMemo(Q, table, &table.slots.items[e.slot].memo.?, gpa);
             }
+        }
+
+        /// Size above which a read transaction evicts values of `Q`: a larger configured capacity
+        /// applies (unlimited disables it)
+        fn readEvictionLimit(db: *Db, comptime Q: type) usize {
+            return @max(Q.lru_read_bytes, db.lru_limits[comptime queryIndex(Q)].bytes.load(.monotonic));
+        }
+
+        /// Whether the caller, which holds the table's mutex, is to run `evictInRead`. Only one read
+        /// transaction runs it at a time.
+        fn claimReadEviction(db: *Db, comptime Q: type) bool {
+            const table = &db.tables[comptime queryIndex(Q)];
+            if (table.live_bytes <= db.readEvictionLimit(Q) or table.live_bytes <= table.read_eviction_floor) return false;
+            table.read_eviction_floor = std.math.maxInt(usize);
+            return true;
+        }
+
+        /// Evicts the least recently used values of `Q` that no read holds, down to 3/4 of the limit.
+        /// Values being brought up to date are left alone. When held values keep the table above
+        /// that, the next pass waits for it to grow by another 1/8 of the limit, so that a table
+        /// that cannot shrink is not scanned on every read.
+        fn evictInRead(db: *Db, comptime Q: type) void {
+            const table = &db.tables[comptime queryIndex(Q)];
+            const limit = db.readEvictionLimit(Q);
+            const Entry = struct { tick: u64, slot: u32 };
+            var evicted: []Q.Value = &.{};
+            var count: usize = 0;
+            defer {
+                for (evicted[0..count]) |*value| deinitValue(Q, value, db.gpa);
+                db.gpa.free(evicted);
+            }
+            table.mutex.lockUncancelable(db.io);
+            defer table.mutex.unlock(db.io);
+            defer table.read_eviction_floor = if (table.live_bytes > threeQuarters(limit)) table.live_bytes + limit / 8 else 0;
+            const entries = db.gpa.alloc(Entry, table.live) catch return;
+            defer db.gpa.free(entries);
+            evicted = db.gpa.alloc(Q.Value, table.live) catch return;
+            var n: usize = 0;
+            for (table.slots.items, 0..) |slot, i| if (slot.memo) |m| if (!m.evicted and slot.pins == 0 and slot.owner == null) {
+                entries[n] = .{ .tick = m.last_used, .slot = @intCast(i) };
+                n += 1;
+            };
+            std.mem.sort(Entry, entries[0..n], {}, struct {
+                fn lt(_: void, a: Entry, b: Entry) bool {
+                    return a.tick < b.tick;
+                }
+            }.lt);
+            for (entries[0..n]) |e| {
+                if (table.live_bytes <= threeQuarters(limit)) break;
+                const m = &table.slots.items[e.slot].memo.?;
+                table.live_bytes -= Q.bytes(m.value);
+                table.live -= 1;
+                evicted[count] = m.value;
+                count += 1;
+                m.value = undefined;
+                m.evicted = true;
+            }
+        }
+
+        fn unpin(db: *Db, deps: []const DepKey) void {
+            for (deps) |dep| inline for (queries, 0..) |Q, qi| {
+                if (comptime @hasDecl(Q, "lru_read_bytes")) if (dep.query == qi) {
+                    const table = &db.tables[qi];
+                    table.mutex.lockUncancelable(db.io);
+                    defer table.mutex.unlock(db.io);
+                    table.slots.items[dep.index].pins -= 1;
+                };
+            };
         }
 
         /// ⌊n × 3/4⌋, without overflow when n is the maximum value (unlimited)
@@ -712,6 +792,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     table.keys.clearAndFree(db.gpa);
                     table.live = 0;
                     table.live_bytes = 0;
+                    table.read_eviction_floor = 0;
                 }
             }
             if (!db.bumped_in_write) {
@@ -863,6 +944,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             /// `beginReadAt`): all its reads are canceled
             stale: bool = false,
             stack: std.ArrayList(Frame) = .empty,
+            /// Like `Frame.pinned`, for the reads outside any query
+            pinned: std.ArrayList(DepKey) = .empty,
             /// Stack position where the read transaction began (the stack grows downward)
             stack_base: usize,
             /// Native stack nested computations may use (bytes)
@@ -919,12 +1002,17 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 /// it returns. A read that computes large cycles repeatedly would otherwise keep
                 /// every result until its read transaction ends.
                 discarded: std.ArrayList(Discarded) = .empty,
+                /// Values this query read that must not be evicted before it returns (one entry per
+                /// read; see `lru_read_bytes`)
+                pinned: std.ArrayList(DepKey) = .empty,
                 /// Time spent in other queries executed within this frame (for the self time)
                 child_ns: u64 = 0,
             };
 
             pub fn end(ctx: *Ctx) void {
                 assert(ctx.stack.items.len == 0 and ctx.unverifiable.items.len == 0 and ctx.deep_frames.count() == 0 and ctx.waiting_for == null);
+                ctx.db.unpin(ctx.pinned.items);
+                ctx.pinned.deinit(ctx.db.gpa);
                 ctx.stack.deinit(ctx.gpa);
                 ctx.unverifiable.deinit(ctx.gpa);
                 ctx.deep_frames.deinit(ctx.gpa);
@@ -988,7 +1076,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             /// computed here, and no dependency is recorded. A returned value is valid until this
             /// read transaction ends.
             pub fn memoized(ctx: *Ctx, comptime Q: type, key: Q.Key) Memoized(Q) {
-                comptime assert(Q.kind == .derived);
+                comptime assert(Q.kind == .derived and !@hasDecl(Q, "lru_read_bytes"));
                 const db = ctx.db;
                 const table = &db.tables[comptime queryIndex(Q)];
                 table.mutex.lockUncancelable(db.io);
@@ -1111,11 +1199,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 reader.discarded.appendAssumeCapacity(.of(Q, box));
             }
 
-            /// Frees what the popped `frame` read and gave up (see `Frame.discarded`)
-            fn freeDiscarded(ctx: *Ctx, frame: *Frame) void {
+            /// Ends the reads of the popped `frame`: frees the results it gave up (see
+            /// `Frame.discarded`) and unpins the values it held (see `Frame.pinned`)
+            fn releaseReads(ctx: *Ctx, frame: *Frame) void {
                 const gpa = ctx.db.gpa;
                 for (frame.discarded.items) |d| d.free(d.ptr, gpa);
                 frame.discarded.deinit(gpa);
+                ctx.db.unpin(frame.pinned.items);
+                frame.pinned.deinit(gpa);
             }
 
             fn getInner(ctx: *Ctx, comptime Q: type, key: Q.Key) Error!Q.Value {
@@ -1138,8 +1229,20 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     .input => db.readInputLocked(Q, index),
                     .derived => db.useMemoLocked(Q, index),
                 };
+                // Pinned before the value is read, however it is then obtained
+                const pins = comptime @hasDecl(Q, "lru_read_bytes");
+                if (pins) table.slots.items[index].pins += 1;
+                const evict = pins and db.claimReadEviction(Q);
                 table.mutex.unlock(db.io);
                 const dep: DepKey = .{ .query = qi, .index = index };
+                if (pins) {
+                    if (evict) db.evictInRead(Q);
+                    const list = if (ctx.stack.items.len == 0) &ctx.pinned else &ctx.stack.items[ctx.stack.items.len - 1].pinned;
+                    list.append(db.gpa, dep) catch |err| {
+                        db.unpin(&.{dep});
+                        return err;
+                    };
+                }
 
                 const fresh = switch (Q.kind) {
                     .input => slot,
@@ -1603,7 +1706,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 } else Q.compute(ctx, key);
                 var value = computed catch |err| {
                     var frame = ctx.popFrame();
-                    defer ctx.freeDiscarded(&frame);
+                    defer ctx.releaseReads(&frame);
                     ctx.finishTiming(qi, &frame, t0, trace_index, true);
                     frame.deps.deinit(ctx.db.gpa);
                     return err;
@@ -1615,7 +1718,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 // acquires the exclusive lock), so a single check here is enough to detect it.
                 if (ctx.checkCanceled()) |_| {} else |err| {
                     var frame = ctx.popFrame();
-                    defer ctx.freeDiscarded(&frame);
+                    defer ctx.releaseReads(&frame);
                     ctx.finishTiming(qi, &frame, t0, trace_index, true);
                     frame.deps.deinit(db.gpa);
                     // Never published, the new value has no other references: free it directly
@@ -1623,7 +1726,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     return err;
                 }
                 var frame = ctx.popFrame();
-                defer ctx.freeDiscarded(&frame);
+                defer ctx.releaseReads(&frame);
                 ctx.finishTiming(qi, &frame, t0, trace_index, false);
 
                 const table = &db.tables[qi];
@@ -1800,6 +1903,9 @@ fn validate(comptime Q: type) void {
     }
     if (!@hasDecl(Q, "eql") and containsPointer(Q.Value)) {
         @compileError(@typeName(Q) ++ " has a Value containing pointers and must declare eql");
+    }
+    if (@hasDecl(Q, "lru_read_bytes") and (!@hasDecl(Q, "lru_bytes") or @hasDecl(Q, "computeIncremental"))) {
+        @compileError(@typeName(Q) ++ " declares lru_read_bytes, so it must declare lru_bytes and not computeIncremental");
     }
     if (@hasDecl(Q, "fixpoint") and !(@hasDecl(Q, "cycleFallback") and @hasDecl(Q, "depthFallback"))) {
         @compileError(@typeName(Q) ++ " declares fixpoint and must declare cycleFallback and depthFallback");

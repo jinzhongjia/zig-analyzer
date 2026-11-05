@@ -95,6 +95,8 @@ Read transactions that need the same memo brought up to date do it once: the fir
 
 A query may declare `lru` (count) and `lru_bytes`; eviction deletes the value and keeps the dependencies. Capacities can be changed with `cache.capacity` and `cache.queries`. `resetQueries` clears the type-related queries a generation at a time, together with `InternPool.reset`.
 
+Eviction normally waits for a moment without read transactions, but one read transaction can compute a large part of a project under many instances. A query may therefore declare `lru_read_bytes`: above that size, a read evicts the least recently used values that nothing holds. A read pins the value until the compute that read it returns, or until its transaction ends when read outside any query; values store no pointers into the values they read, so nothing else can hold it. Only `Infer` declares it, at 512 MB: recomputing it costs little there, while the syntax trees and bodies are read again so often during such a computation that evicting them dominates its time.
+
 ### Allocator
 
 Release builds use `PagedAllocator`, one heap shared by all threads: cached values are allocated on worker threads but freed on the threads that sweep and run write transactions, so a block freed by any thread must be reusable by any thread. `std.heap.smp_allocator` splits its free lists by thread slot, so resident memory keeps growing over a session.

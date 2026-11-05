@@ -76,6 +76,10 @@ pub const Infer = struct {
     /// Values vary greatly in size (the HIR / inference result of a long function can reach
     /// hundreds of KB), so the cache is limited by byte count as well
     pub const lru_bytes = 48 * 1024 * 1024;
+    /// One read transaction can infer a large part of a project under many instances (the closure
+    /// of `seed.AllInstances`). A much smaller limit makes those computations infer the same
+    /// results again.
+    pub const lru_read_bytes = 512 * 1024 * 1024;
 
     pub fn bytes(v: Value) usize {
         if (v == &empty_result) return 0;

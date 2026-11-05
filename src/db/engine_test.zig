@@ -371,6 +371,51 @@ const Sized = struct {
     }
 };
 
+/// A query whose values read transactions evict above 30 bytes
+const ReadBounded = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = []const u8;
+    pub const lru: usize = 1000;
+    pub const lru_bytes: usize = 10;
+    pub const lru_read_bytes: usize = 30;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return ctx.db.gpa.dupe(u8, try ctx.get(Text, key));
+    }
+    pub fn bytes(v: Value) usize {
+        return v.len;
+    }
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(u8, a, b);
+    }
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.*);
+    }
+};
+
+const ReadBoundedLen = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = usize;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return (try ctx.get(ReadBounded, key)).len;
+    }
+};
+
+/// Whether the value of `ReadBounded` it read stays intact while it reads many others
+const ReadBoundedHolder = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = bool;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        const held = try ctx.get(ReadBounded, key);
+        for (0..read_bounded_keys) |k| _ = try ctx.get(ReadBoundedLen, @intCast(k));
+        return std.mem.eql(u8, held, try ctx.get(Text, key));
+    }
+};
+
+const read_bounded_keys = 20;
+
 const CachedLen = struct {
     pub const kind: db.Kind = .derived;
     pub const Key = u32;
@@ -469,7 +514,7 @@ fn crossStarted(which: usize) void {
     while (!cross_started[1 - which].load(.acquire)) std.Thread.yield() catch {};
 }
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Gated, CrossA, CrossB, FixA, FixB, OwnedCycleA, OwnedCycleB, OwnedCycleLen });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Gated, CrossA, CrossB, FixA, FixB, OwnedCycleA, OwnedCycleB, OwnedCycleLen, ReadBounded, ReadBoundedLen, ReadBoundedHolder });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions(Q);
@@ -1553,6 +1598,109 @@ fn setText(d: *Db, key: u32, text: []const u8) !void {
     d.beginWrite();
     defer d.endWrite();
     try d.set(Text, key, try testing.allocator.dupe(u8, text), .low);
+}
+
+fn setReadBoundedTexts(d: *Db) !void {
+    for (0..read_bounded_keys) |k| {
+        var buf: [16]u8 = undefined;
+        try setText(d, @intCast(k), try std.fmt.bufPrint(&buf, "value-{d:0>4}", .{k}));
+    }
+}
+
+test "lru_read_bytes: a read transaction evicts the values no query holds" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setReadBoundedTexts(&d);
+    var ctx = d.beginRead(testing.allocator);
+    defer ctx.end();
+    for (0..read_bounded_keys) |k| try testing.expectEqual(10, try ctx.get(ReadBoundedLen, @intCast(k)));
+    try testing.expect(d.tables[comptime Db.queryIndex(ReadBounded)].live_bytes <= 40);
+    try testing.expectEqual(read_bounded_keys, executions(&d, ReadBounded));
+}
+
+test "lru_read_bytes: a value stays valid while a compute holds it" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setReadBoundedTexts(&d);
+    var ctx = d.beginRead(testing.allocator);
+    defer ctx.end();
+    try testing.expect(try ctx.get(ReadBoundedHolder, 3));
+}
+
+test "lru_read_bytes: a value read outside any query stays valid until the transaction ends" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setReadBoundedTexts(&d);
+    var ctx = d.beginRead(testing.allocator);
+    defer ctx.end();
+    const held = try ctx.get(ReadBounded, 3);
+    for (0..read_bounded_keys) |k| _ = try ctx.get(ReadBoundedLen, @intCast(k));
+    try testing.expectEqualStrings("value-0003", held);
+}
+
+test "lru_read_bytes: an evicted value is restored in the transaction without invalidating dependents" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setReadBoundedTexts(&d);
+    {
+        var ctx = d.beginRead(testing.allocator);
+        defer ctx.end();
+        for (0..read_bounded_keys) |k| _ = try ctx.get(ReadBoundedLen, @intCast(k));
+        try testing.expectEqualStrings("value-0000", try ctx.get(ReadBounded, 0));
+        try testing.expectEqual(read_bounded_keys + 1, executions(&d, ReadBounded));
+    }
+    try setText(&d, read_bounded_keys, "unrelated");
+    const lens = executions(&d, ReadBoundedLen);
+    try testing.expectEqual(10, try read(&d, ReadBoundedLen, 0));
+    try testing.expectEqual(lens, executions(&d, ReadBoundedLen));
+}
+
+test "lru_read_bytes: pins are released when allocations fail" {
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
+        var d: Db = .init(testing.io, failing.allocator(), {});
+        defer d.deinit();
+        try setReadBoundedTexts(&d);
+        failing.fail_index = failing.alloc_index + i;
+        var failed = false;
+        {
+            var ctx = d.beginRead(testing.allocator);
+            defer ctx.end();
+            _ = ctx.get(ReadBoundedHolder, 3) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                failed = true;
+            };
+        }
+        for (d.tables[comptime Db.queryIndex(ReadBounded)].slots.items) |slot| try testing.expectEqual(0, slot.pins);
+        if (!failed) break;
+    }
+}
+
+const ReadBoundedWorker = struct {
+    fn run(d: *Db, failed: *std.atomic.Value(bool)) void {
+        var buf: [16]u8 = undefined;
+        for (0..300) |round| {
+            var ctx = d.beginRead(testing.allocator);
+            defer ctx.end();
+            const k: u32 = @intCast(round * 7 % read_bounded_keys);
+            const value = ctx.get(ReadBounded, k) catch return failed.store(true, .monotonic);
+            const holder = ctx.get(ReadBoundedHolder, k) catch return failed.store(true, .monotonic);
+            const expected = std.fmt.bufPrint(&buf, "value-{d:0>4}", .{k}) catch unreachable;
+            if (!holder or !std.mem.eql(u8, value, expected)) failed.store(true, .monotonic);
+        }
+    }
+};
+
+test "lru_read_bytes: concurrent read transactions keep the values they hold" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setReadBoundedTexts(&d);
+    var failed: std.atomic.Value(bool) = .init(false);
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, ReadBoundedWorker.run, .{ &d, &failed });
+    for (threads) |t| t.join();
+    try testing.expect(!failed.load(.monotonic));
 }
 
 test "lru: evicted values are restored without invalidating dependents" {
