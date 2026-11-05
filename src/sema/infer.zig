@@ -1087,7 +1087,8 @@ const Inferrer = struct {
             .container => |c| {
                 if (c.arg) |arg| _ = try inf.infer(arg, null);
                 const ns = try inf.containerAt(e) orelse return .unknown;
-                return TypedValue.ofType(try queries.containerType(inf.r, ns, try inf.containerInst(e)));
+                const inst = try inf.containerInst(e);
+                return TypedValue.ofType(if (inf.mode == .signature) try queries.prototypeContainerType(inf.r, ns, inst) else try queries.containerType(inf.r, ns, inst));
             },
             .fn_type => |f| {
                 const params = try inf.scratch.alloc(Index, f.params.len);

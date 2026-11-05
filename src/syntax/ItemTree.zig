@@ -52,6 +52,9 @@ pub const Container = struct {
     /// containers in a member (local types, call arguments, `?struct {...}`, parameter types) are
     /// only lexically inside it
     is_value: bool = false,
+    /// In the prototype of function `parent_item` (a parameter or return type) rather than in its
+    /// body
+    in_signature: bool = false,
     /// The name of the declaration (a member or a local constant) whose initializer is the
     /// container; null for anonymous containers and the file root
     name: ?[]const u8 = null,
@@ -121,7 +124,7 @@ pub fn eql(a: *const ItemTree, b: *const ItemTree) bool {
     if (!std.mem.eql(u32, a.member_list, b.member_list)) return false;
     for (a.containers, b.containers) |x, y| {
         if (x.ast_id != y.ast_id or x.kind != y.kind or x.parent_item != y.parent_item) return false;
-        if (x.layout != y.layout or x.auto_enum != y.auto_enum or x.nonexhaustive != y.nonexhaustive or x.is_value != y.is_value) return false;
+        if (x.layout != y.layout or x.auto_enum != y.auto_enum or x.nonexhaustive != y.nonexhaustive or x.is_value != y.is_value or x.in_signature != y.in_signature) return false;
         if (!optStrEql(x.name, y.name)) return false;
         if (x.members.start != y.members.start or x.members.len != y.members.len) return false;
     }
@@ -180,6 +183,8 @@ const Builder = struct {
     pending_members: std.ArrayList(std.ArrayList(u32)) = .empty,
     items: std.ArrayList(Item) = .empty,
     taken: std.AutoHashMapUnmanaged(AstId, void) = .empty,
+    /// Visiting the prototype of a function member (see `Container.in_signature`)
+    in_signature: bool = false,
 
     fn deinit(b: *Builder) void {
         b.containers.deinit(b.gpa);
@@ -247,6 +252,9 @@ const Builder = struct {
         var it = node.children();
         while (it.nextNode()) |c| {
             if (c.kind() != .container_decl) {
+                const outer = b.in_signature;
+                defer b.in_signature = outer;
+                if (node.kind() == .fn_decl and c.kind() == .fn_proto) b.in_signature = true;
                 try b.visitNested(c, parent_item, value);
                 continue;
             }
@@ -267,8 +275,12 @@ const Builder = struct {
                 .layout = if (c.childToken(.keyword_packed) != null) .@"packed" else if (c.childToken(.keyword_extern) != null) .@"extern" else .auto,
                 .auto_enum = kind == .@"union" and c.childToken(.keyword_enum) != null,
                 .is_value = value == c.offset or (node.kind() == .return_expr and b.items.items[parent_item].kind == .@"fn"),
+                .in_signature = b.in_signature,
                 .name = bound,
             });
+            const outer = b.in_signature;
+            defer b.in_signature = outer;
+            b.in_signature = false;
             try b.visitContainer(c, index);
         }
     }

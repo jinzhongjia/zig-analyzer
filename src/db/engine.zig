@@ -24,12 +24,13 @@
 //! };
 //! ```
 //!
-//! A derived query may declare `pub const fixpoint = true`: `cycleFallback` is the least element
-//! of the values, and a read of itself within a cycle only merges the value read into the result
-//! (e.g. error sets). One computation of the cycle head then yields the least fixpoint; the result
-//! of the cycle head is written to its memo, while the results of the other queries in the cycle
-//! are still not written. Exceeding the stack depth limit is not a cycle, and its fallback value
-//! cannot be the least element, so `depthFallback` must be declared.
+//! A derived query may declare `pub const fixpoint = true` when one computation of the cycle head
+//! yields its complete result: either `cycleFallback` is the least element of the values and a read
+//! of itself within a cycle only merges the value read into the result (e.g. error sets), which
+//! gives the least fixpoint, or the result does not depend on the value read within the cycle. The
+//! result of the cycle head is written to its memo, while the results of the other queries in the
+//! cycle are still not written. Exceeding the stack depth limit is not a cycle, and its fallback
+//! value cannot stand in for the complete result, so `depthFallback` must be declared.
 //!
 //! A derived query may instead declare `computeIncremental(ctx, key, prev: ?Value)`: when
 //! recomputing, the engine passes in the previous value (null on the first computation). The
