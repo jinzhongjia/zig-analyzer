@@ -25,7 +25,7 @@ Benchmark project: the Zig 0.17.0 compiler source (540k lines + standard library
 Resident memory over a long session on the Zig compiler source:
 
 - Zig compiler source, 240 rounds on Linux: 1.1-1.4 GB from round 120 on, heap about 520 MB. The allocator's memory stays flat (0.43 GB of pages for 0.18 GB of live small blocks, and 0.36 GB of large allocations); the rest, mostly worker stacks (0.57 GB at round 240), grows in steps as deeper recursions touch more of them.
-- macOS, 160 rounds: RSS 3.4-3.7 GB from round 120 on, heap 2.6 GB at round 160, of which 2.5 GB are large allocations. Peak RSS 8.4 GB, with at most 4.7 GB assigned to size classes: the hover that computes the largest instance closure (all instances of `Writer.printValue`) holds about 900,000 inference results, 3.9 GB, until its read transaction ends, and the other rounds with a closure stay near 4 GB. The memory is returned to the system afterwards.
+- macOS, 160 rounds: RSS 2.9-3.1 GB from round 120 on, heap 2.1 GB at round 160, of which 2.0 GB are large allocations. Peak RSS 3.9-5.0 GB across runs, with at most 1.5 GB assigned to size classes: the hover that computes the largest instance closure (all instances of `Writer.printValue`) infers about 900,000 results in one read transaction, which holds at most 512 MB of them. The memory is returned to the system afterwards.
 - Windows, 40 rounds: working set 0.87 GB with 0.98 GB committed at round 40.
 
 ## Real projects
