@@ -493,12 +493,12 @@ const Inferrer = struct {
             if (a == .runtime or a == .unknown) return .unknown;
             // comptime anytype: the instance records the argument value; anytype: the argument type
             if (binding.is_comptime) return .{ .ty = value.typeOfValue(inf.ip, a), .val = a };
-            return .{ .ty = a };
+            return .{ .ty = a, .val = try value.comptimeFieldsValue(inf.ip, inf.scratch, a) };
         };
         const ty: Index = (try inf.inferComptime(ty_e, null)).asType() orelse .unknown;
         if (arg) |a| if (a != .unknown and a != .runtime) return .{ .ty = ty, .val = (try value.coerceValue(inf.ip, a, ty)) orelse a };
         if (ty == .type_type and (arg == null or arg.? == .unknown)) return TypedValue.ofType(try inf.ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = try inf.body_owner(), .binding = @backingInt(p), .name = binding.name } }));
-        return .{ .ty = ty };
+        return .{ .ty = ty, .val = try value.comptimeFieldsValue(inf.ip, inf.scratch, ty) };
     }
 
     /// Reading the ItemTree is a query: even when it is cached, `error.Canceled` is returned when
@@ -1477,7 +1477,8 @@ const Inferrer = struct {
         const skip: usize = if (inf.bound.contains(callee_e)) 1 else 0;
         const g = try genericCallee(inf.r, inf.scratch, callee, f) orelse {
             for (args, 0..) |a, i| _ = try inf.infer(a, paramType(f, i + skip));
-            if (inf.comptime_depth > 0) if (try inf.comptimeCall(callee, callee_e, args, skip)) |tv| return tv;
+            const evaluate = inf.comptime_depth > 0 or (f.cc == .@"inline" and allKnown(try inf.argValues(callee_e, args, skip, args.len + skip)));
+            if (evaluate) if (try inf.comptimeCall(callee, callee_e, args, skip)) |tv| return tv;
             return .{ .ty = f.ret };
         };
         // Generic call: comptime arguments determine the instance, so infer them first; parameter
@@ -1495,7 +1496,7 @@ const Inferrer = struct {
         for (args, 0..) |a, i| if (g.kind(i + skip) == .runtime) {
             _ = try inf.infer(a, instParamType(sig, g.body, i + skip) orelse inf.concrete(paramType(f, i + skip)));
         };
-        const result = try inf.callResult(g, inst, sig, try inf.argValues(callee_e, args, skip, g.body.params.len));
+        const result = try inf.callResult(g, inst, sig, try inf.argValues(callee_e, args, skip, g.body.params.len), f.cc == .@"inline");
         try inf.literalArgTargets(g, inst, args, skip);
         return result;
     }
@@ -1538,10 +1539,13 @@ const Inferrer = struct {
     /// function returns a comptime-only type (such as `type`) or the call is in a comptime
     /// context, the interpreter executes the function body to compute the value; when the
     /// interpreter gives up, a function returning `type` takes the value of the `return` actually
-    /// reached during inference.
-    fn callResult(inf: *Inferrer, g: Generic, inst: Index, sig: *const Result, args: []const TypedValue) Error!TypedValue {
+    /// reached during inference. An inline call whose arguments are all known at comptime is
+    /// evaluated too: its result is known at comptime when the body computes it from them (as in
+    /// `std.fmt.comptimePrint`).
+    fn callResult(inf: *Inferrer, g: Generic, inst: Index, sig: *const Result, args: []const TypedValue, is_inline: bool) Error!TypedValue {
         const ret = try queries.returnType(inf.r, g.owner, g.body, sig, inst);
-        if ((try eval.isComptimeOnly(inf.r, ret) or inf.comptime_depth > 0) and !inf.r.ctx.incomplete()) {
+        const evaluate = try eval.isComptimeOnly(inf.r, ret) or inf.comptime_depth > 0 or (is_inline and allKnown(args));
+        if (evaluate and !inf.r.ctx.incomplete()) {
             const tv = try eval.call(inf.r, inst, args, inf.branchQuota());
             if (tv.val != null and (ret == .unknown or tv.ty == ret)) return tv;
         }
@@ -4354,6 +4358,12 @@ fn seedRegion(body: *const Body, binding: u32) ?Body.Range {
         else => {},
     };
     return null;
+}
+
+/// Whether all arguments of a call are known at comptime
+fn allKnown(args: []const TypedValue) bool {
+    for (args) |a| if (a.val == null) return false;
+    return true;
 }
 
 pub fn runtimeInstance(ip: *InternPool, scratch: Allocator, fv: @FieldType(InternPool.Key, "fn_value"), n: usize) Error!Index {

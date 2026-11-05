@@ -513,6 +513,33 @@ test "a condition computed by a function selects the branch of a version check" 
     });
 }
 
+test "a format-style length in a signature and a comptime block filling a sentinel array" {
+    // The shape of std.fmt.comptimePrint: `args` is a runtime anytype parameter, but the type of
+    // a tuple literal whose fields are all comptime fields has a single value.
+    try expectTypes(
+        \\fn width(comptime fmt: []const u8, args: anytype) usize { return fmt.len + args[0]; }
+        \\inline fn print(comptime fmt: []const u8, args: anytype) *const [width(fmt, args):0]u8 {
+        \\    comptime {
+        \\        var buf: [width(fmt, args):0]u8 = undefined;
+        \\        for (&buf) |*c| c.* = fmt[0];
+        \\        buf[buf.len] = 0;
+        \\        const final = buf;
+        \\        return &final;
+        \\    }
+        \\}
+        \\const a = print("ab", .{1});
+        \\const nested = print("x", .{print("y", .{2}).len});
+        \\fn g(n: usize) void {
+        \\    const at_runtime = print("ab", .{n});
+        \\    _ = .{ a, nested, at_runtime };
+        \\}
+    , &.{
+        .{ "a", "*const [3:0]u8 = \"aaa\"" },
+        .{ "nested", "*const [4:0]u8 = \"xxxx\"" },
+        .{ "at_runtime", "*const [_:0]u8" },
+    });
+}
+
 test "pointer casts keep the value only when the elements are unchanged" {
     // Relabeling `*const [2][1]u8` as `*const [2]u8` showed array elements as bytes.
     try expectTypes(
@@ -539,7 +566,6 @@ test "pointer casts keep the value only when the elements are unchanged" {
     });
 }
 
-
 test "the sentinel element of an array" {
     try expectTypes(
         \\const read = blk: {
@@ -565,6 +591,23 @@ test "the sentinel element of an array" {
     });
 }
 
+test "inline calls with comptime-known arguments have comptime-known results" {
+    try expectTypes(
+        \\inline fn twice(x: u32) u32 { return x * 2; }
+        \\var global: u32 = 1;
+        \\inline fn readGlobal() u32 { return global; }
+        \\fn g(y: u32) void {
+        \\    const known = twice(4);
+        \\    const runtime_arg = twice(y);
+        \\    const runtime_body = readGlobal();
+        \\    _ = .{ known, runtime_arg, runtime_body };
+        \\}
+    , &.{
+        .{ "known", "u32 = 8" },
+        .{ "runtime_arg", "u32" },
+        .{ "runtime_body", "u32" },
+    });
+}
 
 test "names of containers defined in bodies" {
     try expectTypes(
@@ -2243,9 +2286,9 @@ test "tuple and anonymous struct literals have comptime fields like the compiler
         .{ "sa1", "comptime_int = 4" },
         .{ "sa2", "comptime_int = 16" },
         .{ "oa2", "comptime_int = 12" },
-        // Whether the result of an inline function is comptime-known depends on its body:
-        // whether the field takes space is unknown
-        .{ "su", "comptime_int" },
+        // The result of an inline call computed from comptime-known values is comptime-known
+        .{ "tu", "struct { comptime u32 = 1 } = .{ 1 }" },
+        .{ "su", "comptime_int = 0" },
         .{ "empty", "@TypeOf(.{}) = .{}" },
         // All fields are comptime fields
         .{ "s0", "comptime_int = 0" },

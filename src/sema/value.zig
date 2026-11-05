@@ -776,6 +776,22 @@ fn anyComptimeOnly(ip: *InternPool, types: []const Index) bool {
 
 /// Tuples and anonymous structs: comptime fields (such as `comptime comptime_int = 5`) do not
 /// make the type comptime-only
+/// The value of a tuple or anonymous struct type whose fields are all comptime fields (the type
+/// of `.{ 1, "a" }`): it is the only value of the type, so it is known at comptime even when it
+/// is passed to a runtime parameter. Null for other types.
+pub fn comptimeFieldsValue(ip: *InternPool, gpa: Allocator, t: Index) Allocator.Error!?Index {
+    const types, const values = switch (ip.key(t)) {
+        .tuple_type => |tt| .{ tt.types, tt.values },
+        .anon_struct_type => |a| .{ a.types, a.values },
+        else => return null,
+    };
+    for (0..types.len) |i| switch (InternPool.fieldValue(values, i)) {
+        .runtime, .unknown => return null,
+        else => {},
+    };
+    return try aggregate(ip, gpa, t, values);
+}
+
 fn anyRuntimeComptimeOnly(ip: *InternPool, types: []const Index, values: []const Index) bool {
     for (types, 0..) |t, i| {
         const v = InternPool.fieldValue(values, i);
