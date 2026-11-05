@@ -216,8 +216,21 @@ pub fn returnType(r: *Resolver, owner: hir.OwnerKey, body: *const Body, sig: *co
     const ret = sig.exprs[@backingInt(t)].asType() orelse return .unknown;
     if (ret == .unknown or !try inferredErrorSet(r, owner)) return ret;
     const ip = r.ctx.db.env.ip;
-    const set = try ip.get(.{ .inferred_error_set = .{ .file = owner.file, .decl = owner.item, .inst = inst } });
+    const set = try ip.get(.{ .inferred_error_set = .{ .file = owner.file, .decl = owner.item, .inst = declaredInst(ip, owner, inst) } });
     return ip.get(.{ .error_union_type = .{ .err = set, .payload = ret } });
+}
+
+/// The instance context of the declaration of a function, given an instance it runs in. A call of
+/// a non-generic function runs in an instance whose arguments are all runtime; it is the function
+/// as declared, so its return type must be the one in the type of the function.
+fn declaredInst(ip: *InternPool, owner: hir.OwnerKey, inst: ?Index) ?Index {
+    const i = switch (ip.key(inst orelse return null)) {
+        .instance => |i| i,
+        else => return inst,
+    };
+    if (i.file != owner.file or i.decl != owner.item) return inst;
+    for (i.args) |a| if (a != .runtime) return inst;
+    return i.parent;
 }
 
 /// Ranges of code in a member that is not compiled: the `inactive` and `dead_spans` of `Infer`

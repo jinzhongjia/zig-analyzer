@@ -434,6 +434,85 @@ test "generic functions, anytype and comptime branches" {
     });
 }
 
+test "functions with an inferred error set are evaluated in constants" {
+    // The inferred error set of the running function must be the one in the function's type,
+    // otherwise the computed value of the initializer is discarded.
+    try expectTypes(
+        \\fn check(c: u8) !u8 {
+        \\    if (c == 0) return error.Bad;
+        \\    return c;
+        \\}
+        \\const ok = check(1);
+        \\const bad = check(0);
+        \\const unwrapped = check(2) catch unreachable;
+        \\const known = if (unwrapped >= 2) u16 else u8;
+        \\fn g() void { _ = .{ ok, bad, known }; }
+    , &.{
+        .{ "ok", "error{Bad}!u8 = 1" },
+        .{ "bad", "error{Bad}!u8 = error.Bad" },
+        .{ "unwrapped", "u8 = 2" },
+        .{ "known", "type = u16" },
+    });
+}
+
+test "struct literals with an error union or optional result type" {
+    // A literal whose result type is an error union was given up on, unlike an optional one.
+    try expectTypes(
+        \\const V = struct { minor: usize };
+        \\fn inferred() !V { return .{ .minor = 1 }; }
+        \\fn explicit() error{X}!V { return .{ .minor = 2 }; }
+        \\fn optional() ?V { return .{ .minor = 3 }; }
+        \\const a = inferred();
+        \\const b = explicit();
+        \\const c = optional();
+        \\fn g() void { _ = .{ a, b, c }; }
+    , &.{
+        .{ "a", "error{}!V = .{ .minor = 1 }" },
+        .{ "b", "error{X}!V = .{ .minor = 2 }" },
+        .{ "c", "?V = .{ .minor = 3 }" },
+    });
+}
+
+test "enums defined in a signature compare and switch by tag across instances" {
+    // A tag keeping the type of another instance of the function made its comparison unknown.
+    try expectTypes(
+        \\fn runtime(s: enum { pos, neg }) u8 { return if (s == .pos) 1 else 2; }
+        \\fn generic(comptime s: enum { pos, neg }) u8 { return if (s == .neg) 1 else 2; }
+        \\fn switched(comptime s: enum { pos, neg }) u8 { return switch (s) { .pos => 1, .neg => 2 }; }
+        \\const a = runtime(.pos);
+        \\const b = generic(.pos);
+        \\const c = switched(.neg);
+        \\fn g() void { _ = .{ a, b, c }; }
+    , &.{
+        .{ "a", "u8 = 1" },
+        .{ "b", "u8 = 2" },
+        .{ "c", "u8 = 2" },
+    });
+}
+
+test "a condition computed by a function selects the branch of a version check" {
+    // The arm that is not taken names a field that does not exist, so the type comes from the
+    // condition's value alone.
+    try expectTypes(
+        \\const Version = struct { minor: usize };
+        \\fn parseNum(text: []const u8, comptime sign: enum { pos, neg }) !usize {
+        \\    if (text.len == 0) return error.Empty;
+        \\    return switch (sign) { .pos => text.len, .neg => 0 };
+        \\}
+        \\fn parse(text: []const u8) !Version {
+        \\    return .{ .minor = try parseNum(text, .pos) };
+        \\}
+        \\const version = parse("ab") catch unreachable;
+        \\const Build = struct { current: u32 };
+        \\fn g(b: *Build) void {
+        \\    const root = if (comptime version.minor >= 2) b.current else b.removed;
+        \\    _ = root;
+        \\}
+    , &.{
+        .{ "root", "u32" },
+    });
+}
+
 test "names of containers defined in bodies" {
     try expectTypes(
         \\fn Box(comptime T: type) type { return struct { v: T }; }

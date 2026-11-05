@@ -2591,6 +2591,10 @@ const Evaluator = struct {
                 const inner = try ev.initExpr(f, null, fields, child);
                 return .{ .ty = target, .v = inner.v };
             },
+            .error_union_type => |eu| {
+                const inner = try ev.initExpr(f, null, fields, eu.payload);
+                return .{ .ty = target, .v = inner.v };
+            },
             .array_type, .vector_type, .tuple_type => {
                 if (try ev.typeElemCount(target)) |n| if (n != fields.len) return error.Abort;
                 const elems = try ev.a.alloc(Val, fields.len);
@@ -2735,6 +2739,12 @@ const Evaluator = struct {
                 .union_value => |u| if (value.isEnumType(ip, t)) {
                     // A union coerces to its tag
                     return Val.of(t, try ip.get(.{ .enum_tag = .{ .ty = t, .name = u.tag } }));
+                },
+                // An enum defined in a signature (`comptime sign: enum { pos, neg }`) has a type per
+                // instance of the function, and they are one type in the compiler unless the
+                // captures differ: the tag must carry the type it is coerced to
+                .enum_tag => |tag| if (value.isEnumType(ip, t) and try eqlValues(ev.r, tag.ty, t) != false) {
+                    return Val.of(t, try ip.get(.{ .enum_tag = .{ .ty = t, .name = tag.name } }));
                 },
                 else => {},
             },
