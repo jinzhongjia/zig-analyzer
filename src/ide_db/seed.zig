@@ -571,9 +571,10 @@ pub const RootCallers = struct {
         }
         var out: Collector = .{ .limit = std.math.maxInt(usize), .strict = key.strict };
         var callers: std.ArrayList(Caller) = .empty;
+        const mention = try mentioning(&r, key.root.file, candidates.names);
         for (0..files.len + 1) |fi| {
             const f = if (fi == 0) key.root.file else files[fi - 1];
-            if (fi != 0 and (f == key.root.file or !try containsAny(&r, f, candidates.names))) continue;
+            if (fi != 0 and (f == key.root.file or !mention.contains(f))) continue;
             for (try ctx.get(Callers, .{ .root = key.root, .in = f })) |i| {
                 // In a file that does not import the target's file, code outside generic functions
                 // cannot name the target's types, so it does not call the target; likewise it
@@ -1001,9 +1002,10 @@ fn collect(r: *Resolver, key: hir.OwnerKey, depth: u8, out: *Collector) resolve.
     const root_key = try r.ownerKey(key.file, root);
     const candidates = try r.ctx.get(Candidates, root_key);
     const files = candidates.files;
+    const mention = try mentioning(r, key.file, candidates.names);
     for (0..files.len + 1) |fi| {
         const f = if (fi == 0) key.file else files[fi - 1];
-        if (fi != 0 and (f == key.file or !try containsAny(r, f, candidates.names))) continue;
+        if (fi != 0 and (f == key.file or !mention.contains(f))) continue;
         for (try r.ctx.get(Callers, .{ .root = root_key, .in = f })) |i| {
             if (out.full()) return;
             try collectIn(r, f, i, key.file, item, root_key, candidates.names, depth, out);
@@ -1042,9 +1044,10 @@ fn search_(r: *Resolver, key: hir.OwnerKey, depth: u8, strict: bool) resolve.Err
     const root_key = try r.ownerKey(key.file, root);
     const candidates = try r.ctx.get(Candidates, root_key);
     const files = candidates.files;
+    const mention = try mentioning(r, key.file, candidates.names);
     for (0..files.len + 1) |fi| {
         const f = if (fi == 0) key.file else files[fi - 1];
-        if (fi != 0 and (f == key.file or !try containsAny(r, f, candidates.names))) continue;
+        if (fi != 0 and (f == key.file or !mention.contains(f))) continue;
         for (try r.ctx.get(Callers, .{ .root = root_key, .in = f })) |i| {
             if (try findIn(r, f, i, key.file, item, root_key, candidates.names, depth, strict)) |s| return s;
         }
@@ -1070,8 +1073,9 @@ fn typeFlow(r: *Resolver, file: FileId, item: u32, root: u32, files: []const Fil
     const root_key = try r.ownerKey(file, root);
     const names = [_][]const u8{name};
     var flow: Flow = .{ .r = r, .target = target, .file = file, .item = item, .root_key = root_key, .all = all, .strict = strict, .cut = cut };
+    const mention = try mentioning(r, file, &names);
     for (files) |f| {
-        if (!try containsAny(r, f, &names)) continue;
+        if (!mention.contains(f)) continue;
         const ft = try r.itemTree(f);
         for (ft.items, 0..) |_, i| {
             if (flow.full()) return null;
@@ -1335,8 +1339,9 @@ fn callNames(r: *Resolver, file: FileId, root: u32, files: []const FileId) resol
     var changed = true;
     while (changed) {
         changed = false;
+        const mention = try mentioning(r, file, names.items);
         for (files) |f| {
-            if (!try containsAny(r, f, names.items)) continue;
+            if (!mention.contains(f)) continue;
             const tree = try r.itemTree(f);
             for (tree.items, 0..) |it, i| {
                 if (it.kind != .@"const") continue;
@@ -1359,10 +1364,100 @@ fn contains(names: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-fn containsAny(r: *Resolver, f: FileId, names: []const []const u8) resolve.Error!bool {
-    const index = try r.ctx.get(FileIndex.Query, f);
-    for (names) |n| if (index.contains(n)) return true;
-    return false;
+/// A name in `NameIndex`. A collision only adds a file to a pre-filter, whose files are then checked
+/// precisely.
+const NameHash = u64;
+
+fn nameHash(name: []const u8) NameHash {
+    return std.hash.Wyhash.hash(0, name);
+}
+
+/// The searched files by the names they contain. Queries that pre-filter files by name read
+/// `FileIndex` of the project through this one memo rather than each recording one dependency per
+/// file, which takes hundreds of MB on the Zig compiler source.
+pub const NameIndex = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = void;
+    pub const Value = *const Data;
+    pub const Data = struct {
+        arena: std.heap.ArenaAllocator.State,
+        files: std.AutoHashMapUnmanaged(NameHash, []const FileId),
+    };
+
+    pub fn bytes(v: Value) usize {
+        return @sizeOf(Data) + @import("../util/mem.zig").arenaBytes(v.arena);
+    }
+
+    pub fn compute(ctx: *database.Db.Ctx, _: Key) engine.Error!Value {
+        const gpa = ctx.db.gpa;
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        var lists: std.AutoHashMapUnmanaged(NameHash, std.ArrayList(FileId)) = .empty;
+        for (try search.searchFiles(&r)) |f| {
+            for ((try ctx.get(FileIndex.Query, f)).names) |name| {
+                const gop = try lists.getOrPut(r.arena, nameHash(name));
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(r.arena, f);
+            }
+        }
+        const data = try gpa.create(Data);
+        errdefer gpa.destroy(data);
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var files: std.AutoHashMapUnmanaged(NameHash, []const FileId) = .empty;
+        try files.ensureTotalCapacity(a, lists.count());
+        var it = lists.iterator();
+        while (it.next()) |e| files.putAssumeCapacity(e.key_ptr.*, try a.dupe(FileId, e.value_ptr.items));
+        data.* = .{ .arena = arena.state, .files = files };
+        return data;
+    }
+
+    /// `NameFiles` cuts off what did not change
+    pub fn eql(_: Value, _: Value) bool {
+        return false;
+    }
+
+    pub fn deinit(v: *Value, gpa: std.mem.Allocator) void {
+        const data: *Data = @constCast(v.*);
+        var arena = data.arena.promote(gpa);
+        arena.deinit();
+        gpa.destroy(data);
+    }
+};
+
+/// The searched files that contain a name. It changes only when a file gains or loses that name, so
+/// other changes to the names of a file do not recompute the queries that read it.
+pub const NameFiles = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = NameHash;
+    pub const Value = []const FileId;
+
+    pub fn compute(ctx: *database.Db.Ctx, name: Key) engine.Error!Value {
+        const index = try ctx.get(NameIndex, {});
+        return ctx.db.gpa.dupe(FileId, index.files.get(name) orelse &.{});
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(FileId, a, b);
+    }
+
+    pub fn deinit(v: *Value, gpa: std.mem.Allocator) void {
+        gpa.free(v.*);
+    }
+};
+
+const Mentioning = std.AutoHashMapUnmanaged(FileId, void);
+
+/// The candidate files of `target` that contain any of `names`. Candidates are searched files plus
+/// `target` itself, which need not be one (see `search.importers`).
+fn mentioning(r: *Resolver, target: FileId, names: []const []const u8) resolve.Error!Mentioning {
+    var out: Mentioning = .empty;
+    for (names) |n| for (try r.ctx.get(NameFiles, nameHash(n))) |f| try out.put(r.arena, f, {});
+    const index = try r.ctx.get(FileIndex.Query, target);
+    for (names) |n| if (index.contains(n)) try out.put(r.arena, target, {});
+    return out;
 }
 
 /// Coarse filtering by the member summary first, to avoid building a Body for unrelated members
