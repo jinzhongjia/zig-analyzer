@@ -496,9 +496,30 @@ const Inferrer = struct {
             return .{ .ty = a, .val = try value.comptimeFieldsValue(inf.ip, inf.scratch, a) };
         };
         const ty: Index = (try inf.inferComptime(ty_e, null)).asType() orelse .unknown;
-        if (arg) |a| if (a != .unknown and a != .runtime) return .{ .ty = ty, .val = (try value.coerceValue(inf.ip, a, ty)) orelse a };
+        if (arg) |a| if (a != .unknown and a != .runtime) return .{ .ty = ty, .val = (try value.coerceValue(inf.ip, try inf.paramTag(a, ty), ty)) orelse a };
         if (ty == .type_type and (arg == null or arg.? == .unknown)) return TypedValue.ofType(try inf.ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = try inf.body_owner(), .binding = @backingInt(p), .name = binding.name } }));
         return .{ .ty = ty, .val = try value.comptimeFieldsValue(inf.ip, inf.scratch, ty) };
+    }
+
+    /// An enum defined in the signature (`comptime sign: enum { pos, neg }`) has a type per
+    /// instance: the argument the instance records was coerced to the parameter type of the
+    /// signature the caller saw, and is the same tag of the parameter type here
+    fn paramTag(inf: *Inferrer, a: Index, ty: Index) Error!Index {
+        const ip = inf.ip;
+        const tag = switch (ip.key(a)) {
+            .enum_tag => |t| t,
+            else => return a,
+        };
+        const x = switch (ip.key(tag.ty)) {
+            .container_type => |c| c,
+            else => return a,
+        };
+        const y = switch (ip.key(ty)) {
+            .container_type => |c| c,
+            else => return a,
+        };
+        if (tag.ty == ty or x.file != y.file or x.ast_id != y.ast_id) return a;
+        return ip.get(.{ .enum_tag = .{ .ty = ty, .name = tag.name } });
     }
 
     /// Reading the ItemTree is a query: even when it is cached, `error.Canceled` is returned when
@@ -1598,7 +1619,7 @@ const Inferrer = struct {
         const ip = inf.ip;
         const a = lhs.val orelse return null;
         const b = rhs.val orelse return null;
-        if (value.intOf(ip, a)) |x| if (value.intOf(ip, b)) |y| return order(op, x, y);
+        if (value.intOf(ip, a)) |x| if (value.intOf(ip, b)) |y| return value.compareInts(ip, op, lhs.ty, rhs.ty, x, y);
         if (ip.key(a) == .float_value or ip.key(b) == .float_value) if (value.floatOf(ip, a)) |x| if (value.floatOf(ip, b)) |y| return order(op, x, y);
         if (op != .equal_equal and op != .bang_equal) return null;
         const eq = try eval.eqlValues(inf.r, a, b) orelse return null;

@@ -566,6 +566,23 @@ test "pointer casts keep the value only when the elements are unchanged" {
     });
 }
 
+test "a function chosen by switching on an enum defined in the signature" {
+    // The tag recorded by the instance kept the type of another instance, so no prong was chosen
+    // and the error set became anyerror.
+    try expectTypes(
+        \\fn add(comptime T: type, a: T, b: T) error{Overflow}!T { return a + b; }
+        \\fn sub(comptime T: type, a: T, b: T) error{Overflow}!T { return a - b; }
+        \\fn pick(comptime s: enum { pos, neg }) !u8 {
+        \\    const f = switch (s) { .pos => add, .neg => sub };
+        \\    return f(u8, 1, 2);
+        \\}
+        \\const r = pick(.pos);
+        \\fn g() void { _ = r; }
+    , &.{
+        .{ "r", "error{Overflow}!u8 = 3" },
+    });
+}
+
 test "the sentinel element of an array" {
     try expectTypes(
         \\const read = blk: {
