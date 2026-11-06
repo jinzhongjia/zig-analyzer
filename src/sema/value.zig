@@ -15,6 +15,7 @@ const Allocator = std.mem.Allocator;
 const InternPool = @import("InternPool.zig");
 const Index = InternPool.Index;
 const SyntaxKind = @import("../syntax/kind.zig").SyntaxKind;
+const bigint = @import("bigint.zig");
 
 // ── Integers ─────────────────────────────────────────────────────────
 
@@ -318,6 +319,7 @@ pub fn bitNot(ip: *InternPool, ty: Index, a: i128) ?i128 {
 pub fn typeOfValue(ip: *InternPool, v: Index) Index {
     return switch (ip.key(v)) {
         .int_value => |i| i.ty,
+        .big_int => .comptime_int_type,
         .enum_literal => .enum_literal_type,
         .enum_tag => |t| t.ty,
         .simple_value => |s| switch (s) {
@@ -450,6 +452,7 @@ pub fn floatOf(ip: *InternPool, v: ?Index) ?f128 {
     return switch (ip.key(v orelse return null)) {
         .float_value => |f| @bitCast(f.bits),
         .int_value => |i| if (isUnsigned128(ip, i.ty)) @floatFromInt(@as(u128, @bitCast(i.value))) else @floatFromInt(i.value),
+        .big_int => |i| bigint.toFloat(.{ .limbs = i.limbs, .positive = i.positive }),
         else => null,
     };
 }
@@ -641,6 +644,28 @@ pub fn intOf(ip: *InternPool, v: ?Index) ?i128 {
         .int_value => |i| i.value,
         else => null,
     };
+}
+
+/// The arbitrary-precision value of an interned `comptime_int`
+pub fn bigValueOf(ip: *InternPool, allocator: Allocator, v: Index) Allocator.Error!?bigint.Big {
+    return switch (ip.key(v)) {
+        .big_int => |b| .{ .limbs = b.limbs, .positive = b.positive },
+        .int_value => |i| if (i.ty == .comptime_int_type) try bigint.fromInt(allocator, i.value) else null,
+        else => null,
+    };
+}
+
+/// Like `bigValueOf`, also converting other integer values (a shift amount of a fixed-width
+/// type)
+pub fn bigValueOfAny(ip: *InternPool, allocator: Allocator, v: ?Index) Allocator.Error!?bigint.Big {
+    if (try bigValueOf(ip, allocator, v orelse return null)) |b| return b;
+    return try bigint.fromInt(allocator, intOf(ip, v) orelse return null);
+}
+
+/// Interns a `comptime_int` value; a value in the range of i128 is interned as `int_value`
+pub fn internComptimeInt(ip: *InternPool, allocator: Allocator, b: bigint.Big) Allocator.Error!Index {
+    if (bigint.toInt(b)) |x| return ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = x } });
+    return ip.get(.{ .big_int = .{ .positive = b.positive, .limbs = b.limbs, .decimal = try bigint.decimalAlloc(allocator, b) } });
 }
 
 // ── Size and alignment ───────────────────────────────────────────────
@@ -1173,11 +1198,19 @@ pub fn eqlValues(ip: *InternPool, a: Index, b: Index) ?bool {
     return switch (ka) {
         .int_value => |x| switch (kb) {
             .int_value => |y| x.value == y.value,
+            // An integer that does not fit i128 is outside the range of every stored int_value
+            .big_int => false,
             .float_value => |y| @as(f128, @floatFromInt(x.value)) == @as(f128, @bitCast(y.bits)),
             else => null,
         },
+        .big_int => |x| switch (kb) {
+            .big_int => |y| x.positive == y.positive and std.mem.eql(std.math.big.Limb, x.limbs, y.limbs),
+            .int_value => false,
+            .float_value => |y| bigint.toFloat(.{ .limbs = x.limbs, .positive = x.positive }) == @as(f128, @bitCast(y.bits)),
+            else => null,
+        },
         .float_value => |x| switch (kb) {
-            .float_value, .int_value => @as(f128, @bitCast(x.bits)) == floatOf(ip, b).?,
+            .float_value, .int_value, .big_int => @as(f128, @bitCast(x.bits)) == floatOf(ip, b).?,
             else => null,
         },
         .simple_value => |x| switch (kb) {
@@ -1291,6 +1324,14 @@ pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index 
         else => {},
     };
     if (ip.isInt(to)) switch (ip.key(v)) {
+        .big_int => |b| {
+            const info = intInfo(ip, to) orelse return null;
+            if (info.bits > 128) return null;
+            const big: bigint.Big = .{ .limbs = b.limbs, .positive = b.positive };
+            if (!big.fitsInTwosComp(if (info.signed) .signed else .unsigned, info.bits)) return null;
+            const x: i128 = if (info.signed) big.toInt(i128) catch return null else @bitCast(big.toInt(u128) catch return null);
+            return try ip.get(.{ .int_value = .{ .ty = to, .value = x } });
+        },
         .int_value => |i| {
             if (i.ty == to) return v;
             if (!intFitsFrom(ip, i.ty, to, i.value)) return null;

@@ -32,6 +32,7 @@ const SyntaxKind = @import("../syntax/kind.zig").SyntaxKind;
 const queries = @import("queries.zig");
 const infer = @import("infer.zig");
 const value = @import("value.zig");
+const bigint = @import("bigint.zig");
 const zon = @import("zon.zig");
 
 /// Default quota of backward branches (each loop iteration, each call), same as the compiler;
@@ -626,6 +627,11 @@ const Val = struct {
         return .{ .ty = ty, .v = .{ .int = x } };
     }
 
+    /// An integer that may not fit i128; a value that fits is stored inline
+    fn ofBig(ty: Index, b: bigint.Big) Val {
+        return if (bigint.toInt(b)) |x| .{ .ty = ty, .v = .{ .int = x } } else .{ .ty = ty, .v = .{ .big = b } };
+    }
+
     /// Whether `v` is the interned value `x` (integers are not interned)
     fn is(v: Val, x: Index) bool {
         return v.v == .ip and v.v.ip == x;
@@ -640,6 +646,8 @@ const Repr = union(enum) {
     /// Integer: intermediate results of arithmetic are not interned; they are interned only when
     /// `freeze` hands out the result, so large comptime loops do not bloat the InternPool
     int: i128 align(8),
+    /// A `comptime_int` outside the range of i128: intermediate results are not interned
+    big: bigint.Big,
     /// Mutable aggregate inside the interpreter: arrays, vectors, tuples, structs (in field order)
     agg: *Agg,
     /// Pointer: points to an element inside a storage cell
@@ -802,6 +810,7 @@ const Evaluator = struct {
             .undef => return .undefined_value,
             .ip => |x| return x,
             .int => |x| return try ev.ip.get(.{ .int_value = .{ .ty = v.ty, .value = x } }),
+            .big => |b| return try value.internComptimeInt(ev.ip, ev.a, b),
             .agg, .ref => {},
         }
         if (ev.freeze_depth >= max_freeze_depth) return null;
@@ -818,7 +827,7 @@ const Evaluator = struct {
                 const pointee = try ev.freeze(target) orelse return null;
                 return try ev.pointerTo(v.ty, pointee);
             },
-            .unknown, .undef, .ip, .int => unreachable,
+            .unknown, .undef, .ip, .int, .big => unreachable,
         }
     }
 
@@ -828,6 +837,7 @@ const Evaluator = struct {
         return switch (v.v) {
             .ip => |x| x,
             .int => |x| try ev.ip.get(.{ .int_value = .{ .ty = v.ty, .value = x } }),
+            .big => |b| try value.internComptimeInt(ev.ip, ev.a, b),
             else => null,
         };
     }
@@ -841,10 +851,21 @@ const Evaluator = struct {
         };
     }
 
+    /// Integer value at arbitrary precision; null when it is not a known integer
+    fn bigOf(ev: *Evaluator, v: Val) EvalError!?bigint.Big {
+        return switch (v.v) {
+            .big => |b| b,
+            .int => |x| try bigint.fromInt(ev.a, x),
+            .ip => |x| if (try value.bigValueOf(ev.ip, ev.a, x)) |b| b else if (value.intOf(ev.ip, x)) |n| try bigint.fromInt(ev.a, n) else null,
+            else => null,
+        };
+    }
+
     /// Float value (integers as floats); null when it is not a known number
     fn floatOf(ev: *Evaluator, v: Val) ?f128 {
         return switch (v.v) {
             .int => |x| @floatFromInt(x),
+            .big => |b| bigint.toFloat(b),
             .ip => |x| value.floatOf(ev.ip, x),
             else => null,
         };
@@ -964,7 +985,7 @@ const Evaluator = struct {
         switch (v.v) {
             .unknown => return .{ .ty = ty },
             .undef => return .{ .ty = ty, .v = .undef },
-            .int => return error.Abort,
+            .int, .big => return error.Abort,
             .agg => |agg| return if (i < agg.elems.len) agg.elems[i] else error.Abort,
             .ref => |ref| {
                 // Range: the index is relative to the start of the range; take the element
@@ -1701,6 +1722,11 @@ const Evaluator = struct {
                     try key.append(ka, 1);
                     try key.appendSlice(ka, std.mem.asBytes(&x));
                 },
+                .big => |b| {
+                    const i: u32 = @backingInt(try value.internComptimeInt(ev.ip, ev.a, b));
+                    try key.append(ka, 2);
+                    try key.appendSlice(ka, std.mem.asBytes(&i));
+                },
                 .ip => |x| {
                     const i: u32 = @backingInt(x);
                     try key.append(ka, 2);
@@ -1727,7 +1753,7 @@ const Evaluator = struct {
             // and pointers
             break :blk switch (v.v) {
                 .int, .ip, .undef, .unknown => v,
-                .agg, .ref => thaw(callee.toTyped(v) catch |err| switch (err) {
+                .big, .agg, .ref => thaw(callee.toTyped(v) catch |err| switch (err) {
                     error.Abort, error.Break, error.Continue, error.Return => break :blk .unknown,
                     else => |e| return e,
                 }),
@@ -2140,6 +2166,11 @@ const Evaluator = struct {
                     return boolVal(eq == (op == .equal_equal));
                 }
                 if (ev.intOf(lhs)) |x| if (ev.intOf(rhs)) |y| return boolVal(value.compareInts(ip, op, lhs.ty, rhs.ty, x, y));
+                if (lhs.ty == .comptime_int_type or rhs.ty == .comptime_int_type) {
+                    if (try ev.bigOf(lhs)) |x| {
+                        if (try ev.bigOf(rhs)) |y| return boolVal(compareBig(op, x, y));
+                    }
+                }
                 const a = try ev.freeze(lhs) orelse return error.Abort;
                 const b = try ev.freeze(rhs) orelse return error.Abort;
                 if (value.intOf(ip, a)) |x| if (value.intOf(ip, b)) |y| return boolVal(value.compareInts(ip, op, value.typeOfValue(ip, a), value.typeOfValue(ip, b), x, y));
@@ -2183,10 +2214,20 @@ const Evaluator = struct {
                     return Val.of(ty, try value.binaryFloat(ip, op, ty, x, y) orelse return error.Abort);
                 }
                 const ty = if (is_shift) lhs.ty else value.peerIntType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
-                const a = ev.intOf(lhs) orelse return error.Abort;
-                const b = ev.intOf(rhs) orelse return error.Abort;
-                const r = value.binaryInt(ip, op, ty, a, b) orelse return error.Abort;
-                return Val.ofInt(ty, r);
+                if (ev.intOf(lhs)) |a| {
+                    if (ev.intOf(rhs)) |b| {
+                        if (value.binaryInt(ip, op, ty, a, b)) |r| return Val.ofInt(ty, r);
+                    }
+                }
+                // A comptime_int operand may not fit i128 (or the result may not): compute at
+                // arbitrary precision
+                if (ty == .comptime_int_type) {
+                    const a = try ev.bigOf(lhs) orelse return error.Abort;
+                    const b = try ev.bigOf(rhs) orelse return error.Abort;
+                    const r = try bigint.binary(ev.a, op, a, b) orelse return error.Abort;
+                    return Val.ofBig(ty, r);
+                }
+                return error.Abort;
             },
         }
     }
@@ -2272,12 +2313,22 @@ const Evaluator = struct {
                     const x = ev.floatOf(v) orelse return error.Abort;
                     return Val.of(v.ty, try value.floatValue(ip, v.ty, -x) orelse return error.Abort);
                 }
-                const a = ev.intOf(v) orelse return error.Abort;
-                const r = switch (op) {
-                    .tilde => value.bitNot(ip, v.ty, a),
-                    else => value.negate(ip, v.ty, a, op == .minus_percent),
-                } orelse return error.Abort;
-                return Val.ofInt(v.ty, r);
+                if (ev.intOf(v)) |a| {
+                    if (switch (op) {
+                        .tilde => value.bitNot(ip, v.ty, a),
+                        else => value.negate(ip, v.ty, a, op == .minus_percent),
+                    }) |r| return Val.ofInt(v.ty, r);
+                }
+                if (v.ty == .comptime_int_type) {
+                    const a = try ev.bigOf(v) orelse return error.Abort;
+                    const r: bigint.Big = switch (op) {
+                        // `~` is not defined for comptime_int
+                        .minus => bigint.negate(a),
+                        else => return error.Abort,
+                    };
+                    return Val.ofBig(v.ty, r);
+                }
+                return error.Abort;
             },
             .ampersand => {
                 // `&s.*` for a slice `s`: a single-item pointer to its array, with the constness
@@ -2481,6 +2532,12 @@ const Evaluator = struct {
                 .caret => x != y,
                 else => return error.Abort,
             }));
+        }
+        if (old.ty == .comptime_int_type) {
+            const a = try ev.bigOf(old) orelse return error.Abort;
+            const b = try ev.bigOf(rhs) orelse return error.Abort;
+            const r = try bigint.binary(ev.a, bin, a, b) orelse return error.Abort;
+            return ev.store(ref, Val.ofBig(old.ty, r));
         }
         const a = ev.intOf(old) orelse return error.Abort;
         const b = ev.intOf(rhs) orelse return error.Abort;
@@ -2774,6 +2831,7 @@ const Evaluator = struct {
             // Coercion to floats, enums, etc.: coerce the interned value
             return ev.coerceValue(Val.of(v.ty, (try ev.ipOf(v)).?), want);
         }
+        if (v.v == .big) return ev.coerceValue(Val.of(v.ty, try value.internComptimeInt(ip, ev.a, v.v.big)), want);
         switch (v.v) {
             .ip => |x| switch (ip.key(x)) {
                 .int_value, .enum_literal => {
@@ -2784,6 +2842,12 @@ const Evaluator = struct {
                         // Tag of a void field in a union
                         if (ev.isUnion(t)) return Val.of(t, try ip.get(.{ .union_value = .{ .ty = t, .tag = ip.key(x).enum_literal, .payload = .void_value } }));
                     }
+                    return Val.of(t, cx);
+                },
+                // A comptime_int outside i128: an integer type takes the value if it fits, a
+                // float type rounds it
+                .big_int => if (ip.isFloat(t) or ip.isInt(t)) {
+                    const cx = try value.coerceValue(ip, x, t) orelse return error.Abort;
                     return Val.of(t, cx);
                 },
                 // Float value to a float / integer type: round to the target precision or convert
@@ -3190,6 +3254,21 @@ const Evaluator = struct {
         if (eq(u8, name, "@min") or eq(u8, name, "@max")) {
             if (vals.len == 0) return error.Abort;
             const op: value.FloatBinFn = if (eq(u8, name, "@min")) .min else .max;
+            // All comptime_int operands may be arbitrary-precision values
+            var all_comptime = true;
+            for (vals) |v| if (v.ty != .comptime_int_type) {
+                all_comptime = false;
+                break;
+            };
+            if (all_comptime) {
+                var best = try ev.bigOf(vals[0]) orelse return error.Abort;
+                for (vals[1..]) |v| {
+                    const x = try ev.bigOf(v) orelse return error.Abort;
+                    const ord = bigint.order(x, best);
+                    if ((op == .min and ord == .lt) or (op == .max and ord == .gt)) best = x;
+                }
+                return Val.ofBig(.comptime_int_type, best);
+            }
             const operands = try ev.a.alloc(TypedValue, vals.len);
             for (vals, operands) |v, *o| o.* = .{ .ty = v.ty, .val = try ev.ipOf(v) };
             if (anyFloat(ip, vals)) {
@@ -3213,6 +3292,10 @@ const Evaluator = struct {
         if (eq(u8, name, "@abs")) {
             if (vals.len != 1) return error.Abort;
             if (ip.isFloat(vals[0].ty)) return try floatResult(vals[0].ty, try value.floatUnary(ip, .abs, vals[0].ty, try ev.floatArg(vals[0])));
+            if (vals[0].ty == .comptime_int_type) {
+                const b = try ev.bigOf(vals[0]) orelse return error.Abort;
+                return Val.ofBig(vals[0].ty, if (b.positive) b else bigint.negate(b));
+            }
             const x = try ev.intArg(vals[0]);
             if (x == std.math.minInt(i128)) return error.Abort;
             const ty = try value.absType(ip, vals[0].ty) orelse return error.Abort;
@@ -3239,6 +3322,21 @@ const Evaluator = struct {
                 return try floatResult(ty, try value.floatBinary(ip, d[1], ty, try ev.floatArg(vals[0]), try ev.floatArg(vals[1])));
             }
             const ty = value.peerIntType(ip, vals[0].ty, vals[1].ty) orelse return error.Abort;
+            if (ty == .comptime_int_type) {
+                const a = try ev.bigOf(vals[0]) orelse return error.Abort;
+                const b = try ev.bigOf(vals[1]) orelse return error.Abort;
+                const mode: bigint.DivMode = switch (d[1]) {
+                    .div_trunc => .trunc,
+                    .div_floor => .floor,
+                    .div_ceil => .ceil,
+                    .div_exact => .exact,
+                    .mod => .mod,
+                    .rem => .rem,
+                    else => unreachable,
+                };
+                const r = try bigint.divide(ev.a, mode, a, b) orelse return error.Abort;
+                return Val.ofBig(ty, r);
+            }
             const x = try ev.intArg(vals[0]);
             const y = try ev.intArg(vals[1]);
             // The minimum of i128 divided by -1 overflows (the safety check in the interpreter
@@ -3271,6 +3369,13 @@ const Evaluator = struct {
         };
         if (eq(u8, name, "@shlExact") or eq(u8, name, "@shrExact")) {
             if (vals.len != 2) return error.Abort;
+            if (vals[0].ty == .comptime_int_type) {
+                const a = try ev.bigOf(vals[0]) orelse return error.Abort;
+                const n = try ev.intArg(vals[1]);
+                if (n < 0) return error.Abort;
+                const r = try bigint.exactShift(ev.a, eq(u8, name, "@shlExact"), a, @intCast(n)) orelse return error.Abort;
+                return Val.ofBig(vals[0].ty, r);
+            }
             const r = value.exactShift(ip, eq(u8, name, "@shlExact"), vals[0].ty, try ev.intArg(vals[0]), try ev.intArg(vals[1])) orelse return error.Abort;
             return try ev.int(vals[0].ty, r);
         }
@@ -3392,18 +3497,32 @@ const Evaluator = struct {
         const eq = std.mem.eql;
         if (eq(u8, name, "@bitCast")) if (try ev.floatBitCast(v, t)) |r| return r;
         if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast")) {
-            const x = ev.intOf(v) orelse return .{ .ty = t };
-            if (eq(u8, name, "@intCast")) {
-                if (!value.intFitsFrom(ip, v.ty, t, x)) return error.Abort;
-                return ev.int(t, x);
+            if (ev.intOf(v)) |x| {
+                if (eq(u8, name, "@intCast")) {
+                    if (!value.intFitsFrom(ip, v.ty, t, x)) return error.Abort;
+                    return ev.int(t, x);
+                }
+                const info = value.intInfo(ip, t) orelse return error.Abort;
+                if (eq(u8, name, "@bitCast")) {
+                    const src = value.intInfo(ip, v.ty) orelse return error.Abort;
+                    if (src.bits != info.bits) return error.Abort;
+                }
+                const r = value.binaryInt(ip, .plus_percent, t, x, 0) orelse return error.Abort;
+                return ev.int(t, r);
             }
-            const info = value.intInfo(ip, t) orelse return error.Abort;
-            if (eq(u8, name, "@bitCast")) {
-                const src = value.intInfo(ip, v.ty) orelse return error.Abort;
-                if (src.bits != info.bits) return error.Abort;
+            // A comptime_int outside i128
+            if (try ev.bigOf(v)) |b| {
+                if (!ip.isInt(t)) return error.Abort;
+                const info = value.intInfo(ip, t) orelse return error.Abort;
+                if (eq(u8, name, "@truncate")) {
+                    const r = try bigint.truncate(ev.a, b, info.signed, info.bits) orelse return error.Abort;
+                    return ev.int(t, r);
+                }
+                if (!eq(u8, name, "@intCast")) return error.Abort;
+                const cx = try value.coerceValue(ip, try ev.ipOf(v) orelse return .{ .ty = t }, t) orelse return error.Abort;
+                return Val.of(t, cx);
             }
-            const r = value.binaryInt(ip, .plus_percent, t, x, 0) orelse return error.Abort;
-            return ev.int(t, r);
+            return .{ .ty = t };
         }
         if (eq(u8, name, "@enumFromInt") or eq(u8, name, "@fromBackingInt")) {
             const x = ev.intOf(v) orelse return .{ .ty = t };
@@ -4425,6 +4544,18 @@ const Evaluator = struct {
         return ev.ip.intType(.unsigned, std.math.cast(u16, bits) orelse return error.Abort);
     }
 };
+
+fn compareBig(op: SyntaxKind, x: bigint.Big, y: bigint.Big) bool {
+    const ord = bigint.order(x, y);
+    return switch (op) {
+        .equal_equal => ord == .eq,
+        .bang_equal => ord != .eq,
+        .angle_bracket_left => ord == .lt,
+        .angle_bracket_right => ord == .gt,
+        .angle_bracket_left_equal => ord != .gt,
+        else => ord != .lt,
+    };
+}
 
 fn compareNumbers(op: SyntaxKind, x: anytype, y: @TypeOf(x)) bool {
     return switch (op) {

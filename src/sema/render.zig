@@ -435,6 +435,10 @@ const QualifiedNames = struct {
         const ip = q.r.ctx.db.env.ip;
         switch (ip.key(v)) {
             .int_value => |x| if (sema_value.isUnsigned128(ip, x.ty)) try q.w.print("{d}", .{@as(u128, @bitCast(x.value))}) else try q.w.print("{d}", .{x.value}),
+            .big_int => |x| {
+                if (!x.positive) try q.w.writeAll("-");
+                try q.w.writeAll(x.decimal);
+            },
             .simple_value => |s| try q.w.writeAll(if (s == .void) "{}" else @tagName(s)),
             .enum_literal => |n| try q.w.print(".{s}", .{n}),
             .enum_tag => |tag| try q.w.print(".{s}", .{tag.name}),

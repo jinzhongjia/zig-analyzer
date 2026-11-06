@@ -3705,6 +3705,7 @@ test "unsigned 128-bit integers above i128's range" {
     try expectStdTypes(
         \\const std = @import("std");
         \\const high: u128 = @as(u128, 1) << 127;
+        \\const max: u128 = std.math.maxInt(u128);
         \\const shr: u128 = high >> 126;
         \\const sum: u128 = high +% high;
         \\const product: u128 = high *% 2;
@@ -3713,12 +3714,63 @@ test "unsigned 128-bit integers above i128's range" {
         \\const cast: u128 = @intCast(high);
     , &.{
         .{ "high", "u128 = 170141183460469231731687303715884105728" },
+        .{ "max", "u128 = 340282366920938463463374607431768211455" },
         .{ "shr", "u128 = 2" },
         .{ "sum", "u128 = 0" },
         .{ "product", "u128 = 0" },
         .{ "cmp", "bool = true" },
         .{ "truncated", "u64 = 0" },
         .{ "cast", "u128 = 170141183460469231731687303715884105728" },
+    });
+}
+
+test "comptime_int values outside i128" {
+    // `comptime_int` is arbitrary precision: a value beyond i128 was unknown, and so was the
+    // arithmetic on it
+    try expectTypes(
+        \\const a = 0x1_0000_0000_0000_0000_0000_0000_0000_0000;
+        \\const b = 1 << 200;
+        \\const c = b / 3;
+        \\const n = -(1 << 200);
+        \\const folded = blk: {
+        \\    var x = 1 << 200;
+        \\    x += 1;
+        \\    x *= 2;
+        \\    break :blk x;
+        \\};
+        \\const cmp = (1 << 200) > (1 << 199);
+        \\const trunc: i8 = @truncate(-(1 << 200) + 5);
+        \\const cast: u128 = @intCast((1 << 128) - 1);
+        \\const floor = @divFloor(-(1 << 200), 3);
+        \\const mod = @mod(-(1 << 200), 7);
+        \\const rem = @rem(-(1 << 200), 7);
+        \\const min = @min(1 << 200, 1 << 201);
+        \\const max = @max(-(1 << 200), 3);
+        \\const abs = @abs(-(1 << 200));
+        \\const shl = @shlExact(3, 100);
+        \\const shr = @shrExact(1 << 100, 50);
+        \\const mul = (1 << 200) * (1 << 200);
+        \\fn g() void {
+        \\    _ = .{ a, b, c, n, folded, cmp, trunc, cast, floor, mod, rem, min, max, abs, shl, shr, mul };
+        \\}
+    , &.{
+        .{ "a", "comptime_int = 340282366920938463463374607431768211456" },
+        .{ "b", "comptime_int = 1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "c", "comptime_int = 535646014752996758513987364113720867507400997927597611767125" },
+        .{ "n", "comptime_int = -1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "folded", "comptime_int = 3213876088517980551083924184682325205044405987565585670602754" },
+        .{ "cmp", "bool = true" },
+        .{ "trunc", "i8 = 5" },
+        .{ "cast", "u128 = 340282366920938463463374607431768211455" },
+        .{ "floor", "comptime_int = -535646014752996758513987364113720867507400997927597611767126" },
+        .{ "mod", "comptime_int = 3" },
+        .{ "rem", "comptime_int = -4" },
+        .{ "min", "comptime_int = 1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "max", "comptime_int = 3" },
+        .{ "abs", "comptime_int = 1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "shl", "comptime_int = 3802951800684688204490109616128" },
+        .{ "shr", "comptime_int = 1125899906842624" },
+        .{ "mul", "comptime_int = 2582249878086908589655919172003011874329705792829223512830659356540647622016841194629645353280137831435903171972747493376" },
     });
 }
 
@@ -5038,7 +5090,7 @@ test "@import of a zon file is its value in inference and comptime evaluation" {
     _ = try w.add("/p/pos.zon", ".{ .x = 3, .y = 4, .list = .{ 1, 2, 3 } }");
     _ = try w.add("/p/cfg.zon", ".{ .port = 8080 }");
     _ = try w.add("/p/n.zon", "5");
-    // An integer beyond i128
+    // An integer beyond i128 has an arbitrary-precision value
     _ = try w.add("/p/big.zon", "0x1_0000_0000_0000_0000_0000_0000_0000_0000");
     const src =
         \\const pos = @import("pos.zon");
@@ -5075,7 +5127,7 @@ test "@import of a zon file is its value in inference and comptime evaluation" {
         // Structs are parsed according to the result type, not converted from the anonymous
         // value: the value cannot be evaluated
         .{ "port_value", "u16" },
-        .{ "big", "comptime_int" },
+        .{ "big", "comptime_int = 340282366920938463463374607431768211456" },
     };
     for (cases) |c| {
         testing.expectEqualStrings(c[1], try typeAt(&w, f.file, src, c[0], 0)) catch |err| {
