@@ -1088,7 +1088,14 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         },
         // The void value is written as `{}` (`void` is the type)
         .simple_value => |v| try w.writeAll(if (v == .void) "{}" else @tagName(v)),
-        .int_value => |v| try w.print("{d}", .{v.value}),
+        // An unsigned 128-bit value above i128's range is stored as the bit pattern
+        .int_value => |v| {
+            const wide = switch (ip.key(v.ty)) {
+                .int_type => |i| i.signedness == .unsigned and i.bits == 128,
+                else => false,
+            };
+            if (wide) try w.print("{d}", .{@as(u128, @bitCast(v.value))}) else try w.print("{d}", .{v.value});
+        },
         .float_value => |v| {
             // Prints the shortest representation for the type of the value (√2 as f32 is
             // 1.4142135, not its expansion as f128)

@@ -1123,8 +1123,7 @@ const Evaluator = struct {
 
     fn eval(ev: *Evaluator, f: *Frame, e: ExprId, want: ?Index) EvalError!Val {
         try ev.tick();
-        const raw = try ev.evalInner(f, e, want);
-        return ev.coerce(raw, want);
+        return ev.coerce(try ev.evalInner(f, e, want), want);
     }
 
     /// Evaluates to a type
@@ -1404,6 +1403,8 @@ const Evaluator = struct {
             },
             else => {},
         }
+        // A pointer to a type (`tables.T` with `tables: *const type` in std.fmt.float)
+        if (v.ty == .type_type) return ev.typeMember((try ev.ipOf(v)) orelse return error.Abort, name);
         if (std.mem.eql(u8, name, "len")) if (ev.isSequence(v.ty)) {
             const n = try ev.elemCount(v) orelse return .{ .ty = .usize_type };
             return Val.of(.usize_type, try ip.get(.{ .int_value = .{ .ty = .usize_type, .value = n } }));
@@ -1652,7 +1653,15 @@ const Evaluator = struct {
             // Call through a query once half of the native stack is used: the query engine
             // interrupts very deep recursion when the stack is nearly exhausted and computes it in
             // segments from where it was interrupted
-            if (scalar and ev.r.ctx.stackUsed() < ev.r.ctx.stack_budget / 2) return ev.scalarCall(.{ .file = fv.file, .item = fv.decl }, inst, args);
+            if (scalar and ev.r.ctx.stackUsed() < ev.r.ctx.stack_budget / 2) {
+                // Aggregates and pointers passed to comptime parameters are interned (they
+                // determine the instance): pass the interned values
+                const scalar_args = try ev.a.dupe(Val, args);
+                for (scalar_args, tvs) |*a, tv| if (a.v == .agg or a.v == .ref) {
+                    a.* = thaw(tv);
+                };
+                return ev.scalarCall(.{ .file = fv.file, .item = fv.decl }, inst, scalar_args);
+            }
             for (args, tvs) |a, *tv| if (a.v == .int) {
                 tv.val = try ev.freeze(a);
             };
@@ -2130,10 +2139,10 @@ const Evaluator = struct {
                     const eq = pointerEql(lhs, rhs) orelse return error.Abort;
                     return boolVal(eq == (op == .equal_equal));
                 }
-                if (ev.intOf(lhs)) |x| if (ev.intOf(rhs)) |y| return boolVal(compareNumbers(op, x, y));
+                if (ev.intOf(lhs)) |x| if (ev.intOf(rhs)) |y| return boolVal(value.compareInts(ip, op, lhs.ty, rhs.ty, x, y));
                 const a = try ev.freeze(lhs) orelse return error.Abort;
                 const b = try ev.freeze(rhs) orelse return error.Abort;
-                if (value.intOf(ip, a)) |x| if (value.intOf(ip, b)) |y| return boolVal(compareNumbers(op, x, y));
+                if (value.intOf(ip, a)) |x| if (value.intOf(ip, b)) |y| return boolVal(value.compareInts(ip, op, value.typeOfValue(ip, a), value.typeOfValue(ip, b), x, y));
                 if (ip.key(a) == .float_value or ip.key(b) == .float_value) if (value.floatOf(ip, a)) |x| if (value.floatOf(ip, b)) |y| return boolVal(compareNumbers(op, x, y));
                 if (op != .equal_equal and op != .bang_equal) return error.Abort;
                 const eq = try eqlValues(ev.r, a, b) orelse return error.Abort;
@@ -2422,6 +2431,18 @@ const Evaluator = struct {
                     else => return error.Abort,
                 };
                 old = try ev.deref(p);
+            },
+            // `r.? *= 10` (std.fmt's Parser.number): the payload of a non-null optional, written
+            // back as the optional
+            .unwrap_optional => |x| {
+                ref = try ev.place(f, x);
+                const opt = try ev.load(ref);
+                const child = switch (ev.ip.key(opt.ty)) {
+                    .optional_type => |c| c,
+                    else => return error.Abort,
+                };
+                if (opt.is(.null_value) or opt.v == .unknown or opt.v == .undef) return error.Abort;
+                old = .{ .ty = child, .v = opt.v };
             },
             else => {
                 ref = try ev.place(f, lhs_e);
@@ -3369,10 +3390,11 @@ const Evaluator = struct {
     fn cast(ev: *Evaluator, name: []const u8, v: Val, t: Index) EvalError!Val {
         const ip = ev.ip;
         const eq = std.mem.eql;
+        if (eq(u8, name, "@bitCast")) if (try ev.floatBitCast(v, t)) |r| return r;
         if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast")) {
             const x = ev.intOf(v) orelse return .{ .ty = t };
             if (eq(u8, name, "@intCast")) {
-                if (!value.intFits(ip, t, x)) return error.Abort;
+                if (!value.intFitsFrom(ip, v.ty, t, x)) return error.Abort;
                 return ev.int(t, x);
             }
             const info = value.intInfo(ip, t) orelse return error.Abort;
@@ -3403,6 +3425,38 @@ const Evaluator = struct {
             return ev.int(t, i);
         }
         return .{ .ty = t, .v = v.v };
+    }
+
+    /// `@bitCast` between a float and an integer of the same bit width (as std.fmt.float does to
+    /// read the parts of a float); null when neither side is a float
+    fn floatBitCast(ev: *Evaluator, v: Val, t: Index) EvalError!?Val {
+        const ip = ev.ip;
+        if (ip.isFloat(v.ty) and ip.isInt(t)) {
+            const x = ev.floatOf(v) orelse return .{ .ty = t };
+            const bits = value.floatToBits(ip, v.ty, x) orelse return .{ .ty = t };
+            const info = value.intInfo(ip, t) orelse return error.Abort;
+            if (info.bits != value.floatBits(ip, v.ty)) return error.Abort;
+            const n: i128 = if (info.signed) switch (info.bits) {
+                16 => @as(i16, @bitCast(@as(u16, @truncate(bits)))),
+                32 => @as(i32, @bitCast(@as(u32, @truncate(bits)))),
+                64 => @as(i64, @bitCast(@as(u64, @truncate(bits)))),
+                80 => @as(i80, @bitCast(@as(u80, @truncate(bits)))),
+                128 => @bitCast(bits),
+                else => return error.Abort,
+            } else if (info.bits == 128) @bitCast(bits) else std.math.cast(i128, bits) orelse return .{ .ty = t };
+            return try ev.int(t, n);
+        }
+        if (ip.isInt(v.ty) and ip.isFloat(t)) {
+            const x = ev.intOf(v) orelse return .{ .ty = t };
+            const info = value.intInfo(ip, v.ty) orelse return error.Abort;
+            const width = value.floatBits(ip, t) orelse return .{ .ty = t };
+            if (info.bits != width) return error.Abort;
+            const mask: u128 = if (width == 128) std.math.maxInt(u128) else (@as(u128, 1) << @intCast(width)) - 1;
+            const bits = @as(u128, @bitCast(x)) & mask;
+            const f = value.floatFromBits(ip, t, bits) orelse return .{ .ty = t };
+            return Val.of(t, try value.floatValue(ip, t, f) orelse return error.Abort);
+        }
+        return null;
     }
 
     fn enumInt(ev: *Evaluator, v: Val) EvalError!Val {

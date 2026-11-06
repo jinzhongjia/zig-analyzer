@@ -10,6 +10,7 @@ const Resolver = resolve.Resolver;
 const Namespace = resolve.Namespace;
 const queries = @import("queries.zig");
 const eval = @import("eval.zig");
+const sema_value = @import("value.zig");
 const database = @import("../database.zig");
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
@@ -433,7 +434,7 @@ const QualifiedNames = struct {
     fn writeValue(q: *QualifiedNames, v: Index) Error!void {
         const ip = q.r.ctx.db.env.ip;
         switch (ip.key(v)) {
-            .int_value => |x| try q.w.print("{d}", .{x.value}),
+            .int_value => |x| if (sema_value.isUnsigned128(ip, x.ty)) try q.w.print("{d}", .{@as(u128, @bitCast(x.value))}) else try q.w.print("{d}", .{x.value}),
             .simple_value => |s| try q.w.writeAll(if (s == .void) "{}" else @tagName(s)),
             .enum_literal => |n| try q.w.print(".{s}", .{n}),
             .enum_tag => |tag| try q.w.print(".{s}", .{tag.name}),

@@ -3648,9 +3648,25 @@ test "an array length that a call instance cannot evaluate is unknown, not the c
     });
 }
 
+/// A builtin with the target and optimize mode of the local machine: the standard library
+/// selects its float tables by the optimize mode (`std.fmt.float`) and whether to use vectors by
+/// the backend (`std.mem`)
+const target_builtin =
+    \\const std = @import("std");
+    \\pub const mode: std.lang.Optimize = .debug;
+    \\pub const cpu: std.Target.Cpu = .{ .arch = .x86_64, .model = undefined, .features = undefined };
+    \\pub const os: std.Target.Os = .{ .tag = .linux, .version_range = undefined };
+    \\pub const abi: std.Target.Abi = .gnu;
+    \\pub const object_format: std.Target.ObjectFormat = .elf;
+    \\pub const link_libc = false;
+    \\pub const single_threaded = false;
+    \\pub const zig_backend: std.lang.CompilerBackend = .stage2_llvm;
+    \\pub const fuzz = false;
+;
+
 test "std.fmt.comptimePrint results keep their pointer, element and sentinel types" {
     // The results were shown with the callee's length text `count(fmt, args)`
-    try expectStdTypes(
+    try expectStdTypesBuiltin(target_builtin,
         \\const std = @import("std");
         \\pub const version = std.fmt.comptimePrint("{d}.{d}.{d}", .{ 1, 22, 3 });
         \\fn probe() void {
@@ -3659,9 +3675,50 @@ test "std.fmt.comptimePrint results keep their pointer, element and sentinel typ
         \\    _ = n;
         \\}
     , &.{
-        .{ "s", "*const [_:0]u8" },
-        .{ "version", "*const [_:0]u8" },
-        .{ "n", "usize" },
+        .{ "s", "*const [1:0]u8 = \"3\"" },
+        .{ "version", "*const [6:0]u8 = \"1.22.3\"" },
+        .{ "n", "usize = 1" },
+    });
+}
+
+test "float formatting in std.fmt at comptime" {
+    // Formatting an f128 reads the parts of the value as u128, which the interpreter stored as
+    // i128: all operations on such values gave up.
+    try expectStdTypesBuiltin(target_builtin,
+        \\const std = @import("std");
+        \\pub const decimal = std.fmt.comptimePrint("{d:3.1}", .{30.0});
+        \\pub const precise = std.fmt.comptimePrint("{d:.3}", .{@as(f64, 1.0 / 3.0)});
+        \\pub const scientific = std.fmt.comptimePrint("{e}", .{@as(f64, 0.05)});
+        \\pub const wide = std.fmt.comptimePrint("{d}", .{@as(f128, 30.0)});
+        \\pub const negative = std.fmt.comptimePrint("{d}", .{@as(f128, -1.25)});
+    , &.{
+        .{ "decimal", "*const [4:0]u8 = \"30.0\"" },
+        .{ "precise", "*const [5:0]u8 = \"0.333\"" },
+        .{ "scientific", "*const [4:0]u8 = \"5e-2\"" },
+        .{ "wide", "*const [2:0]u8 = \"30\"" },
+        .{ "negative", "*const [5:0]u8 = \"-1.25\"" },
+    });
+}
+
+test "unsigned 128-bit integers above i128's range" {
+    // The bit pattern of a u128 value at or above 2^127 was read back as a negative number.
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const high: u128 = @as(u128, 1) << 127;
+        \\const shr: u128 = high >> 126;
+        \\const sum: u128 = high +% high;
+        \\const product: u128 = high *% 2;
+        \\const cmp: bool = high > 1;
+        \\const truncated: u64 = @truncate(high);
+        \\const cast: u128 = @intCast(high);
+    , &.{
+        .{ "high", "u128 = 170141183460469231731687303715884105728" },
+        .{ "shr", "u128 = 2" },
+        .{ "sum", "u128 = 0" },
+        .{ "product", "u128 = 0" },
+        .{ "cmp", "bool = true" },
+        .{ "truncated", "u64 = 0" },
+        .{ "cast", "u128 = 170141183460469231731687303715884105728" },
     });
 }
 

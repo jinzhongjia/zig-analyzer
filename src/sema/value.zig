@@ -91,6 +91,32 @@ fn truncate(info: IntInfo, v: Wide) Wide {
 
 const Overflow = enum { check, wrap, saturate };
 
+/// Whether unsigned values of `info` above the range of i128 are stored as the two's complement
+/// bit pattern in the i128 field
+fn wideStorage(info: IntInfo) bool {
+    return !info.signed and info.bits == 128;
+}
+
+/// The numeric value of the stored bit pattern `a`
+fn toWide(info: IntInfo, a: i128) Wide {
+    return if (wideStorage(info)) @as(u128, @bitCast(a)) else a;
+}
+
+/// The storage of the numeric value `v`; null when it is out of the range of the type
+fn fromWide(info: IntInfo, v: Wide) ?i128 {
+    if (wideStorage(info)) {
+        if (v < 0 or v > std.math.maxInt(u128)) return null;
+        return @bitCast(@as(u128, @intCast(v)));
+    }
+    return std.math.cast(i128, v);
+}
+
+/// Whether the type is an unsigned 128-bit integer
+pub fn isUnsigned128(ip: *InternPool, t: Index) bool {
+    const info = intInfo(ip, t) orelse return false;
+    return wideStorage(info);
+}
+
 /// Fits an arithmetic result into type `ty` (comptime_int or a fixed-width integer). When it is
 /// out of range: plain operations give null (the compiler reports an error), wrapping operations
 /// truncate, and saturating operations clamp to the bound.
@@ -103,14 +129,40 @@ fn fit(ip: *InternPool, ty: Index, v: Wide, mode: Overflow) ?i128 {
         .wrap => truncate(info, v),
         .saturate => if (v < b.min) b.min else b.max,
     };
-    return std.math.cast(i128, r);
+    return fromWide(info, r);
 }
 
-/// Result of a binary integer operation at comptime (`ty` is the result type); null when the
+/// Comparison of two integer values of the given types: unsigned 128-bit values above i128's
+/// range are stored as the bit pattern, so they are compared as u128
+pub fn compareInts(ip: *InternPool, op: SyntaxKind, a_ty: Index, b_ty: Index, a: i128, b: i128) bool {
+    if (isUnsigned128(ip, a_ty) or isUnsigned128(ip, b_ty)) {
+        const x: u128 = @bitCast(a);
+        const y: u128 = @bitCast(b);
+        return switch (op) {
+            .equal_equal => x == y,
+            .bang_equal => x != y,
+            .angle_bracket_left => x < y,
+            .angle_bracket_right => x > y,
+            .angle_bracket_left_equal => x <= y,
+            else => x >= y,
+        };
+    }
+    return switch (op) {
+        .equal_equal => a == b,
+        .bang_equal => a != b,
+        .angle_bracket_left => a < b,
+        .angle_bracket_right => a > b,
+        .angle_bracket_left_equal => a <= b,
+        else => a >= b,
+    };
+}
+
+/// Result type of a binary integer operation at comptime (`ty` is the result type); null when the
 /// result is not determined or the compiler would report an error
 pub fn binaryInt(ip: *InternPool, op: SyntaxKind, ty: Index, a: i128, b: i128) ?i128 {
-    const x: Wide = a;
-    const y: Wide = b;
+    const info: ?IntInfo = if (ty == .comptime_int_type) null else intInfo(ip, ty) orelse return null;
+    const x: Wide = if (info) |i| toWide(i, a) else a;
+    const y: Wide = if (info) |i| toWide(i, b) else b;
     return switch (op) {
         .plus => fit(ip, ty, x + y, .check),
         .plus_percent => fit(ip, ty, x + y, .wrap),
@@ -118,9 +170,9 @@ pub fn binaryInt(ip: *InternPool, op: SyntaxKind, ty: Index, a: i128, b: i128) ?
         .minus => fit(ip, ty, x - y, .check),
         .minus_percent => fit(ip, ty, x - y, .wrap),
         .minus_pipe => fit(ip, ty, x - y, .saturate),
-        .asterisk => fit(ip, ty, x * y, .check),
-        .asterisk_percent => fit(ip, ty, x * y, .wrap),
-        .asterisk_pipe => fit(ip, ty, x * y, .saturate),
+        .asterisk => mul(ip, ty, x, y, .check),
+        .asterisk_percent => mul(ip, ty, x, y, .wrap),
+        .asterisk_pipe => mul(ip, ty, x, y, .saturate),
         // Signed `/` and `%` require @divTrunc etc., so only nonnegative operands are folded
         .slash => if (y <= 0 or x < 0) null else fit(ip, ty, @divTrunc(x, y), .check),
         .percent => if (y <= 0 or x < 0) null else fit(ip, ty, @rem(x, y), .check),
@@ -131,6 +183,23 @@ pub fn binaryInt(ip: *InternPool, op: SyntaxKind, ty: Index, a: i128, b: i128) ?
         .angle_bracket_angle_bracket_left_pipe => shl(ip, ty, x, y, true),
         .angle_bracket_angle_bracket_right => shr(ip, ty, x, y),
         else => null,
+    };
+}
+
+/// `*` and its wrapping and saturating forms: the product of two u128 values does not fit the
+/// intermediate type
+fn mul(ip: *InternPool, ty: Index, x: Wide, y: Wide, mode: Overflow) ?i128 {
+    const r, const overflow = @mulWithOverflow(x, y);
+    if (overflow == 0) return fit(ip, ty, r, mode);
+    return switch (mode) {
+        .check => null,
+        .wrap => fit(ip, ty, x *% y, .wrap),
+        .saturate => blk: {
+            if (ty == .comptime_int_type) break :blk null;
+            const info = intInfo(ip, ty) orelse return null;
+            const b = bounds(info) orelse return null;
+            break :blk fromWide(info, if ((x < 0) != (y < 0)) b.min else b.max);
+        },
     };
 }
 
@@ -148,7 +217,7 @@ fn shl(ip: *InternPool, ty: Index, x: Wide, y: Wide, saturate: bool) ?i128 {
         if (!saturate) return null;
         if (x == 0) return 0;
         const b = bounds(info).?;
-        return std.math.cast(i128, if (x < 0) b.min else b.max);
+        return fromWide(info, if (x < 0) b.min else b.max);
     }
     return fit(ip, ty, x << @intCast(y), if (saturate) .saturate else .wrap);
 }
@@ -157,8 +226,9 @@ fn shr(ip: *InternPool, ty: Index, x: Wide, y: Wide) ?i128 {
     if (y < 0) return null;
     if (ty == .comptime_int_type) return fit(ip, ty, x >> @intCast(@min(y, 255)), .check);
     const info = intInfo(ip, ty) orelse return null;
-    // Values are stored as i128, so results wider than 128 bits cannot be represented; return
-    // null early so that the @intCast of the shift amount to u8 cannot overflow
+    // Values are stored as i128 (or as the bit pattern for u128), so results wider than 128 bits
+    // cannot be represented; return null early so that the @intCast of the shift amount cannot
+    // overflow
     if (info.bits > 128) return null;
     if (y >= info.bits) return null;
     return fit(ip, ty, x >> @intCast(y), .check);
@@ -173,12 +243,18 @@ pub const OverflowOp = enum { add, sub, mul, shl };
 pub fn overflowInt(ip: *InternPool, op: OverflowOp, ty: Index, a: i128, b: i128) ?struct { i128, bool } {
     const info = intInfo(ip, ty) orelse return null;
     if (ty == .comptime_int_type or info.bits > 128) return null;
-    const x: Wide = a;
-    const y: Wide = b;
+    const x: Wide = toWide(info, a);
+    const y: Wide = toWide(info, b);
     const r: Wide = switch (op) {
         .add => x + y,
         .sub => x - y,
-        .mul => x * y,
+        .mul => blk: {
+            // The product of two u128 values does not fit the intermediate type; the low 128
+            // bits are still the wrapped result
+            const m = @mulWithOverflow(x, y);
+            if (m[1] != 0) return .{ fit(ip, ty, x *% y, .wrap) orelse return null, true };
+            break :blk m[0];
+        },
         .shl => if (y < 0 or y >= info.bits) return null else x << @intCast(y),
     };
     const wrapped = fit(ip, ty, r, .wrap) orelse return null;
@@ -189,13 +265,16 @@ pub fn overflowInt(ip: *InternPool, op: OverflowOp, ty: Index, a: i128, b: i128)
 /// overflows or a right shift shifts out a 1 bit
 pub fn exactShift(ip: *InternPool, left: bool, ty: Index, a: i128, b: i128) ?i128 {
     if (b < 0) return null;
-    const x: Wide = a;
     if (ty == .comptime_int_type) {
         if (b > 127) return if (a == 0) 0 else null;
-    } else {
-        const info = intInfo(ip, ty) orelse return null;
-        if (info.bits > 128 or b >= info.bits) return null;
+        const n: u8 = @intCast(b);
+        if (left) return fit(ip, ty, @as(Wide, a) << n, .check);
+        if (a & ((@as(Wide, 1) << n) - 1) != 0) return null;
+        return fit(ip, ty, @as(Wide, a) >> n, .check);
     }
+    const info = intInfo(ip, ty) orelse return null;
+    if (info.bits > 128 or b >= info.bits) return null;
+    const x = toWide(info, a);
     const n: u8 = @intCast(b);
     if (left) return fit(ip, ty, x << n, .check);
     if (x & ((@as(Wide, 1) << n) - 1) != 0) return null;
@@ -219,18 +298,19 @@ pub fn reverseBits(ip: *InternPool, bytes: bool, ty: Index, a: i128) ?i128 {
     } else {
         for (0..info.bits) |i| out |= ((src >> @intCast(i)) & 1) << @intCast(info.bits - 1 - i);
     }
-    return std.math.cast(i128, truncate(info, out));
+    return fromWide(info, truncate(info, out));
 }
 
 /// `-x` / `-%x`
 pub fn negate(ip: *InternPool, ty: Index, a: i128, wrapping: bool) ?i128 {
-    return fit(ip, ty, -@as(Wide, a), if (wrapping) .wrap else .check);
+    const x: Wide = if (ty == .comptime_int_type) a else toWide(intInfo(ip, ty) orelse return null, a);
+    return fit(ip, ty, -x, if (wrapping) .wrap else .check);
 }
 
 /// `~x`: defined only for fixed-width integers
 pub fn bitNot(ip: *InternPool, ty: Index, a: i128) ?i128 {
     const info = intInfo(ip, ty) orelse return null;
-    return fit(ip, ty, truncate(info, ~@as(Wide, a)), .check);
+    return fit(ip, ty, truncate(info, ~toWide(info, a)), .check);
 }
 
 /// Type of a comptime value itself (for values interned without a type, such as the arguments of
@@ -275,6 +355,13 @@ pub fn peerIntType(ip: *InternPool, a: Index, b: Index) ?Index {
 /// Whether the value is in the range of the integer type (always true for comptime_int)
 pub fn intFits(ip: *InternPool, ty: Index, v: i128) bool {
     return fit(ip, ty, v, .check) != null;
+}
+
+/// Whether the value, stored as a value of type `from`, is in the range of the integer type `to`
+pub fn intFitsFrom(ip: *InternPool, from: Index, to: Index, v: i128) bool {
+    if (from == .comptime_int_type) return intFits(ip, to, v);
+    const info = intInfo(ip, from) orelse return intFits(ip, to, v);
+    return fit(ip, to, toWide(info, v), .check) != null;
 }
 
 /// Result type of `@min` / `@max` with integer operands (matches the compiler's `analyzeMinMax`):
@@ -362,7 +449,7 @@ pub fn minMaxFloatType(ip: *InternPool, types: []const Index) ?Index {
 pub fn floatOf(ip: *InternPool, v: ?Index) ?f128 {
     return switch (ip.key(v orelse return null)) {
         .float_value => |f| @bitCast(f.bits),
-        .int_value => |i| @floatFromInt(i.value),
+        .int_value => |i| if (isUnsigned128(ip, i.ty)) @floatFromInt(@as(u128, @bitCast(i.value))) else @floatFromInt(i.value),
         else => null,
     };
 }
@@ -410,6 +497,38 @@ fn FloatOf(comptime k: InternPool.Simple) type {
         .f64 => f64,
         .f80 => f80,
         else => f128,
+    };
+}
+
+/// The bit pattern of float `x` in float type `ty` (what `@bitCast` to an integer gives); null
+/// for comptime_float and c_longdouble, which have no fixed representation here
+pub fn floatToBits(ip: *InternPool, ty: Index, x: f128) ?u128 {
+    return switch (ip.key(ty)) {
+        .simple_type => |s| switch (s) {
+            .f16 => @as(u16, @bitCast(@as(f16, @floatCast(x)))),
+            .f32 => @as(u32, @bitCast(@as(f32, @floatCast(x)))),
+            .f64 => @as(u64, @bitCast(@as(f64, @floatCast(x)))),
+            .f80 => @as(u80, @bitCast(@as(f80, @floatCast(x)))),
+            .f128 => @as(u128, @bitCast(x)),
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// The float of type `ty` with bit pattern `bits` (`@bitCast` from an integer); null as for
+/// `floatToBits`
+pub fn floatFromBits(ip: *InternPool, ty: Index, bits: u128) ?f128 {
+    return switch (ip.key(ty)) {
+        .simple_type => |s| switch (s) {
+            .f16 => @as(f16, @bitCast(@as(u16, @truncate(bits)))),
+            .f32 => @as(f32, @bitCast(@as(u32, @truncate(bits)))),
+            .f64 => @as(f64, @bitCast(@as(u64, @truncate(bits)))),
+            .f80 => @as(f80, @bitCast(@as(u80, @truncate(bits)))),
+            .f128 => @as(f128, @bitCast(bits)),
+            else => null,
+        },
+        else => null,
     };
 }
 
@@ -1174,7 +1293,7 @@ pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index 
     if (ip.isInt(to)) switch (ip.key(v)) {
         .int_value => |i| {
             if (i.ty == to) return v;
-            if (!intFits(ip, to, i.value)) return null;
+            if (!intFitsFrom(ip, i.ty, to, i.value)) return null;
             return try ip.get(.{ .int_value = .{ .ty = to, .value = i.value } });
         },
         else => {},
@@ -1232,6 +1351,25 @@ test "integer folding follows the type's width" {
     try testing.expectEqual(@as(?i128, -128), negate(&ip, i8_t, -128, true));
     try testing.expectEqual(@as(?i128, 0xfe), bitNot(&ip, u8_t, 1));
     try testing.expectEqual(@as(?i128, null), bitNot(&ip, .comptime_int_type, 1));
+    // u128 keeps its bit pattern above i128's range
+    const u128_t = try ip.intType(.unsigned, 128);
+    const high: i128 = @bitCast(@as(u128, 1) << 127);
+    try testing.expectEqual(@as(?i128, high), binaryInt(&ip, .angle_bracket_angle_bracket_left, u128_t, 1, 127));
+    try testing.expectEqual(@as(?i128, 2), binaryInt(&ip, .angle_bracket_angle_bracket_right, u128_t, high, 126));
+    try testing.expectEqual(@as(?i128, std.math.maxInt(i128)), binaryInt(&ip, .minus, u128_t, high, 1));
+    try testing.expectEqual(@as(?i128, 1 << 100), binaryInt(&ip, .slash, u128_t, high, @bitCast(@as(u128, 1) << 27)));
+    try testing.expectEqual(@as(?i128, 0), binaryInt(&ip, .percent, u128_t, high, high));
+    try testing.expectEqual(@as(?i128, 0), binaryInt(&ip, .plus_percent, u128_t, high, high));
+    try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .asterisk, u128_t, high, 2));
+    try testing.expectEqual(@as(?i128, 0), binaryInt(&ip, .asterisk_percent, u128_t, high, 2));
+    try testing.expectEqual(@as(?i128, -1), binaryInt(&ip, .asterisk_pipe, u128_t, high, 2));
+    const product = overflowInt(&ip, .mul, u128_t, high, 2).?;
+    try testing.expectEqual(@as(i128, 0), product[0]);
+    try testing.expectEqual(true, product[1]);
+    try testing.expectEqual(true, compareInts(&ip, .angle_bracket_right, u128_t, u128_t, high, 1));
+    try testing.expectEqual(@as(?i128, high), negate(&ip, u128_t, high, true));
+    try testing.expectEqual(@as(?bool, false), intFits(&ip, u128_t, high));
+    try testing.expectEqual(@as(?bool, true), intFitsFrom(&ip, u128_t, u128_t, high));
 }
 
 test "reified types compare field attributes" {
