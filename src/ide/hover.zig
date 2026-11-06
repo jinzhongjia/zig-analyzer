@@ -119,7 +119,7 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, 
     // A value that is directly the result of `@embedFile`: the call instead of the content
     const embed = if (def) |d| try context.embedOf(r, d, tv) else if (tv.val != null) try context.embedCall(r, a, expr_id.?) else null;
     const code = if (def) |d|
-        try context.signature(r, d, tv)
+        try context.signature(r, d, tv, .multi_line)
     else if (embed) |e|
         try render.embedAlloc(r, tv.ty, e.path)
     else
@@ -194,7 +194,7 @@ fn initFieldHover(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.Expr
     const def = try context.defOfKey(r, field.member orelse return null) orelse return null;
     var out: std.Io.Writer.Allocating = .init(r.arena);
     const w = &out.writer;
-    w.print("```zig\n{s}\n```", .{try context.signature(r, def, .{ .ty = field.ty orelse .unknown })}) catch return error.OutOfMemory;
+    w.print("```zig\n{s}\n```", .{try context.signature(r, def, .{ .ty = field.ty orelse .unknown }, .multi_line)}) catch return error.OutOfMemory;
     if (try context.doc(r, def)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
     return .{ .text = out.written(), .start = tok.offset, .end = tok.range().end };
 }

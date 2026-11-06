@@ -601,28 +601,62 @@ pub fn typeAllocNoting(r: *Resolver, t: Index, max_length: ?usize) error{OutOfMe
     return .{ .text = out.written(), .anonymous = anonymous };
 }
 
-/// Displays `type = T` when the value is a type, and `T = v` for other values known at comptime.
-/// Lists the full contents of the type; the value is limited (see `shownValue`) (hover,
-/// completion details).
+/// How a displayed comptime value is arranged
+pub const ValueLayout = enum {
+    /// On one line, for inline displays such as completion details
+    single_line,
+    /// Across several lines when it is too wide, see `layoutValue` (hover)
+    multi_line,
+};
+
+/// Displays `type = T` when the value is a type, and `T = v` for other values known at comptime,
+/// on one line. Lists the full contents of the type; the value is limited (see `shownValue`).
 pub fn typedValueAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const u8 {
     var out: Io.Writer.Allocating = .init(r.arena);
-    writeFull(r, tv.ty, &out.writer) catch return error.OutOfMemory;
-    if (try shownValue(r, tv)) |v| out.writer.print(" = {s}", .{v}) catch return error.OutOfMemory;
+    try writeTypedValue(r, tv, &out, .single_line);
     return out.written();
 }
 
-/// The part after the declaration name: `: T = v`; only ` = v` when the value determines the
-/// type (see `valueDetermined`)
-pub fn annotationAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const u8 {
-    if (valueDetermined(r.ctx.db.env.ip, tv)) return std.fmt.allocPrint(r.arena, " = {s}", .{(try shownValue(r, tv)).?});
-    return std.fmt.allocPrint(r.arena, ": {s}", .{try typedValueAlloc(r, tv)});
+fn writeTypedValue(r: *Resolver, tv: TypedValue, out: *Io.Writer.Allocating, layout: ValueLayout) error{OutOfMemory}!void {
+    writeFull(r, tv.ty, &out.writer) catch return error.OutOfMemory;
+    if (try shownValue(r, tv)) |v| {
+        out.writer.writeAll(" = ") catch return error.OutOfMemory;
+        try writeValue(v, out, layout);
+    }
 }
 
-/// Display without a declaration (for an expression): only the value when the value determines
-/// the type, otherwise the same as `typedValueAlloc`
+/// Writes `value` after what `out` holds so far, which must be a single line
+fn writeValue(value: []const u8, out: *Io.Writer.Allocating, layout: ValueLayout) error{OutOfMemory}!void {
+    switch (layout) {
+        .single_line => out.writer.writeAll(value) catch return error.OutOfMemory,
+        .multi_line => layoutValue(&out.writer, value, displayWidth(out.written()), 0, 0) catch return error.OutOfMemory,
+    }
+}
+
+/// A declaration with its type and value: `head: T = v`, where `head` is the part before the
+/// colon; only `head = v` when the value determines the type (see `valueDetermined`)
+pub fn declarationAlloc(r: *Resolver, head: []const u8, tv: TypedValue, layout: ValueLayout) error{OutOfMemory}![]const u8 {
+    var out: Io.Writer.Allocating = .init(r.arena);
+    out.writer.writeAll(head) catch return error.OutOfMemory;
+    if (valueDetermined(r.ctx.db.env.ip, tv)) {
+        out.writer.writeAll(" = ") catch return error.OutOfMemory;
+        try writeValue((try shownValue(r, tv)).?, &out, layout);
+    } else {
+        out.writer.writeAll(": ") catch return error.OutOfMemory;
+        try writeTypedValue(r, tv, &out, layout);
+    }
+    return out.written();
+}
+
+/// Display of an expression in hover: only the value when the value determines the type, otherwise
+/// the type and the value
 pub fn exprAlloc(r: *Resolver, tv: TypedValue) error{OutOfMemory}![]const u8 {
-    if (valueDetermined(r.ctx.db.env.ip, tv)) return (try shownValue(r, tv)).?;
-    return typedValueAlloc(r, tv);
+    var out: Io.Writer.Allocating = .init(r.arena);
+    if (valueDetermined(r.ctx.db.env.ip, tv))
+        try writeValue((try shownValue(r, tv)).?, &out, .multi_line)
+    else
+        try writeTypedValue(r, tv, &out, .multi_line);
+    return out.written();
 }
 
 /// Display of a value that is directly the result of `@embedFile(path)`: the type (in full) and
@@ -666,3 +700,142 @@ fn shownValue(r: *Resolver, tv: TypedValue) error{OutOfMemory}!?[]const u8 {
     r.ctx.db.env.ip.print(v, &out.writer, ContainerNames{ .r = r, .full = true, .max_length = max_value_length, .show_total = true }) catch return error.OutOfMemory;
     return out.written();
 }
+
+/// Width of a line of a multi-line value
+const max_value_line_width = 80;
+const value_indent_width = 4;
+
+fn displayWidth(text: []const u8) usize {
+    return std.unicode.utf8CountCodepoints(text) catch text.len;
+}
+
+/// Writes a value printed on one line by `InternPool.print`, breaking its `.{ ... }` lists when it
+/// does not fit in `max_value_line_width`, starting at `column` (`trailing` more characters follow
+/// it on the line). Each item of a broken list is on its own line and is broken the same way;
+/// lists of atoms such as numbers fill their lines instead, so that a large array stays compact.
+/// Only `.{ ... }` lists outside parentheses and other brackets are values: anything else in the
+/// text, such as `struct { ... }` or the arguments of `List(.{ ... })`, belongs to a type and stays
+/// on its line.
+pub fn layoutValue(w: *Io.Writer, value: []const u8, column: usize, indent: usize, trailing: usize) Io.Writer.Error!void {
+    if (column + displayWidth(value) + trailing <= max_value_line_width) return w.writeAll(value);
+    const list = ValueList.find(value) orelse return w.writeAll(value);
+
+    var fill = true;
+    var items = list.items();
+    while (items.next()) |item| fill = fill and (isCutMark(item) or isAtom(item));
+
+    const inner = indent + value_indent_width;
+    try w.writeAll(value[0 .. list.body_start - 1]);
+    try w.writeAll("\n");
+    var line: usize = 0;
+    items = list.items();
+    while (items.next()) |item| {
+        const cut = isCutMark(item);
+        const width = displayWidth(item) + 1;
+        if (line != 0 and (!fill or cut or line + 1 + width > max_value_line_width)) {
+            try w.writeAll("\n");
+            line = 0;
+        }
+        if (line == 0) {
+            try w.splatByteAll(' ', inner);
+            line = inner;
+        } else {
+            try w.writeAll(" ");
+            line += 1;
+        }
+        if (cut) {
+            try w.writeAll(item);
+        } else {
+            try layoutValue(w, item, inner, inner, 1);
+            try w.writeAll(",");
+        }
+        line += width;
+    }
+    try w.writeAll("\n");
+    try w.splatByteAll(' ', indent);
+    try w.writeAll(value[list.body_end + 1 ..]);
+}
+
+/// The `…` that ends a cut list
+fn isCutMark(item: []const u8) bool {
+    return std.mem.startsWith(u8, item, "…");
+}
+
+/// A single token or string, without spaces outside the string
+fn isAtom(item: []const u8) bool {
+    var s: ValueScanner = .{ .text = item };
+    while (s.next()) |c| if (c == ' ') return false;
+    return true;
+}
+
+/// Walks a printed value, treating a string literal as a single `"`
+const ValueScanner = struct {
+    text: []const u8,
+    pos: usize = 0,
+    /// Number of open brackets of any kind
+    depth: usize = 0,
+
+    fn next(s: *ValueScanner) ?u8 {
+        if (s.pos >= s.text.len) return null;
+        const c = s.text[s.pos];
+        s.pos += 1;
+        switch (c) {
+            '"' => while (s.pos < s.text.len) : (s.pos += 1) switch (s.text[s.pos]) {
+                '\\' => s.pos += 1,
+                '"' => {
+                    s.pos += 1;
+                    break;
+                },
+                else => {},
+            },
+            '{', '(', '[' => s.depth += 1,
+            '}', ')', ']' => s.depth -|= 1,
+            else => {},
+        }
+        return c;
+    }
+};
+
+/// The first non-empty `.{ ... }` list of a printed value outside any bracket
+const ValueList = struct {
+    text: []const u8,
+    /// The contents, without the spaces next to the braces
+    body_start: usize,
+    /// Index of the space before the closing brace
+    body_end: usize,
+
+    fn find(text: []const u8) ?ValueList {
+        var s: ValueScanner = .{ .text = text };
+        while (true) {
+            const outside = s.depth == 0;
+            const c = s.next() orelse return null;
+            if (!outside or c != '{' or !std.mem.endsWith(u8, text[0..s.pos], ".{") or !std.mem.startsWith(u8, text[s.pos..], " ")) continue;
+            const body_start = s.pos + 1;
+            while (s.depth != 0) _ = s.next() orelse return null;
+            return .{ .text = text, .body_start = body_start, .body_end = s.pos - 2 };
+        }
+    }
+
+    fn items(l: ValueList) Items {
+        return .{ .scanner = .{ .text = l.text[l.body_start..l.body_end] } };
+    }
+
+    /// Splits the contents at the commas outside any bracket
+    const Items = struct {
+        scanner: ValueScanner,
+        start: usize = 0,
+
+        fn next(it: *Items) ?[]const u8 {
+            const text = it.scanner.text;
+            if (it.start >= text.len) return null;
+            while (it.scanner.next()) |c| if (c == ',' and it.scanner.depth == 0) {
+                const item = text[it.start .. it.scanner.pos - 1];
+                it.scanner.pos += 1;
+                it.start = it.scanner.pos;
+                return item;
+            };
+            defer it.start = text.len;
+            return text[it.start..];
+        }
+    };
+};

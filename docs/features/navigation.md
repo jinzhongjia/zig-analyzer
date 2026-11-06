@@ -19,6 +19,7 @@ Hover, inlay hints, and completion details share `render.zig`.
 A declaration is displayed as `const x: T = v`. At a reference, `T` is the reference's own type, not its coerced result type. A tuple or anonymous struct with only comptime fields shows just the value.
 
 - **Hover and completion details** list types in full, without truncation. Values are cut at about 2000 characters (`render.max_value_length`), marked by `…` and the full size.
+- **Layout**: completion details keep a value on one line. Hover breaks a value that does not fit in 80 columns, with each item of a `.{ ... }` list on its own line and broken the same way; lists of atoms such as numbers and strings fill their lines. Types stay on one line.
 - **`@embedFile`**: a value directly from it is shown as the call, not its bytes. Hover adds the resolved file and size, and the text when it is short, valid text. Values computed from the content keep the cut display.
 - **Inlay hints** are inline, with nested anonymous containers as `struct {...}`. A type hint is at most about `inlay_hints.max_length` characters (default 25, 0 for no limit), and may exceed that by one list item.
 

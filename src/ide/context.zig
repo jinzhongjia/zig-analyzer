@@ -208,7 +208,7 @@ pub fn fileDoc(r: *Resolver, file: FileId) resolve.Error!?[]const u8 {
 
 /// Signature of a definition: the prototype for functions (see `ast.FnProto.writeSignature`), the
 /// `const name: T = v` form for everything else
-pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u8 {
+pub fn signature(r: *Resolver, def: Def, tv: TypedValue, layout: render.ValueLayout) resolve.Error![]const u8 {
     const ip = r.ctx.db.env.ip;
     switch (def) {
         .item => |it| {
@@ -234,7 +234,7 @@ pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u
                 else => {},
             };
             if (try embedOf(r, def, tv)) |e| return std.fmt.allocPrint(r.arena, "{s}{s}: {s}", .{ keyword, name, try render.embedAlloc(r, tv.ty, e.path) });
-            return std.fmt.allocPrint(r.arena, "{s}{s}{s}", .{ keyword, name, try render.annotationAlloc(r, tv) });
+            return render.declarationAlloc(r, try std.mem.concat(r.arena, u8, &.{ keyword, name }), tv, layout);
         },
         .local => |l| {
             const b = (try r.body(l.file, l.item)).binding(l.binding);
@@ -244,7 +244,7 @@ pub fn signature(r: *Resolver, def: Def, tv: TypedValue) resolve.Error![]const u
                 .param, .capture => "",
             };
             if (try embedOf(r, def, tv)) |e| return std.fmt.allocPrint(r.arena, "{s}{f}: {s}", .{ keyword, std.zig.fmtId(b.name), try render.embedAlloc(r, tv.ty, e.path) });
-            return std.fmt.allocPrint(r.arena, "{s}{f}{s}", .{ keyword, std.zig.fmtId(b.name), try render.annotationAlloc(r, tv) });
+            return render.declarationAlloc(r, try std.fmt.allocPrint(r.arena, "{s}{f}", .{ keyword, std.zig.fmtId(b.name) }), tv, layout);
         },
         .file => |f| return std.fmt.allocPrint(r.arena, "@import(\"{s}\")", .{std.fs.path.basename(r.ctx.db.env.vfs.path(f))}),
     }

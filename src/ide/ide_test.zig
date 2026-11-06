@@ -2247,7 +2247,7 @@ test "imported zon files are values with member completion and hover" {
         };
     }
     const hovers = [_]struct { []const u8, []const u8 }{
-        .{ "pos =", "const pos = .{ .x = 1, .y = 2, .name = \"origin\", .tags = .{ .a, .b }, .inner = .{ .z = 1.5, .on = true } }" },
+        .{ "pos =", "const pos = .{\n    .x = 1,\n    .y = 2,\n    .name = \"origin\",\n    .tags = .{ .a, .b },\n    .inner = .{ .z = 1.5, .on = true },\n}" },
         .{ "x, @", "comptime_int = 1" },
         .{ "y, pos", "comptime_int = 2" },
         .{ "z, pos", "comptime_float = 1.5" },
@@ -5202,7 +5202,7 @@ test "hover shows tuples whose fields are all comptime by value and does not tru
         .{ "point =", "const point = .{ .x = 1, .y = true }" },
         // hover does not truncate: long values, strings over 64 bytes and tuples with more than 16
         // fields are all shown in full
-        .{ "long =", "const long = .{ Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name }" },
+        .{ "long =", "const long = .{\n    Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name,\n    Alpha_Long_Name, Beta_Long_Name, Alpha_Long_Name, Beta_Long_Name,\n}" },
         .{ "msg =", "const msg: *const [72:0]u8 = \"a message that is longer than sixty-four bytes, all of it shown in hover\"" },
         .{ "many =", "const many: struct { u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8, u8 }" },
         // Nested anonymous containers are expanded too; only self-references are shown as `{...}`
@@ -5337,11 +5337,80 @@ test "hover and completion details bound large comptime values and mark the cut"
     try testing.expect(std.mem.endsWith(u8, head, "…\" (4096 bytes total)\n```"));
     const table = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "table:").?), roots)).?.text;
     try testing.expect(table.len < 4096);
-    try testing.expect(std.mem.startsWith(u8, table, "```zig\nconst table: [3000]u16 = .{ 7, 7, "));
-    try testing.expect(std.mem.endsWith(u8, table, ", … (3000 total) }\n```"));
+    try testing.expect(std.mem.startsWith(u8, table, "```zig\nconst table: [3000]u16 = .{\n    7, 7, "));
+    try testing.expect(std.mem.endsWith(u8, table, ",\n    … (3000 total)\n}\n```"));
     // Values within the limit are shown in full
     const small = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "small =").?), roots)).?.text;
     try testing.expectEqualStrings("```zig\nconst small: *const [4:0]u8 = \"fits\"\n```", small);
+}
+
+test "hover breaks values too wide for one line, completion details keep them on one line" {
+    const text =
+        \\const Pair = struct { name: []const u8, value: u32 };
+        \\const short = [_][2][]const u8{ .{ "a", "b" }, .{ "c", "d" } };
+        \\const types = [_][2][]const u8{
+        \\    .{ ".html, with comma", "text/html" },
+        \\    .{ ".webmanifest", "application/manifest+json" },
+        \\    .{ ".xhtml", "application/xhtml+xml" },
+        \\};
+        \\const pairs = [_]Pair{
+        \\    .{ .name = "first entry of the table", .value = 1 },
+        \\    .{ .name = "second entry of the table, which does not fit on a line of its own", .value = 2 },
+        \\};
+        \\const words = [_][]const u8{ "first word", "second word", "third word", "fourth word", "fifth word", "sixth word", "seventh word" };
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{
+            "short =",
+            \\const short: [2][2][]const u8 = .{ .{ "a", "b" }, .{ "c", "d" } }
+        },
+        .{
+            "types =",
+            \\const types: [3][2][]const u8 = .{
+            \\    .{ ".html, with comma", "text/html" },
+            \\    .{ ".webmanifest", "application/manifest+json" },
+            \\    .{ ".xhtml", "application/xhtml+xml" },
+            \\}
+        },
+        .{
+            "pairs =",
+            \\const pairs: [2]Pair = .{
+            \\    .{ .name = "first entry of the table", .value = 1 },
+            \\    .{
+            \\        .name = "second entry of the table, which does not fit on a line of its own",
+            \\        .value = 2,
+            \\    },
+            \\}
+        },
+        .{
+            "words =",
+            \\const words: [7][]const u8 = .{
+            \\    "first word", "second word", "third word", "fourth word", "fifth word",
+            \\    "sixth word", "seventh word",
+            \\}
+        },
+    };
+    for (cases) |c| {
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{})).?;
+        try testing.expectEqualStrings(try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}\n```", .{c[1]}), info.text);
+    }
+
+    const item: u32 = for ((try r.itemTree(file)).items, 0..) |it, i| {
+        if (it.name) |n| if (std.mem.eql(u8, n, "types")) break @intCast(i);
+    } else unreachable;
+    const detail = (try completion.describe(&r, file, .{ .decl = .{ .file = file, .item = item } })).detail;
+    try testing.expectEqualStrings(
+        \\const types: [3][2][]const u8 = .{ .{ ".html, with comma", "text/html" }, .{ ".webmanifest", "application/manifest+json" }, .{ ".xhtml", "application/xhtml+xml" } }
+    , detail);
 }
 
 test "hover shows the file and size of @embedFile values, and the content of short text" {
