@@ -655,6 +655,9 @@ const Ref = struct {
     /// Slice: points to the range `[start, start + len)` of the aggregate at `path` (shares
     /// storage with the original array)
     window: ?Window = null,
+    /// The place cannot be written: a constant, a temporary, or a place reached through a
+    /// `*const` pointer. A pointer taken to it with `&` is `*const`.
+    is_const: bool = false,
 
     const Window = struct { start: u32, len: u32 };
 };
@@ -2314,11 +2317,11 @@ const Evaluator = struct {
             error.Abort => blk: {
                 const cell = try ev.a.create(Val);
                 cell.* = try ev.copy(v);
-                break :blk Ref{ .cell = cell, .path = &.{} };
+                break :blk Ref{ .cell = cell, .path = &.{}, .is_const = true };
             },
             else => |x| return x,
         };
-        return .{ .ty = try ev.ip.ptrTo(v.ty, .one, false), .v = .{ .ref = ref } };
+        return .{ .ty = try ev.ip.ptrTo(v.ty, .one, ref.is_const), .v = .{ .ref = ref } };
     }
 
     /// Place of assignment targets and address-of operands
@@ -2327,7 +2330,11 @@ const Evaluator = struct {
             .name_ref => |name| {
                 const def = try ev.r.resolveName(f.file, f.item, f.body, f.body.expr_scopes[@backingInt(e)], name) orelse return error.Abort;
                 switch (def) {
-                    .local => |l| if (l.file == f.file and l.item == f.item) return .{ .cell = &f.slots[@backingInt(l.binding)], .path = &.{} },
+                    .local => |l| if (l.file == f.file and l.item == f.item) return .{
+                        .cell = &f.slots[@backingInt(l.binding)],
+                        .path = &.{},
+                        .is_const = f.body.binding(l.binding).kind != .local_var,
+                    },
                     else => {},
                 }
                 return error.Abort;
@@ -2347,7 +2354,7 @@ const Evaluator = struct {
             .deref => |x| {
                 const p = try ev.eval(f, x, null);
                 return switch (p.v) {
-                    .ref => |r| r,
+                    .ref => |r| ev.through(r, p.ty),
                     else => error.Abort,
                 };
             },
@@ -2364,9 +2371,19 @@ const Evaluator = struct {
         if (ref.window != null) return ref;
         const v = try ev.load(ref);
         return switch (v.v) {
-            .ref => |r| r,
+            .ref => |r| ev.through(r, v.ty),
             else => ref,
         };
+    }
+
+    /// The place a pointer of type `ptr_ty` points to: writable as the pointer allows
+    fn through(ev: *Evaluator, r: Ref, ptr_ty: Index) Ref {
+        var out = r;
+        out.is_const = switch (ev.ip.key(ptr_ty)) {
+            .ptr_type => |p| p.is_const,
+            else => r.is_const,
+        };
+        return out;
     }
 
     /// Place of element `i`; for a range, the index is relative to the start of the range
@@ -2378,7 +2395,7 @@ const Evaluator = struct {
         const path = try ev.a.alloc(u32, base.path.len + 1);
         @memcpy(path[0..base.path.len], base.path);
         path[base.path.len] = index;
-        return .{ .cell = base.cell, .path = path };
+        return .{ .cell = base.cell, .path = path, .is_const = base.is_const };
     }
 
     fn assign(ev: *Evaluator, f: *Frame, op: SyntaxKind, lhs_e: ExprId, rhs_e: ExprId) EvalError!void {

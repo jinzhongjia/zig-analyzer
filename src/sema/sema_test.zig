@@ -583,6 +583,33 @@ test "a function chosen by switching on an enum defined in the signature" {
     });
 }
 
+test "the address of a place is const unless the place can be written" {
+    // A pointer to a constant had a mutable type, so the evaluated value of the initializer was
+    // discarded as having a different type than inference gave.
+    try expectTypes(
+        \\const S = struct { x: u8 };
+        \\const of_const = blk: {
+        \\    const final: [2:0]u8 = "ab".*;
+        \\    break :blk &final;
+        \\};
+        \\const of_copy = blk: {
+        \\    var buf: [2:0]u8 = "ab".*;
+        \\    buf[0] = 'c';
+        \\    const final = buf;
+        \\    break :blk &final;
+        \\};
+        \\const field_of_const = blk: {
+        \\    const s: S = .{ .x = 1 };
+        \\    break :blk (&s.x).*;
+        \\};
+        \\fn g() void { _ = .{ of_const, of_copy, field_of_const }; }
+    , &.{
+        .{ "of_const", "*const [2:0]u8 = \"ab\"" },
+        .{ "of_copy", "*const [2:0]u8 = \"cb\"" },
+        .{ "field_of_const", "u8 = 1" },
+    });
+}
+
 test "the sentinel element of an array" {
     try expectTypes(
         \\const read = blk: {
