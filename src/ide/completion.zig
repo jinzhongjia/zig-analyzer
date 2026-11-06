@@ -253,7 +253,7 @@ pub fn describe(r: *Resolver, from: FileId, target: imports.Target) resolve.Erro
         .decl => |d| {
             const def: resolve.Def = .{ .item = .{ .file = d.file, .item = d.item } };
             const tv = try r.ctx.get(queries.DeclType, .{ .owner = try r.ownerKey(d.file, d.item) });
-            const detail = try context.signature(r, def, tv);
+            const detail = try context.signature(r, def, tv, .single_line);
             if (try context.docOf(r, def, tv)) |text| w.print("{s}\n\n", .{text}) catch return error.OutOfMemory;
             const text = (try r.ctx.get(database.syntax.SourceText, d.file)).text;
             var offset: usize = 0;
