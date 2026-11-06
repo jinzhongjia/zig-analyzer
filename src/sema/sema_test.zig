@@ -667,6 +667,42 @@ test "@This() in a generic body is the abstract instance, like the written call"
     });
 }
 
+const signature_container_src =
+    \\const S = struct { v: u8 };
+    \\fn f(s: *S, comptime kind: enum { a, b }, data: switch (kind) { .a => u8, .b => u16 }, n: u32) struct { x: u8 } {
+    \\    const own = s;
+    \\    const first = data;
+    \\    const size = n;
+    \\    _ = .{ own, first, size };
+    \\    return .{ .x = 1 };
+    \\}
+    \\fn g(s: *S) void {
+    \\    const viaA = f(s, .a, 1, 2);
+    \\    const field = viaA.x;
+    \\    _ = field;
+    \\}
+;
+
+test "a container in a function prototype keeps parameters and instances resolved" {
+    try expectTypes(signature_container_src, &.{
+        .{ "own", "*S" },
+        .{ "size", "u32" },
+        .{ "field", "u8" },
+    });
+}
+
+test "a container in a function prototype computes its abstract instance once" {
+    // The function's type and parameters are evaluated from the container, whose abstract instance
+    // reads them: every read computed that cycle again
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const src = signature_container_src;
+    const f = try w.add("/p/main.zig", src);
+    for ([_][]const u8{ "own", "first", "size", "viaA", "field" }) |name| _ = try typeAt(&w, f.file, src, name, 0);
+    try testing.expectEqual(1, w.db.executions(queries.SignatureInst));
+}
+
 test "unknown parts stay unknown" {
     try expectTypes(
         \\fn opaqueFn(x: u8) type { _ = x; return u8; }

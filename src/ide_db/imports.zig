@@ -868,8 +868,8 @@ pub fn publicTargets(ctx: *database.Db.Ctx, file: FileId, out: *std.ArrayList(Fi
 }
 
 pub const Export = struct {
-    /// Points into the value of `FileDecls` (never evicted; this query depends on it and is
-    /// recomputed along with it)
+    /// Points into the value of `FileDecls` (never evicted and never in a cycle, since it reads
+    /// only syntax queries; this query depends on it and is recomputed along with it)
     name: []const u8,
     path: []const u8,
     /// Number of segments in the path
