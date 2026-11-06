@@ -78,6 +78,7 @@ A memo that passes verification takes the current lowest durability of its depen
 Each thread keeps an active query stack; a cycle calls the query's `cycleFallback`.
 
 - A result in a cycle is not written to a memo, and its reader does not record it as a dependency: the dependencies it read go to the nearest frame not in a cycle. Memos therefore form no cycles among themselves, and early cutoff on a member's old memo cannot mask a change seen by the cycle's entry.
+- Such a result is freed when the query that read it returns, or at the end of the read transaction when read outside any query. A value may point only into values of queries that are never in a cycle (those that read no query declaring `cycleFallback`, such as the syntax queries and `FileDecls`), so nothing else can hold it, and a read that computes a cycle repeatedly does not accumulate its results.
 - During verification, a memo whose dependencies lead through a cycle back to a query on the stack is unverifiable until that query is popped: reading it recomputes it, and verifying other memos treats it as changed.
 - When nested computations exceed the native stack limit (48 MiB on 64 MiB worker stacks, 4 MiB elsewhere), they fall back the same way, and no query on the stack writes a memo. The interrupted read computes from the bottom of the stack and retries, so deep chains complete in segments; at most 16 segments per top-level read, so infinite recursion terminates.
 
@@ -94,13 +95,15 @@ Read transactions that need the same memo brought up to date do it once: the fir
 
 A query may declare `lru` (count) and `lru_bytes`; eviction deletes the value and keeps the dependencies. Capacities can be changed with `cache.capacity` and `cache.queries`. `resetQueries` clears the type-related queries a generation at a time, together with `InternPool.reset`.
 
+Eviction normally waits for a moment without read transactions, but one read transaction can compute a large part of a project under many instances. A query may therefore declare `lru_read_bytes`: above that size, a read evicts the least recently used values that nothing holds. A read pins the value until the compute that read it returns, or until its transaction ends when read outside any query; values store no pointers into the values they read, so nothing else can hold it. Only `Infer` declares it, at 512 MB: recomputing it costs little there, while the syntax trees and bodies are read again so often during such a computation that evicting them dominates its time.
+
 ### Allocator
 
 Release builds use `PagedAllocator`, one heap shared by all threads: cached values are allocated on worker threads but freed on the threads that sweep and run write transactions, so a block freed by any thread must be reusable by any thread. `std.heap.smp_allocator` splits its free lists by thread slot, so resident memory keeps growing over a session.
 
 - Blocks up to 32 KiB come from 64 KiB pages carved from 4 MiB segments; each page holds one size class. Larger allocations are mapped directly.
 - A size class allocates from the page that most recently got room, reusing blocks likely still cached; pages with less than an eighth of their blocks in use get new blocks only when no other page has room, which lets the rest become empty.
-- Empty pages go to a pool shared by all classes, which keeps 256 committed and returns the others to the system. The analyzer has transient peaks of 10-12 GB, so memory that is never returned would stay near the peak; the cost is the system time of faulting pages in again.
+- Empty pages go to a pool shared by all classes, which keeps 256 committed and returns the others to the system. The analyzer has transient peaks of several GB, so memory that is never returned would stay near the peak; the cost is the system time of faulting pages in again.
 - Returning pages differs per platform: `madvise(MADV_DONTNEED)` on Linux; a new mapping on macOS, where `madvise` leaves the resident size unchanged; decommit on Windows.
 - On Linux, segments are excluded from transparent huge pages: with THP `always`, touching a page would back the whole 2 MiB around it.
 
@@ -217,7 +220,7 @@ Executes on HIR: arithmetic by bit width, control flow, calls, container constru
 
 ### Generic function bodies
 
-Without a concrete instance, a body is inferred under an abstract instance: `comptime T: type` is an abstract parameter shown as `T`, and a container defined in the body is the same type as the call that names it (`Pair(A, B)`). **Call-site seeding** then infers under a call site that yields a concrete instance, and hover notes the source.
+Without a concrete instance, a body is inferred under an abstract instance: `comptime T: type` is an abstract parameter shown as `T`, and a container defined in the body is the same type as the call that names it (`Pair(A, B)`). A container in the function's prototype is outside the abstract instance in the function's own type, which that instance is made from, so arguments still coerce to it; elsewhere it has the abstract instance, computed once at the entry of that cycle (`SignatureInst`). **Call-site seeding** then infers under a call site that yields a concrete instance, and hover notes the source.
 
 - **First instance** (hover, goto, completion): call sites are searched in the target's file, then importers by import distance and path order, so the result depends only on the source, not on which files were opened. Lookup goes up at most 16 levels through generic callers.
 - **All instances** (references, rename, goto, last stage of semantic tokens): a closure (`AllInstances`) from calls outside generic functions, type flow, and dispatch sites in std, propagated until no new instance appears, with no truncation by depth or count. Code that compiles has finitely many instances; when argument nesting exceeds 64 levels or instances exceed 2^18, the closure is marked incomplete and rename and naming fixes refuse.

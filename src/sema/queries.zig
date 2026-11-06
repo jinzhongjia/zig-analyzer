@@ -76,6 +76,10 @@ pub const Infer = struct {
     /// Values vary greatly in size (the HIR / inference result of a long function can reach
     /// hundreds of KB), so the cache is limited by byte count as well
     pub const lru_bytes = 48 * 1024 * 1024;
+    /// One read transaction can infer a large part of a project under many instances (the closure
+    /// of `seed.AllInstances`). A much smaller limit makes those computations infer the same
+    /// results again.
+    pub const lru_read_bytes = 512 * 1024 * 1024;
 
     pub fn bytes(v: Value) usize {
         if (v == &empty_result) return 0;
@@ -742,7 +746,21 @@ pub fn enclosedBy(r: *Resolver, file: FileId, item: u32, fn_decl: @import("../sy
 pub fn containerType(r: *Resolver, ns: Namespace, inst: ?Index) resolve.Error!Index {
     const tree = try r.itemTree(ns.file);
     const c = tree.containers[ns.container];
-    const container_inst = if (c.parent_item) |p| try abstractInst(r, ns.file, p, try normalizeInst(r, ns.file, p, inst)) else try rootInst(r, ns.file, inst);
+    const container_inst = if (c.parent_item) |p| try abstractInst(r, ns.file, p, c.in_signature, try normalizeInst(r, ns.file, p, inst)) else try rootInst(r, ns.file, inst);
+    return containerTypeIn(r, tree, ns, c, container_inst);
+}
+
+/// The type of a container as the function's own type sees it, when evaluating the prototype that
+/// contains it: outside the abstract instance, which is made from that function type, so that the
+/// type is concrete and arguments coerce to it
+pub fn prototypeContainerType(r: *Resolver, ns: Namespace, inst: ?Index) resolve.Error!Index {
+    const tree = try r.itemTree(ns.file);
+    const c = tree.containers[ns.container];
+    if (!c.in_signature) return containerType(r, ns, inst);
+    return containerTypeIn(r, tree, ns, c, try normalizeInst(r, ns.file, c.parent_item.?, inst));
+}
+
+fn containerTypeIn(r: *Resolver, tree: *const ItemTree, ns: Namespace, c: ItemTree.Container, container_inst: ?Index) resolve.Error!Index {
     if (c.kind == .@"struct") if (try tupleDecl(r, tree, ns, container_inst)) |t| return t;
     return r.ctx.db.env.ip.get(.{ .container_type = .{ .file = ns.file, .ast_id = c.ast_id, .kind = switch (c.kind) {
         .file => .file,
@@ -758,19 +776,63 @@ pub fn containerType(r: *Resolver, ns: Namespace, inst: ?Index) resolve.Error!In
 /// instance, whose arguments are the function's own parameters (abstract type parameters,
 /// unknown values): the instance the call `Pair(A, B)` written in the body of
 /// `fn Pair(comptime A: type, comptime B: type) type` refers to, so `@This()` there is the same
-/// type, as in the compiler.
-fn abstractInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolve.Error!?Index {
+/// type, as in the compiler. A container in the function's prototype (`in_signature`) goes through
+/// `SignatureInst`.
+fn abstractInst(r: *Resolver, file: FileId, item: u32, in_signature: bool, inst: ?Index) resolve.Error!?Index {
     const ip = r.ctx.db.env.ip;
     const tree = try r.itemTree(file);
     var cur: ?u32 = item;
+    var signature = in_signature;
     const f: u32 = while (cur) |it| {
         if (tree.items[it].kind == .@"fn") break it;
-        cur = tree.containers[tree.items[it].container].parent_item;
+        const outer = tree.containers[tree.items[it].container];
+        signature = outer.in_signature;
+        cur = outer.parent_item;
     } else return inst;
     if (inst) |i| switch (ip.key(i)) {
         .instance => |k| if (k.file == file and k.decl == tree.items[f].ast_id) return inst,
         else => {},
     };
+    if (signature) return r.ctx.get(SignatureInst, .{ .owner = .{ .file = file, .item = tree.items[f].ast_id }, .inst = inst });
+    return functionInst(r, file, f, inst);
+}
+
+/// The abstract instance of a container in the prototype of function `owner`. It is made from the
+/// function's type and parameters, which are evaluated from that container: inside this query the
+/// container keeps `inst`. The instance only takes the kinds of the parameters and the values of
+/// comptime ones, so one computation at the entry of the cycle gives the result. As a fixpoint it
+/// is written to a memo; otherwise every read of the function's type would compute the cycle again.
+pub const SignatureInst = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = DeclKey;
+    pub const Value = ?Index;
+    pub const fixpoint = true;
+
+    pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
+        var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        const scope = try enterContext(&r, key.owner.file, key.inst);
+        defer scope.leave();
+        const tree = try r.itemTree(key.owner.file);
+        const f: u32 = for (tree.items, 0..) |it, i| {
+            if (it.ast_id == key.owner.item) break @intCast(i);
+        } else return key.inst;
+        return functionInst(&r, key.owner.file, f, key.inst);
+    }
+
+    pub fn cycleFallback(key: Key) Value {
+        return key.inst;
+    }
+
+    pub fn depthFallback(key: Key) Value {
+        return key.inst;
+    }
+};
+
+/// The abstract instance of function member `f` under `inst`
+fn functionInst(r: *Resolver, file: FileId, f: u32, inst: ?Index) resolve.Error!?Index {
+    const ip = r.ctx.db.env.ip;
     const callee = try defType(r, .{ .item = .{ .file = file, .item = f } }, null, inst);
     const fn_type = switch (ip.key(callee.ty)) {
         .fn_type => |x| x,

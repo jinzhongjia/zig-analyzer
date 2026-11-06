@@ -16,7 +16,7 @@ Benchmark project: the Zig 0.17.0 compiler source (540k lines + standard library
 | | keystroke → hover (continuous typing) | — | `Sema.zig` p50 97 ms; other projects 5-21 ms | — |
 | | keystroke → name completion (typing words in a method) | — | `Sema.zig`: auto-import on p50 72-84 ms, p95 160-181 ms; off p50 43-45 ms, p95 67-73 ms (see below) | — |
 | | save → compiler diagnostics (`check` step) | < 1 s | small projects about 120 ms; Zig compiler 5.2 s | ⚠️ limited by the compiler |
-| | resident memory (long session) | does not grow over the session | Zig compiler source: 1.1-1.4 GB from round 120 on (Linux, see below) | ⚠️ worker stacks |
+| | resident memory (long session) | does not grow over the session | Zig compiler source: 2.5-2.8 GB from round 120 on (Linux, see below) | ⚠️ the heap grows |
 | Cold start | process start → `initialize` | < 100 ms | 1-9 ms | ✅ |
 | | open file → syntax features | < 200 ms | 53 ms (`Sema.zig`) | ✅ |
 | | open file → hover / goto / completion | < 3 s | project loading 1.5-4.4 s; hover is available before loading finishes (with incomplete name resolution, which the hover states; see Requests during project loading in `docs/design.md`) | ✅ |
@@ -24,9 +24,11 @@ Benchmark project: the Zig 0.17.0 compiler source (540k lines + standard library
 
 Resident memory over a long session on the Zig compiler source:
 
-- Zig compiler source, 240 rounds on Linux: 1.1-1.4 GB from round 120 on, heap about 520 MB. The allocator's memory stays flat (0.43 GB of pages for 0.18 GB of live small blocks, and 0.36 GB of large allocations); the rest, mostly worker stacks (0.57 GB at round 240), grows in steps as deeper recursions touch more of them. The rounds that compute the largest type graphs peak at 10.1 GB, which is returned to the system afterwards.
-- macOS, 240 rounds: RSS 0.89-1.24 GB and physical footprint 1.12-1.36 GB from round 120 on (peak footprint 11.6 GB).
-- Windows, 40 rounds: working set 0.87 GB with 0.98 GB committed at round 40 (peak working set 10.1 GB).
+- Linux, 160 rounds: RSS 2.5-2.8 GB from round 120 on, heap 2.1 GB at round 160, of which 1.8 GB are large allocations. Peak RSS 4.6 GB, with at most 1.55 GB assigned to size classes.
+- macOS, 160 rounds: RSS 2.9-3.1 GB from round 120 on, heap 2.1 GB at round 160, of which 2.0 GB are large allocations. Peak RSS 3.9-5.0 GB across runs, with at most 1.5 GB assigned to size classes.
+- Windows, 160 rounds: working set 2.9 GB and heap 2.1 GB at round 160. Peak working set 4.7-4.8 GB and peak commit 5.4-5.5 GB, with at most 1.55 GB assigned to size classes.
+
+The heap grows over the session on all three; from round 120 to 160 on Linux it grows from 1.9 to 2.1 GB, mostly in large allocations, while the recorded dependencies grow from 105 to 126 million. The peak comes from the hover that computes the largest instance closure (all instances of `Writer.printValue`): it infers about 900,000 results in one read transaction, which holds at most 512 MB of them. The memory is returned to the system afterwards.
 
 ## Real projects
 
@@ -120,9 +122,9 @@ Batch validation: for each library, dependencies are fetched with `zig build --f
 
 | Scope | Result |
 |---|---|
-| Batch validation of 97 Zig 0.17.0 libraries (zls, zigimg, libvaxis, zine, microzig, Cubyz, flow, raylib, etc.; 2026-10-19) | All have a build graph; crashes / timeouts 0; declaration mismatches 0 (median resolution rate 90.8%, median 100% excluding identifiers without a declaration position); reference and rename errors 0; median completion recall 100%, 95 / 97 ≥ 95%; median hover p50 0.2 ms, max 1.0 ms; median resident memory 93 MB, max 308 MB |
+| Batch validation of 97 Zig 0.17.0 libraries (zls, zigimg, libvaxis, zine, microzig, Cubyz, flow, raylib, etc.; 2026-11-05) | All have a build graph; crashes / timeouts 0; declaration mismatches 0 (median resolution rate 90.9%, median 100% excluding identifiers without a declaration position); reference false positives 2 (in known-folders), no other reference or rename errors; median completion recall 100%, 96 / 97 ≥ 95%; median hover p50 0.3 ms, max 0.9 ms; median resident memory 107 MB, max 598 MB |
 | Corpus cross-check (10305 files, 264.6 MB, 2026-10-16) | All pass; no inconsistency between incremental and full parses under 120k random edits |
 | Compiler diagnostics cross-check (2026-10-16) | 15 / 15 identical |
 | Formatting cross-check (2026-10-16) | 372 / 372 files identical |
 
-The 2 libraries with recall below 95%: in strand, the members not completed are in comptime reflection code under several layers of generics (such as the result of `descriptor.options(T)`); in morse, `shakedown`, imported by the test code, is added by a test step that does not exist in the default configuration, and is not in the build graph.
+The library with recall below 95% is morse: `shakedown`, imported by the test code, is added by a test step that does not exist in the default configuration, and is not in the build graph. The 2 reference false positives are in known-folders: the references of `DefaultSystem.getenv` include two `system.getenv` calls in a function with the parameters `comptime System: type, system: *System`, and declaration at those calls does not lead back to it.
