@@ -32,6 +32,7 @@ const ItemTree = @import("../syntax/ItemTree.zig");
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 const queries = @import("queries.zig");
 const value = @import("value.zig");
+const bigint = @import("bigint.zig");
 const eval = @import("eval.zig");
 const zon = @import("zon.zig");
 const SyntaxKind = @import("../syntax/kind.zig").SyntaxKind;
@@ -493,12 +494,33 @@ const Inferrer = struct {
             if (a == .runtime or a == .unknown) return .unknown;
             // comptime anytype: the instance records the argument value; anytype: the argument type
             if (binding.is_comptime) return .{ .ty = value.typeOfValue(inf.ip, a), .val = a };
-            return .{ .ty = a };
+            return .{ .ty = a, .val = try value.comptimeFieldsValue(inf.ip, inf.scratch, a) };
         };
         const ty: Index = (try inf.inferComptime(ty_e, null)).asType() orelse .unknown;
-        if (arg) |a| if (a != .unknown and a != .runtime) return .{ .ty = ty, .val = (try value.coerceValue(inf.ip, a, ty)) orelse a };
+        if (arg) |a| if (a != .unknown and a != .runtime) return .{ .ty = ty, .val = (try value.coerceValue(inf.ip, try inf.paramTag(a, ty), ty)) orelse a };
         if (ty == .type_type and (arg == null or arg.? == .unknown)) return TypedValue.ofType(try inf.ip.get(.{ .opaque_param = .{ .file = inf.file, .owner = try inf.body_owner(), .binding = @backingInt(p), .name = binding.name } }));
-        return .{ .ty = ty };
+        return .{ .ty = ty, .val = try value.comptimeFieldsValue(inf.ip, inf.scratch, ty) };
+    }
+
+    /// An enum defined in the signature (`comptime sign: enum { pos, neg }`) has a type per
+    /// instance: the argument the instance records was coerced to the parameter type of the
+    /// signature the caller saw, and is the same tag of the parameter type here
+    fn paramTag(inf: *Inferrer, a: Index, ty: Index) Error!Index {
+        const ip = inf.ip;
+        const tag = switch (ip.key(a)) {
+            .enum_tag => |t| t,
+            else => return a,
+        };
+        const x = switch (ip.key(tag.ty)) {
+            .container_type => |c| c,
+            else => return a,
+        };
+        const y = switch (ip.key(ty)) {
+            .container_type => |c| c,
+            else => return a,
+        };
+        if (tag.ty == ty or x.file != y.file or x.ast_id != y.ast_id) return a;
+        return ip.get(.{ .enum_tag = .{ .ty = ty, .name = tag.name } });
     }
 
     /// Reading the ItemTree is a query: even when it is cached, `error.Canceled` is returned when
@@ -1211,7 +1233,10 @@ const Inferrer = struct {
                 return .{ .ty = .comptime_float_type, .val = try value.floatValue(ip, .comptime_float_type, x) };
             } else switch (std.zig.parseNumberLiteral(text)) {
                 .int => |v| return .{ .ty = .comptime_int_type, .val = try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = v } }) },
-                .big_int => return .{ .ty = .comptime_int_type },
+                .big_int => |base| {
+                    const b = try bigint.fromLiteral(inf.scratch, text, @backingInt(base)) orelse return .{ .ty = .comptime_int_type };
+                    return .{ .ty = .comptime_int_type, .val = try value.internComptimeInt(ip, inf.scratch, b) };
+                },
                 .float => {
                     const x = std.fmt.parseFloat(f128, text) catch return .{ .ty = .comptime_float_type };
                     return .{ .ty = .comptime_float_type, .val = try value.floatValue(ip, .comptime_float_type, x) };
@@ -1478,7 +1503,8 @@ const Inferrer = struct {
         const skip: usize = if (inf.bound.contains(callee_e)) 1 else 0;
         const g = try genericCallee(inf.r, inf.scratch, callee, f) orelse {
             for (args, 0..) |a, i| _ = try inf.infer(a, paramType(f, i + skip));
-            if (inf.comptime_depth > 0) if (try inf.comptimeCall(callee, callee_e, args, skip)) |tv| return tv;
+            const evaluate = inf.comptime_depth > 0 or (f.cc == .@"inline" and allKnown(try inf.argValues(callee_e, args, skip, args.len + skip)));
+            if (evaluate) if (try inf.comptimeCall(callee, callee_e, args, skip)) |tv| return tv;
             return .{ .ty = f.ret };
         };
         // Generic call: comptime arguments determine the instance, so infer them first; parameter
@@ -1496,7 +1522,7 @@ const Inferrer = struct {
         for (args, 0..) |a, i| if (g.kind(i + skip) == .runtime) {
             _ = try inf.infer(a, instParamType(sig, g.body, i + skip) orelse inf.concrete(paramType(f, i + skip)));
         };
-        const result = try inf.callResult(g, inst, sig, try inf.argValues(callee_e, args, skip, g.body.params.len));
+        const result = try inf.callResult(g, inst, sig, try inf.argValues(callee_e, args, skip, g.body.params.len), f.cc == .@"inline");
         try inf.literalArgTargets(g, inst, args, skip);
         return result;
     }
@@ -1539,10 +1565,13 @@ const Inferrer = struct {
     /// function returns a comptime-only type (such as `type`) or the call is in a comptime
     /// context, the interpreter executes the function body to compute the value; when the
     /// interpreter gives up, a function returning `type` takes the value of the `return` actually
-    /// reached during inference.
-    fn callResult(inf: *Inferrer, g: Generic, inst: Index, sig: *const Result, args: []const TypedValue) Error!TypedValue {
+    /// reached during inference. An inline call whose arguments are all known at comptime is
+    /// evaluated too: its result is known at comptime when the body computes it from them (as in
+    /// `std.fmt.comptimePrint`).
+    fn callResult(inf: *Inferrer, g: Generic, inst: Index, sig: *const Result, args: []const TypedValue, is_inline: bool) Error!TypedValue {
         const ret = try queries.returnType(inf.r, g.owner, g.body, sig, inst);
-        if ((try eval.isComptimeOnly(inf.r, ret) or inf.comptime_depth > 0) and !inf.r.ctx.incomplete()) {
+        const evaluate = try eval.isComptimeOnly(inf.r, ret) or inf.comptime_depth > 0 or (is_inline and allKnown(args));
+        if (evaluate and !inf.r.ctx.incomplete()) {
             const tv = try eval.call(inf.r, inst, args, inf.branchQuota());
             if (tv.val != null and (ret == .unknown or tv.ty == ret)) return tv;
         }
@@ -1594,8 +1623,21 @@ const Inferrer = struct {
         const ip = inf.ip;
         const a = lhs.val orelse return null;
         const b = rhs.val orelse return null;
-        if (value.intOf(ip, a)) |x| if (value.intOf(ip, b)) |y| return order(op, x, y);
+        if (value.intOf(ip, a)) |x| if (value.intOf(ip, b)) |y| return value.compareInts(ip, op, lhs.ty, rhs.ty, x, y);
         if (ip.key(a) == .float_value or ip.key(b) == .float_value) if (value.floatOf(ip, a)) |x| if (value.floatOf(ip, b)) |y| return order(op, x, y);
+        if (lhs.ty == .comptime_int_type or rhs.ty == .comptime_int_type) {
+            const x = try value.bigValueOfAny(ip, inf.scratch, a) orelse return null;
+            const y = try value.bigValueOfAny(ip, inf.scratch, b) orelse return null;
+            const ord = bigint.order(x, y);
+            return switch (op) {
+                .equal_equal => ord == .eq,
+                .bang_equal => ord != .eq,
+                .angle_bracket_left => ord == .lt,
+                .angle_bracket_right => ord == .gt,
+                .angle_bracket_left_equal => ord != .gt,
+                else => ord != .lt,
+            };
+        }
         if (op != .equal_equal and op != .bang_equal) return null;
         const eq = try eval.eqlValues(inf.r, a, b) orelse return null;
         return eq == (op == .equal_equal);
@@ -2877,10 +2919,20 @@ const Inferrer = struct {
             return .{ .ty = ty, .val = try value.binaryFloat(ip, op, ty, a, b) };
         }
         if (ty != .comptime_int_type and !ip.isInt(ty)) return .{ .ty = ty };
-        const a = value.intOf(ip, lhs.val) orelse return .{ .ty = ty };
-        const b = value.intOf(ip, rhs.val) orelse return .{ .ty = ty };
-        const v = value.binaryInt(ip, op, ty, a, b) orelse return .{ .ty = ty };
-        return .{ .ty = ty, .val = try ip.get(.{ .int_value = .{ .ty = ty, .value = v } }) };
+        if (value.intOf(ip, lhs.val)) |a| {
+            if (value.intOf(ip, rhs.val)) |b| {
+                if (value.binaryInt(ip, op, ty, a, b)) |v| return .{ .ty = ty, .val = try ip.get(.{ .int_value = .{ .ty = ty, .value = v } }) };
+            }
+        }
+        // A comptime_int operand may not fit i128 (or the result may not): compute at arbitrary
+        // precision
+        if (ty == .comptime_int_type) {
+            const a = try value.bigValueOfAny(ip, inf.scratch, lhs.val) orelse return .{ .ty = ty };
+            const b = try value.bigValueOfAny(ip, inf.scratch, rhs.val) orelse return .{ .ty = ty };
+            const r = try bigint.binary(inf.scratch, op, a, b) orelse return .{ .ty = ty };
+            return .{ .ty = ty, .val = try value.internComptimeInt(ip, inf.scratch, r) };
+        }
+        return .{ .ty = ty };
     }
 
     fn prefix(inf: *Inferrer, op: SyntaxKind, operand_e: ExprId, expected: ?Index) Error!TypedValue {
@@ -2954,12 +3006,22 @@ const Inferrer = struct {
                     const x = value.floatOf(ip, v.val) orelse return .{ .ty = v.ty };
                     return .{ .ty = v.ty, .val = try value.floatValue(ip, v.ty, -x) };
                 }
-                const a = value.intOf(ip, v.val) orelse return .{ .ty = v.ty };
-                const r = switch (op) {
-                    .tilde => value.bitNot(ip, v.ty, a),
-                    else => value.negate(ip, v.ty, a, op == .minus_percent),
-                } orelse return .{ .ty = v.ty };
-                return .{ .ty = v.ty, .val = try ip.get(.{ .int_value = .{ .ty = v.ty, .value = r } }) };
+                if (value.intOf(ip, v.val)) |a| {
+                    if (switch (op) {
+                        .tilde => value.bitNot(ip, v.ty, a),
+                        else => value.negate(ip, v.ty, a, op == .minus_percent),
+                    }) |r| return .{ .ty = v.ty, .val = try ip.get(.{ .int_value = .{ .ty = v.ty, .value = r } }) };
+                }
+                if (v.ty == .comptime_int_type) {
+                    const a = try value.bigValueOfAny(ip, inf.scratch, v.val) orelse return .{ .ty = v.ty };
+                    const r: bigint.Big = switch (op) {
+                        // `~` is not defined for comptime_int
+                        .minus => bigint.negate(a),
+                        else => return .{ .ty = v.ty },
+                    };
+                    return .{ .ty = v.ty, .val = try value.internComptimeInt(ip, inf.scratch, r) };
+                }
+                return .{ .ty = v.ty };
             },
             else => return .{ .ty = (try inf.infer(operand_e, expected)).ty },
         }
@@ -4355,6 +4417,12 @@ fn seedRegion(body: *const Body, binding: u32) ?Body.Range {
         else => {},
     };
     return null;
+}
+
+/// Whether all arguments of a call are known at comptime
+fn allKnown(args: []const TypedValue) bool {
+    for (args) |a| if (a.val == null) return false;
+    return true;
 }
 
 pub fn runtimeInstance(ip: *InternPool, scratch: Allocator, fv: @FieldType(InternPool.Key, "fn_value"), n: usize) Error!Index {

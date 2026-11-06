@@ -780,7 +780,7 @@ const Closure = struct {
     fn reachesInner(c: *Closure, x: Index) resolve.Error!bool {
         const ip = c.r.ctx.db.env.ip;
         return switch (ip.key(x)) {
-            .simple_type, .int_type, .error_set_type, .simple_value, .int_value, .float_value, .enum_literal, .error_value, .runtime, .context => false,
+            .simple_type, .int_type, .error_set_type, .simple_value, .int_value, .big_int, .float_value, .enum_literal, .error_value, .runtime, .context => false,
             .unknown, .opaque_param => true,
             .ptr_type => |p| c.reaches(p.child),
             .array_type => |a| c.reaches(a.child),

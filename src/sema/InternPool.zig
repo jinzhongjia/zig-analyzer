@@ -289,6 +289,9 @@ pub const Key = union(enum) {
 
     simple_value: SimpleValue,
     int_value: struct { ty: Index, value: i128 },
+    /// A `comptime_int` value outside the range of i128 (little-endian limbs with a sign);
+    /// `decimal` is the magnitude in decimal, for display
+    big_int: struct { positive: bool, limbs: []const std.math.big.Limb, decimal: []const u8 },
     /// Float value (the bit representation as f128, already rounded to the precision of the type)
     float_value: struct { ty: Index, bits: u128 },
     enum_literal: []const u8,
@@ -857,6 +860,7 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
         },
         .aggregate => |v| .{ .aggregate = .{ .ty = v.ty, .elems = try a.dupe(Index, v.elems) } },
         .bytes => |v| .{ .bytes = .{ .ty = v.ty, .bytes = try a.dupe(u8, v.bytes) } },
+        .big_int => |v| .{ .big_int = .{ .positive = v.positive, .limbs = try a.dupe(std.math.big.Limb, v.limbs), .decimal = try a.dupe(u8, v.decimal) } },
         .union_value => |v| .{ .union_value = .{ .ty = v.ty, .tag = try a.dupe(u8, v.tag), .payload = v.payload } },
         .opaque_param => |o| .{ .opaque_param = .{ .file = o.file, .owner = o.owner, .binding = o.binding, .name = try a.dupe(u8, o.name) } },
         else => k,
@@ -1088,7 +1092,25 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         },
         // The void value is written as `{}` (`void` is the type)
         .simple_value => |v| try w.writeAll(if (v == .void) "{}" else @tagName(v)),
-        .int_value => |v| try w.print("{d}", .{v.value}),
+        .big_int => |v| {
+            if (!v.positive) try w.writeAll("-");
+            const rem = remaining(container_name, w);
+            if (rem) |n| if (v.decimal.len > n) {
+                try w.writeAll(v.decimal[0..n]);
+                try w.writeAll("…");
+                try writeTotal(container_name, w, v.decimal.len, " digits");
+                return;
+            };
+            try w.writeAll(v.decimal);
+        },
+        // An unsigned 128-bit value above i128's range is stored as the bit pattern
+        .int_value => |v| {
+            const wide = switch (ip.key(v.ty)) {
+                .int_type => |i| i.signedness == .unsigned and i.bits == 128,
+                else => false,
+            };
+            if (wide) try w.print("{d}", .{@as(u128, @bitCast(v.value))}) else try w.print("{d}", .{v.value});
+        },
         .float_value => |v| {
             // Prints the shortest representation for the type of the value (√2 as f32 is
             // 1.4142135, not its expansion as f128)

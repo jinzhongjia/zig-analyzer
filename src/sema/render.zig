@@ -10,6 +10,7 @@ const Resolver = resolve.Resolver;
 const Namespace = resolve.Namespace;
 const queries = @import("queries.zig");
 const eval = @import("eval.zig");
+const sema_value = @import("value.zig");
 const database = @import("../database.zig");
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
@@ -212,6 +213,9 @@ const ContainerNames = struct {
             .container_type => |c| if (!c.kind.isStruct()) return null,
             .anon_struct_type => |s| return s.names,
             .reified_type => |rt| if (rt.kind != .@"struct") return null,
+            // A struct value coerced to an optional or an error union keeps its elements
+            .optional_type => |child| return n.fieldNames(child),
+            .error_union_type => |eu| return n.fieldNames(eu.payload),
             else => return null,
         }
         const fields = @import("eval.zig").fieldNames(n.r, t) catch return null;
@@ -430,7 +434,11 @@ const QualifiedNames = struct {
     fn writeValue(q: *QualifiedNames, v: Index) Error!void {
         const ip = q.r.ctx.db.env.ip;
         switch (ip.key(v)) {
-            .int_value => |x| try q.w.print("{d}", .{x.value}),
+            .int_value => |x| if (sema_value.isUnsigned128(ip, x.ty)) try q.w.print("{d}", .{@as(u128, @bitCast(x.value))}) else try q.w.print("{d}", .{x.value}),
+            .big_int => |x| {
+                if (!x.positive) try q.w.writeAll("-");
+                try q.w.writeAll(x.decimal);
+            },
             .simple_value => |s| try q.w.writeAll(if (s == .void) "{}" else @tagName(s)),
             .enum_literal => |n| try q.w.print(".{s}", .{n}),
             .enum_tag => |tag| try q.w.print(".{s}", .{tag.name}),

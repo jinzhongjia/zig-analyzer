@@ -434,6 +434,225 @@ test "generic functions, anytype and comptime branches" {
     });
 }
 
+test "functions with an inferred error set are evaluated in constants" {
+    // The inferred error set of the running function must be the one in the function's type,
+    // otherwise the computed value of the initializer is discarded.
+    try expectTypes(
+        \\fn check(c: u8) !u8 {
+        \\    if (c == 0) return error.Bad;
+        \\    return c;
+        \\}
+        \\const ok = check(1);
+        \\const bad = check(0);
+        \\const unwrapped = check(2) catch unreachable;
+        \\const known = if (unwrapped >= 2) u16 else u8;
+        \\fn g() void { _ = .{ ok, bad, known }; }
+    , &.{
+        .{ "ok", "error{Bad}!u8 = 1" },
+        .{ "bad", "error{Bad}!u8 = error.Bad" },
+        .{ "unwrapped", "u8 = 2" },
+        .{ "known", "type = u16" },
+    });
+}
+
+test "struct literals with an error union or optional result type" {
+    // A literal whose result type is an error union was given up on, unlike an optional one.
+    try expectTypes(
+        \\const V = struct { minor: usize };
+        \\fn inferred() !V { return .{ .minor = 1 }; }
+        \\fn explicit() error{X}!V { return .{ .minor = 2 }; }
+        \\fn optional() ?V { return .{ .minor = 3 }; }
+        \\const a = inferred();
+        \\const b = explicit();
+        \\const c = optional();
+        \\fn g() void { _ = .{ a, b, c }; }
+    , &.{
+        .{ "a", "error{}!V = .{ .minor = 1 }" },
+        .{ "b", "error{X}!V = .{ .minor = 2 }" },
+        .{ "c", "?V = .{ .minor = 3 }" },
+    });
+}
+
+test "enums defined in a signature compare and switch by tag across instances" {
+    // A tag keeping the type of another instance of the function made its comparison unknown.
+    try expectTypes(
+        \\fn runtime(s: enum { pos, neg }) u8 { return if (s == .pos) 1 else 2; }
+        \\fn generic(comptime s: enum { pos, neg }) u8 { return if (s == .neg) 1 else 2; }
+        \\fn switched(comptime s: enum { pos, neg }) u8 { return switch (s) { .pos => 1, .neg => 2 }; }
+        \\const a = runtime(.pos);
+        \\const b = generic(.pos);
+        \\const c = switched(.neg);
+        \\fn g() void { _ = .{ a, b, c }; }
+    , &.{
+        .{ "a", "u8 = 1" },
+        .{ "b", "u8 = 2" },
+        .{ "c", "u8 = 2" },
+    });
+}
+
+test "a condition computed by a function selects the branch of a version check" {
+    // The arm that is not taken names a field that does not exist, so the type comes from the
+    // condition's value alone.
+    try expectTypes(
+        \\const Version = struct { minor: usize };
+        \\fn parseNum(text: []const u8, comptime sign: enum { pos, neg }) !usize {
+        \\    if (text.len == 0) return error.Empty;
+        \\    return switch (sign) { .pos => text.len, .neg => 0 };
+        \\}
+        \\fn parse(text: []const u8) !Version {
+        \\    return .{ .minor = try parseNum(text, .pos) };
+        \\}
+        \\const version = parse("ab") catch unreachable;
+        \\const Build = struct { current: u32 };
+        \\fn g(b: *Build) void {
+        \\    const root = if (comptime version.minor >= 2) b.current else b.removed;
+        \\    _ = root;
+        \\}
+    , &.{
+        .{ "root", "u32" },
+    });
+}
+
+test "a format-style length in a signature and a comptime block filling a sentinel array" {
+    // The shape of std.fmt.comptimePrint: `args` is a runtime anytype parameter, but the type of
+    // a tuple literal whose fields are all comptime fields has a single value.
+    try expectTypes(
+        \\fn width(comptime fmt: []const u8, args: anytype) usize { return fmt.len + args[0]; }
+        \\inline fn print(comptime fmt: []const u8, args: anytype) *const [width(fmt, args):0]u8 {
+        \\    comptime {
+        \\        var buf: [width(fmt, args):0]u8 = undefined;
+        \\        for (&buf) |*c| c.* = fmt[0];
+        \\        buf[buf.len] = 0;
+        \\        const final = buf;
+        \\        return &final;
+        \\    }
+        \\}
+        \\const a = print("ab", .{1});
+        \\const nested = print("x", .{print("y", .{2}).len});
+        \\fn g(n: usize) void {
+        \\    const at_runtime = print("ab", .{n});
+        \\    _ = .{ a, nested, at_runtime };
+        \\}
+    , &.{
+        .{ "a", "*const [3:0]u8 = \"aaa\"" },
+        .{ "nested", "*const [4:0]u8 = \"xxxx\"" },
+        .{ "at_runtime", "*const [_:0]u8" },
+    });
+}
+
+test "pointer casts keep the value only when the elements are unchanged" {
+    // Relabeling `*const [2][1]u8` as `*const [2]u8` showed array elements as bytes.
+    try expectTypes(
+        \\const nested: [2][1]u8 = .{ "a".*, "b".* };
+        \\const flat: *const [2]u8 = @ptrCast(&nested);
+        \\const bytes: [2]u8 = "ab".*;
+        \\const many: [*]const u8 = @ptrCast(&bytes);
+        \\const first = many[0];
+        \\const signed: *const [2]i8 = @ptrCast(&bytes);
+        \\const zero: u8 = 0;
+        \\const erased: ?*const anyopaque = @ptrCast(&zero);
+        \\const back: ?*const u8 = @ptrCast(@alignCast(erased));
+        \\const wrong: ?*const u16 = @ptrCast(@alignCast(erased));
+        \\const none: ?*const anyopaque = null;
+        \\const none_back: ?*const u8 = @ptrCast(none);
+        \\fn g() void { _ = .{ flat, first, signed, back, wrong, none_back }; }
+    , &.{
+        .{ "flat", "*const [2]u8" },
+        .{ "first", "u8 = 97" },
+        .{ "signed", "*const [2]i8" },
+        .{ "back", "?*const u8 = &0" },
+        .{ "wrong", "?*const u16" },
+        .{ "none_back", "?*const u8 = null" },
+    });
+}
+
+test "a function chosen by switching on an enum defined in the signature" {
+    // The tag recorded by the instance kept the type of another instance, so no prong was chosen
+    // and the error set became anyerror.
+    try expectTypes(
+        \\fn add(comptime T: type, a: T, b: T) error{Overflow}!T { return a + b; }
+        \\fn sub(comptime T: type, a: T, b: T) error{Overflow}!T { return a - b; }
+        \\fn pick(comptime s: enum { pos, neg }) !u8 {
+        \\    const f = switch (s) { .pos => add, .neg => sub };
+        \\    return f(u8, 1, 2);
+        \\}
+        \\const r = pick(.pos);
+        \\fn g() void { _ = r; }
+    , &.{
+        .{ "r", "error{Overflow}!u8 = 3" },
+    });
+}
+
+test "the address of a place is const unless the place can be written" {
+    // A pointer to a constant had a mutable type, so the evaluated value of the initializer was
+    // discarded as having a different type than inference gave.
+    try expectTypes(
+        \\const S = struct { x: u8 };
+        \\const of_const = blk: {
+        \\    const final: [2:0]u8 = "ab".*;
+        \\    break :blk &final;
+        \\};
+        \\const of_copy = blk: {
+        \\    var buf: [2:0]u8 = "ab".*;
+        \\    buf[0] = 'c';
+        \\    const final = buf;
+        \\    break :blk &final;
+        \\};
+        \\const field_of_const = blk: {
+        \\    const s: S = .{ .x = 1 };
+        \\    break :blk (&s.x).*;
+        \\};
+        \\fn g() void { _ = .{ of_const, of_copy, field_of_const }; }
+    , &.{
+        .{ "of_const", "*const [2:0]u8 = \"ab\"" },
+        .{ "of_copy", "*const [2:0]u8 = \"cb\"" },
+        .{ "field_of_const", "u8 = 1" },
+    });
+}
+
+test "the sentinel element of an array" {
+    try expectTypes(
+        \\const read = blk: {
+        \\    const buf: [2:0]u8 = "ab".*;
+        \\    break :blk buf[2];
+        \\};
+        \\const same = blk: {
+        \\    var buf: [2:0]u8 = "ab".*;
+        \\    buf[2] = 0;
+        \\    break :blk buf;
+        \\};
+        \\const other = blk: {
+        \\    var buf: [2:0]u8 = "ab".*;
+        \\    buf[2] = 1;
+        \\    break :blk buf;
+        \\};
+        \\fn g() void { _ = .{ read, same, other }; }
+    , &.{
+        .{ "read", "u8 = 0" },
+        .{ "same", "[2:0]u8 = \"ab\"" },
+        // Storing a value other than the sentinel is a compile error
+        .{ "other", "[2:0]u8" },
+    });
+}
+
+test "inline calls with comptime-known arguments have comptime-known results" {
+    try expectTypes(
+        \\inline fn twice(x: u32) u32 { return x * 2; }
+        \\var global: u32 = 1;
+        \\inline fn readGlobal() u32 { return global; }
+        \\fn g(y: u32) void {
+        \\    const known = twice(4);
+        \\    const runtime_arg = twice(y);
+        \\    const runtime_body = readGlobal();
+        \\    _ = .{ known, runtime_arg, runtime_body };
+        \\}
+    , &.{
+        .{ "known", "u32 = 8" },
+        .{ "runtime_arg", "u32" },
+        .{ "runtime_body", "u32" },
+    });
+}
+
 test "names of containers defined in bodies" {
     try expectTypes(
         \\fn Box(comptime T: type) type { return struct { v: T }; }
@@ -2147,9 +2366,9 @@ test "tuple and anonymous struct literals have comptime fields like the compiler
         .{ "sa1", "comptime_int = 4" },
         .{ "sa2", "comptime_int = 16" },
         .{ "oa2", "comptime_int = 12" },
-        // Whether the result of an inline function is comptime-known depends on its body:
-        // whether the field takes space is unknown
-        .{ "su", "comptime_int" },
+        // The result of an inline call computed from comptime-known values is comptime-known
+        .{ "tu", "struct { comptime u32 = 1 } = .{ 1 }" },
+        .{ "su", "comptime_int = 0" },
         .{ "empty", "@TypeOf(.{}) = .{}" },
         // All fields are comptime fields
         .{ "s0", "comptime_int = 0" },
@@ -3429,9 +3648,25 @@ test "an array length that a call instance cannot evaluate is unknown, not the c
     });
 }
 
+/// A builtin with the target and optimize mode of the local machine: the standard library
+/// selects its float tables by the optimize mode (`std.fmt.float`) and whether to use vectors by
+/// the backend (`std.mem`)
+const target_builtin =
+    \\const std = @import("std");
+    \\pub const mode: std.lang.Optimize = .debug;
+    \\pub const cpu: std.Target.Cpu = .{ .arch = .x86_64, .model = undefined, .features = undefined };
+    \\pub const os: std.Target.Os = .{ .tag = .linux, .version_range = undefined };
+    \\pub const abi: std.Target.Abi = .gnu;
+    \\pub const object_format: std.Target.ObjectFormat = .elf;
+    \\pub const link_libc = false;
+    \\pub const single_threaded = false;
+    \\pub const zig_backend: std.lang.CompilerBackend = .stage2_llvm;
+    \\pub const fuzz = false;
+;
+
 test "std.fmt.comptimePrint results keep their pointer, element and sentinel types" {
     // The results were shown with the callee's length text `count(fmt, args)`
-    try expectStdTypes(
+    try expectStdTypesBuiltin(target_builtin,
         \\const std = @import("std");
         \\pub const version = std.fmt.comptimePrint("{d}.{d}.{d}", .{ 1, 22, 3 });
         \\fn probe() void {
@@ -3440,9 +3675,102 @@ test "std.fmt.comptimePrint results keep their pointer, element and sentinel typ
         \\    _ = n;
         \\}
     , &.{
-        .{ "s", "*const [_:0]u8" },
-        .{ "version", "*const [_:0]u8" },
-        .{ "n", "usize" },
+        .{ "s", "*const [1:0]u8 = \"3\"" },
+        .{ "version", "*const [6:0]u8 = \"1.22.3\"" },
+        .{ "n", "usize = 1" },
+    });
+}
+
+test "float formatting in std.fmt at comptime" {
+    // Formatting an f128 reads the parts of the value as u128, which the interpreter stored as
+    // i128: all operations on such values gave up.
+    try expectStdTypesBuiltin(target_builtin,
+        \\const std = @import("std");
+        \\pub const decimal = std.fmt.comptimePrint("{d:3.1}", .{30.0});
+        \\pub const precise = std.fmt.comptimePrint("{d:.3}", .{@as(f64, 1.0 / 3.0)});
+        \\pub const scientific = std.fmt.comptimePrint("{e}", .{@as(f64, 0.05)});
+        \\pub const wide = std.fmt.comptimePrint("{d}", .{@as(f128, 30.0)});
+        \\pub const negative = std.fmt.comptimePrint("{d}", .{@as(f128, -1.25)});
+    , &.{
+        .{ "decimal", "*const [4:0]u8 = \"30.0\"" },
+        .{ "precise", "*const [5:0]u8 = \"0.333\"" },
+        .{ "scientific", "*const [4:0]u8 = \"5e-2\"" },
+        .{ "wide", "*const [2:0]u8 = \"30\"" },
+        .{ "negative", "*const [5:0]u8 = \"-1.25\"" },
+    });
+}
+
+test "unsigned 128-bit integers above i128's range" {
+    // The bit pattern of a u128 value at or above 2^127 was read back as a negative number.
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const high: u128 = @as(u128, 1) << 127;
+        \\const max: u128 = std.math.maxInt(u128);
+        \\const shr: u128 = high >> 126;
+        \\const sum: u128 = high +% high;
+        \\const product: u128 = high *% 2;
+        \\const cmp: bool = high > 1;
+        \\const truncated: u64 = @truncate(high);
+        \\const cast: u128 = @intCast(high);
+    , &.{
+        .{ "high", "u128 = 170141183460469231731687303715884105728" },
+        .{ "max", "u128 = 340282366920938463463374607431768211455" },
+        .{ "shr", "u128 = 2" },
+        .{ "sum", "u128 = 0" },
+        .{ "product", "u128 = 0" },
+        .{ "cmp", "bool = true" },
+        .{ "truncated", "u64 = 0" },
+        .{ "cast", "u128 = 170141183460469231731687303715884105728" },
+    });
+}
+
+test "comptime_int values outside i128" {
+    // `comptime_int` is arbitrary precision: a value beyond i128 was unknown, and so was the
+    // arithmetic on it
+    try expectTypes(
+        \\const a = 0x1_0000_0000_0000_0000_0000_0000_0000_0000;
+        \\const b = 1 << 200;
+        \\const c = b / 3;
+        \\const n = -(1 << 200);
+        \\const folded = blk: {
+        \\    var x = 1 << 200;
+        \\    x += 1;
+        \\    x *= 2;
+        \\    break :blk x;
+        \\};
+        \\const cmp = (1 << 200) > (1 << 199);
+        \\const trunc: i8 = @truncate(-(1 << 200) + 5);
+        \\const cast: u128 = @intCast((1 << 128) - 1);
+        \\const floor = @divFloor(-(1 << 200), 3);
+        \\const mod = @mod(-(1 << 200), 7);
+        \\const rem = @rem(-(1 << 200), 7);
+        \\const min = @min(1 << 200, 1 << 201);
+        \\const max = @max(-(1 << 200), 3);
+        \\const abs = @abs(-(1 << 200));
+        \\const shl = @shlExact(3, 100);
+        \\const shr = @shrExact(1 << 100, 50);
+        \\const mul = (1 << 200) * (1 << 200);
+        \\fn g() void {
+        \\    _ = .{ a, b, c, n, folded, cmp, trunc, cast, floor, mod, rem, min, max, abs, shl, shr, mul };
+        \\}
+    , &.{
+        .{ "a", "comptime_int = 340282366920938463463374607431768211456" },
+        .{ "b", "comptime_int = 1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "c", "comptime_int = 535646014752996758513987364113720867507400997927597611767125" },
+        .{ "n", "comptime_int = -1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "folded", "comptime_int = 3213876088517980551083924184682325205044405987565585670602754" },
+        .{ "cmp", "bool = true" },
+        .{ "trunc", "i8 = 5" },
+        .{ "cast", "u128 = 340282366920938463463374607431768211455" },
+        .{ "floor", "comptime_int = -535646014752996758513987364113720867507400997927597611767126" },
+        .{ "mod", "comptime_int = 3" },
+        .{ "rem", "comptime_int = -4" },
+        .{ "min", "comptime_int = 1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "max", "comptime_int = 3" },
+        .{ "abs", "comptime_int = 1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "shl", "comptime_int = 3802951800684688204490109616128" },
+        .{ "shr", "comptime_int = 1125899906842624" },
+        .{ "mul", "comptime_int = 2582249878086908589655919172003011874329705792829223512830659356540647622016841194629645353280137831435903171972747493376" },
     });
 }
 
@@ -4762,7 +5090,7 @@ test "@import of a zon file is its value in inference and comptime evaluation" {
     _ = try w.add("/p/pos.zon", ".{ .x = 3, .y = 4, .list = .{ 1, 2, 3 } }");
     _ = try w.add("/p/cfg.zon", ".{ .port = 8080 }");
     _ = try w.add("/p/n.zon", "5");
-    // An integer beyond i128
+    // An integer beyond i128 has an arbitrary-precision value
     _ = try w.add("/p/big.zon", "0x1_0000_0000_0000_0000_0000_0000_0000_0000");
     const src =
         \\const pos = @import("pos.zon");
@@ -4799,7 +5127,7 @@ test "@import of a zon file is its value in inference and comptime evaluation" {
         // Structs are parsed according to the result type, not converted from the anonymous
         // value: the value cannot be evaluated
         .{ "port_value", "u16" },
-        .{ "big", "comptime_int" },
+        .{ "big", "comptime_int = 340282366920938463463374607431768211456" },
     };
     for (cases) |c| {
         testing.expectEqualStrings(c[1], try typeAt(&w, f.file, src, c[0], 0)) catch |err| {
