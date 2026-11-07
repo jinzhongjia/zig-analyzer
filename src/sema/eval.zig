@@ -2356,7 +2356,7 @@ const Evaluator = struct {
                     .ptr_type => |p| if (p.size == .one) p.child else null,
                     else => null,
                 } else null;
-                return ev.addressOf(f, operand_e, try ev.eval(f, operand_e, child_want));
+                return ev.addressOf(f, operand_e, try ev.addressOperand(f, operand_e, child_want));
             },
             .keyword_try => {
                 const v = try ev.eval(f, operand_e, null);
@@ -2368,6 +2368,20 @@ const Evaluator = struct {
             },
             else => return error.Abort,
         }
+    }
+
+    /// Operand of `&` whose result type points to `want` (`Sema.zirCoercePtrElemTy`): a `T`
+    /// referenced as the element of a `*[n]T` is not coerced to the array, the pointer is coerced
+    /// instead (`*T` → `*[1]T`)
+    fn addressOperand(ev: *Evaluator, f: *Frame, e: ExprId, want: ?Index) EvalError!Val {
+        const t = want orelse return ev.eval(f, e, null);
+        const elem = switch (ev.ip.key(t)) {
+            .array_type => |a| a.child,
+            else => return ev.eval(f, e, t),
+        };
+        try ev.tick();
+        const v = try ev.evalInner(f, e, t);
+        return if (v.ty == elem) v else ev.coerce(v, t);
     }
 
     /// `&x`: points to x when x is a local variable (or an element of one), otherwise to a
