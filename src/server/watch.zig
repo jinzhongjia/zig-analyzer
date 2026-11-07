@@ -1456,7 +1456,11 @@ const DirNotify = struct {
         _ = windows.ntdll.NtSetEvent(d.wake_event, null);
     }
 
+    /// Returns at once when notifications have already completed: their APCs may have run during
+    /// an alertable wait elsewhere on this thread (such as file I/O while a batch was handled), and
+    /// those directories are not listening again until they are drained
     fn wait(d: *DirNotify, timeout_ns: ?u64) void {
+        if (d.ready.first != null) return;
         if (timeout_ns) |ns| {
             const interval: windows.LARGE_INTEGER = -@as(windows.LARGE_INTEGER, @intCast(@min(ns / 100, std.math.maxInt(i63))));
             _ = windows.ntdll.NtWaitForSingleObject(d.wake_event, .TRUE, &interval);
@@ -1736,6 +1740,36 @@ test "native watching reports changes, creation and removal in watched directori
     n.wait(null);
     var events: std.ArrayList(Event) = .empty;
     try n.drain(a, &events);
+}
+
+// Prevents waiting forever for a notification whose APC already ran during an alertable wait
+// elsewhere on the thread
+test "DirNotify: a notification completed outside of waiting ends the next wait at once" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+
+    const n = try DirNotify.create(testing.allocator, testing.io);
+    defer n.destroy(testing.allocator);
+    var failed: std.ArrayList([]const u8) = .empty;
+    defer failed.deinit(testing.allocator);
+    try n.setDirs(testing.allocator, &.{dir}, &failed);
+    try testing.expectEqual(0, failed.items.len);
+
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "a" });
+    // The APC runs here, not in `wait`
+    while (n.ready.first == null) std.Io.Threaded.waitForApcOrAlert();
+    const start = Io.Clock.awake.now(testing.io);
+    n.wait(10 * std.time.ns_per_s);
+    try testing.expect(start.durationTo(Io.Clock.awake.now(testing.io)).toSeconds() < 5);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var events: std.ArrayList(Event) = .empty;
+    try n.drain(arena.allocator(), &events);
+    try testing.expect(events.items.len != 0);
 }
 
 // Prevents freeing the real path of an aliased watch root without its sentinel: the allocator
