@@ -978,6 +978,25 @@ const Evaluator = struct {
         return if (i == a.len) Val.of(a.child, s) else null;
     }
 
+    /// The sentinel after the elements of a sequence of type `t`: an array, the array a
+    /// single-item pointer points to, a slice, or a many-item pointer
+    fn seqSentinel(ev: *Evaluator, t: Index) ?Index {
+        const ip = ev.ip;
+        return switch (ip.key(t)) {
+            .array_type => |a| a.sentinel,
+            .abstract_array_type => |a| a.sentinel,
+            .ptr_type => |p| switch (p.size) {
+                .one => switch (ip.key(p.child)) {
+                    .array_type => |a| a.sentinel,
+                    .abstract_array_type => |a| a.sentinel,
+                    else => null,
+                },
+                .slice, .many, .c => p.sentinel,
+            },
+            else => null,
+        };
+    }
+
     /// Element `i`; unknown when the value is unknown
     fn elemAt(ev: *Evaluator, v: Val, i: usize) EvalError!Val {
         const ty = ev.elemTypeOf(v.ty, i);
@@ -2635,19 +2654,7 @@ const Evaluator = struct {
         };
         // Consistent with the inference path: an explicit sentinel takes precedence; slicing to
         // the end keeps the sentinel of the source array
-        const src_sentinel: ?Index = switch (ip.key(base.ty)) {
-            .array_type => |a| a.sentinel,
-            .abstract_array_type => |a| a.sentinel,
-            .ptr_type => |p| switch (p.size) {
-                .one => switch (ip.key(p.child)) {
-                    .array_type => |a| a.sentinel,
-                    .abstract_array_type => |a| a.sentinel,
-                    else => null,
-                },
-                .slice, .many, .c => p.sentinel,
-            },
-            else => null,
-        };
+        const src_sentinel = ev.seqSentinel(base.ty);
         const explicit: ?Index = if (s.sentinel) |se| blk: {
             const v = try ev.eval(f, se, child);
             break :blk try ev.freeze(v) orelse return error.Abort;
