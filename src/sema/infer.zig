@@ -3135,18 +3135,25 @@ const Inferrer = struct {
         const ip = inf.ip;
         const types = try inf.scratch.alloc(Index, fields.len);
         const vals = try inf.scratch.alloc(Index, fields.len);
-        var known = true;
         for (fields, types, vals) |f, *t, *v| {
             const tv = try inf.infer(f.value, null);
             t.* = tv.ty;
             v.* = tv.val orelse .unknown;
-            if (tv.val == null) known = false;
         }
         for (types) |t| if (t == .unknown) return .unknown;
         // comptime-known fields are comptime fields, and their values belong to the type
         // (matches the compiler)
         const values = try inf.scratch.alloc(Index, fields.len);
-        for (fields, types, vals, values) |f, t, v, *o| o.* = try inf.literalField(f.value, t, v);
+        for (fields, types, vals, values) |f, t, *v, *o| {
+            o.* = try inf.literalField(f.value, t, v.*);
+            // A value the interpreter computed for the field is also part of the literal's value
+            if (v.* == .unknown) if (inf.get(f.value).val) |x| {
+                v.* = x;
+            };
+        }
+        const known = for (vals) |v| {
+            if (v == .unknown) break false;
+        } else true;
         const field_values = InternPool.fieldValues(values);
         const named = fields.len > 0 and fields[0].name != null;
         const ty = if (named) blk: {
@@ -3172,7 +3179,27 @@ const Inferrer = struct {
         }
         if (value.intInfo(inf.ip, ty)) |info| if (info.bits == 0) return inf.ip.get(.{ .int_value = .{ .ty = ty, .value = 0 } });
         if (inf.comptime_depth > 0) return .unknown;
-        return if (try inf.knownness(e, 0) == .runtime) .runtime else .unknown;
+        if (try inf.knownness(e, 0) == .runtime) return .runtime;
+        // The compiler makes every field whose value is comptime-known a comptime field, including
+        // values inference does not compute (slices of strings: `.{@as([]const u8, "abc")}`)
+        if (try inf.interpretedValue(e, ty)) |v| return v;
+        return .unknown;
+    }
+
+    /// comptime value of `e` (of type `ty`) computed by the interpreter under the current bindings,
+    /// for a value that inference does not compute outside a comptime context; it becomes the
+    /// value of the expression
+    fn interpretedValue(inf: *Inferrer, e: ExprId, ty: Index) Error!?Index {
+        if (inf.dead > 0 or inf.r.ctx.incomplete()) return null;
+        switch (inf.body.expr(e)) {
+            .missing, .other => return null,
+            else => {},
+        }
+        const ev = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
+        const v = ev.val orelse return null;
+        if (ev.ty != ty) return null;
+        inf.exprs[@backingInt(e)] = ev;
+        return v;
     }
 
     const Knownness = enum { comptime_known, runtime, uncertain };

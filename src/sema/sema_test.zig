@@ -3063,6 +3063,45 @@ test "tuple and anonymous struct literals have comptime fields like the compiler
     });
 }
 
+test "comptime-known slices in tuple literals are comptime fields that anytype callees can read" {
+    // A field holding a slice of a string was neither a comptime nor a runtime field, so the
+    // instance of a callee receiving the tuple through anytype had no value for it.
+    try expectTypes(
+        \\fn lenOfArg(args: anytype) usize {
+        \\    return args[0].len;
+        \\}
+        \\fn RetArr(args: anytype) type {
+        \\    return [lenOfArg(args)]u8;
+        \\}
+        \\fn retTypeUsesArg(args: anytype) [lenOfArg(args)]u8 {
+        \\    return @splat(1);
+        \\}
+        \\inline fn retTypeInline(args: anytype) [lenOfArg(args)]u8 {
+        \\    return @splat(1);
+        \\}
+        \\const slice_t = @TypeOf(.{@as([]const u8, "abc")});
+        \\const mixed_t = @TypeOf(.{ @as([]const u8, "abc"), @as(u8, 1) });
+        \\const anon_t = @TypeOf(.{ .a = @as([]const u8, "abc") });
+        \\const ret_type_arg = @TypeOf(retTypeUsesArg(.{@as([]const u8, "abc")}));
+        \\const ret_type_direct = RetArr(.{@as([]const u8, "abc")});
+        \\const ret_type_inline = @TypeOf(retTypeInline(.{@as([]const u8, "abc")}));
+        \\fn g(p: []const u8) void {
+        \\    const with_runtime = .{ @as([]const u8, "xy"), p };
+        \\    const in_fn = retTypeUsesArg(.{@as([]const u8, "ab")});
+        \\    _ = .{ with_runtime, in_fn };
+        \\}
+    , &.{
+        .{ "slice_t", "type = struct { comptime []const u8 = \"abc\" }" },
+        .{ "mixed_t", "type = struct { comptime []const u8 = \"abc\", comptime u8 = 1 }" },
+        .{ "anon_t", "type = struct { comptime a: []const u8 = \"abc\" }" },
+        .{ "ret_type_arg", "type = [3]u8" },
+        .{ "ret_type_direct", "type = [3]u8" },
+        .{ "ret_type_inline", "type = [3]u8" },
+        .{ "with_runtime", "struct { comptime []const u8 = \"xy\", []const u8 }" },
+        .{ "in_fn", "[2]u8" },
+    });
+}
+
 test "union fields without a type are void, enum member names are not expressions" {
     try expectTypes(
         \\fn read() void {}
@@ -4403,12 +4442,19 @@ test "std.fmt.comptimePrint results keep their pointer, element and sentinel typ
         \\fn probe() void {
         \\    const s = std.fmt.comptimePrint("{d}", .{3});
         \\    const n = s.len;
-        \\    _ = n;
+        \\    const named = std.fmt.comptimePrint("{s}!", .{@as([]const u8, "xyz")});
+        \\    _ = .{ n, named };
         \\}
+        \\pub const one_slice = std.fmt.comptimePrint("{s}", .{@as([]const u8, "bc")});
+        \\pub const two_args = std.fmt.comptimePrint("{s}|{s}", .{ "a", @as([]const u8, "bc") });
     , &.{
         .{ "s", "*const [1:0]u8 = \"3\"" },
         .{ "version", "*const [6:0]u8 = \"1.22.3\"" },
         .{ "n", "usize = 1" },
+        // Slice arguments: the tuple's comptime fields carry their values
+        .{ "one_slice", "*const [2:0]u8 = \"bc\"" },
+        .{ "two_args", "*const [4:0]u8 = \"a|bc\"" },
+        .{ "named", "*const [4:0]u8 = \"xyz!\"" },
     });
 }
 
