@@ -661,11 +661,15 @@ const Ref = struct {
     /// Element indices taken level by level from the value of the storage cell
     path: []const u32,
     /// Slice: points to the range `[start, start + len)` of the aggregate at `path` (shares
-    /// storage with the original array)
+    /// storage with the original array); with `as_array`, of the one-element array view
     window: ?Window = null,
     /// The place cannot be written: a constant, a temporary, or a place reached through a
     /// `*const` pointer. A pointer taken to it with `&` is `*const`.
     is_const: bool = false,
+    /// A single-item pointer coerced to a pointer to a one-element array (`*T` → `*[1]T`): the
+    /// place at `path` itself is the only element of the array pointed to, so reads and writes
+    /// through the pointer reach that place
+    as_array: bool = false,
 
     const Window = struct { start: u32, len: u32 };
 };
@@ -823,7 +827,10 @@ const Evaluator = struct {
                 return try ev.aggregate(v.ty, elems);
             },
             .ref => |ref| {
-                const target = try ev.load(ref);
+                const target = if (ref.as_array) blk: {
+                    const elems = try ev.viewElems(v, ref);
+                    break :blk try ev.makeAgg(try ev.ip.get(.{ .array_type = .{ .len = elems.len, .child = ev.elemTypeOf(v.ty, 0) } }), elems);
+                } else try ev.load(ref);
                 const pointee = try ev.freeze(target) orelse return null;
                 return try ev.pointerTo(v.ty, pointee);
             },
@@ -949,7 +956,7 @@ const Evaluator = struct {
         switch (v.v) {
             .agg => |agg| return agg.elems.len,
             // The length of a range is known without taking out its elements
-            .ref => |ref| return if (ref.window) |w| w.len else ev.elemCount(try ev.load(ref)),
+            .ref => |ref| return if (ref.window) |w| w.len else if (ref.as_array) 1 else ev.elemCount(try ev.load(ref)),
             .ip => |x| switch (ev.ip.key(x)) {
                 .aggregate => |agg| return agg.elems.len,
                 .bytes => |b| return b.bytes.len,
@@ -995,6 +1002,9 @@ const Evaluator = struct {
                     if (i >= w.len) return error.Abort;
                     break :blk w.start + i;
                 } else i;
+                // `*T` → `*[1]T`: the place itself is element 0, read as the pointer's element
+                // type
+                if (ref.as_array) return if (index == 0) ev.readAs(base, ty) else error.Abort;
                 var elem = try ev.elemAt(base, index);
                 // When tracking origins, a byte from a literal records its position, so a name
                 // built byte by byte (`&[1]u8{c}`) can also be traced back to the literal
@@ -1022,12 +1032,42 @@ const Evaluator = struct {
     /// on read; writes reach the original storage through `extend`); to get only an element or the
     /// length, use `elemAt` / `elemCount`, which do not copy the range.
     fn load(ev: *Evaluator, ref: Ref) EvalError!Val {
-        const cur = try ev.loadPath(ref);
+        var cur = try ev.loadPath(ref);
+        // `*T` → `*[1]T`: an array whose only element is the place, as stored (`deref` reads the
+        // elements as the pointer's element type)
+        if (ref.as_array) {
+            const elems = try ev.allocElems(1);
+            elems[0] = cur;
+            cur = try ev.makeAgg(try ev.ip.get(.{ .array_type = .{ .len = 1, .child = cur.ty } }), elems);
+        }
         const w = ref.window orelse return cur;
         const elems = try ev.allocElems(w.len);
         for (elems, w.start..) |*o, i| o.* = try ev.elemAt(cur, i);
         const array = try ev.ip.get(.{ .array_type = .{ .len = w.len, .child = ev.elemTypeOf(cur.ty, w.start) } });
         return ev.makeAgg(array, elems);
+    }
+
+    /// Elements read through a pointer `p` to a `*T` → `*[1]T` view (see `Ref.as_array`), as its
+    /// element type
+    fn viewElems(ev: *Evaluator, p: Val, ref: Ref) EvalError![]Val {
+        const elems = try ev.allocElems(if (ref.window) |w| w.len else 1);
+        for (elems, 0..) |*o, i| o.* = try ev.elemAt(p, i);
+        return elems;
+    }
+
+    /// Value read through a pointer to `child` from a place holding `v`. A pointer to the payload
+    /// of an optional (`if (opt) |*x|`) points to where the optional is, and an optional is
+    /// represented by its payload: it is read as the payload type.
+    fn readAs(ev: *Evaluator, v: Val, child: Index) Val {
+        if (child != .unknown and v.ty != child) switch (ev.ip.key(v.ty)) {
+            .optional_type => |c| if (c == child) {
+                var out = v;
+                out.ty = child;
+                return out;
+            },
+            else => {},
+        };
+        return v;
     }
 
     /// Value obtained by taking elements level by level along `path`; for a range, the aggregate
@@ -1056,6 +1096,8 @@ const Evaluator = struct {
             }
             return;
         }
+        // `*T` → `*[1]T`: the place itself is the only element
+        if (ref.as_array) return ev.store(try ev.extend(ref, 0), try ev.elemAt(v, 0));
         var cell = ref.cell;
         for (ref.path, 0..) |i, depth| {
             // The sentinel of an array (`buf[buf.len] = 0` in std.fmt.comptimePrint) is part of
@@ -1357,7 +1399,7 @@ const Evaluator = struct {
             .ref => |x| x,
             else => return null,
         };
-        if (ref.path.len != 0) return null;
+        if (ref.path.len != 0 or ref.as_array) return null;
         for (ev.track.?.literals.items) |lit| if (lit.cell == ref.cell) return .{
             .file = lit.file,
             .item = lit.item,
@@ -2018,9 +2060,9 @@ const Evaluator = struct {
             .ref => |r| r,
             else => return error.Abort,
         };
-        // The element type comes from the containing aggregate, without taking out the range
-        const target = try ev.loadPath(ref);
-        const child = ev.elemTypeOf(target.ty, if (ref.window) |w| w.start + i else i);
+        // The element type comes from the containing aggregate, without taking out the range; the
+        // place of a `*T` → `*[1]T` view is itself the element
+        const child = if (ref.as_array) ev.elemTypeOf(seq.ty, i) else ev.elemTypeOf((try ev.loadPath(ref)).ty, if (ref.window) |w| w.start + i else i);
         const is_const = switch (ev.ip.key(seq.ty)) {
             .ptr_type => |p| p.is_const,
             else => false,
@@ -2243,6 +2285,9 @@ const Evaluator = struct {
                     if (!std.mem.eql(u32, x.path, y.path)) return null;
                     const xs = if (x.window) |w| w.start else 0;
                     const ys = if (y.window) |w| w.start else 0;
+                    // A `*T` → `*[1]T` view counts positions in units of the place, a pointer into
+                    // the place in units of its elements: only their starts are known to coincide
+                    if (x.as_array != y.as_array) return if (xs == 0 and ys == 0) true else null;
                     return xs == ys;
                 },
                 .ip => return false,
@@ -2441,8 +2486,8 @@ const Evaluator = struct {
     /// (automatic dereferencing)
     fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!Ref {
         const ref = try ev.place(f, e);
-        // The value of a range is an array, not a pointer
-        if (ref.window != null) return ref;
+        // The value of a range, or of a `*T` → `*[1]T` view, is an array, not a pointer
+        if (ref.window != null or ref.as_array) return ref;
         const v = try ev.load(ref);
         return switch (v.v) {
             .ref => |r| ev.through(r, v.ty),
@@ -2466,6 +2511,8 @@ const Evaluator = struct {
             if (i >= w.len) return error.Abort;
             break :blk w.start + i;
         } else i;
+        // `*T` → `*[1]T`: element 0 is the place itself
+        if (base.as_array) return if (index == 0) .{ .cell = base.cell, .path = base.path, .is_const = base.is_const } else error.Abort;
         const path = try ev.a.alloc(u32, base.path.len + 1);
         @memcpy(path[0..base.path.len], base.path);
         path[base.path.len] = index;
@@ -2577,7 +2624,8 @@ const Evaluator = struct {
             .ref => |r| r,
             else => return false,
         };
-        const w = r.window orelse return false;
+        // A `*T` → `*[1]T` view without a range covers its only element
+        const w: Ref.Window = r.window orelse if (r.as_array) .{ .start = 0, .len = 1 } else return false;
         const rhs = try ev.evalInt(f, rhs_e, .usize_type);
         const len: i128 = switch (op) {
             .equal => rhs,
@@ -2585,10 +2633,9 @@ const Evaluator = struct {
             .minus_equal => @as(i128, w.len) - rhs,
             else => return error.Abort,
         };
-        const whole = try ev.load(.{ .cell = r.cell, .path = r.path });
-        const n = try ev.elemCount(whole) orelse return error.Abort;
+        const n = if (r.as_array) 1 else try ev.elemCount(try ev.load(.{ .cell = r.cell, .path = r.path })) orelse return error.Abort;
         if (len < 0 or w.start + len > n) return error.Abort;
-        try ev.store(ref, .{ .ty = s.ty, .v = .{ .ref = .{ .cell = r.cell, .path = r.path, .window = .{ .start = w.start, .len = @intCast(len) } } } });
+        try ev.store(ref, .{ .ty = s.ty, .v = .{ .ref = .{ .cell = r.cell, .path = r.path, .window = .{ .start = w.start, .len = @intCast(len) }, .as_array = r.as_array } } });
         return true;
     }
 
@@ -2597,14 +2644,12 @@ const Evaluator = struct {
         const child = ev.pointeeType(p.ty);
         switch (p.v) {
             .ref => |r| {
-                const v = try ev.load(r);
-                // Pointer to the payload of an optional (`if (opt) |*x|`): an optional is
-                // represented by its payload, so read it as the payload type
-                if (child != .unknown and v.ty != child) switch (ip.key(v.ty)) {
-                    .optional_type => |c| if (c == child) return .{ .ty = child, .v = v.v },
-                    else => {},
-                };
-                return v;
+                // `*T` → `*[1]T`: the elements are read as the pointer's element type
+                if (r.as_array) {
+                    const elems = try ev.viewElems(p, r);
+                    return ev.makeAgg(try ev.derefType(p.ty, elems.len), elems);
+                }
+                return ev.readAs(try ev.load(r), child);
             },
             .ip => |x| switch (ip.key(x)) {
                 .ptr_value => |pv| return Val.of(child, pv.pointee),
@@ -2888,15 +2933,29 @@ const Evaluator = struct {
         // Pointer to a tuple → slice: coerce the elements one by one; tuple / anonymous struct
         // literal → array, struct
         switch (ip.key(t)) {
-            // `*const T` → `*const [1]T`: take out the element and point to a constant array
-            // containing only that element
-            .ptr_type => |p| if (p.size == .one and p.is_const and ip.key(p.child) == .array_type and
+            // `*T` → `*[1]T` (`Sema.coerceExtra`): the same place viewed as a one-element array.
+            // An interned pointer points to immutable data, which is copied into an interned
+            // array.
+            .ptr_type => |p| if (p.size == .one and ip.key(p.child) == .array_type and
                 ip.key(p.child).array_type.len == 1 and ip.key(v.ty) == .ptr_type and
                 ip.key(v.ty).ptr_type.size == .one and ip.key(v.ty).ptr_type.child == ip.key(p.child).array_type.child)
             {
-                const elem = try ev.freeze(try ev.deref(v)) orelse return error.Abort;
-                const array = try ip.get(.{ .aggregate = .{ .ty = p.child, .elems = &.{elem} } });
-                return Val.of(t, try ev.pointerTo(t, array));
+                switch (v.v) {
+                    .ref => |r| {
+                        // The pointee is itself an array (`*[n]U` → `*[1][n]U`) taken from a
+                        // range or a view, which has no place of its own to view
+                        if (r.window != null or r.as_array) return error.Abort;
+                        var view = r;
+                        view.as_array = true;
+                        return .{ .ty = t, .v = .{ .ref = view } };
+                    },
+                    .ip => {
+                        const elem = try ev.freeze(try ev.deref(v)) orelse return error.Abort;
+                        const array = try ip.get(.{ .aggregate = .{ .ty = p.child, .elems = &.{elem} } });
+                        return Val.of(t, try ev.pointerTo(t, array));
+                    },
+                    else => return error.Abort,
+                }
             } else if (p.size == .slice or p.size == .many) {
                 const target_ty = ev.pointeeType(v.ty);
                 if (target_ty != .unknown and (ip.key(target_ty) == .tuple_type or ip.key(target_ty) == .anon_struct_type)) {
