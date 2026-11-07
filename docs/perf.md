@@ -25,10 +25,10 @@ Benchmark project: the Zig 0.17.0 compiler source (540k lines + standard library
 Resident memory over a long session on the Zig compiler source:
 
 - Linux, 160 rounds: RSS 2.5-2.8 GB from round 120 on, heap 2.1 GB at round 160, of which 1.8 GB are large allocations. Peak RSS 4.6 GB, with at most 1.55 GB assigned to size classes.
-- macOS, 160 rounds: RSS 2.9-3.1 GB from round 120 on, heap 2.1 GB at round 160, of which 2.0 GB are large allocations. Peak RSS 3.9-5.0 GB across runs, with at most 1.5 GB assigned to size classes.
+- macOS, 160 rounds: RSS 2.1-2.3 GB from round 120 on, heap 1.5 GB at round 160, of which 1.2 GB are large allocations. Peak RSS about 4.2 GB, with at most 1.6 GB assigned to size classes.
 - Windows, 160 rounds: working set 2.9 GB and heap 2.1 GB at round 160. Peak working set 4.7-4.8 GB and peak commit 5.4-5.5 GB, with at most 1.55 GB assigned to size classes.
 
-The heap grows over the session on all three; from round 120 to 160 on Linux it grows from 1.9 to 2.1 GB, mostly in large allocations, while the recorded dependencies grow from 105 to 126 million. The peak comes from the hover that computes the largest instance closure (all instances of `Writer.printValue`): it infers about 900,000 results in one read transaction, which holds at most 512 MB of them. The memory is returned to the system afterwards.
+The heap grows over the session; from round 120 to 160 on macOS it grows from 1.4 to 1.5 GB, mostly in large allocations, while the recorded dependencies grow from 42 to 45 million. The peak comes from the hover that computes the largest instance closure (all instances of `Writer.printValue`): it infers about 900,000 results in one read transaction, which holds at most 512 MB of them. The memory is returned to the system afterwards.
 
 ## Real projects
 

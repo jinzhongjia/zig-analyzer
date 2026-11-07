@@ -7036,6 +7036,53 @@ fn expectCallers(w: *World, file: FileId, name: []const u8, expected: []const []
     for (callers, expected) |i, n| try testing.expectEqualStrings(n, tree.items[i].name.?);
 }
 
+/// Instances of the generic function `name` in `file`
+fn instanceCount(w: *World, file: FileId, name: []const u8) !usize {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    const tree = try r.itemTree(file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.name) |n| if (std.mem.eql(u8, n, name)) break @intCast(i);
+    } else return error.NoItem;
+    return (try seed.allInstances(&r, file, item)).insts.len;
+}
+
+test "call sites are found through the names files gain and lose, without recomputing for other names" {
+    const lib = "pub fn leaf(x: anytype) void { _ = x; }\nfn run() void { leaf(@as(u8, 1)); }\n";
+    const header = "const lib = @import(\"lib.zig\");\n";
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/lib.zig", lib)).file;
+    const other = (try w.add("/p/other.zig", header ++ "const a = 1;\n")).file;
+    try w.setWorkspaceFiles(&.{ file, other });
+    try testing.expectEqual(1, try instanceCount(&w, file, "leaf"));
+
+    // A name no lookup asks for: the call sites of `leaf` are not looked for again
+    const before = w.db.executions(seed.RootCallers);
+    _ = try w.add("/p/other.zig", header ++ "const a = 1;\nconst unrelated = 2;\n");
+    try testing.expectEqual(1, try instanceCount(&w, file, "leaf"));
+    try testing.expectEqual(before, w.db.executions(seed.RootCallers));
+
+    // The file gains the name, with a new instance; then loses it
+    _ = try w.add("/p/other.zig", header ++ "fn call() void { lib.leaf(@as(u16, 1)); }\n");
+    try testing.expectEqual(2, try instanceCount(&w, file, "leaf"));
+    _ = try w.add("/p/other.zig", header ++ "const a = 1;\n");
+    try testing.expectEqual(1, try instanceCount(&w, file, "leaf"));
+}
+
+test "call sites in the file of a generic function outside the searched files are found" {
+    // The file of the function is a candidate without being a searched file
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/alone.zig", "fn leaf(x: anytype) void { _ = x; }\nconst alias = leaf;\nfn run() void { alias(@as(u8, 1)); }\n")).file;
+    const other = (try w.add("/p/other.zig", "const a = 1;\n")).file;
+    try w.setWorkspaceFiles(&.{other});
+    try testing.expectEqual(1, try instanceCount(&w, file, "leaf"));
+}
+
 test "seed selection invalidates for arguments caller bodies signatures aliases and new candidates" {
     const decls =
         \\fn leaf(x: anytype) @TypeOf(x) { return x; }
