@@ -486,6 +486,14 @@ pub fn binaryFloat(ip: *InternPool, op: SyntaxKind, ty: Index, a: f128, b: f128)
         .minus => a - b,
         .asterisk => a * b,
         .slash => if (b == 0) return null else a / b,
+        // `%` is `@rem`; when an operand may be negative (or is NaN) and the remainder is not
+        // zero, `@rem` and `@mod` differ and the compiler reports an error (`Sema.zirModRem`)
+        .percent => blk: {
+            if (b == 0) return null;
+            const r = @rem(a, b);
+            if (!(a >= 0 and b >= 0) and r != 0) return null;
+            break :blk r;
+        },
         else => return null,
     };
     return floatValue(ip, ty, r);
