@@ -1496,6 +1496,56 @@ test "comptime compound assignment gives no value where the compiler reports an 
     });
 }
 
+test "comptime float remainder" {
+    // `%` on floats is `@rem` when no operand is negative, or when the remainder is zero; with a
+    // negative operand and a nonzero remainder the compiler reports an error; expected values
+    // are the results of zig 0.17.0 and 0.17.1
+    try expectTypes(
+        \\fn modAssign() f64 {
+        \\    var x: f64 = 7.5;
+        \\    x %= 2;
+        \\    return x;
+        \\}
+        \\fn modFrac() f32 {
+        \\    var x: f32 = 5.75;
+        \\    x %= 1.5;
+        \\    return x;
+        \\}
+        \\fn modCt() comptime_float {
+        \\    var x: comptime_float = 7.5;
+        \\    x %= 2;
+        \\    return x;
+        \\}
+        \\fn modNegZero() f64 {
+        \\    var x: f64 = -4.0;
+        \\    x %= 2;
+        \\    return x;
+        \\}
+        \\fn modNegRhs() f64 {
+        \\    var x: f64 = 5.5;
+        \\    x %= -2;
+        \\    return x;
+        \\}
+        \\const mod_f64 = @as(f64, 7.5) % 2;
+        \\const mod_ct = 7.5 % 2.0;
+        \\const mod_neg = @as(f64, -5.5) % 2;
+        \\const mod_assign = modAssign();
+        \\const mod_frac = modFrac();
+        \\const mod_ct_assign = modCt();
+        \\const mod_neg_zero = modNegZero();
+        \\const mod_neg_rhs = modNegRhs();
+    , &.{
+        .{ "mod_f64", "f64 = 1.5" },
+        .{ "mod_ct", "comptime_float = 1.5" },
+        .{ "mod_neg", "f64" },
+        .{ "mod_assign", "f64 = 1.5" },
+        .{ "mod_frac", "f32 = 1.25" },
+        .{ "mod_ct_assign", "comptime_float = 1.5" },
+        .{ "mod_neg_zero", "f64 = -0" },
+        .{ "mod_neg_rhs", "f64" },
+    });
+}
+
 test "instances of the same container compare by their captured values" {
     // Matches the compiler: the identity of a container = definition position + captured values
     try expectTypes(
