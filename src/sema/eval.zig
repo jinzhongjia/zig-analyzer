@@ -2509,7 +2509,9 @@ const Evaluator = struct {
         }
         const rhs_want: ?Index = if (old.ty != .unknown) old.ty else null;
         if (op == .equal) return ev.store(ref, try ev.eval(f, rhs_e, rhs_want));
-        // Compound assignment `a += b`
+        // Compound assignment `a op= b`: as in the compiler (`AstGen.assignOp`), the old value and
+        // the right operand go through the operator of `a op b`, and the result is stored (and
+        // coerced to the type of `a`)
         const bin: SyntaxKind = switch (op) {
             .plus_equal => .plus,
             .minus_equal => .minus,
@@ -2529,27 +2531,20 @@ const Evaluator = struct {
             .angle_bracket_angle_bracket_right_equal => .angle_bracket_angle_bracket_right,
             else => return error.Abort,
         };
-        const rhs = try ev.eval(f, rhs_e, if (bin == .angle_bracket_angle_bracket_left or bin == .angle_bracket_angle_bracket_right) null else rhs_want);
-        if (old.ty == .bool_type) {
-            const x = (try ev.condition(old)).yes;
-            const y = (try ev.condition(rhs)).yes;
-            return ev.store(ref, boolVal(switch (bin) {
-                .ampersand => x and y,
-                .pipe => x or y,
-                .caret => x != y,
-                else => return error.Abort,
-            }));
-        }
-        if (old.ty == .comptime_int_type) {
-            const a = try ev.bigOf(old) orelse return error.Abort;
-            const b = try ev.bigOf(rhs) orelse return error.Abort;
-            const r = try bigint.binary(ev.a, bin, a, b) orelse return error.Abort;
-            return ev.store(ref, Val.ofBig(old.ty, r));
-        }
-        const a = ev.intOf(old) orelse return error.Abort;
-        const b = ev.intOf(rhs) orelse return error.Abort;
-        const r = value.binaryInt(ev.ip, bin, old.ty, a, b) orelse return error.Abort;
-        try ev.store(ref, Val.ofInt(old.ty, r));
+        const rhs = try ev.eval(f, rhs_e, if (bin == .angle_bracket_angle_bracket_left or bin == .angle_bracket_angle_bracket_right) null else ev.compoundRhsType(bin, rhs_want));
+        try ev.store(ref, try ev.arith(bin, old, rhs));
+    }
+
+    /// Result type of the right operand of the compound assignment with operator `bin` to a place
+    /// of type `t` (`Sema.zirInplaceArithResultTy`): the type of the place, except that `+=` on a
+    /// many-item or C pointer adds a `usize`, and `-=` on one subtracts either an integer or a
+    /// pointer, so its right operand has no result type
+    fn compoundRhsType(ev: *Evaluator, bin: SyntaxKind, t: ?Index) ?Index {
+        if (bin == .plus or bin == .minus) if (t) |ty| switch (ev.ip.key(ty)) {
+            .ptr_type => |p| if (p.size == .many or p.size == .c) return if (bin == .plus) .usize_type else null,
+            else => {},
+        };
+        return t;
     }
 
     /// Modifies the `len` of a slice (`list.items.len += 1`): when the slice points to storage
