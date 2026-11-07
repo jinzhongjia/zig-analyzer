@@ -199,12 +199,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&generator_run.step);
     test_step.dependOn(&manifest_generator_run.step);
     test_step.dependOn(&imports_checker_run.step);
-    test_step.dependOn(&b.addRunArtifact(analyzerTests(b, target, optimize, test_runner, tracy != null, false, null)).step);
+    test_step.dependOn(&runAnalyzerTests(b, analyzerTests(b, target, optimize, test_runner, tracy != null, false, null)).step);
     const all_step = b.step("test-all", "Run all tests, including those that run the zig in PATH");
     all_step.dependOn(&generator_run.step);
     all_step.dependOn(&manifest_generator_run.step);
     all_step.dependOn(&imports_checker_run.step);
-    all_step.dependOn(&b.addRunArtifact(analyzerTests(b, target, optimize, test_runner, tracy != null, true, null)).step);
+    all_step.dependOn(&runAnalyzerTests(b, analyzerTests(b, target, optimize, test_runner, tracy != null, true, null)).step);
 
     // Stress verification (for concurrency-related changes): run the selected tests repeatedly, one
     // after another, in server mode; every run really executes, without cached results
@@ -215,7 +215,7 @@ pub fn build(b: *std.Build) void {
         const tests = analyzerTests(b, target, optimize, test_runner, tracy != null, true, filter);
         var prev: ?*std.Build.Step = null;
         for (0..stress_runs) |_| {
-            const run = b.addRunArtifact(tests);
+            const run = runAnalyzerTests(b, tests);
             run.has_side_effects = true;
             if (prev) |p| run.step.dependOn(p);
             prev = &run.step;
@@ -282,6 +282,18 @@ fn analyzerTests(
     });
     setStackReserve(tests);
     return tests;
+}
+
+/// Runs the analyzer tests without the cache directory overrides of the environment. The fixtures
+/// are created under `.zig-cache/tmp` of the current directory: with `ZIG_GLOBAL_CACHE_DIR` naming
+/// that `.zig-cache` (as setup-zig does in CI), every fixture file is inside the global cache and
+/// is classified as generated; with `ZIG_LOCAL_CACHE_DIR` set, the makers of the fixtures put
+/// their local caches outside the fixtures' build roots
+fn runAnalyzerTests(b: *std.Build, tests: *std.Build.Step.Compile) *std.Build.Step.Run {
+    const run = b.addRunArtifact(tests);
+    run.removeEnvironmentVariable("ZIG_GLOBAL_CACHE_DIR");
+    run.removeEnvironmentVariable("ZIG_LOCAL_CACHE_DIR");
+    return run;
 }
 
 /// Windows: threads take the executable's stack reserve as theirs, and the worker threads of
