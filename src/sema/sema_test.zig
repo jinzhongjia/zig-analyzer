@@ -1831,6 +1831,83 @@ test "orelse and catch on comptime-known operands take only the evaluated side" 
     });
 }
 
+test "catch and orelse on operands evaluated at comptime take the type of the side that is taken" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 (`@TypeOf` and `{any}` of each
+    // declaration, printed by a `zig test` runner). The handler gets the result type of the whole
+    // expression, not the payload type; operands of `@TypeOf` are runtime, so their peer type
+    // stays. Typing the result as the peer of the payload and the handler gave `u32 = "s"`.
+    try expectTypes(
+        \\const Err = error{ Foo, Bar };
+        \\fn mayFail(x: u32) Err!u32 {
+        \\    if (x == 0) return error.Foo;
+        \\    return x;
+        \\}
+        \\fn fails() error{Oops}!u32 {
+        \\    return error.Oops;
+        \\}
+        \\fn ok() error{Oops}!u32 {
+        \\    return 5;
+        \\}
+        \\fn maybe(x: u32) ?u32 {
+        \\    return if (x == 0) null else x;
+        \\}
+        \\fn catchInCall() bool {
+        \\    const x = fails() catch 9;
+        \\    return @TypeOf(x) == comptime_int;
+        \\}
+        \\fn orelseInCall() bool {
+        \\    const x = maybe(0) orelse "s";
+        \\    return @TypeOf(x) == *const [1:0]u8;
+        \\}
+        \\pub const catch_int = fails() catch 9;
+        \\pub const catch_typed = fails() catch @as(u64, 9);
+        \\pub const catch_str = fails() catch "s";
+        \\pub const catch_capture = fails() catch |e| @errorName(e);
+        \\pub const catch_capture_arg = mayFail(0) catch |e| @errorName(e);
+        \\pub const catch_block = fails() catch blk: {
+        \\    break :blk "blk";
+        \\};
+        \\pub const catch_ok_str = ok() catch "s";
+        \\pub const catch_ok_typed = ok() catch @as(u64, 9);
+        \\pub const catch_annotated: u64 = fails() catch 9;
+        \\pub const orelse_null_str = @as(?u32, null) orelse "s";
+        \\pub const orelse_call_str = maybe(0) orelse "s";
+        \\pub const orelse_call_typed = maybe(0) orelse @as(u64, 1);
+        \\pub const orelse_call_int = maybe(0) orelse 1;
+        \\pub const orelse_call_some = maybe(3) orelse "s";
+        \\pub const catch_then_orelse = (fails() catch @as(?u8, null)) orelse "n";
+        \\pub const local_type = blk: {
+        \\    const x = fails() catch 9;
+        \\    break :blk @TypeOf(x);
+        \\};
+        \\pub const typeof_catch = @TypeOf(fails() catch 0);
+        \\pub const typeof_orelse = @TypeOf(maybe(0) orelse 1);
+        \\pub const catch_in_call = catchInCall();
+        \\pub const orelse_in_call = orelseInCall();
+    , &.{
+        .{ "catch_int", "comptime_int = 9" },
+        .{ "catch_typed", "u64 = 9" },
+        .{ "catch_str", "*const [1:0]u8 = \"s\"" },
+        .{ "catch_capture", "*const [4:0]u8 = \"Oops\"" },
+        .{ "catch_capture_arg", "*const [3:0]u8 = \"Foo\"" },
+        .{ "catch_block", "*const [3:0]u8 = \"blk\"" },
+        .{ "catch_ok_str", "u32 = 5" },
+        .{ "catch_ok_typed", "u32 = 5" },
+        .{ "catch_annotated", "u64 = 9" },
+        .{ "orelse_null_str", "*const [1:0]u8 = \"s\"" },
+        .{ "orelse_call_str", "*const [1:0]u8 = \"s\"" },
+        .{ "orelse_call_typed", "u64 = 1" },
+        .{ "orelse_call_int", "comptime_int = 1" },
+        .{ "orelse_call_some", "u32 = 3" },
+        .{ "catch_then_orelse", "*const [1:0]u8 = \"n\"" },
+        .{ "local_type", "type = comptime_int" },
+        .{ "typeof_catch", "type = u32" },
+        .{ "typeof_orelse", "type = u32" },
+        .{ "catch_in_call", "bool = true" },
+        .{ "orelse_in_call", "bool = true" },
+    });
+}
+
 test "peer types of error sets, error unions, arrays, vectors, floats and C pointers" {
     // Expected values are the results of zig 0.17.0 (`@compileLog(@TypeOf(p1), ..., @TypeOf(p14))`
     // prints `error{Foo}!u8`, `error{A,B}`, `anyerror!u32`, `[2]u32`, `@Vector(2, u16)`,
