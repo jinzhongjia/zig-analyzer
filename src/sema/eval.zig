@@ -2193,43 +2193,50 @@ const Evaluator = struct {
                 // `const m: u8 = (0xFF << 4) >> 4` is computed as comptime_int and gives 255 when
                 // coerced to u8
                 const lhs = try ev.eval(f, lhs_e, null);
-                const is_shift = op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right or op == .angle_bracket_angle_bracket_left_pipe;
                 const rhs = try ev.eval(f, rhs_e, null);
-                // Bitwise operations on bool
-                if (lhs.ty == .bool_type and rhs.ty == .bool_type) {
-                    const x = (try ev.condition(lhs)).yes;
-                    const y = (try ev.condition(rhs)).yes;
-                    return boolVal(switch (op) {
-                        .ampersand => x and y,
-                        .pipe => x or y,
-                        .caret => x != y,
-                        else => return error.Abort,
-                    });
-                }
-                if (!is_shift and (ip.isFloat(lhs.ty) or ip.isFloat(rhs.ty))) {
-                    const ty = peerFloatType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
-                    // Comptime operands are coerced (rounded) to the peer type first
-                    const x = ev.floatOf(try ev.coerce(lhs, ty)) orelse return error.Abort;
-                    const y = ev.floatOf(try ev.coerce(rhs, ty)) orelse return error.Abort;
-                    return Val.of(ty, try value.binaryFloat(ip, op, ty, x, y) orelse return error.Abort);
-                }
-                const ty = if (is_shift) lhs.ty else value.peerIntType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
-                if (ev.intOf(lhs)) |a| {
-                    if (ev.intOf(rhs)) |b| {
-                        if (value.binaryInt(ip, op, ty, a, b)) |r| return Val.ofInt(ty, r);
-                    }
-                }
-                // A comptime_int operand may not fit i128 (or the result may not): compute at
-                // arbitrary precision
-                if (ty == .comptime_int_type) {
-                    const a = try ev.bigOf(lhs) orelse return error.Abort;
-                    const b = try ev.bigOf(rhs) orelse return error.Abort;
-                    const r = try bigint.binary(ev.a, op, a, b) orelse return error.Abort;
-                    return Val.ofBig(ty, r);
-                }
-                return error.Abort;
+                return ev.arith(op, lhs, rhs);
             },
         }
+    }
+
+    /// Arithmetic, bitwise and shift operator `op` on evaluated operands: the binary expression
+    /// `a op b`, and the operator of the compound assignment `a op= b`
+    fn arith(ev: *Evaluator, op: SyntaxKind, lhs: Val, rhs: Val) EvalError!Val {
+        const ip = ev.ip;
+        const is_shift = op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right or op == .angle_bracket_angle_bracket_left_pipe;
+        // Bitwise operations on bool
+        if (lhs.ty == .bool_type and rhs.ty == .bool_type) {
+            const x = (try ev.condition(lhs)).yes;
+            const y = (try ev.condition(rhs)).yes;
+            return boolVal(switch (op) {
+                .ampersand => x and y,
+                .pipe => x or y,
+                .caret => x != y,
+                else => return error.Abort,
+            });
+        }
+        if (!is_shift and (ip.isFloat(lhs.ty) or ip.isFloat(rhs.ty))) {
+            const ty = peerFloatType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
+            // Comptime operands are coerced (rounded) to the peer type first
+            const x = ev.floatOf(try ev.coerce(lhs, ty)) orelse return error.Abort;
+            const y = ev.floatOf(try ev.coerce(rhs, ty)) orelse return error.Abort;
+            return Val.of(ty, try value.binaryFloat(ip, op, ty, x, y) orelse return error.Abort);
+        }
+        const ty = if (is_shift) lhs.ty else value.peerIntType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
+        if (ev.intOf(lhs)) |a| {
+            if (ev.intOf(rhs)) |b| {
+                if (value.binaryInt(ip, op, ty, a, b)) |r| return Val.ofInt(ty, r);
+            }
+        }
+        // A comptime_int operand may not fit i128 (or the result may not): compute at
+        // arbitrary precision
+        if (ty == .comptime_int_type) {
+            const a = try ev.bigOf(lhs) orelse return error.Abort;
+            const b = try ev.bigOf(rhs) orelse return error.Abort;
+            const r = try bigint.binary(ev.a, op, a, b) orelse return error.Abort;
+            return Val.ofBig(ty, r);
+        }
+        return error.Abort;
     }
 
     /// Whether two comptime pointers are equal; null when it cannot be determined. Storage cells
