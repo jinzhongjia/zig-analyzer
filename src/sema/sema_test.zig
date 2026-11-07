@@ -3681,6 +3681,27 @@ test "std.fmt.comptimePrint results keep their pointer, element and sentinel typ
     });
 }
 
+test "std.fmt formats a character at comptime" {
+    // `{c}` writes `@as(*const [1]u8, &c)`: the result used to have no value
+    try expectStdTypesBuiltin(target_builtin,
+        \\const std = @import("std");
+        \\pub const char = std.fmt.comptimePrint("{c}", .{'z'});
+        \\pub const mixed = std.fmt.comptimePrint("<{c}{c}|{d}>", .{ 'a', 'b', 42 });
+        \\pub const padded = std.fmt.comptimePrint("[{c:>3}]", .{'q'});
+        \\pub const counted = std.fmt.count("{c}", .{'z'});
+        \\pub const printed = blk: {
+        \\    var buf: [8]u8 = undefined;
+        \\    break :blk (std.fmt.bufPrint(&buf, "{c}", .{'z'}) catch unreachable).len;
+        \\};
+    , &.{
+        .{ "char", "*const [1:0]u8 = \"z\"" },
+        .{ "mixed", "*const [7:0]u8 = \"<ab|42>\"" },
+        .{ "padded", "*const [5:0]u8 = \"[  q]\"" },
+        .{ "counted", "usize = 1" },
+        .{ "printed", "usize = 1" },
+    });
+}
+
 test "float formatting in std.fmt at comptime" {
     // Formatting an f128 reads the parts of the value as u128, which the interpreter stored as
     // i128: all operations on such values gave up.
@@ -4725,6 +4746,131 @@ test "comptime evaluation: slices of interpreter storage read elements in place"
         .{ "counted", "usize = 512" },
         // Reading, copying, concatenating and writing through ranges
         .{ "copied", "usize = 12344" },
+    });
+}
+
+test "comptime evaluation: a *T coerced to *[1]T views the same place" {
+    try expectTypes(
+        \\fn param(c: u8) u8 {
+        \\    const p: *const [1]u8 = &c;
+        \\    return p[0];
+        \\}
+        \\fn paramSlice(c: u8) usize {
+        \\    const s: []const u8 = @as(*const [1]u8, &c);
+        \\    return s.len + s[0];
+        \\}
+        \\fn local(c: u8) u8 {
+        \\    const x = c;
+        \\    const p: *const [1]u8 = &x;
+        \\    return p[0];
+        \\}
+        \\const glob: u8 = 11;
+        \\const glob_ptr: *const u8 = &glob;
+        \\fn global() u8 {
+        \\    const p: *const [1]u8 = &glob;
+        \\    const q: *const [1]u8 = glob_ptr;
+        \\    return p[0] + q[0];
+        \\}
+        \\fn writeThrough() u8 {
+        \\    var x: u8 = 1;
+        \\    const p: *[1]u8 = &x;
+        \\    p[0] = 5;
+        \\    return x;
+        \\}
+        \\fn writeOriginal() u8 {
+        \\    var x: u8 = 1;
+        \\    const p: *const [1]u8 = &x;
+        \\    x = 9;
+        \\    return p[0];
+        \\}
+        \\fn writeDeref() u8 {
+        \\    var x: u8 = 1;
+        \\    const p: *[1]u8 = &x;
+        \\    p.* = .{4};
+        \\    return x;
+        \\}
+        \\fn elemAndField() usize {
+        \\    var a = [_]u8{ 1, 2, 3 };
+        \\    var s: struct { a: u8, b: u8 } = .{ .a = 1, .b = 2 };
+        \\    const p: *[1]u8 = &a[1];
+        \\    const q: *[1]u8 = &s.b;
+        \\    p[0] = 7;
+        \\    q[0] += 10;
+        \\    return @as(usize, a[1]) * 100 + s.b + p.len;
+        \\}
+        \\fn viaPointer() u8 {
+        \\    var x: u8 = 2;
+        \\    const q: *u8 = &x;
+        \\    const p: *[1]u8 = q;
+        \\    p[0] *= 3;
+        \\    return q.*;
+        \\}
+        \\fn slices() usize {
+        \\    var x: u8 = 3;
+        \\    const s: []u8 = @as(*[1]u8, &x);
+        \\    s[0] = 6;
+        \\    for (s) |*e| e.* += 1;
+        \\    var t: []const u8 = s;
+        \\    t.len = 0;
+        \\    const same = &s[0] == &x;
+        \\    return @as(usize, x) * 1000 + s.len * 100 + s[1..].len * 10 + t.len + @intFromBool(same);
+        \\}
+        \\fn concat(c: u8) usize {
+        \\    const s: []const u8 = @as(*const [1]u8, &c);
+        \\    const t = s[0..s.len] ++ "!";
+        \\    return t.len * 1000 + t[0];
+        \\}
+        \\fn nested() u8 {
+        \\    const a = [2]u8{ 1, 2 };
+        \\    const p: *const [1][2]u8 = &a;
+        \\    return p[0][1];
+        \\}
+        \\fn derefValue(c: u8) [1]u8 {
+        \\    const p: *const [1]u8 = &c;
+        \\    return p.*;
+        \\}
+        \\const Names = struct { short: ?u8 };
+        \\fn payload() u8 {
+        \\    var n: Names = .{ .short = 1 };
+        \\    if (n.short) |*s| {
+        \\        const p: *[1]u8 = s;
+        \\        p[0] = 8;
+        \\    }
+        \\    return n.short.?;
+        \\}
+        \\const r_param = param(7);
+        \\const r_param_slice = paramSlice(7);
+        \\const r_local = local(7);
+        \\const r_global = global();
+        \\const r_write_through = writeThrough();
+        \\const r_write_original = writeOriginal();
+        \\const r_write_deref = writeDeref();
+        \\const r_elem_field = elemAndField();
+        \\const r_via_pointer = viaPointer();
+        \\const r_slices = slices();
+        \\const r_concat = concat('a');
+        \\const r_nested = nested();
+        \\const r_deref = derefValue(7);
+        \\const r_payload = payload();
+    , &.{
+        // `&c` with a `*[1]T` result type takes the address of `c` itself
+        .{ "r_param", "u8 = 7" },
+        .{ "r_param_slice", "usize = 8" },
+        .{ "r_local", "u8 = 7" },
+        .{ "r_global", "u8 = 22" },
+        // Writes through the view reach the place, and the view sees writes to the place
+        .{ "r_write_through", "u8 = 5" },
+        .{ "r_write_original", "u8 = 9" },
+        .{ "r_write_deref", "u8 = 4" },
+        .{ "r_elem_field", "usize = 713" },
+        .{ "r_via_pointer", "u8 = 6" },
+        // Slicing, iterating, shortening and comparing addresses of the view
+        .{ "r_slices", "usize = 7101" },
+        .{ "r_concat", "usize = 2097" },
+        .{ "r_nested", "u8 = 2" },
+        .{ "r_deref", "[1]u8 = \"\\x07\"" },
+        // A pointer to the payload of an optional, viewed as an array
+        .{ "r_payload", "u8 = 8" },
     });
 }
 
