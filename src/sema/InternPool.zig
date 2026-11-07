@@ -779,17 +779,18 @@ pub const VectorAbi = enum(u8) {
     /// The alignment of the element (C and wasm backends)
     elem,
 
-    pub fn of(backend: std.lang.CompilerBackend, arch: std.Target.Cpu.Arch, avx: bool, avx512f: bool, soft_float: bool) VectorAbi {
-        // Soft float on x86: float elements use the element layout, and element types are not
-        // distinguished here
-        if (soft_float) return .unknown;
+    /// The rules for target `t` compiled by `backend`
+    pub fn of(backend: std.lang.CompilerBackend, t: *const std.Target) VectorAbi {
+        // Soft float on x86 (`std.zig.target.compilerRtFloatAbi`): float elements use the element
+        // layout, and element types are not distinguished here
+        if (t.cpu.has(.x86, .soft_float)) return .unknown;
         return switch (backend) {
-            .stage2_x86_64 => if (avx512f) .x86_64_avx512 else if (avx) .x86_64_avx else .x86_64,
+            .stage2_x86_64 => if (t.cpu.has(.x86, .avx512f)) .x86_64_avx512 else if (t.cpu.has(.x86, .avx)) .x86_64_avx else .x86_64,
             .stage2_c, .stage2_wasm => .elem,
             // Other backends go by the byte size. On ARM and s390x the alignment does not exceed
             // their respective stack alignments, and f16 is soft float on MIPS and PowerPC, so
             // only common architectures are handled
-            else => switch (arch) {
+            else => switch (t.cpu.arch) {
                 .x86, .x86_64, .riscv32, .riscv64, .wasm32, .wasm64, .loongarch64 => .llvm,
                 .aarch64, .aarch64_be => .llvm_aarch64,
                 else => .unknown,

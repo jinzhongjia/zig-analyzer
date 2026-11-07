@@ -1096,11 +1096,11 @@ fn builtinTarget(server: *Server, file: Vfs.FileId) Allocator.Error!za.sema.Inte
         else => return server.builtin_targets.get(file) orelse .{ .pointer_bits = null, .scalar_abi = .unknown },
     };
     defer server.gpa.free(text);
-    const facts = za.project.builtin.vectorFacts(text);
+    const backend = za.project.builtin.backend(text);
     const target = za.project.builtin.target(text);
     const result: za.sema.InternPool.Target = .{
         .pointer_bits = za.project.builtin.pointerBits(text),
-        .vector_abi = if (facts) |f| .of(f.backend, f.arch, f.avx, f.avx512f, f.soft_float) else .unknown,
+        .vector_abi = if (backend) |b| if (target) |*t| .of(b, t) else .unknown else .unknown,
         .scalar_abi = if (target) |*t| .of(t) else .unknown,
     };
     try server.builtin_targets.put(server.gpa, file, result);
