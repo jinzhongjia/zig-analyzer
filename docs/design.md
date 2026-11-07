@@ -201,6 +201,7 @@ Bidirectional inference mirrors Zig's result type semantics, with peer type reso
 
 - An enum literal received by an anytype parameter refers to a member of the type it is coerced to in the callee's instance (`testing.expectEqual(.x, actual)`).
 - The capture of an `inline` prong on a tagged union is inferred per payload, like a loop over types.
+- `@tagName` and `@errorName` of a comptime-known operand are string literals `*const [N:0]u8`, as in the compiler (`Sema.zirTagName`); when inference has no value for the operand (a tagged union literal, `@enumFromInt`, a call in a container-level initializer), the interpreter evaluates the name, and the type is `unknown` when it cannot. Only a runtime operand gives `[:0]const u8`.
 
 ### `.zon` files
 
