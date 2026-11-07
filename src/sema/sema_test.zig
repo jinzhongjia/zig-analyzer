@@ -5873,6 +5873,47 @@ test "comptime evaluation gives the right operand of a shift the result type Log
     });
 }
 
+test "comptime saturating shift assignment" {
+    // `<<|=` was missing from the compound assignment operators: the evaluation gave up, and a
+    // `comptime var` lost its value
+    try expectTypes(
+        \\fn shlSat(a: u8, n: u8) u8 {
+        \\    var x = a;
+        \\    x <<|= n;
+        \\    return x;
+        \\}
+        \\fn shlSatSigned(a: i8, n: u64) i8 {
+        \\    var x = a;
+        \\    x <<|= n;
+        \\    return x;
+        \\}
+        \\fn shlSatComptime() comptime_int {
+        \\    var x: comptime_int = 3;
+        \\    x <<|= 200;
+        \\    return x;
+        \\}
+        \\const saturated = shlSat(3, 7);
+        \\const in_range = shlSat(3, 2);
+        \\const signed_saturated = shlSatSigned(-3, 100);
+        \\const comptime_shifted = shlSatComptime();
+        \\const big_shifted = 3 <<| 200;
+        \\export fn entry() u8 {
+        \\    comptime var s: u8 = 3;
+        \\    s <<|= 7;
+        \\    const s_v = s;
+        \\    return s_v;
+        \\}
+    , &.{
+        .{ "saturated", "u8 = 255" },
+        .{ "in_range", "u8 = 12" },
+        .{ "signed_saturated", "i8 = -128" },
+        // A comptime_int has no bound: `<<|` is `<<`
+        .{ "comptime_shifted", "comptime_int = 4820814132776970826625886277023487807566608981348378505904128" },
+        .{ "big_shifted", "comptime_int = 4820814132776970826625886277023487807566608981348378505904128" },
+        .{ "s_v", "u8 = 255" },
+    });
+}
+
 test "@embedFile reads the file next to the source; missing files are unknown" {
     var w: World = undefined;
     try w.init();

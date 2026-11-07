@@ -2583,12 +2583,14 @@ const Evaluator = struct {
             .caret_equal => .caret,
             .angle_bracket_angle_bracket_left_equal => .angle_bracket_angle_bracket_left,
             .angle_bracket_angle_bracket_right_equal => .angle_bracket_angle_bracket_right,
+            .angle_bracket_angle_bracket_left_pipe_equal => .angle_bracket_angle_bracket_left_pipe,
             else => return error.Abort,
         };
         // Matching the compiler, the right operand of `<<=` / `>>=` has the result type
-        // `Log2Int(T)`
+        // `Log2Int(T)`, and that of `<<|=` has none
         const rhs = try ev.eval(f, rhs_e, switch (bin) {
             .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right => try value.log2IntType(ev.ip, old.ty),
+            .angle_bracket_angle_bracket_left_pipe => null,
             else => ev.compoundRhsType(bin, rhs_want),
         });
         try ev.store(ref, try ev.arith(bin, old, rhs));

@@ -44,10 +44,11 @@ pub fn negate(a: Big) Big {
 }
 
 /// Result of a binary operation between two `comptime_int` values; null when the compiler would
-/// report an error or the result is beyond `max_bits`
+/// report an error or the result is beyond `max_bits`. `<<|` is `<<`: a comptime_int has no bound
+/// to saturate at.
 pub fn binary(allocator: Allocator, op: SyntaxKind, a: Big, b: Big) Allocator.Error!?Big {
     switch (op) {
-        .plus, .minus, .asterisk, .slash, .percent, .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right => {},
+        .plus, .minus, .asterisk, .slash, .percent, .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_left_pipe, .angle_bracket_angle_bracket_right => {},
         else => return null,
     }
     var ma = try a.toManaged(allocator);
@@ -68,11 +69,11 @@ pub fn binary(allocator: Allocator, op: SyntaxKind, a: Big, b: Big) Allocator.Er
                 try q.divTrunc(&out, &ma, &mb);
             }
         },
-        .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right => {
+        .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_left_pipe, .angle_bracket_angle_bracket_right => {
             const x = toInt(b) orelse return null;
             if (x < 0) return null;
             const shift: usize = if (x > max_bits) max_bits else @intCast(x);
-            if (op == .angle_bracket_angle_bracket_left) {
+            if (op != .angle_bracket_angle_bracket_right) {
                 if (a.bitCountAbs() + shift > max_bits) return null;
                 try out.shiftLeft(&ma, shift);
             } else try out.shiftRight(&ma, shift);

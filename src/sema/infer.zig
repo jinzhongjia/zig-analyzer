@@ -2468,6 +2468,7 @@ const Inferrer = struct {
             .caret_equal => .caret,
             .angle_bracket_angle_bracket_left_equal => .angle_bracket_angle_bracket_left,
             .angle_bracket_angle_bracket_right_equal => .angle_bracket_angle_bracket_right,
+            .angle_bracket_angle_bracket_left_pipe_equal => .angle_bracket_angle_bracket_left_pipe,
             else => {
                 slot.val = null;
                 return;
