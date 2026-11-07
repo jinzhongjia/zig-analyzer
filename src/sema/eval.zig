@@ -997,10 +997,40 @@ const Evaluator = struct {
         };
     }
 
+    /// Whether a pointer of type `t` reads the element right after the elements it holds. A slice
+    /// with a sentinel reads it there (`Sema.elemValSlice` accepts index `len`); a many-item or C
+    /// pointer reads whatever its storage holds there (`Sema.elemVal` loads through it, and the
+    /// loaded storage includes the sentinel of an array: `Type.arrayBase` counts it).
+    fn readsPastEnd(ev: *Evaluator, t: Index) bool {
+        return switch (ev.ip.key(t)) {
+            .ptr_type => |p| switch (p.size) {
+                .slice => p.sentinel != null,
+                .many, .c => true,
+                .one => false,
+            },
+            else => false,
+        };
+    }
+
+    /// Element `i` of an interned slice or many-item pointer of type `t` holding `len` elements,
+    /// for `i` past them; `storage` is the type the elements were interned with. Only the element
+    /// right after them is known, as a sentinel: for a slice its own, which the language
+    /// guarantees the storage holds there; for a many-item pointer that of the storage, since the
+    /// pointer type does not bound the read (`[*]const u8` pointing to `"ab"` reads its `0`).
+    fn elemPastEnd(ev: *Evaluator, t: Index, storage: Index, i: usize, len: usize) EvalError!Val {
+        if (i != len or !ev.readsPastEnd(t)) return error.Abort;
+        const p = ev.ip.key(t).ptr_type;
+        const s = (if (p.size == .slice) p.sentinel else ev.seqSentinel(storage)) orelse return error.Abort;
+        return Val.of(p.child, s);
+    }
+
     /// Element `i`; unknown when the value is unknown
     fn elemAt(ev: *Evaluator, v: Val, i: usize) EvalError!Val {
         const ty = ev.elemTypeOf(v.ty, i);
-        if (v.v != .ref) if (ev.sentinelElem(v.ty, i)) |s| return s;
+        // The sentinel of an array is part of its type, and so is that of the array a single-item
+        // pointer points to: index `len` reads it whatever the value (`Sema.elemValArray`, and
+        // the single-item pointer case of `Sema.elemVal`)
+        if (ev.sentinelElem(ev.arrayOf(v.ty), i)) |s| return s;
         switch (v.v) {
             .unknown => return .{ .ty = ty },
             .undef => return .{ .ty = ty, .v = .undef },
@@ -1008,10 +1038,11 @@ const Evaluator = struct {
             .agg => |agg| return if (i < agg.elems.len) agg.elems[i] else error.Abort,
             .ref => |ref| {
                 // Range: the index is relative to the start of the range; take the element
-                // directly from the containing aggregate
+                // directly from the containing aggregate, which also holds the element right after
+                // the range (the sentinel position of `buf[0..n :0]`)
                 const base = try ev.loadPath(ref);
                 const index = if (ref.window) |w| blk: {
-                    if (i >= w.len) return error.Abort;
+                    if (i > w.len or (i == w.len and !ev.readsPastEnd(v.ty))) return error.Abort;
                     break :blk w.start + i;
                 } else i;
                 var elem = try ev.elemAt(base, index);
@@ -1026,10 +1057,10 @@ const Evaluator = struct {
                 return elem;
             },
             .ip => |x| switch (ev.ip.key(x)) {
-                .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else error.Abort,
+                .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else ev.elemPastEnd(v.ty, agg.ty, i, agg.elems.len),
                 // Aggregates whose elements are all u8 are also represented as bytes (e.g. a
                 // value of `struct { short: ?u8 }`): use the declared type of the element
-                .bytes => |b| return if (i < b.bytes.len) Val.of(if (ty != .unknown) ty else .u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else error.Abort,
+                .bytes => |b| return if (i < b.bytes.len) Val.of(if (ty != .unknown) ty else .u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else ev.elemPastEnd(v.ty, b.ty, i, b.bytes.len),
                 .ptr_value => |p| return ev.elemAt(Val.of(ev.pointeeType(v.ty), p.pointee), i),
                 .union_value => |u| return if (i == 0) Val.of(ty, u.payload) else error.Abort,
                 else => return error.Abort,
