@@ -4265,6 +4265,46 @@ test "std generic containers" {
     });
 }
 
+test "std.enums.values, std.enums.fromInt, std.meta.stringToEnum and StaticStringMap.initEnum at comptime" {
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const Color = enum { red, green, blue };
+        \\const Small = enum(u4) { a = 3, b = 5 };
+        \\const Open = enum(u8) { x = 1, y = 2, _ };
+        \\const from_fields = std.enums.valuesFromFields(Color, &.{ 0, 2 }).len;
+        \\const values_len = std.enums.values(Color).len;
+        \\const values_2 = std.enums.values(Color)[2];
+        \\const backing_cmp = blk: {
+        \\    for (std.enums.values(Color)) |v| {
+        \\        if (@backingInt(v) == 2) break :blk v;
+        \\    }
+        \\    break :blk Color.red;
+        \\};
+        \\const from_int = std.enums.fromInt(Color, 1);
+        \\const from_int_none = std.enums.fromInt(Color, 7);
+        \\const from_int_explicit = std.enums.fromInt(Small, 5);
+        \\const from_int_open = std.enums.fromInt(Open, @as(u32, 2));
+        \\const string_red = std.meta.stringToEnum(Color, "red");
+        \\const string_green = std.meta.stringToEnum(Color, "green");
+        \\const string_none = std.meta.stringToEnum(Color, "pink");
+        \\const map_get = std.StaticStringMap(Color).initEnum().get("green");
+    , &.{
+        .{ "from_fields", "usize = 2" },
+        .{ "values_len", "usize = 3" },
+        .{ "values_2", "Color = .blue" },
+        .{ "backing_cmp", "Color = .blue" },
+        .{ "from_int", "?Color = .green" },
+        .{ "from_int_none", "?Color = null" },
+        .{ "from_int_explicit", "?Small = .b" },
+        // A non-exhaustive enum: `return @fromBackingInt(@intCast(tag))` with the result type `?E`
+        .{ "from_int_open", "?Open = .y" },
+        .{ "string_red", "?Color = .red" },
+        .{ "string_green", "?Color = .green" },
+        .{ "string_none", "?Color = null" },
+        .{ "map_get", "?Color = .green" },
+    });
+}
+
 test "local types used by containers in the body: no cycle through the whole function" {
     // A method of a container in the body uses a local type of the outer function, and the outer
     // function body references that method; the body has an `enum(u32)`.
@@ -5053,6 +5093,60 @@ test "comptime evaluation of integer builtins, @memset, @memmove and @call" {
         .{ "filled", "u8 = 7" },
         .{ "moved", "u8 = 3" },
         .{ "called", "u8 = 3" },
+    });
+}
+
+test "comptime @fromBackingInt coerces its operand to the backing integer of the destination type" {
+    try expectTypes(
+        \\const Color = enum { red, green, blue };
+        \\const E8 = enum(u8) { a = 10, b, c = 20 };
+        \\const Es = enum(i8) { neg = -3, zero = 0, pos = 5 };
+        \\const cast: Color = @fromBackingInt(@intCast(@as(comptime_int, 2)));
+        \\const cast_u: Color = @fromBackingInt(@intCast(@as(u32, 1)));
+        \\const truncated: Color = @fromBackingInt(@truncate(@as(u32, 0x102)));
+        \\const bit_cast: Es = @fromBackingInt(@bitCast(@as(u8, 0xfd)));
+        \\const explicit: E8 = @fromBackingInt(@intCast(@as(usize, 11)));
+        \\const signed: Es = @fromBackingInt(@intCast(@as(i64, 5)));
+        \\const as_dest = @as(Color, @fromBackingInt(@intCast(@as(u64, 2))));
+        \\fn optional(x: u32) ?Color {
+        \\    return @fromBackingInt(@intCast(x));
+        \\}
+        \\const from_opt = optional(2);
+        \\fn errorUnion(x: u32) error{Bad}!Color {
+        \\    if (x > 2) return error.Bad;
+        \\    return @fromBackingInt(@intCast(x));
+        \\}
+        \\const from_eu = errorUnion(1) catch unreachable;
+        \\const stored = blk: {
+        \\    var result: [2]Color = undefined;
+        \\    result[0] = @fromBackingInt(1);
+        \\    result[1] = @fromBackingInt(@intCast(2));
+        \\    const final = result;
+        \\    break :blk final;
+        \\};
+        \\const stored_by_ptr = blk: {
+        \\    var result: [3]Color = undefined;
+        \\    for (&result, [_]comptime_int{ 0, 1, 2 }) |*r, v| {
+        \\        r.* = @fromBackingInt(@intCast(v));
+        \\    }
+        \\    const final = result;
+        \\    break :blk final;
+        \\};
+    , &.{
+        // The operand's result type is the tag type: `u2` for `Color`, the explicit one otherwise
+        .{ "cast", "Color = .blue" },
+        .{ "cast_u", "Color = .green" },
+        .{ "truncated", "Color = .blue" },
+        .{ "bit_cast", "Es = .neg" },
+        .{ "explicit", "E8 = .b" },
+        .{ "signed", "Es = .pos" },
+        .{ "as_dest", "Color = .blue" },
+        // The destination type drops the optional and the error union of the result type
+        .{ "from_opt", "?Color = .blue" },
+        .{ "from_eu", "Color = .green" },
+        // Stores through element places and pointer captures (the shape of std.enums.valuesFromFields)
+        .{ "stored", "[2]Color = .{ .green, .blue }" },
+        .{ "stored_by_ptr", "[3]Color = .{ .red, .green, .blue }" },
     });
 }
 
