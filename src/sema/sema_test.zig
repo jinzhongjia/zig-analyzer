@@ -2041,7 +2041,7 @@ test "vector layouts follow the backend and CPU features" {
         .{ "v100bool", "comptime_int = 16" },
         .{ "v3ptr", "comptime_int = 32" },
     });
-    try expectTypesTargeted(.{ .vector_abi = .llvm_aarch64 }, src, &.{
+    try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_16 }, src, &.{
         .{ "v16f32", "comptime_int = 16" },
         .{ "v8u32", "comptime_int = 16" },
         .{ "v3ptr", "comptime_int = 32" },
@@ -2065,7 +2065,7 @@ test "LLVM vector sizes are powers of two even where the alignment is capped" {
         \\const s5u64 = @sizeOf(@Vector(5, u64));
         \\const s0 = @sizeOf(@Vector(0, u8));
     ;
-    try expectTypesTargeted(.{ .vector_abi = .llvm_aarch64 }, src, &.{
+    try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_16 }, src, &.{
         .{ "s3", "comptime_int = 4" },
         .{ "s17", "comptime_int = 32" },
         .{ "s33", "comptime_int = 64" },
@@ -2095,7 +2095,7 @@ test "vector sizes follow the user's zig where the alignment is capped" {
         \\const s0 = @sizeOf(@Vector(0, u8));
         \\const s_struct = @sizeOf(S);
     ;
-    try expectTypesTargeted(.{ .vector_abi = .llvm_aarch64, .dialect = .zig_0_17_0 }, src, &.{
+    try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_16, .dialect = .zig_0_17_0 }, src, &.{
         .{ "s3", "comptime_int = 4" },
         .{ "s17", "comptime_int = 32" },
         .{ "s32", "comptime_int = 32" },
@@ -2106,7 +2106,7 @@ test "vector sizes follow the user's zig where the alignment is capped" {
         .{ "s0", "comptime_int = 0" },
         .{ "s_struct", "comptime_int = 64" },
     });
-    try expectTypesTargeted(.{ .vector_abi = .llvm_aarch64, .dialect = .zig_0_17_1 }, src, &.{
+    try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_16, .dialect = .zig_0_17_1 }, src, &.{
         .{ "s3", "comptime_int = 4" },
         .{ "s17", "comptime_int = 32" },
         .{ "s32", "comptime_int = 32" },
@@ -2127,6 +2127,67 @@ test "vector sizes follow the user's zig where the alignment is capped" {
             .{ "s_struct", "comptime_int = 128" },
         });
     }
+}
+
+test "vector alignment is capped at the stack alignment of 8 on 32-bit ARM and s390x" {
+    // Expected values are the results of `zig build-obj` of each version for arm-linux-gnueabihf
+    // and s390x-linux-gnu, which agree; the layout of these vectors was unknown
+    const src =
+        \\const S = struct { v: @Vector(5, u64), x: u8 };
+        \\const U = union(enum) { v: @Vector(3, u64), x: u8 };
+        \\const s4f32 = @sizeOf(@Vector(4, f32));
+        \\const a4f32 = @alignOf(@Vector(4, f32));
+        \\const a8f32 = @alignOf(@Vector(8, f32));
+        \\const s3u8 = @sizeOf(@Vector(3, u8));
+        \\const a3u8 = @alignOf(@Vector(3, u8));
+        \\const s9u8 = @sizeOf(@Vector(9, u8));
+        \\const s17u8 = @sizeOf(@Vector(17, u8));
+        \\const s5u64 = @sizeOf(@Vector(5, u64));
+        \\const a5u64 = @alignOf(@Vector(5, u64));
+        \\const s16u64 = @sizeOf(@Vector(16, u64));
+        \\const s0 = @sizeOf(@Vector(0, u8));
+        \\const a0 = @alignOf(@Vector(0, u8));
+        \\const s_struct = @sizeOf(S);
+        \\const a_struct = @alignOf(S);
+        \\const s_union = @sizeOf(U);
+        \\const s_array = @sizeOf([2]@Vector(10, u32));
+        \\const s_opt = @sizeOf(?@Vector(4, f32));
+        \\const bits = @bitSizeOf(@Vector(3, u5));
+    ;
+    const Dialect = @import("../syntax/Parse.zig").Dialect;
+    // The same in both versions: sizes that are powers of 2 or multiples of the alignment
+    for ([_]Dialect{ .zig_0_17_0, .zig_0_17_1 }) |dialect| {
+        try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_8, .dialect = dialect }, src, &.{
+            .{ "s4f32", "comptime_int = 16" },
+            .{ "a4f32", "comptime_int = 8" },
+            .{ "a8f32", "comptime_int = 8" },
+            .{ "s3u8", "comptime_int = 4" },
+            .{ "a3u8", "comptime_int = 4" },
+            .{ "s9u8", "comptime_int = 16" },
+            .{ "a5u64", "comptime_int = 8" },
+            .{ "s16u64", "comptime_int = 128" },
+            .{ "s0", "comptime_int = 0" },
+            .{ "a0", "comptime_int = 1" },
+            .{ "a_struct", "comptime_int = 8" },
+            .{ "s_opt", "comptime_int = 24" },
+            .{ "bits", "comptime_int = 15" },
+        });
+    }
+    // Zig 0.17.0 pads the byte size to the alignment, 0.17.1 rounds it up to a power of 2
+    try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_8, .dialect = .zig_0_17_0 }, src, &.{
+        .{ "s17u8", "comptime_int = 24" },
+        .{ "s5u64", "comptime_int = 40" },
+        .{ "s_struct", "comptime_int = 48" },
+        .{ "s_union", "comptime_int = 32" },
+        .{ "s_array", "comptime_int = 80" },
+    });
+    try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_8, .dialect = .zig_0_17_1 }, src, &.{
+        .{ "s17u8", "comptime_int = 32" },
+        .{ "s5u64", "comptime_int = 64" },
+        .{ "s_struct", "comptime_int = 72" },
+        .{ "s_union", "comptime_int = 40" },
+        .{ "s_array", "comptime_int = 128" },
+    });
 }
 
 test "pointer layouts follow the target and the user's zig" {

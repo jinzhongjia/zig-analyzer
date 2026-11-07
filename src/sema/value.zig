@@ -759,18 +759,18 @@ fn vectorLayout(ip: *InternPool, len: u32, child: Index) ?Layout {
     if (len == 0) return .{ .size = 0, .alignment = 1, .bits = 0 };
     const alignment: u64, const bytes: u64 = switch (abi) {
         .unknown => unreachable,
-        .llvm, .llvm_aarch64 => blk: {
+        .llvm, .llvm_stack_align_8, .llvm_stack_align_16 => blk: {
             if (elem_bits == 0) break :blk .{ 1, 0 };
             const bytes = (bits + 7) / 8;
             const rounded = std.math.ceilPowerOfTwo(u64, bytes) catch return null;
-            // aarch64: the alignment is no larger than the stack alignment. The size is the byte
-            // size rounded up to a power of 2 also where the alignment is smaller; in Zig 0.17.0
-            // it is only padded to the alignment.
+            // 32-bit ARM, aarch64 and s390x: the alignment is no larger than the stack alignment.
+            // The size is the byte size rounded up to a power of 2 also where the alignment is
+            // smaller; in Zig 0.17.0 it is only padded to the alignment.
             const size = switch (ip.dialect()) {
                 .zig_0_17_0 => bytes,
                 .zig_0_17_1 => rounded,
             };
-            break :blk .{ if (abi == .llvm_aarch64) @min(rounded, 16) else rounded, size };
+            break :blk .{ if (abi.maxAlignment()) |max| @min(rounded, max) else rounded, size };
         },
         .x86_64, .x86_64_avx, .x86_64_avx512 => blk: {
             const avx = abi != .x86_64;

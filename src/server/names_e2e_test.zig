@@ -630,6 +630,48 @@ test "type layouts follow the project's target and are recomputed when it change
     try h.notify("exit", {});
 }
 
+test "vector layouts follow a 32-bit ARM project target" {
+    // Expected values are the results of `zig build-obj -target arm-linux-gnueabihf` of each
+    // version: the alignment is capped at the stack alignment of 8, and the size of a vector whose
+    // byte size is not a power of 2 differs between versions
+    const text =
+        \\pub fn main() void {
+        \\    const align_v = @alignOf(@Vector(8, f32));
+        \\    const size_v = @sizeOf(@Vector(4, f32));
+        \\    const size_5u64 = @sizeOf(@Vector(5, u64));
+        \\    _ = .{ align_v, size_v, size_5u64 };
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = text },
+        .{ .path = "src/lib.zig", .text = "pub fn hello() void {}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const root_uri = try za.base.uri.fromPath(h.arena.allocator(), project.root);
+    const arm = try std.json.parseFromSliceLeaky(std.json.Value, h.arena.allocator(),
+        \\{"build": {"args": ["-Dtarget=arm-linux-gnueabihf"]}}
+    , .{});
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{}, .initializationOptions = arm });
+    try h.notify("initialized", Empty{});
+    const uri = try za.base.uri.fromPath(h.arena.allocator(), try project.path(h.arena.allocator(), "src/main.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqualStrings("```zig\nconst align_v: comptime_int = 8\n```", try hoverText(&h, uri, text, "align_v ="));
+    try testing.expectEqualStrings("```zig\nconst size_v: comptime_int = 16\n```", try hoverText(&h, uri, text, "size_v ="));
+    const size_5u64 = switch (za.syntax.Parse.Dialect.of(project.env.version)) {
+        .zig_0_17_0 => "```zig\nconst size_5u64: comptime_int = 40\n```",
+        .zig_0_17_1 => "```zig\nconst size_5u64: comptime_int = 64\n```",
+    };
+    try testing.expectEqualStrings(size_5u64, try hoverText(&h, uri, text, "size_5u64 ="));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "single-file mode: @import(\"root\") is the file itself for goto, references and rename" {
     // Prevents an empty goto on `root.marker` and a rename that misses it and breaks the build
     const text =
