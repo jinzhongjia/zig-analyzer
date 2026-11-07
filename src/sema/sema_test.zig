@@ -3102,6 +3102,36 @@ test "comptime-known slices in tuple literals are comptime fields that anytype c
     });
 }
 
+test "a comptime call evaluates its anytype arguments at comptime" {
+    // A function returning `type` executes at comptime, but its anytype arguments were inferred
+    // as runtime values: a slice argument had no value and `[s.len]u8` was `[_]u8`.
+    try expectTypes(
+        \\fn RetArrAny(s: anytype) type {
+        \\    return [s.len]u8;
+        \\}
+        \\fn RetArrSlice(s: []const u8) type {
+        \\    return [s.len]u8;
+        \\}
+        \\const name: []const u8 = "abc";
+        \\const any_slice = RetArrAny(@as([]const u8, "abcd"));
+        \\const any_decl = RetArrAny(name);
+        \\const any_lit = RetArrAny("abcd");
+        \\const slice_param = RetArrSlice("abcd");
+        \\fn g() void {
+        \\    const in_fn = RetArrAny(@as([]const u8, "abcde"));
+        \\    const in_fn_decl = RetArrAny(name);
+        \\    _ = .{ in_fn, in_fn_decl };
+        \\}
+    , &.{
+        .{ "any_slice", "type = [4]u8" },
+        .{ "any_decl", "type = [3]u8" },
+        .{ "any_lit", "type = [4]u8" },
+        .{ "slice_param", "type = [4]u8" },
+        .{ "in_fn", "type = [5]u8" },
+        .{ "in_fn_decl", "type = [3]u8" },
+    });
+}
+
 test "union fields without a type are void, enum member names are not expressions" {
     try expectTypes(
         \\fn read() void {}

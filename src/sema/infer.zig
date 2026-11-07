@@ -1553,11 +1553,13 @@ const Inferrer = struct {
         };
         // Generic call: comptime arguments determine the instance, so infer them first; parameter
         // types in the abstract signature that depend on other parameters cannot serve as expected
-        // types. anytype arguments need only their types and are not in a comptime context.
+        // types. anytype arguments take part in the instance only by their types; they are in a
+        // comptime context only when the whole call executes at comptime, where the interpreter
+        // needs their values.
         for (args, 0..) |a, i| switch (g.kind(i + skip)) {
             .comptime_value => _ = try inf.inferComptime(a, inf.concrete(paramType(f, i + skip))),
             .comptime_anytype => _ = try inf.inferComptime(a, null),
-            .anytype_type => _ = try inf.infer(a, null),
+            .anytype_type => _ = if (g.comptime_call) try inf.inferComptime(a, null) else try inf.infer(a, null),
             .runtime => {},
         };
         const inst = try instanceOf(inf.r, inf.scratch, g, f, try inf.argValues(callee_e, args, skip, g.body.params.len));
@@ -4459,6 +4461,9 @@ pub const Generic = struct {
     body: *const Body,
     parent: ?Index,
     kinds: []const ParamKind,
+    /// The call executes at comptime because the callee is not inline and returns a comptime-only
+    /// type: as in the compiler, all arguments are evaluated in a comptime scope
+    comptime_call: bool = false,
 
     pub fn kind(g: Generic, i: usize) ParamKind {
         return if (i < g.kinds.len) g.kinds[i] else .runtime;
@@ -4490,7 +4495,7 @@ pub fn genericCallee(r: *Resolver, scratch: Allocator, callee: TypedValue, f: Fn
         if (k.* != .runtime) generic = true;
     }
     if (!generic) return null;
-    return .{ .owner = owner, .body = try r.ctx.get(hir.ItemBody, owner), .parent = fv.inst, .kinds = kinds };
+    return .{ .owner = owner, .body = try r.ctx.get(hir.ItemBody, owner), .parent = fv.inst, .kinds = kinds, .comptime_call = all_comptime and f.cc != .@"inline" };
 }
 
 /// Instance of a call (`args` is parallel to the parameters). comptime arguments are coerced to
