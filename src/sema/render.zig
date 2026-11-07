@@ -442,6 +442,11 @@ const QualifiedNames = struct {
             .simple_value => |s| try q.w.writeAll(if (s == .void) "{}" else @tagName(s)),
             .enum_literal => |n| try q.w.print(".{s}", .{n}),
             .enum_tag => |tag| try q.w.print(".{s}", .{tag.name}),
+            .enum_unnamed => |u| {
+                try q.w.writeAll("@fromBackingInt(");
+                try q.writeValue(u.int);
+                try q.w.writeAll(")");
+            },
             .error_value => |n| try q.w.print("error.{s}", .{n}),
             else => try q.writeType(v),
         }

@@ -297,6 +297,10 @@ pub const Key = union(enum) {
     enum_literal: []const u8,
     /// A member of an enum type
     enum_tag: struct { ty: Index, name: []const u8 },
+    /// A value of a non-exhaustive enum that no member has: `int` is its integer, a value of the
+    /// tag type. A value that a member has is always its `enum_tag`, so each value has one
+    /// representation.
+    enum_unnamed: struct { ty: Index, int: Index },
     error_value: []const u8,
     /// Function declaration; `inst` is the instance the function belongs to (methods of generic
     /// containers)
@@ -1144,6 +1148,12 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         },
         .enum_literal => |n| try w.print(".{f}", .{std.zig.fmtId(n)}),
         .enum_tag => |t| try w.print(".{f}", .{std.zig.fmtId(t.name)}),
+        // As the compiler prints it
+        .enum_unnamed => |u| {
+            try w.writeAll("@fromBackingInt(");
+            try ip.print(u.int, w, container_name);
+            try w.writeAll(")");
+        },
         .error_value => |n| try w.print("error.{s}", .{n}),
         .fn_value => |f| try ip.print(f.ty, w, container_name),
         .aggregate => |v| {

@@ -194,6 +194,7 @@ The unique representation of types and comptime values. The identity of a contai
 - Past `sema.max_intern_pool_mb` it is reclaimed as a generation once no read is in progress; this changes no result, so it cancels nothing. The reclaim also waits until the type information is twice the most one request has added: otherwise every later request would infer it all again and exceed the limit once more.
 - Interpreter integers are interned only when a result is handed out, so comptime loops do not bloat the pool.
 - Error sets, pointer attributes (`align`, bit ranges, `addrspace`, `volatile`, `allowzero`), and function types (calling convention, genericity) follow the compiler's identity and derivation rules (`fieldPtrType`, `elemPtrType`, `builtin.target.cCallingConvention()`). An attribute that cannot be evaluated is unknown, never equal to another, and printed as such (`align(unknown)`, `callconv(unknown)`).
+- An enum value is its member (`enum_tag`) whenever a member has it, so each value has one representation; a value of a non-exhaustive enum that no member has is its tag integer (`enum_unnamed`), and a `switch` takes the `_` prong for it, as the compiler does.
 
 ### Inference
 

@@ -509,14 +509,15 @@ const Inferrer = struct {
 
     /// An enum defined in the signature (`comptime sign: enum { pos, neg }`) has a type per
     /// instance: the argument the instance records was coerced to the parameter type of the
-    /// signature the caller saw, and is the same tag of the parameter type here
+    /// signature the caller saw, and is the same value of the parameter type here
     fn paramTag(inf: *Inferrer, a: Index, ty: Index) Error!Index {
         const ip = inf.ip;
-        const tag = switch (ip.key(a)) {
-            .enum_tag => |t| t,
+        const enum_ty = switch (ip.key(a)) {
+            .enum_tag => |t| t.ty,
+            .enum_unnamed => |u| u.ty,
             else => return a,
         };
-        const x = switch (ip.key(tag.ty)) {
+        const x = switch (ip.key(enum_ty)) {
             .container_type => |c| c,
             else => return a,
         };
@@ -524,8 +525,11 @@ const Inferrer = struct {
             .container_type => |c| c,
             else => return a,
         };
-        if (tag.ty == ty or x.file != y.file or x.ast_id != y.ast_id) return a;
-        return ip.get(.{ .enum_tag = .{ .ty = ty, .name = tag.name } });
+        if (enum_ty == ty or x.file != y.file or x.ast_id != y.ast_id) return a;
+        return switch (ip.key(a)) {
+            .enum_unnamed => |u| ip.get(.{ .enum_unnamed = .{ .ty = ty, .int = u.int } }),
+            else => ip.get(.{ .enum_tag = .{ .ty = ty, .name = ip.key(a).enum_tag.name } }),
+        };
     }
 
     /// Reading the ItemTree is a query: even when it is cached, `error.Canceled` is returned when
@@ -1643,12 +1647,17 @@ const Inferrer = struct {
     fn chooseProng(inf: *Inferrer, prongs: []const Body.Prong, operand: TypedValue) Error!?usize {
         const v = operand.val orelse return null;
         var else_prong: ?usize = null;
+        var under_prong: ?usize = null;
         for (prongs, 0..) |prong, i| {
             if (prong.is_else) {
                 else_prong = i;
                 continue;
             }
             for (prong.items) |item| {
+                if (inf.body.isUnderscore(item)) {
+                    under_prong = i;
+                    continue;
+                }
                 const hit = if (switchRange(inf.body, item)) |range|
                     (try inf.compare(.angle_bracket_right_equal, operand, inf.get(range[0])) orelse return null) and
                         (try inf.compare(.angle_bracket_left_equal, operand, inf.get(range[1])) orelse return null)
@@ -1657,7 +1666,7 @@ const Inferrer = struct {
                 if (hit) return i;
             }
         }
-        return else_prong;
+        return eval.otherProng(inf.ip, v, else_prong, under_prong);
     }
 
     /// comptime-known comparison

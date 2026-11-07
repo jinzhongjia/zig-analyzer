@@ -491,6 +491,16 @@ pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
 
 pub const Capture = struct { item: u32, binding: Body.BindingId };
 
+/// The prong a switch takes when no item equals the operand `v`: with both `else` and `_` (a
+/// non-exhaustive enum), `else` takes the values a member has and `_` the others; otherwise the
+/// one present takes them all (matches the compiler's comptime switch)
+pub fn otherProng(ip: *InternPool, v: ?Index, else_prong: ?usize, under_prong: ?usize) ?usize {
+    const under = under_prong orelse return else_prong;
+    if (else_prong == null) return under;
+    const unnamed = if (v) |x| ip.key(x) == .enum_unnamed else false;
+    return if (unnamed) under else else_prong;
+}
+
 /// Parameters and locals of the enclosing function that are referenced by the members of the
 /// container (including nested containers)
 pub fn captures(r: *Resolver, ns: Namespace) Error![]const Capture {
@@ -2106,6 +2116,7 @@ const Evaluator = struct {
         // Integer operands are not interned; they are compared with the prong items by value
         const v: ?Index = if (operand.v == .int) null else try ev.freeze(operand) orelse return error.Abort;
         var else_prong: ?usize = null;
+        var under_prong: ?usize = null;
         // Prong items that cannot be evaluated: the values of prong items are all distinct
         // (duplicates are a compile error), so if another prong item equals the operand, this one
         // cannot also be equal; therefore keep searching. Only when none is equal is the result
@@ -2118,6 +2129,10 @@ const Evaluator = struct {
                 continue;
             }
             for (prong.items) |item| {
+                if (f.body.isUnderscore(item)) {
+                    under_prong = i;
+                    continue;
+                }
                 const hit = ev.prongItemMatches(f, item, operand, v) catch |err| switch (err) {
                     error.Abort => {
                         unknown = true;
@@ -2129,7 +2144,7 @@ const Evaluator = struct {
             }
         }
         if (unknown) return error.Abort;
-        return else_prong;
+        return otherProng(ev.ip, v, else_prong, under_prong);
     }
 
     fn prongItemMatches(ev: *Evaluator, f: *Frame, item: ExprId, operand: Val, v: ?Index) EvalError!bool {
@@ -2915,9 +2930,12 @@ const Evaluator = struct {
                 },
                 // An enum defined in a signature (`comptime sign: enum { pos, neg }`) has a type per
                 // instance of the function, and they are one type in the compiler unless the
-                // captures differ: the tag must carry the type it is coerced to
+                // captures differ: the value must carry the type it is coerced to
                 .enum_tag => |tag| if (value.isEnumType(ip, t) and try eqlValues(ev.r, tag.ty, t) != false) {
                     return Val.of(t, try ip.get(.{ .enum_tag = .{ .ty = t, .name = tag.name } }));
+                },
+                .enum_unnamed => |u| if (value.isEnumType(ip, t) and try eqlValues(ev.r, u.ty, t) != false) {
+                    return Val.of(t, try ip.get(.{ .enum_unnamed = .{ .ty = t, .int = u.int } }));
                 },
                 else => {},
             },
@@ -3596,7 +3614,14 @@ const Evaluator = struct {
             const names = try ev.enumNames(t) orelse return error.Abort;
             const values = try ev.enumValues(t);
             for (names, values) |n, val| if (val == x) return Val.of(t, try ip.get(.{ .enum_tag = .{ .ty = t, .name = n } }));
-            return error.Abort;
+            // A non-exhaustive enum also has every other integer of its tag type, which is always
+            // given explicitly; an integer that does not fit in it is a compile error (as is one
+            // that no member of an exhaustive enum has)
+            if (!try ev.nonexhaustive(t)) return error.Abort;
+            const tag = (try ev.containerSyntax(t)).arg orelse return .{ .ty = t };
+            if (!value.intFitsFrom(ip, v.ty, tag, x)) return error.Abort;
+            const tag_int = try ip.get(.{ .int_value = .{ .ty = tag, .value = x } });
+            return Val.of(t, try ip.get(.{ .enum_unnamed = .{ .ty = t, .int = tag_int } }));
         }
         if (eq(u8, name, "@floatCast") or eq(u8, name, "@floatFromInt")) {
             const x = ev.floatOf(v) orelse return .{ .ty = t };
@@ -3649,6 +3674,7 @@ const Evaluator = struct {
         const x = try ev.freeze(v) orelse return error.Abort;
         const enum_ty: Index, const tag_name: []const u8 = switch (ip.key(x)) {
             .enum_tag => |t| .{ t.ty, t.name },
+            .enum_unnamed => |u| return ev.int(value.typeOfValue(ip, u.int), value.intOf(ip, u.int) orelse return error.Abort),
             // Tagged union: the integer of the tag
             .union_value => |u| .{ try ev.unionTagType(u.ty) orelse return error.Abort, u.tag },
             else => return error.Abort,

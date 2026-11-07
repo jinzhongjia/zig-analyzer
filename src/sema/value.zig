@@ -322,6 +322,7 @@ pub fn typeOfValue(ip: *InternPool, v: Index) Index {
         .big_int => .comptime_int_type,
         .enum_literal => .enum_literal_type,
         .enum_tag => |t| t.ty,
+        .enum_unnamed => |u| u.ty,
         .simple_value => |s| switch (s) {
             .true, .false => .bool_type,
             .void => .void_type,
@@ -981,6 +982,7 @@ pub fn isPrecise(ip: *InternPool, v: Index) bool {
         .ptr_value => |p| isPrecise(ip, p.pointee),
         .fn_value => |f| f.inst == null or isPrecise(ip, f.inst.?),
         .enum_tag => |t| isPrecise(ip, t.ty),
+        .enum_unnamed => |u| isPrecise(ip, u.ty),
         .instance => |i| blk: {
             for (i.args) |a| if (!isPrecise(ip, a)) break :blk false;
             break :blk i.parent == null or isPrecise(ip, i.parent.?);
@@ -1228,6 +1230,8 @@ pub fn eqlValues(ip: *InternPool, a: Index, b: Index) ?bool {
         .enum_literal => |n| switch (kb) {
             .enum_literal => |m| std.mem.eql(u8, n, m),
             .enum_tag => |t| std.mem.eql(u8, n, t.name),
+            // A literal names a member, which never has an unnamed value
+            .enum_unnamed => false,
             // A tagged union compared with a tag
             .union_value => |u| std.mem.eql(u8, n, u.tag),
             else => null,
@@ -1235,7 +1239,14 @@ pub fn eqlValues(ip: *InternPool, a: Index, b: Index) ?bool {
         .enum_tag => |t| switch (kb) {
             .enum_literal => |m| std.mem.eql(u8, t.name, m),
             .enum_tag => |u| if (eqlTypes(ip, t.ty, u.ty) == true) std.mem.eql(u8, t.name, u.name) else null,
+            .enum_unnamed => |u| if (eqlTypes(ip, t.ty, u.ty) == true) false else null,
             .union_value => |u| std.mem.eql(u8, t.name, u.tag),
+            else => null,
+        },
+        .enum_unnamed => |x| switch (kb) {
+            .enum_literal => false,
+            .enum_tag => |t| if (eqlTypes(ip, x.ty, t.ty) == true) false else null,
+            .enum_unnamed => |y| if (eqlTypes(ip, x.ty, y.ty) == true) eqlValues(ip, x.int, y.int) else null,
             else => null,
         },
         .union_value => |u| switch (kb) {
