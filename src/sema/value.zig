@@ -223,7 +223,8 @@ fn mul(ip: *InternPool, ty: Index, x: Wide, y: Wide, mode: Overflow) ?i128 {
 }
 
 /// `<<`: bits shifted out of a fixed-width integer are discarded (the shift amount must be less
-/// than the bit width); `<<|` saturates
+/// than the bit width); `<<|` saturates. As in the compiler, a shift by zero is the left operand
+/// for every width, u0 included (its shift amount type `Log2Int(u0)` is u0).
 fn shl(ip: *InternPool, ty: Index, x: Wide, y: Wide, saturate: bool) ?i128 {
     if (y < 0) return null;
     if (ty == .comptime_int_type) {
@@ -232,7 +233,7 @@ fn shl(ip: *InternPool, ty: Index, x: Wide, y: Wide, saturate: bool) ?i128 {
     }
     const info = intInfo(ip, ty) orelse return null;
     if (info.bits > 128) return null;
-    if (y >= info.bits) {
+    if (y != 0 and y >= info.bits) {
         if (!saturate) return null;
         if (x == 0) return 0;
         const b = bounds(info).?;
@@ -249,7 +250,7 @@ fn shr(ip: *InternPool, ty: Index, x: Wide, y: Wide) ?i128 {
     // cannot be represented; return null early so that the @intCast of the shift amount cannot
     // overflow
     if (info.bits > 128) return null;
-    if (y >= info.bits) return null;
+    if (y != 0 and y >= info.bits) return null;
     return fit(ip, ty, x >> @intCast(y), .check);
 }
 
@@ -274,7 +275,7 @@ pub fn overflowInt(ip: *InternPool, op: OverflowOp, ty: Index, a: i128, b: i128)
             if (m[1] != 0) return .{ fit(ip, ty, x *% y, .wrap) orelse return null, true };
             break :blk m[0];
         },
-        .shl => if (y < 0 or y >= info.bits) return null else x << @intCast(y),
+        .shl => if (y < 0 or (y != 0 and y >= info.bits)) return null else x << @intCast(y),
     };
     const wrapped = fit(ip, ty, r, .wrap) orelse return null;
     return .{ wrapped, fit(ip, ty, r, .check) == null };
@@ -292,7 +293,7 @@ pub fn exactShift(ip: *InternPool, left: bool, ty: Index, a: i128, b: i128) ?i12
         return fit(ip, ty, @as(Wide, a) >> n, .check);
     }
     const info = intInfo(ip, ty) orelse return null;
-    if (info.bits > 128 or b >= info.bits) return null;
+    if (info.bits > 128 or (b != 0 and b >= info.bits)) return null;
     const x = toWide(info, a);
     const n: u8 = @intCast(b);
     if (left) return fit(ip, ty, x << n, .check);

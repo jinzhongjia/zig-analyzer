@@ -5855,6 +5855,8 @@ test "comptime evaluation gives the right operand of a shift the result type Log
         \\const direct = @as(u32, 1) << @intCast(@as(u64, 3));
         \\const wide_lhs = @as(i64, -1) << @truncate(@as(u64, 64 + 63));
         \\const big_lhs = (1 << 100) >> @intCast(@as(u64, 98));
+        \\const zero_width = @as(u0, 0) << @intCast(@as(u64, 0));
+        \\const zero_width_exact = @shrExact(@as(u0, 0), 0);
         \\const too_far = shrCast(256, 32);
     , &.{
         .{ "shr_cast", "u32 = 16" },
@@ -5868,6 +5870,9 @@ test "comptime evaluation gives the right operand of a shift the result type Log
         .{ "wide_lhs", "i64 = -9223372036854775808" },
         // `Log2Int(comptime_int)` is comptime_int
         .{ "big_lhs", "comptime_int = 4" },
+        // `Log2Int(u0)` is u0, and a shift by zero is the left operand
+        .{ "zero_width", "u0 = 0" },
+        .{ "zero_width_exact", "u0 = 0" },
         // 32 does not fit the shift amount type u5: a compile error, no value
         .{ "too_far", "u32" },
     });
