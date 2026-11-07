@@ -65,6 +65,24 @@ pub fn absType(ip: *InternPool, t: Index) Allocator.Error!?Index {
     };
 }
 
+/// `Log2Int(T)`, the result type of the right operand of `<<` / `>>` / `<<=` / `>>=` /
+/// `@shlExact` / `@shrExact` (matches the compiler's `Sema.log2IntType`): comptime_int for
+/// comptime_int, the unsigned integer of `log2_int_ceil(bits)` bits for a fixed-width integer,
+/// vectors element-wise. Null for other types (a compile error) and when the bit width is
+/// unknown.
+pub fn log2IntType(ip: *InternPool, t: Index) Allocator.Error!?Index {
+    if (t == .comptime_int_type) return .comptime_int_type;
+    switch (ip.key(t)) {
+        .vector_type => |v| {
+            const child = try log2IntType(ip, v.child) orelse return null;
+            return try ip.get(.{ .vector_type = .{ .len = v.len, .child = child } });
+        },
+        else => {},
+    }
+    const info = intInfo(ip, t) orelse return null;
+    return try ip.intType(.unsigned, if (info.bits == 0) 0 else std.math.log2_int_ceil(u16, info.bits));
+}
+
 /// Intermediate result of arithmetic: holds both the product of two i128 values and shift results
 const Wide = i256;
 
