@@ -666,6 +666,11 @@ const Ref = struct {
     /// The place cannot be written: a constant, a temporary, or a place reached through a
     /// `*const` pointer. A pointer taken to it with `&` is `*const`.
     is_const: bool = false,
+    /// The storage cell never changes after it is initialized: the slot of a binding other than a
+    /// `var`, or a new cell reachable only through `*const` pointers. A property of the cell, not
+    /// of the access path: a place reached through a `*const` pointer to a `var` is const but not
+    /// immutable.
+    immutable: bool = false,
 
     const Window = struct { start: u32, len: u32 };
 };
@@ -908,6 +913,32 @@ const Evaluator = struct {
         out.* = .{ .elems = try ev.allocElems(agg.elems.len) };
         for (agg.elems, out.elems) |e, *o| o.* = try ev.copy(e);
         return .{ .ty = v.ty, .v = .{ .agg = out } };
+    }
+
+    /// Whether the value is or contains a pointer through which storage inside the interpreter
+    /// can change: a pointer to a cell that is not immutable, or to an immutable cell whose
+    /// content in turn contains such a pointer. The same rule as the compiler's
+    /// `Value.canMutateComptimeVarState`. Past `depth` levels of pointers the answer is yes.
+    fn refersToMutableStorage(v: Val, depth: u32) bool {
+        return switch (v.v) {
+            .ref => |r| !r.immutable or depth == 0 or refersToMutableStorage(pointeeOf(r), depth - 1),
+            .agg => |agg| for (agg.elems) |e| {
+                if (refersToMutableStorage(e, depth)) break true;
+            } else false,
+            .unknown, .undef, .ip, .int, .big => false,
+        };
+    }
+
+    /// The value at the end of the reference's path, without copying (for a range, the whole
+    /// aggregate it is a range of); an interned level contains no pointers into the interpreter,
+    /// so the walk stops there
+    fn pointeeOf(r: Ref) Val {
+        var cur = r.cell.*;
+        for (r.path) |i| switch (cur.v) {
+            .agg => |agg| cur = if (i < agg.elems.len) agg.elems[i] else return .unknown,
+            else => return .unknown,
+        };
+        return cur;
     }
 
     // ── Aggregates ───────────────────────────────────────────────────
@@ -1630,8 +1661,9 @@ const Evaluator = struct {
     }
 
     /// Calls a function value: through `CallEval` (results are cached) when all arguments can be
-    /// interned; otherwise (an argument contains a pointer to storage inside the interpreter,
-    /// through which the callee may write) executes it in the current interpreter
+    /// interned; otherwise executes it in the current interpreter: when an argument of a runtime
+    /// parameter is an aggregate or a pointer inside the interpreter, or an argument of an anytype
+    /// or comptime parameter refers to storage that can change (the callee may write through it)
     fn callFn(ev: *Evaluator, callee: Val, fty: infer.FnType, args: []const Val) EvalError!Val {
         const ip = ev.ip;
         const fv = switch (ip.key((try ev.ipOf(callee)) orelse return error.Abort)) {
@@ -1641,8 +1673,8 @@ const Evaluator = struct {
         const callee_tv: TypedValue = .{ .ty = callee.ty, .val = try ev.ipOf(callee) };
         const g = try infer.genericCallee(ev.r, ev.a, callee_tv, fty);
         // Arguments are interned and the call goes through a query (results are cached). Mutable
-        // aggregates and pointers passed to non-comptime parameters are not interned: the callee
-        // may write through the pointers, and large intermediate values should not stay in the
+        // aggregates and pointers passed to runtime parameters are not interned: the callee may
+        // write through the pointers, and large intermediate values should not stay in the
         // grow-only InternPool either.
         const tvs = try ev.a.alloc(TypedValue, args.len);
         var local = false;
@@ -1650,16 +1682,28 @@ const Evaluator = struct {
         // through `scalarCall`
         var scalar = false;
         for (args, tvs, 0..) |a, *tv, i| {
-            const comptime_param = if (g) |gg| gg.kind(i) != .runtime else false;
-            if (!comptime_param and (a.v == .agg or a.v == .ref)) {
+            const kind: infer.ParamKind = if (g) |gg| gg.kind(i) else .runtime;
+            if (kind == .runtime and (a.v == .agg or a.v == .ref)) {
                 local = true;
                 tv.* = .{ .ty = a.ty };
                 continue;
             }
-            if (!comptime_param and a.v == .int) {
+            if (kind == .runtime and a.v == .int) {
                 scalar = true;
                 tv.* = .{ .ty = a.ty };
                 continue;
+            }
+            // A pointer to storage that can change, directly or inside an aggregate, passed to an
+            // anytype or comptime parameter: the callee may write through it or return it, so the
+            // call runs on the caller's storage, as in the compiler, which does not memoize a
+            // comptime call when an argument can mutate comptime state. The instance of an anytype
+            // parameter records only the type; a comptime parameter still takes the value.
+            if (refersToMutableStorage(a, max_freeze_depth)) {
+                local = true;
+                if (kind == .anytype_type) {
+                    tv.* = .{ .ty = a.ty };
+                    continue;
+                }
             }
             tv.* = .{ .ty = a.ty, .val = try ev.freeze(a) };
         }
@@ -2287,11 +2331,16 @@ const Evaluator = struct {
         return ev.makeAgg(ty, elems);
     }
 
-    /// Pointer to a new storage cell (holding `target`)
+    /// Pointer to a new storage cell (holding `target`); the cell is reachable only through this
+    /// pointer and its copies, so with a `*const` type it never changes
     fn pointerToNew(ev: *Evaluator, ptr_ty: Index, target: Val) Error!Val {
         const cell = try ev.a.create(Val);
         cell.* = target;
-        return .{ .ty = ptr_ty, .v = .{ .ref = .{ .cell = cell, .path = &.{} } } };
+        const immutable = switch (ev.ip.key(ptr_ty)) {
+            .ptr_type => |p| p.is_const,
+            else => false,
+        };
+        return .{ .ty = ptr_ty, .v = .{ .ref = .{ .cell = cell, .path = &.{}, .immutable = immutable } } };
     }
 
     /// Array type: a pointer to an array yields the array it points to; a slice is treated as an
@@ -2377,7 +2426,7 @@ const Evaluator = struct {
             error.Abort => blk: {
                 const cell = try ev.a.create(Val);
                 cell.* = try ev.copy(v);
-                break :blk Ref{ .cell = cell, .path = &.{}, .is_const = true };
+                break :blk Ref{ .cell = cell, .path = &.{}, .is_const = true, .immutable = true };
             },
             else => |x| return x,
         };
@@ -2390,10 +2439,14 @@ const Evaluator = struct {
             .name_ref => |name| {
                 const def = try ev.r.resolveName(f.file, f.item, f.body, f.body.expr_scopes[@backingInt(e)], name) orelse return error.Abort;
                 switch (def) {
-                    .local => |l| if (l.file == f.file and l.item == f.item) return .{
-                        .cell = &f.slots[@backingInt(l.binding)],
-                        .path = &.{},
-                        .is_const = f.body.binding(l.binding).kind != .local_var,
+                    .local => |l| if (l.file == f.file and l.item == f.item) {
+                        const is_var = f.body.binding(l.binding).kind == .local_var;
+                        return .{
+                            .cell = &f.slots[@backingInt(l.binding)],
+                            .path = &.{},
+                            .is_const = !is_var,
+                            .immutable = !is_var,
+                        };
                     },
                     else => {},
                 }
@@ -2455,7 +2508,7 @@ const Evaluator = struct {
         const path = try ev.a.alloc(u32, base.path.len + 1);
         @memcpy(path[0..base.path.len], base.path);
         path[base.path.len] = index;
-        return .{ .cell = base.cell, .path = path, .is_const = base.is_const };
+        return .{ .cell = base.cell, .path = path, .is_const = base.is_const, .immutable = base.immutable };
     }
 
     fn assign(ev: *Evaluator, f: *Frame, op: SyntaxKind, lhs_e: ExprId, rhs_e: ExprId) EvalError!void {
@@ -2574,7 +2627,7 @@ const Evaluator = struct {
         const whole = try ev.load(.{ .cell = r.cell, .path = r.path });
         const n = try ev.elemCount(whole) orelse return error.Abort;
         if (len < 0 or w.start + len > n) return error.Abort;
-        try ev.store(ref, .{ .ty = s.ty, .v = .{ .ref = .{ .cell = r.cell, .path = r.path, .window = .{ .start = w.start, .len = @intCast(len) } } } });
+        try ev.store(ref, .{ .ty = s.ty, .v = .{ .ref = .{ .cell = r.cell, .path = r.path, .window = .{ .start = w.start, .len = @intCast(len) }, .immutable = r.immutable } } });
         return true;
     }
 
