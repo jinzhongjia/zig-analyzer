@@ -319,6 +319,42 @@ pub fn explicitTagType(r: *Resolver, t: Index) Error!?Index {
     return decl.arg;
 }
 
+/// The `T` of the source enum `ns` declared `enum(T)`, in instance `inst`, for display: null when
+/// the declaration gives no tag type, `.unknown` when it cannot be evaluated
+pub fn writtenTagType(r: *Resolver, ns: Namespace, inst: ?Index) Error!?Index {
+    const arg = try containerArgValue(r, ns, inst) orelse return null;
+    return arg.asType() orelse .unknown;
+}
+
+/// The value written for member `item` of a source enum (`a = 5`), as the compiler evaluates it:
+/// null when the member has none, `.unknown` when it cannot be evaluated
+pub fn writtenEnumValue(r: *Resolver, file: FileId, item: u32, inst: ?Index) Error!?Index {
+    const owner = try r.ownerKey(file, item);
+    const body = try r.ctx.get(hir.ItemBody, owner);
+    if (body.value == null) return null;
+    return (try ownerValue(r, owner, inst, null)).val orelse .unknown;
+}
+
+/// Value of the argument of `enum(u8)` / `union(E)` / `packed struct(u32)` (in the inference
+/// result of the enclosing member); null when the declaration has no argument
+fn containerArgValue(r: *Resolver, ns: Namespace, inst: ?Index) Error!?TypedValue {
+    const tree = try r.itemTree(ns.file);
+    const parent = tree.containers[ns.container].parent_item orelse return null;
+    const rel = try r.containerRel(ns) orelse return null;
+    const body = try r.body(ns.file, parent);
+    for (body.exprs, 0..) |x, i| switch (x) {
+        .container => |c| if (body.expr_ranges[i].start == rel) {
+            const arg = c.arg orelse return null;
+            // Infer only the argument expression: inference of the enclosing member as a whole
+            // may be in progress (for a container in a body), and taking it would form a cycle
+            const owner = try r.ownerKey(ns.file, parent);
+            return try r.ctx.get(queries.LocalValue, .{ .owner = owner, .target = .{ .expr = arg }, .inst = try queries.normalizeInst(r, ns.file, parent, inst) });
+        },
+        else => {},
+    };
+    return null;
+}
+
 /// Pointer value pointing to the comptime constant value `pointee` (consistent with the
 /// interpreter's representation: a pointer to an array is represented by its elements)
 pub fn constPointer(r: *Resolver, ptr_ty: Index, pointee: Index) Error!Index {
@@ -4544,22 +4580,7 @@ const Evaluator = struct {
     /// Argument of `enum(u8)` / `union(E)` / `packed struct(u32)` (in the inference result of the
     /// enclosing member)
     fn containerArg(ev: *Evaluator, ns: Namespace, inst: ?Index) Error!?Index {
-        const tree = try ev.r.itemTree(ns.file);
-        const parent = tree.containers[ns.container].parent_item orelse return null;
-        const rel = try ev.r.containerRel(ns) orelse return null;
-        const body = try ev.r.body(ns.file, parent);
-        for (body.exprs, 0..) |x, i| switch (x) {
-            .container => |c| if (body.expr_ranges[i].start == rel) {
-                const arg = c.arg orelse return null;
-                // Infer only the argument expression: inference of the enclosing member as a whole
-                // may be in progress (for a container in a body), and taking it would form a cycle
-                const owner = try ev.r.ownerKey(ns.file, parent);
-                const v = try ev.r.ctx.get(queries.LocalValue, .{ .owner = owner, .target = .{ .expr = arg }, .inst = try queries.normalizeInst(ev.r, ns.file, parent, inst) });
-                return v.asType();
-            },
-            else => {},
-        };
-        return null;
+        return (try containerArgValue(ev.r, ns, inst) orelse return null).asType();
     }
 
     fn layoutOf(ev: *Evaluator, t: Index) EvalError!InternPool.Reified.Layout {

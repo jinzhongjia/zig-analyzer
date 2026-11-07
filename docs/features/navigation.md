@@ -13,6 +13,7 @@ Hover, inlay hints, and completion details share `render.zig`.
 - A container that is the value of a member is named after the member, also when an `if` / `switch` chooses among several (more readable than the compiler's `S__struct_1`).
 - A `return`ed container is named after the function and its comptime arguments (`List(u8)`), and one named inside a generic instance is qualified as the compiler names it (`Outer(u8).Inner`).
 - Containers without a name in the source are displayed by their contents; a self-reference is `struct {...}`, so expansion always ends.
+- An enum displayed by its contents keeps what its declaration gives it: the tag type of `enum(T)`, the values written for members (as evaluated), and `_` when it is non-exhaustive (`enum(u8) { a = 1, b, _ }`). An enum constructed by `@Enum` shows its tag type and the value of every member.
 
 ## Value display
 

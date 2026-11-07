@@ -1297,19 +1297,30 @@ fn printField(ip: *InternPool, name: ?[]const u8, ty: Index, v: Index, w: *Io.Wr
 }
 
 /// Displays a constructed type by its contents when there is no name for its construction
-/// location
+/// location. An enum shows what `@Enum` gives it: the tag type, the value of each member, and `_`
+/// when it is non-exhaustive (`enum(u8) { a = 0, b = 1, _ }`).
 pub fn printReified(ip: *InternPool, t: Reified, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
-    try w.print("{t} {{", .{t.kind});
-    for (t.names, 0..) |n, i| {
+    const is_enum = t.kind == .@"enum";
+    try w.print("{t}", .{t.kind});
+    if (is_enum) if (t.tag) |tag| {
+        try w.writeAll("(");
+        try ip.print(tag, w, container_name);
+        try w.writeAll(")");
+    };
+    try w.writeAll(" {");
+    const cut = for (t.names, 0..) |n, i| {
         try w.writeAll(if (i == 0) " " else ", ");
-        if (try truncateList(container_name, w, t.names.len)) break;
+        if (try truncateList(container_name, w, t.names.len)) break true;
         try w.writeAll(n);
         if (i < t.types.len) {
             try w.writeAll(": ");
             try ip.print(t.types[i], w, container_name);
         }
-    }
-    try w.writeAll(if (t.names.len == 0) "}" else " }");
+        if (is_enum and i < t.values.len) try w.print(" = {d}", .{t.values[i]});
+    } else false;
+    const underscore = is_enum and t.nonexhaustive and !cut;
+    if (underscore) try w.writeAll(if (t.names.len == 0) " _" else ", _");
+    try w.writeAll(if (t.names.len == 0 and !underscore) "}" else " }");
 }
 
 const testing = std.testing;

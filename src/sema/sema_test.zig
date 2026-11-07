@@ -4401,6 +4401,41 @@ test "values of non-exhaustive enums that no member has are comptime values" {
         .{ "name", "*const [29:0]u8 = \"main.Gen(@fromBackingInt(15))\"" },
     });
 }
+
+test "anonymous enums display their tag type, the values written for members and _" {
+    // Prevents displaying them by member names only (`enum { a }` for `enum(u8) { a, _ }`);
+    // values are as zig 0.17.0 and 0.17.1 evaluate them
+    try expectTypes(
+        \\const exhaustive: enum(u4) { a = 3, b = 5 } = .b;
+        \\const plain: enum { x, y } = .y;
+        \\const open: enum(u8) { a, _ } = .a;
+        \\const open_unnamed: enum(u8) { a, _ } = @enumFromInt(7);
+        \\const partial: enum(u8) { a = 1, b, c = 7 } = .c;
+        \\const evaluated: enum(u8) { a = 1 << 3, b, c = 0x20 } = .b;
+        \\const empty: enum(u8) { _ } = @enumFromInt(3);
+        \\const signed: enum(i8) { a = -1, b, _ } = @enumFromInt(-5);
+        \\const optional: ?enum(u2) { a, b } = .b;
+        \\const reified: @Enum(u8, .nonexhaustive, &.{ "x", "y" }, &.{ 1, 4 }) = .y;
+        \\const reified_unnamed: @Enum(u8, .nonexhaustive, &.{"x"}, &.{1}) = @enumFromInt(9);
+        \\const reified_exhaustive: @Enum(u2, .exhaustive, &.{ "x", "y" }, &.{ 0, 1 }) = .x;
+    , &.{
+        .{ "exhaustive", "enum(u4) { a = 3, b = 5 } = .b" },
+        .{ "plain", "enum { x, y } = .y" },
+        .{ "open", "enum(u8) { a, _ } = .a" },
+        .{ "open_unnamed", "enum(u8) { a, _ } = @fromBackingInt(7)" },
+        // Only the values written are shown, as evaluated
+        .{ "partial", "enum(u8) { a = 1, b, c = 7 } = .c" },
+        .{ "evaluated", "enum(u8) { a = 8, b, c = 32 } = .b" },
+        .{ "empty", "enum(u8) { _ } = @fromBackingInt(3)" },
+        .{ "signed", "enum(i8) { a = -1, b, _ } = @fromBackingInt(-5)" },
+        .{ "optional", "?enum(u2) { a, b } = .b" },
+        // `@Enum` gives every member its value
+        .{ "reified", "enum(u8) { x = 1, y = 4, _ } = .y" },
+        .{ "reified_unnamed", "enum(u8) { x = 1, _ } = @fromBackingInt(9)" },
+        .{ "reified_exhaustive", "enum(u2) { x = 0, y = 1 } = .x" },
+    });
+}
+
 test "@typeInfo lists error names in declaration order" {
     // Prevents listing `error_names` sorted by their bytes; expected values are the results of
     // zig 0.17.0, which sorts only the names in `@typeName`
