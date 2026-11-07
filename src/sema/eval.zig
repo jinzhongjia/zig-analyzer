@@ -3181,10 +3181,16 @@ const Evaluator = struct {
             // `@ptrCast(@alignCast(p))`), pass it through unchanged
             const pointer_cast = eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast");
             if (want == null and pointer_cast) return vals[0];
-            // The destination of `@fromBackingInt` is the result type without error union and
-            // optional (the compiler's `resolveDestType` with `.remove_eu_opt`); the result is
-            // coerced to the result type afterwards
-            const t = (if (eq(u8, name, "@fromBackingInt")) destType(ip, want, .eu_opt) else want) orelse return error.Abort;
+            // The cast produces its destination type, the result type without its error union
+            // and / or optional (`?u8` gives `u8` to `@intCast`); `eval` coerces the result to the
+            // result type afterwards. `@fromBackingInt` strips both (`.remove_eu_opt`) and needs
+            // a known result type.
+            const t = if (eq(u8, name, "@fromBackingInt"))
+                destType(ip, want, .eu_opt) orelse return error.Abort
+            else if (castDestStrip(name)) |strip|
+                destType(ip, want, strip) orelse want orelse return error.Abort
+            else
+                want orelse return error.Abort;
             if (pointer_cast and !try ev.keepsPointee(vals[0], t)) return .{ .ty = t };
             return ev.cast(name, vals[0], t);
         }
@@ -3193,7 +3199,8 @@ const Evaluator = struct {
             return ev.int(.u1_type, @intFromBool((try ev.condition(vals[0])).yes));
         }
         if (eq(u8, name, "@splat")) {
-            const t = want orelse return error.Abort;
+            // The destination type drops the error union and optional of the result type
+            const t = destType(ip, want, .eu_opt) orelse want orelse return error.Abort;
             if (vals.len != 1) return error.Abort;
             const n = try ev.typeElemCount(t) orelse return error.Abort;
             const elems = try ev.allocElems(n);
