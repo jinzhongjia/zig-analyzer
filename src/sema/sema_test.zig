@@ -635,6 +635,93 @@ test "the sentinel element of an array" {
     });
 }
 
+test "the sentinel element read through pointers, slices and many-item pointers" {
+    try expectTypes(
+        \\const many: [*:0]const u8 = "hello";
+        \\const slice: [:0]const u8 = "hello";
+        \\const plain: [*]const u8 = "hello";
+        \\const c_ptr: [*c]const u8 = "hey";
+        \\const unterminated: [*c]const u8 = &[_]u8{ 1, 2, 3 };
+        \\const no_sentinel: []const u8 = "hello";
+        \\const seven: *const [2:7]u8 = &[_:7]u8{ 1, 2 };
+        \\const wide: [:0]const u16 = &[_:0]u16{ 1, 2, 3 };
+        \\const lit = "hello"[5];
+        \\const via_many = many[5];
+        \\const via_slice = slice[5];
+        \\const via_plain = plain[5];
+        \\const via_c = c_ptr[3];
+        \\const via_unterminated = unterminated[3];
+        \\const via_seven = seven[2];
+        \\const via_wide = wide[3];
+        \\const past_lit = "hello"[6];
+        \\const past_many = many[6];
+        \\const past_slice = slice[6];
+        \\const past_len = no_sentinel[5];
+        \\const in_range = blk: {
+        \\    var buf = [_]u8{ 'a', 'b', 0, 'd' };
+        \\    const s: [:0]u8 = buf[0..2 :0];
+        \\    break :blk s[2];
+        \\};
+        \\const range_to_end = blk: {
+        \\    var buf: [3:0]u8 = "abc".*;
+        \\    const s: [:0]u8 = buf[1..];
+        \\    break :blk s[2];
+        \\};
+        \\const range_written = blk: {
+        \\    var buf = [_]u8{ 'a', 'b', 0, 'd' };
+        \\    const s: [:0]u8 = buf[0..2 :0];
+        \\    buf[2] = 'x';
+        \\    break :blk s[2];
+        \\};
+        \\const range_many = blk: {
+        \\    var buf = [_]u8{ 'a', 'b', 0, 'd' };
+        \\    const s: [:0]u8 = buf[0..2 :0];
+        \\    break :blk s.ptr[2];
+        \\};
+        \\const range_past = blk: {
+        \\    var buf = [_]u8{ 'a', 'b', 0, 'd' };
+        \\    const s: [:0]u8 = buf[0..2 :0];
+        \\    break :blk s[3];
+        \\};
+        \\const range_no_sentinel = blk: {
+        \\    var buf = [_]u8{ 1, 2, 3, 4 };
+        \\    const s: []u8 = buf[0..2];
+        \\    break :blk s[2];
+        \\};
+        \\fn scan(p: [*:0]const u8) usize {
+        \\    var i: usize = 0;
+        \\    while (p[i] != 0) i += 1;
+        \\    return i;
+        \\}
+        \\const scanned = scan("abcd");
+    , &.{
+        .{ "lit", "u8 = 0" },
+        .{ "via_many", "u8 = 0" },
+        .{ "via_slice", "u8 = 0" },
+        // A many-item pointer reads the storage it points to, whose sentinel the pointer type
+        // need not have
+        .{ "via_plain", "u8 = 0" },
+        .{ "via_c", "u8 = 0" },
+        .{ "via_unterminated", "u8" },
+        .{ "via_seven", "u8 = 7" },
+        .{ "via_wide", "u16 = 0" },
+        // Indices past the sentinel, and index `len` of a slice without one, are compile errors
+        .{ "past_lit", "u8" },
+        .{ "past_many", "u8" },
+        .{ "past_slice", "u8" },
+        .{ "past_len", "u8" },
+        // A range of local storage reads the element after it from the containing array: what
+        // that array holds there, which need not be the sentinel once overwritten
+        .{ "in_range", "u8 = 0" },
+        .{ "range_to_end", "u8 = 0" },
+        .{ "range_written", "u8 = 120" },
+        .{ "range_many", "u8 = 0" },
+        .{ "range_past", "u8" },
+        .{ "range_no_sentinel", "u8" },
+        .{ "scanned", "usize = 4" },
+    });
+}
+
 test "inline calls with comptime-known arguments have comptime-known results" {
     try expectTypes(
         \\inline fn twice(x: u32) u32 { return x * 2; }
@@ -4475,6 +4562,34 @@ test "std.mem pointer reinterpretation" {
         .{ "bytes", "[]align(2) const u8" },
         .{ "fs", "[]const F" },
         .{ "zb", "[]const u8" },
+    });
+}
+
+test "std.mem functions that scan a many-item pointer up to its sentinel at comptime" {
+    try expectStdTypesBuiltin(target_builtin,
+        \\const std = @import("std");
+        \\const spanned = std.mem.span(@as([*:0]const u8, "abc")).len;
+        \\const measured = std.mem.len(@as([*:0]const u8, "abcd"));
+        \\const measured_c = std.mem.len(@as([*c]const u8, "hey"));
+        \\const sliced = std.mem.sliceTo(@as([*:0]const u8, "abc"), 0).len;
+        \\const printed = std.mem.span(@as([*:0]const u8, std.fmt.comptimePrint("{d}", .{1234}))).len;
+        \\const wide = std.mem.span(@as([*:0]const u16, &[_:0]u16{ 1, 2, 3 })).len;
+        \\const local = blk: {
+        \\    var buf = [_]u8{ 'a', 'b', 0, 'd' };
+        \\    const s: [:0]u8 = buf[0..2 :0];
+        \\    break :blk std.mem.len(s.ptr);
+        \\};
+        \\const ordered = std.mem.orderZ(u8, "ab", "abc");
+    , &.{
+        .{ "spanned", "usize = 3" },
+        .{ "measured", "usize = 4" },
+        .{ "measured_c", "usize = 3" },
+        .{ "sliced", "usize = 3" },
+        .{ "printed", "usize = 4" },
+        .{ "wide", "usize = 3" },
+        .{ "local", "usize = 2" },
+        // Compares the sentinel of the shorter string with a byte of the longer one
+        .{ "ordered", "Order = .lt" },
     });
 }
 
