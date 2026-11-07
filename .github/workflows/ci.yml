@@ -14,12 +14,13 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }}, Zig ${{ matrix.zig }})
+    name: Test (${{ matrix.os }}, Zig ${{ matrix.zig }}, ${{ matrix.optimize }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         zig: [0.17.0, 0.17.1]
+        optimize: [Debug, ReleaseSafe]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:
@@ -27,14 +28,45 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ matrix.zig }}
-      - name: All tests (Debug)
-        run: zig build test-all --summary all
-      - name: All tests (ReleaseSafe)
-        run: zig build test-all -Doptimize=ReleaseSafe --summary all
+          cache-key: test-${{ matrix.optimize }}
+      - name: All tests
+        run: zig build test-all -Doptimize=${{ matrix.optimize }} --summary all
+
+  build:
+    name: Build (${{ matrix.os }}, Zig ${{ matrix.zig }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        zig: [0.17.0, 0.17.1]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ matrix.zig }}
+          cache-key: build
       - name: Build the executable
         run: zig build -Doptimize=ReleaseSafe
       - name: Compile check (including benchmark tools)
         run: zig build check -Doptimize=ReleaseSafe
+
+  corpus:
+    name: Corpus cross-check (${{ matrix.os }}, Zig ${{ matrix.zig }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        zig: [0.17.0, 0.17.1]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ matrix.zig }}
+          cache-key: corpus
       - name: Corpus cross-check (Zig standard library + this repository's sources and .zon files)
         run: zig build corpus -Doptimize=ReleaseSafe -- src tools build.zig.zon zig-analyzer.default.zon
 
