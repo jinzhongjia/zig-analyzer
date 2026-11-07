@@ -2984,7 +2984,7 @@ const Evaluator = struct {
         }
         const vals = try ev.a.alloc(Val, args.len);
         // Result types of the arguments
-        for (args, vals, 0..) |a, *o, i| o.* = try ev.eval(f, a, try ev.builtinArgType(name, i, vals[0..i]));
+        for (args, vals, 0..) |a, *o, i| o.* = try ev.eval(f, a, try ev.builtinArgType(name, i, vals[0..i], want));
         if (try ev.pureBuiltin(name, vals)) |v| return v;
         if (eq(u8, name, "@TypeOf")) {
             if (vals.len == 0) return error.Abort;
@@ -3128,7 +3128,10 @@ const Evaluator = struct {
             // `@ptrCast(@alignCast(p))`), pass it through unchanged
             const pointer_cast = eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast");
             if (want == null and pointer_cast) return vals[0];
-            const t = want orelse return error.Abort;
+            // The destination of `@fromBackingInt` is the result type without error union and
+            // optional (the compiler's `resolveDestType` with `.remove_eu_opt`); the result is
+            // coerced to the result type afterwards
+            const t = (if (eq(u8, name, "@fromBackingInt")) destType(ip, want) else want) orelse return error.Abort;
             if (pointer_cast and !try ev.keepsPointee(vals[0], t)) return .{ .ty = t };
             return ev.cast(name, vals[0], t);
         }
@@ -3414,11 +3417,21 @@ const Evaluator = struct {
         return ev.floatOf(v) orelse error.Abort;
     }
 
-    /// Result type of argument `i` of a builtin (`prev` holds the preceding arguments). In
-    /// builtins that construct types, arguments given per field get `*const [n]T`, which forms
-    /// such as `&@splat(.{})` need.
-    fn builtinArgType(ev: *Evaluator, name: []const u8, i: usize, prev: []const Val) EvalError!?Index {
+    /// Result type of argument `i` of a builtin (`prev` holds the preceding arguments, `want` is
+    /// the result type of the call). In builtins that construct types, arguments given per field
+    /// get `*const [n]T`, which forms such as `&@splat(.{})` need.
+    fn builtinArgType(ev: *Evaluator, name: []const u8, i: usize, prev: []const Val, want: ?Index) EvalError!?Index {
         const eq = std.mem.eql;
+        // The operand is coerced to the backing integer of the destination type (the compiler's
+        // `from_backing_int_arg_ty`): the tag type of an enum, the backing integer of a packed
+        // struct or union. `@fromBackingInt(@intCast(i))` needs it.
+        if (eq(u8, name, "@fromBackingInt") and i == 0) {
+            const dest = destType(ev.ip, want) orelse return null;
+            return ev.backingIntType(dest) catch |err| switch (err) {
+                error.Abort => null,
+                else => |x| return x,
+            };
+        }
         const is_struct = eq(u8, name, "@Struct");
         const elem: ?Index = if ((is_struct or eq(u8, name, "@Union")) and (i == 3 or i == 4)) blk: {
             if (i == 3) break :blk .type_type;
@@ -4575,6 +4588,22 @@ fn peerFloatType(ip: *InternPool, a: Index, b: Index) ?Index {
     if (a == .comptime_float_type or a == .comptime_int_type) return if (ip.isFloat(b)) b else null;
     if (b == .comptime_float_type or b == .comptime_int_type) return if (ip.isFloat(a)) a else null;
     return null;
+}
+
+/// Destination type of a cast builtin with result type `want`: without error union and optional,
+/// as in the compiler's `resolveDestType` with `.remove_eu_opt`; null without a result type
+fn destType(ip: *InternPool, want: ?Index) ?Index {
+    var t = want orelse return null;
+    if (t == .unknown) return null;
+    switch (ip.key(t)) {
+        .error_union_type => |eu| t = eu.payload,
+        else => {},
+    }
+    switch (ip.key(t)) {
+        .optional_type => |c| t = c,
+        else => {},
+    }
+    return t;
 }
 
 /// Whether a field of a tuple or anonymous struct literal is comptime; gives up when it cannot
