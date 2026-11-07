@@ -2233,9 +2233,12 @@ const Evaluator = struct {
             else => {
                 // Matching the compiler, the operands have no result type:
                 // `const m: u8 = (0xFF << 4) >> 4` is computed as comptime_int and gives 255 when
-                // coerced to u8
+                // coerced to u8. The exception is the right operand of `<<` / `>>`, which has the
+                // result type `Log2Int(T)` of the left operand's type (`x >> @intCast(n)`); that
+                // of `<<|` has none.
                 const lhs = try ev.eval(f, lhs_e, null);
-                const rhs = try ev.eval(f, rhs_e, null);
+                const rhs_want: ?Index = if (op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right) try value.log2IntType(ip, lhs.ty) else null;
+                const rhs = try ev.eval(f, rhs_e, rhs_want);
                 return ev.arith(op, lhs, rhs);
             },
         }
@@ -2582,7 +2585,12 @@ const Evaluator = struct {
             .angle_bracket_angle_bracket_right_equal => .angle_bracket_angle_bracket_right,
             else => return error.Abort,
         };
-        const rhs = try ev.eval(f, rhs_e, if (bin == .angle_bracket_angle_bracket_left or bin == .angle_bracket_angle_bracket_right) null else ev.compoundRhsType(bin, rhs_want));
+        // Matching the compiler, the right operand of `<<=` / `>>=` has the result type
+        // `Log2Int(T)`
+        const rhs = try ev.eval(f, rhs_e, switch (bin) {
+            .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right => try value.log2IntType(ev.ip, old.ty),
+            else => ev.compoundRhsType(bin, rhs_want),
+        });
         try ev.store(ref, try ev.arith(bin, old, rhs));
     }
 
@@ -3497,6 +3505,9 @@ const Evaluator = struct {
             const n = try ev.elemCount(prev[2]) orelse return null;
             return try ev.ip.ptrTo(try ev.ip.get(.{ .array_type = .{ .len = n, .child = t } }), .one, true);
         }
+        // The shift amount of `@shlExact` / `@shrExact` has the result type `Log2Int(T)` of the
+        // shifted operand's type
+        if (i == 1 and (eq(u8, name, "@shlExact") or eq(u8, name, "@shrExact"))) return value.log2IntType(ev.ip, prev[0].ty);
         return builtinParamType(name, i);
     }
 
