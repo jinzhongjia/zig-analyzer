@@ -976,6 +976,10 @@ const Inferrer = struct {
                 for (s.prongs) |prong| for (prong.items) |item| {
                     // Items of a switch on a value of unknown type have an unknown result type
                     if (operand.ty == .unknown) try inf.noteUnknownResult(item);
+                    // `a...b`: the compiler coerces both bounds to the item type, like a scalar item
+                    if (switchRange(inf.body, item)) |range| for (range) |bound| {
+                        _ = try inf.infer(bound, item_ty);
+                    };
                     _ = try inf.infer(item, item_ty);
                 };
                 // Labeled switch: the value of `break :label value` is also a result
@@ -1601,7 +1605,8 @@ const Inferrer = struct {
         return if (value.isConcrete(inf.ip, ty)) ty else null;
     }
 
-    /// The prong that executes when both the switch operand and the prong items are comptime-known
+    /// The prong that executes when both the switch operand and the prong items are comptime-known.
+    /// A range item `a...b` matches an operand between its bounds, both inclusive.
     fn chooseProng(inf: *Inferrer, prongs: []const Body.Prong, operand: TypedValue) Error!?usize {
         const v = operand.val orelse return null;
         var else_prong: ?usize = null;
@@ -1611,8 +1616,12 @@ const Inferrer = struct {
                 continue;
             }
             for (prong.items) |item| {
-                const iv = inf.get(item).val orelse return null;
-                if (try eval.eqlValues(inf.r, iv, v) orelse return null) return i;
+                const hit = if (switchRange(inf.body, item)) |range|
+                    (try inf.compare(.angle_bracket_right_equal, operand, inf.get(range[0])) orelse return null) and
+                        (try inf.compare(.angle_bracket_left_equal, operand, inf.get(range[1])) orelse return null)
+                else
+                    try eval.eqlValues(inf.r, inf.get(item).val orelse return null, v) orelse return null;
+                if (hit) return i;
             }
         }
         return else_prong;
@@ -4531,6 +4540,14 @@ fn hasMember(r: *Resolver, t: Index, name: []const u8, decl: bool) Error!?bool {
     return tree.items[m].flags.is_pub;
 }
 
+/// The bounds of a switch prong item of the form `a...b`
+fn switchRange(body: *const Body, item: ExprId) ?[2]ExprId {
+    return switch (body.expr(item)) {
+        .other => |range| if (range.len == 2) range[0..2].* else null,
+        else => null,
+    };
+}
+
 /// Values of an `inline` prong (for operands that are not unions or error sets): the items are
 /// expanded in order, and a range `a...b` one integer at a time. `count` is the number of values
 /// and `value` is the `want`-th one; `count` is null when an item cannot be evaluated or for an
@@ -4547,10 +4564,15 @@ pub fn inlineProngValues(ip: *InternPool, body: *const Body, exprs: []const Type
                 if (range.len != 2) return .{ .count = null, .value = null };
                 const lo = value.intOf(ip, exprs[@backingInt(range[0])].val) orelse return .{ .count = null, .value = null };
                 const hi = value.intOf(ip, exprs[@backingInt(range[1])].val) orelse return .{ .count = null, .value = null };
-                if (hi < lo) continue;
-                const len: u64 = @intCast(hi - lo + 1);
+                // The bounds are coerced to the operand type: values of `u128` above the range of
+                // i128 are stored as the bit pattern, so they are ordered in that type and their
+                // distance is taken modulo 2^128
+                if (value.compareInts(ip, .angle_bracket_left, int_ty, int_ty, hi, lo)) continue;
+                // A range too long for a u32 count gives no count, like the total below
+                const span = std.math.cast(u32, @as(u128, @bitCast(hi -% lo))) orelse return .{ .count = null, .value = null };
+                const len = @as(u64, span) + 1;
                 if (want) |w| if (found == null and w >= n and w < n + len) {
-                    found = try ip.get(.{ .int_value = .{ .ty = int_ty, .value = lo + @as(i128, w - n) } });
+                    found = try ip.get(.{ .int_value = .{ .ty = int_ty, .value = lo +% @as(i128, w - n) } });
                 };
                 n += len;
             },
