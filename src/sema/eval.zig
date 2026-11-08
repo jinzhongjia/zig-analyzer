@@ -3864,7 +3864,9 @@ const Evaluator = struct {
             .ref => |r| r,
             else => return error.Abort,
         };
-        if (ref.window != null or ref.path.len == 0) return error.Abort;
+        // A `*T` → `*[1]T` view points to an array, which does not coerce to a pointer to the
+        // field
+        if (ref.window != null or ref.as_array or ref.path.len == 0) return error.Abort;
         const parent: Ref = .{ .cell = ref.cell, .path = ref.path[0 .. ref.path.len - 1], .is_const = parent_ptr.is_const, .immutable = ref.immutable };
         if (value.eqlTypes(ip, (try ev.loadPath(parent)).ty, parent_ty) != true) return error.Abort;
         const at = ref.path[ref.path.len - 1];

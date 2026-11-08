@@ -6136,6 +6136,11 @@ test "comptime evaluation: @fieldParentPtr goes back from a field pointer to its
         \\    const parent: *const CF = @fieldParentPtr("b", &cf_val.b);
         \\    break :blk parent.a;
         \\};
+        \\const array_view = blk: {
+        \\    const v: *const [1]u8 = &s_val.b;
+        \\    const parent: *const S = @fieldParentPtr("b", v);
+        \\    break :blk parent.a;
+        \\};
     , &.{
         .{ "via_call", "u8 = 1" },
         .{ "via_block", "u8 = 1" },
@@ -6161,10 +6166,12 @@ test "comptime evaluation: @fieldParentPtr goes back from a field pointer to its
         .{ "same_decl", "bool = true" },
         .{ "union_field", "u8 = 7" },
         // Compile errors: a field pointer that is not that field of a value of the parent type,
-        // and a comptime field
+        // a comptime field, and a `*T` → `*[1]T` view of the field, whose element type is not
+        // the field's
         .{ "wrong_field", "u8" },
         .{ "not_a_field", "u8" },
         .{ "comptime_field", "u8" },
+        .{ "array_view", "u8" },
     });
 }
 
