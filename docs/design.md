@@ -185,7 +185,7 @@ A compilation (`ModuleGraph.Compile`) determines `@import("std")`, `@import("roo
 
 ### Core queries
 
-`DeclType` (type and comptime value of a declaration; reads only the signature), `Infer` (BodyOwner + instance → type and target of every expression), `CallEval` (comptime calls, memoized per instance and arguments), `ErrorSetOf`, and `LocalValue`.
+`DeclType` (type and comptime value of a declaration; reads only the signature), `Infer` (BodyOwner + instance → type and target of every expression), `CallEval` (comptime calls, memoized per instance and arguments), `ErrorSetOf`, `LocalValue` (one local of a member, inferred from its initializer alone), and `LocalEval` (a local constant as the interpreter computes it by executing its function).
 
 ### InternPool
 
@@ -216,6 +216,7 @@ Executes on HIR: arithmetic by bit width, control flow, calls, container constru
 - **Limits**: backward branches are counted as in the compiler (default quota 1000, `@setEvalBranchQuota`), and evaluation never gives up before the compiler does: `CallEval` restarts counting with the current quota. Memory is limited to 1 GB, checked before aggregates expand; interned values nest at most 256 levels.
 - **Goto for constructed types**: names are computed at comptime, so they are traced back to the string literal they came from, through call sites when passed as arguments; names from `@typeInfo(X)` go to the member of X. An untraceable name goes to the call that constructs the type. Fields of anonymous values go to the field names in their initializers.
 - **`comptime var`**: tracked in statement order; once it may be modified indirectly, or in branches and loops that are not inferred per iteration, its value is unknown from there on. A `for` inferred for iteration n takes the value at the end of iteration n - 1.
+- **Captured locals**: a container defined in a function body captures the values the body has computed for the function's locals when it reaches the container, as in the compiler (`getCaptures`). When a member reads a local constant of the enclosing function and inferring the constant's initializer alone gives no value (it reads a local array, or a local variable that earlier statements modify), the interpreter executes the function in the container's instance up to the constant's definition (`LocalEval`). A constant in the body, condition, or continue expression of a loop gets no value this way: it has one value per iteration, while the containers of all iterations share one instance. The instance records only the type of an anytype argument, so values that depend on its value stay unknown. The call sites that produce the instance are not known, so the execution counts backward branches against the default quota, raised by `@setEvalBranchQuota` in the function itself; when only a caller's larger quota lets the function reach the constant, its value is unknown.
 - **comptime-only types** are cached per type (`ComptimeOnly`); recursive types take the least fixpoint.
 
 ### Generic function bodies
