@@ -290,6 +290,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         wake_epoch: std.atomic.Value(u32) = .init(0),
         /// Number of read transactions waiting for a memo claimed by another one
         waiting: std.atomic.Value(u32) = .init(0),
+        /// Number of threads in `waitPendingWrites`, woken through `pending_write` when a write
+        /// transaction acquires the exclusive lock
+        pending_write_waiters: std.atomic.Value(u32) = .init(0),
 
         counters: [queries.len]Counters = @splat(.{}),
         incomplete_causes: [@typeInfo(IncompleteCause).@"enum".field_names.len]std.atomic.Value(u64) = @splat(.init(0)),
@@ -558,7 +561,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             // when woken (see `Ctx.waitFor`)
             if (db.waiting.load(.seq_cst) != 0) db.wakeWaiters();
             db.rw.lockUncancelable(db.io);
-            _ = db.pending_write.fetchSub(1, .release);
+            _ = db.pending_write.fetchSub(1, .seq_cst);
+            if (db.pending_write_waiters.load(.seq_cst) != 0) db.io.futexWake(u32, &db.pending_write.raw, std.math.maxInt(u32));
             it = changes.iterator(.{});
             while (it.next()) |qi| _ = db.pending_inputs[qi].fetchSub(1, .release);
             db.writing = true;
@@ -566,6 +570,22 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             db.bumped_in_write = false;
             db.collectGarbage();
             db.evictLocked();
+        }
+
+        /// Waits until no write transaction is waiting for the exclusive lock (`pending_write` is
+        /// 0): a read transaction begun afterwards reads the changes of the write transactions that
+        /// were waiting. Called before beginning again a read transaction canceled by a pending
+        /// write, as the mutex of the lock is not fair: one begun again at once can take the shared
+        /// lock ahead of the waiting write transaction, be canceled again, and keep the write
+        /// waiting for as long as it retries. Must not be called inside a read or write transaction.
+        pub fn waitPendingWrites(db: *Db) void {
+            _ = db.pending_write_waiters.fetchAdd(1, .seq_cst);
+            defer _ = db.pending_write_waiters.fetchSub(1, .monotonic);
+            while (true) {
+                const pending = db.pending_write.load(.seq_cst);
+                if (pending == 0) return;
+                db.io.futexWaitUncancelable(u32, &db.pending_write.raw, pending);
+            }
         }
 
         /// Begins a write transaction only when no read transaction is in progress, without

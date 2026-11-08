@@ -85,6 +85,7 @@ Each thread keeps an active query stack; a cycle calls the query's `cycleFallbac
 ### Cancellation
 
 - `pending_write` counts write transactions waiting for the exclusive lock. While it is nonzero, read queries return `error.Canceled` on entry to `get`, canceled computations write no memos, and read requests stop (see "Read requests"). A write transaction decrements it only after acquiring the lock, so overlapping writes do not clear each other's registration.
+- `waitPendingWrites` waits until `pending_write` is zero; a read that begins afterwards sees the changes of the writes that were waiting. Diagnostic publishing calls it before beginning a canceled read again: the lock's mutex is not fair, so a read that begins again at once can take the shared lock ahead of the waiting write, be canceled again, and keep the write waiting for as long as it retries.
 - A write may declare the inputs it changes (`beginWriteOf`), and a read the inputs its results may depend on (`Mark`): a write cancels only the reads it may affect, and the others finish first.
 
 ### Concurrent reads
