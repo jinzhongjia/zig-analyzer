@@ -5957,16 +5957,23 @@ const Evaluator = struct {
         }
         var steps = starts.items.len;
         const pointee = tys.items[steps];
+        // A `*T` → `*[1]T` view points into an array holding only the place, in the place's
+        // memory; the cast pointer reaches that memory through the reinterpreting step
+        const in_view = ref.as_array;
+        ref.as_array = false;
+        // The pointee differs from the place, e.g. the payload of an optional, which is
+        // represented by the optional
+        if (in_view and pointee != (if (src.size == .one) ev.elemTypeOf(src.child, 0) else src.child)) return unknown;
         // A range or many-item pointer: the byte offset of its first element in the array
         var offset: u64 = 0;
         if (ref.window != null or src.size != .one) {
-            const a = switch (ip.key(pointee)) {
-                .array_type => |a| a,
+            const elem = if (in_view) pointee else switch (ip.key(pointee)) {
+                .array_type => |a| a.child,
                 else => return unknown,
             };
             const start = if (ref.window) |w| w.start else 0;
-            offset = std.math.mul(u64, start, (try ev.typeLayout(a.child, 0) orelse return unknown).size) catch return unknown;
-        } else if (pointee != src.child) {
+            offset = std.math.mul(u64, start, (try ev.typeLayout(elem, 0) orelse return unknown).size) catch return unknown;
+        } else if (!in_view and pointee != src.child) {
             // E.g. the payload of an optional, which is represented by the optional
             return unknown;
         }

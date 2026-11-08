@@ -3105,6 +3105,46 @@ test "comptime memory reinterpretation through @ptrCast follows the target's byt
         .{ "write_byte", "u32" },
     });
 }
+test "comptime @ptrCast of a *T coerced to *[1]T reinterprets the place" {
+    // The view points into an array holding only the place, in the place's memory
+    try expectTypesTargeted(try targetOf("x86_64-linux-musl", null),
+        \\fn viewCast() u8 {
+        \\    var x: u32 = 0x04030201;
+        \\    const v: *[1]u32 = &x;
+        \\    const b: *[4]u8 = @ptrCast(v);
+        \\    return b[1];
+        \\}
+        \\fn viewManyCast() u8 {
+        \\    var x: [2]u16 = .{ 0x0201, 0x0403 };
+        \\    const m: [*][2]u16 = @as(*[1][2]u16, &x);
+        \\    const b: [*]u8 = @ptrCast(m);
+        \\    return b[3];
+        \\}
+        \\fn viewCastWrite() u32 {
+        \\    var x: u32 = 0;
+        \\    const v: *[1]u32 = &x;
+        \\    const b: *[4]u8 = @ptrCast(v);
+        \\    b[1] = 1;
+        \\    return x;
+        \\}
+        \\fn viewCastBack() u32 {
+        \\    var x: u32 = 0x04030201;
+        \\    const v: *[1]u32 = &x;
+        \\    const b: *[4]u8 = @ptrCast(v);
+        \\    const w: *u32 = @ptrCast(@alignCast(b));
+        \\    return w.*;
+        \\}
+        \\const view_cast = viewCast();
+        \\const view_many_cast = viewManyCast();
+        \\const view_cast_write = viewCastWrite();
+        \\const view_cast_back = viewCastBack();
+    , &.{
+        .{ "view_cast", "u8 = 2" },
+        .{ "view_many_cast", "u8 = 4" },
+        .{ "view_cast_write", "u32 = 256" },
+        .{ "view_cast_back", "u32 = 67305985" },
+    });
+}
 
 test "escaped identifiers name the same declaration as plain ones" {
     try expectTypes(
