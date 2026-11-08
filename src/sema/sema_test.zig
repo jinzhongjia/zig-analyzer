@@ -434,6 +434,143 @@ test "generic functions, anytype and comptime branches" {
     });
 }
 
+test "comptime anytype parameters take the type of the argument" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1, which record the argument as a
+    // value of its type. Prevents taking the parameter type from the value: a non-null optional
+    // or error union is represented by its payload, and `null`, `undefined` and errors carry no
+    // type of their own, so `@TypeOf(x)` was `u8` for `@as(?u8, 3)`.
+    try expectTypes(
+        \\fn TypeOfCt(comptime x: anytype) type {
+        \\    return @TypeOf(x);
+        \\}
+        \\fn forward(comptime x: anytype) type {
+        \\    return TypeOfCt(x);
+        \\}
+        \\fn AnyId(comptime x: anytype) type {
+        \\    return struct {
+        \\        pub const v = x;
+        \\    };
+        \\}
+        \\fn isOptionalU8(comptime x: anytype) bool {
+        \\    return @TypeOf(x) == ?u8;
+        \\}
+        \\fn echo(comptime x: anytype) @TypeOf(x) {
+        \\    return x;
+        \\}
+        \\const E = enum { a, b };
+        \\const opt = TypeOfCt(@as(?u8, 3));
+        \\const opt_null = TypeOfCt(@as(?u8, null));
+        \\const eu = TypeOfCt(@as(anyerror!u8, 3));
+        \\const eu_err = TypeOfCt(@as(anyerror!u8, error.Foo));
+        \\const err = TypeOfCt(error.Foo);
+        \\const opt_opt = TypeOfCt(@as(??u8, null));
+        \\const opt_type = TypeOfCt(@as(?type, u8));
+        \\const opt_tag = TypeOfCt(@as(?E, .a));
+        \\const opt_float = TypeOfCt(@as(?f32, 1.5));
+        \\const opt_slice = TypeOfCt(@as(?[]const u8, "abc"));
+        \\const eu_opt = TypeOfCt(@as(error{A}!?u8, null));
+        \\const undef = TypeOfCt(@as(u8, undefined));
+        \\const null_type = TypeOfCt(null);
+        \\const int = TypeOfCt(3);
+        \\const literal = TypeOfCt(.foo);
+        \\const tag = TypeOfCt(E.a);
+        \\const forwarded = forward(@as(?u8, 3));
+        \\const forwarded_err = forward(@as(error{A}!u8, error.A));
+        \\const v_opt = AnyId(@as(?u8, 3)).v;
+        \\const v_null = AnyId(@as(?u8, null)).v;
+        \\const v_eu = AnyId(@as(anyerror!u8, 3)).v;
+        \\const v_err = AnyId(@as(anyerror!u8, error.Foo)).v;
+        \\const v_int = AnyId(3).v;
+        \\const v_literal = AnyId(.a).v;
+        \\const is_optional = isOptionalU8(@as(?u8, 3));
+        \\const not_optional = isOptionalU8(@as(u8, 3));
+        \\const echoed = echo(@as(?u8, 3));
+        \\const name = @typeName(AnyId(@as(?u8, 3)));
+    , &.{
+        .{ "opt", "type = ?u8" },
+        .{ "opt_null", "type = ?u8" },
+        .{ "eu", "type = anyerror!u8" },
+        .{ "eu_err", "type = anyerror!u8" },
+        .{ "err", "type = error{Foo}" },
+        .{ "opt_opt", "type = ??u8" },
+        .{ "opt_type", "type = ?type" },
+        .{ "opt_tag", "type = ?E" },
+        .{ "opt_float", "type = ?f32" },
+        .{ "opt_slice", "type = ?[]const u8" },
+        .{ "eu_opt", "type = error{A}!?u8" },
+        .{ "undef", "type = u8" },
+        .{ "null_type", "type = @TypeOf(null)" },
+        .{ "int", "type = comptime_int" },
+        .{ "literal", "type = @EnumLiteral()" },
+        .{ "tag", "type = E" },
+        // A parameter passed on to another comptime anytype parameter keeps its type
+        .{ "forwarded", "type = ?u8" },
+        .{ "forwarded_err", "type = error{A}!u8" },
+        .{ "v_opt", "?u8 = 3" },
+        .{ "v_null", "?u8 = null" },
+        .{ "v_eu", "anyerror!u8 = 3" },
+        .{ "v_err", "anyerror!u8 = error.Foo" },
+        .{ "v_int", "comptime_int = 3" },
+        .{ "v_literal", "@EnumLiteral() = .a" },
+        // The interpreter binds the parameter with the recorded type
+        .{ "is_optional", "bool = true" },
+        .{ "not_optional", "bool = false" },
+        .{ "echoed", "?u8 = 3" },
+        // The name shows the value, as the compiler prints an optional by its payload
+        .{ "name", "*const [13:0]u8 = \"main.AnyId(3)\"" },
+    });
+}
+
+test "comptime anytype arguments of different types are different instances" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1, where a container in a generic
+    // function is identified by its captured values with their types. Prevents arguments of
+    // different types from giving the same container, whether their values have the same
+    // representation (`@as(?u8, 3)` and `@as(u8, 3)`) or only compare equal (`3` and `@as(u8, 3)`).
+    try expectTypes(
+        \\fn AnyId(comptime x: anytype) type {
+        \\    return struct {
+        \\        pub const v = x;
+        \\    };
+        \\}
+        \\fn Pair(comptime a: anytype, comptime b: anytype) type {
+        \\    return struct {
+        \\        pub const first = a;
+        \\        pub const second = b;
+        \\    };
+        \\}
+        \\const E = enum { a, b };
+        \\const opt = AnyId(@as(?u8, 3)) == AnyId(@as(u8, 3));
+        \\const opt_null = AnyId(null) == AnyId(@as(?u8, null));
+        \\const null_types = AnyId(@as(?u8, null)) == AnyId(@as(?u16, null));
+        \\const eu = AnyId(@as(anyerror!u8, 3)) == AnyId(@as(u8, 3));
+        \\const undef = AnyId(@as(u8, undefined)) == AnyId(@as(u16, undefined));
+        \\const int = AnyId(3) == AnyId(@as(u8, 3));
+        \\const widths = AnyId(@as(u8, 3)) == AnyId(@as(u16, 3));
+        \\const literal = AnyId(.a) == AnyId(E.a);
+        \\const float = AnyId(1.5) == AnyId(@as(f32, 1.5));
+        \\const pair = Pair(@as(?u8, 3), null) == Pair(@as(u8, 3), null);
+        \\const same = AnyId(@as(?u8, 3)) == AnyId(@as(?u8, 3));
+        \\const coerced = AnyId(@as(?u8, 3)) == AnyId(@as(?u8, @as(u8, 3)));
+        \\const same_pair = Pair(@as(?u8, 3), null) == Pair(@as(?u8, 3), null);
+        \\const second_null = Pair(@as(?u8, 3), @as(?u16, null)).second;
+    , &.{
+        .{ "opt", "bool = false" },
+        .{ "opt_null", "bool = false" },
+        .{ "null_types", "bool = false" },
+        .{ "eu", "bool = false" },
+        .{ "undef", "bool = false" },
+        .{ "int", "bool = false" },
+        .{ "widths", "bool = false" },
+        .{ "literal", "bool = false" },
+        .{ "float", "bool = false" },
+        .{ "pair", "bool = false" },
+        .{ "same", "bool = true" },
+        .{ "coerced", "bool = true" },
+        .{ "same_pair", "bool = true" },
+        .{ "second_null", "?u16 = null" },
+    });
+}
+
 test "functions with an inferred error set are evaluated in constants" {
     // The inferred error set of the running function must be the one in the function's type,
     // otherwise the computed value of the initializer is discarded.
