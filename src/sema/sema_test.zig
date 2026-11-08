@@ -3765,11 +3765,11 @@ test "pointer layouts follow the target and the user's zig" {
 }
 
 /// Target parameters for `arch_os_abi` and the CPU (as with the compiler's `-target` / `-mcpu`):
-/// pointer bit width and layout rules of scalar types
+/// pointer bit width, layout rules of scalar types, and byte order
 fn targetOf(arch_os_abi: []const u8, cpu: ?[]const u8) !InternPool.Target {
     const query = try std.Target.Query.parse(.{ .arch_os_abi = arch_os_abi, .cpu_features = cpu });
     const t = try std.zig.system.resolveTargetQuery(testing.io, query);
-    return .{ .pointer_bits = t.ptrBitWidth(), .scalar_abi = .of(&t) };
+    return .{ .pointer_bits = t.ptrBitWidth(), .scalar_abi = .of(&t), .endian = t.cpu.arch.endian() };
 }
 
 /// Types whose layout varies by target: `s_T` / `a_T` is `@sizeOf(T)` / `@alignOf(T)`
