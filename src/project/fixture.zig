@@ -1,7 +1,8 @@
 //! Sample projects for integration tests: files are written to a temporary directory and
 //! `zig build --listen=-` is actually run. Runs only in `zig build test-all` and `test-stress`;
-//! skipped when there is no zig in PATH or its version differs from the one used at compile time
-//! (both CI and the development environment satisfy this).
+//! skipped when there is no zig in PATH or its version is not in `ZigEnv.supported_versions`. The
+//! zig in PATH may be a supported version other than the one used at compile time: the server
+//! then runs `zig ast-check` for live diagnostics (see `ZigEnv.matchesBuiltin`).
 
 const std = @import("std");
 const builtin = @import("builtin");
