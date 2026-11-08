@@ -2865,11 +2865,32 @@ const Evaluator = struct {
     fn temporaryEql(ev: *Evaluator, x: Ref, y: Ref) EvalError!?bool {
         if (x.cell.ty == .unknown or y.cell.ty == .unknown) return null;
         if (x.cell.ty != y.cell.ty) return false;
-        const vx = try ev.freeze(x.cell.*) orelse return null;
-        const vy = try ev.freeze(y.cell.*) orelse return null;
-        if (vx != vy) return if (try ev.differ(vx, vy)) false else null;
-        if (holdsPointer(ev.ip, vx)) return null;
+        if (!(try ev.sameValue(x.cell.*, y.cell.*) orelse return null)) return false;
         return samePlace(x, y);
+    }
+
+    /// Whether `x` and `y` are the same value: false when they are known to differ, null when
+    /// that is not known or when they are equal but hold a pointer. Integers and aggregates are
+    /// compared in place, element by element, so that comparing the values of constants does
+    /// not intern them; other values are compared as interned values.
+    fn sameValue(ev: *Evaluator, x: Val, y: Val) EvalError!?bool {
+        if (x.ty == y.ty) switch (x.v) {
+            .int => |a| if (y.v == .int) return a == y.v.int,
+            .agg => |a| if (y.v == .agg and a.elems.len == y.v.agg.elems.len) {
+                var eq: ?bool = true;
+                for (a.elems, y.v.agg.elems) |ex, ey| {
+                    const e = try ev.sameValue(ex, ey);
+                    if (e == false) return false;
+                    if (e == null) eq = null;
+                }
+                return eq;
+            },
+            else => {},
+        };
+        const vx = try ev.freeze(x) orelse return null;
+        const vy = try ev.freeze(y) orelse return null;
+        if (vx != vy) return if (try ev.differ(vx, vy)) false else null;
+        return if (holdsPointer(ev.ip, vx)) null else true;
     }
 
     /// Pointer into a declaration, an anonymous constant or a copy `r`, and pointer `p` into
