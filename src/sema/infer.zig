@@ -264,11 +264,11 @@ pub fn runLocal(ctx: *Db.Ctx, owner: hir.OwnerKey, target_ref: @FieldType(querie
             // that iteration (`Inferrer.containerInst`), reached by the member's inference of the
             // iteration, which is still in progress: the same inference runs here, up to where the
             // capture is bound
-            if (split.seed) |seed| if (seed.index != InternPool.Instance.Iteration.unknown_index) {
+            if (inf.iterationSeed() != null) {
                 inf.stop_at = binding;
                 try inf.runOwner(tree.items[item].kind, .full);
                 return inf.bindings[@backingInt(binding)];
-            };
+            }
             const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = split.inst, .loop = split.seed });
             return if (@backingInt(binding) < res.bindings.len) res.bindings[@backingInt(binding)] else .unknown;
         },
