@@ -369,11 +369,16 @@ test "rename refuses when a reference cannot be confirmed" {
     try h.notify("exit", {});
 }
 
-/// "file:line:column" of every edit in a rename result, sorted
+/// "file:line:column" of every edit in a rename result, sorted; prints the response when it has no
+/// result
 fn renameEdits(h: *Harness, resp: std.json.Value) ![]const u8 {
     const a = h.arena.allocator();
+    const result = resp.object.get("result") orelse {
+        std.debug.print("rename failed: {f}\n", .{std.json.fmt(resp, .{})});
+        return error.RenameFailed;
+    };
     var out: std.ArrayList([]const u8) = .empty;
-    var it = resp.object.get("result").?.object.get("changes").?.object.iterator();
+    var it = result.object.get("changes").?.object.iterator();
     while (it.next()) |kv| for (kv.value_ptr.array.items) |e| try out.append(a, try loc(h, kv.key_ptr.*, e.object.get("range").?));
     std.mem.sort([]const u8, out.items, {}, struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
