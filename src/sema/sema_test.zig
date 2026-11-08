@@ -2926,6 +2926,37 @@ test "containers in a function capture a comptime var where the body reaches the
     });
 }
 
+test "captured comptime vars of different types are different captures" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1, where a captured value is
+    // interned with its type. Prevents comparing the value of a captured `comptime var` alone:
+    // `@as(u8, 3)` and `@as(u16, 3)` gave the same type.
+    try expectTypes(
+        \\fn VarId(comptime n: usize) type {
+        \\    comptime var x: u8 = 3;
+        \\    x += @intCast(n * 0);
+        \\    return struct {
+        \\        pub const v = x;
+        \\    };
+        \\}
+        \\fn VarTy(comptime T: type) type {
+        \\    comptime var x: T = 3;
+        \\    x += 0;
+        \\    return struct {
+        \\        pub const v = x;
+        \\    };
+        \\}
+        \\const same = VarId(1) == VarId(2);
+        \\const same_v = VarId(1).v;
+        \\const different_types = VarTy(u8) == VarTy(u16);
+        \\const ty_v = VarTy(u16).v;
+    , &.{
+        .{ "same", "bool = true" },
+        .{ "same_v", "u8 = 3" },
+        .{ "different_types", "bool = false" },
+        .{ "ty_v", "u16 = 3" },
+    });
+}
+
 test "inferred error sets from function bodies" {
     try expectTypes(
         \\fn wrap(x: anytype) !@TypeOf(x) { return x; }
