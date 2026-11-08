@@ -1877,8 +1877,11 @@ const Inferrer = struct {
         // Stripping const / volatile: the result depends only on the argument's type
         // (matches the compiler)
         if (eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast")) {
-            const t = if (args.len == 1) inf.get(args[0]).ty else .unknown;
-            return .{ .ty = if (eq(u8, name, "@constCast")) try inf.mutablePtr(t) else t };
+            if (args.len != 1) return .unknown;
+            const t = inf.get(args[0]).ty;
+            // Merged with a cast below that takes the result type, the chain has that cast's type
+            if (qualifierCastTakesResultType(inf.body, args[0])) return .{ .ty = t };
+            return .{ .ty = try qualifierCastDest(ip, t, name) orelse t };
         }
         if (eq(u8, name, "@intFromEnum") or eq(u8, name, "@backingInt")) {
             if (try inf.pureValue(name, args)) |tv| return tv;
@@ -2114,21 +2117,6 @@ const Inferrer = struct {
             .optional_type => |c| t = c,
             else => {},
         };
-        return t;
-    }
-
-    /// Strips const from a pointer (including an optional pointer)
-    fn mutablePtr(inf: *Inferrer, t: Index) Error!Index {
-        const ip = inf.ip;
-        switch (ip.key(t)) {
-            .ptr_type => |p| {
-                var q = p;
-                q.is_const = false;
-                return ip.get(.{ .ptr_type = q });
-            },
-            .optional_type => |c| if (ip.key(c) == .ptr_type) return ip.optionalOf(try inf.mutablePtr(c)),
-            else => {},
-        }
         return t;
     }
 
@@ -4157,6 +4145,42 @@ fn isPtrCast(name: []const u8) bool {
         if (std.mem.eql(u8, name, n)) return true;
     }
     return false;
+}
+
+/// Whether `@constCast` / `@volatileCast` applied to `operand` is merged with a cast below it that
+/// takes the result type (`@constCast(@ptrCast(p))`, `@volatileCast(@constCast(@alignCast(p)))`,
+/// `@constCast(@fieldParentPtr(...))`): the compiler's AstGen then emits one cast whose
+/// destination is the result type (`ptr_cast_full`, `field_parent_ptr`). Below a chain of only
+/// `@constCast` / `@volatileCast`, it emits `ptr_cast_no_dest`, whose destination comes from the
+/// operand (see `qualifierCastDest`). Parentheses, which the compiler looks through, are not in HIR.
+pub fn qualifierCastTakesResultType(body: *const Body, operand: ExprId) bool {
+    var e = operand;
+    while (true) {
+        const c = switch (body.expr(e)) {
+            .builtin_call => |c| c,
+            else => return false,
+        };
+        if (std.mem.eql(u8, c.name, "@fieldParentPtr")) return c.args.len == 2;
+        if (!isPtrCast(c.name) or c.args.len != 1) return false;
+        if (!std.mem.eql(u8, c.name, "@constCast") and !std.mem.eql(u8, c.name, "@volatileCast")) return true;
+        e = c.args[0];
+    }
+}
+
+/// Destination type of `@constCast` / `@volatileCast` on an operand of type `t` that does not take
+/// the result type (the compiler's `zirPtrCastNoDest`): `t` with `const` or `volatile` cleared, an
+/// optional pointer staying optional. Null when `t` is not a pointer or an optional pointer.
+pub fn qualifierCastDest(ip: *InternPool, t: Index, name: []const u8) Allocator.Error!?Index {
+    switch (ip.key(t)) {
+        .ptr_type => |p| {
+            var q = p;
+            if (std.mem.eql(u8, name, "@constCast")) q.is_const = false else q.attrs.is_volatile = false;
+            return try ip.get(.{ .ptr_type = q });
+        },
+        .optional_type => |c| if (ip.key(c) == .ptr_type) return try ip.optionalOf((try qualifierCastDest(ip, c, name)).?),
+        else => {},
+    }
+    return null;
 }
 
 fn isErrorSet(ip: *InternPool, t: Index) bool {
