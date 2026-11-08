@@ -946,6 +946,19 @@ test "a pointer erased to *anyopaque keeps its value when cast back: optionals a
         \\    }
         \\    break :blk opt;
         \\};
+        \\const eu_result = blk: {
+        \\    var x: u32 = 5;
+        \\    const e: *anyopaque = &x;
+        \\    const r: anyerror!*u32 = @ptrCast(@alignCast(e));
+        \\    const p = r catch unreachable;
+        \\    break :blk p.*;
+        \\};
+        \\const opt_result = blk: {
+        \\    var x: u32 = 6;
+        \\    const e: *anyopaque = &x;
+        \\    const r: ?*u32 = @ptrCast(@alignCast(e));
+        \\    break :blk r.?.*;
+        \\};
     , &.{
         .{ "none_param", "?u8 = null" },
         .{ "none_global", "?u8 = null" },
@@ -959,6 +972,10 @@ test "a pointer erased to *anyopaque keeps its value when cast back: optionals a
         .{ "err_global", "anyerror = error.Bad" },
         // The pointer to the payload points to the optional
         .{ "payload", "?u8 = 5" },
+        // A result type that is an error union or an optional pointer: the cast back gives the
+        // pointer, which is then wrapped
+        .{ "eu_result", "u32 = 5" },
+        .{ "opt_result", "u32 = 6" },
     });
 }
 
