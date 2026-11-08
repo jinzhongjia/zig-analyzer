@@ -6037,6 +6037,153 @@ test "comptime evaluation: a *T coerced to *[1]T views the same place" {
         .{ "r_payload", "u8 = 8" },
     });
 }
+test "comptime evaluation: @fieldParentPtr goes back from a field pointer to its parent" {
+    try expectTypes(
+        \\const S = struct { a: u8, b: u8 };
+        \\const s_val: S = .{ .a = 1, .b = 2 };
+        \\fn parentOf(p: *const u8) *const S {
+        \\    return @fieldParentPtr("b", p);
+        \\}
+        \\fn parentEu(p: *const u8) error{Bad}!*const S {
+        \\    return @fieldParentPtr("b", p);
+        \\}
+        \\fn sumViaParent(p: *const u8) u8 {
+        \\    const parent: *const S = @fieldParentPtr("b", p);
+        \\    return parent.a + parent.b;
+        \\}
+        \\const U = union { x: u32, y: u8 };
+        \\const u_val: U = .{ .y = 7 };
+        \\const Inner = struct { x: u16, y: u16 };
+        \\const Outer = struct { tag: u8, inner: Inner };
+        \\const o_val: Outer = .{ .tag = 5, .inner = .{ .x = 10, .y = 20 } };
+        \\const T = struct { u8, u16 };
+        \\const t_val: T = .{ 1, 2 };
+        \\const arr: [2]S = .{ .{ .a = 1, .b = 2 }, .{ .a = 3, .b = 4 } };
+        \\const via_call = parentOf(&s_val.b).a;
+        \\const via_block = blk: {
+        \\    const parent: *const S = @fieldParentPtr("b", &s_val.b);
+        \\    break :blk parent.a;
+        \\};
+        \\const via_union = blk: {
+        \\    const parent: *const U = @alignCast(@fieldParentPtr("y", &u_val.y));
+        \\    break :blk parent.y;
+        \\};
+        \\const via_var = blk: {
+        \\    var s: S = .{ .a = 3, .b = 4 };
+        \\    const parent: *S = @fieldParentPtr("b", &s.b);
+        \\    parent.a = 9;
+        \\    break :blk s.a;
+        \\};
+        \\const nested = blk: {
+        \\    const inner: *const Inner = @alignCast(@fieldParentPtr("y", &o_val.inner.y));
+        \\    const outer: *const Outer = @alignCast(@fieldParentPtr("inner", inner));
+        \\    break :blk outer.tag + inner.x;
+        \\};
+        \\const optional = blk: {
+        \\    const parent: ?*const S = @fieldParentPtr("b", &s_val.b);
+        \\    break :blk parent.?.a;
+        \\};
+        \\const error_union = (parentEu(&s_val.b) catch unreachable).a;
+        \\const tuple = blk: {
+        \\    const parent: *const T = @alignCast(@fieldParentPtr("1", &t_val[1]));
+        \\    break :blk parent[0];
+        \\};
+        \\const array_elem = blk: {
+        \\    const parent: *const S = @fieldParentPtr("b", &arr[1].b);
+        \\    break :blk parent.a;
+        \\};
+        \\const whole = blk: {
+        \\    const parent: *const S = @fieldParentPtr("a", &s_val.a);
+        \\    break :blk parent.*;
+        \\};
+        \\const in_fn = sumViaParent(&s_val.b);
+        \\const same_parent = blk: {
+        \\    const parent: *const S = @fieldParentPtr("b", &s_val.b);
+        \\    break :blk parent == &s_val;
+        \\};
+        \\const same_decl = &s_val == &s_val;
+        \\const union_field = (&u_val.y).*;
+        \\const wrong_field = blk: {
+        \\    const parent: *const S = @fieldParentPtr("a", &s_val.b);
+        \\    break :blk parent.a;
+        \\};
+        \\const lone: u8 = 9;
+        \\const not_a_field = blk: {
+        \\    const parent: *const S = @fieldParentPtr("b", &lone);
+        \\    break :blk parent.a;
+        \\};
+        \\const CF = struct { a: u8, comptime b: u8 = 2 };
+        \\const cf_val: CF = .{ .a = 1 };
+        \\const comptime_field = blk: {
+        \\    const parent: *const CF = @fieldParentPtr("b", &cf_val.b);
+        \\    break :blk parent.a;
+        \\};
+    , &.{
+        .{ "via_call", "u8 = 1" },
+        .{ "via_block", "u8 = 1" },
+        // `@alignCast` is merged with `@fieldParentPtr` and gives it its result type
+        .{ "via_union", "u8 = 7" },
+        // Writes through the parent pointer reach the variable
+        .{ "via_var", "u8 = 9" },
+        .{ "nested", "u16 = 15" },
+        // The destination type may be an optional pointer; the result type's error union is dropped
+        .{ "optional", "u8 = 1" },
+        .{ "error_union", "u8 = 1" },
+        .{ "tuple", "u8 = 1" },
+        .{ "array_elem", "u8 = 3" },
+        .{ "whole", "S = .{ .a = 1, .b = 2 }" },
+        .{ "in_fn", "u8 = 3" },
+        // The parent pointer is the address of the declaration
+        .{ "same_parent", "bool = true" },
+        .{ "same_decl", "bool = true" },
+        .{ "union_field", "u8 = 7" },
+        // Compile errors: a field pointer that is not that field of a value of the parent type,
+        // and a comptime field
+        .{ "wrong_field", "u8" },
+        .{ "not_a_field", "u8" },
+        .{ "comptime_field", "u8" },
+    });
+}
+
+test "comptime evaluation: @fieldParentPtr in extern and packed containers" {
+    try expectTypes(
+        \\const E = extern struct { a: u32, b: u16, c: u8 };
+        \\const e_val: E = .{ .a = 100, .b = 200, .c = 30 };
+        \\const P = packed struct { a: u4, b: u4, c: u8 };
+        \\const p_val: P = .{ .a = 1, .b = 2, .c = 3 };
+        \\const EU = extern union { x: u8, y: u8 };
+        \\const eu_val: EU = .{ .y = 4 };
+        \\const PU = packed union { x: u8, y: u8 };
+        \\const pu_val: PU = .{ .y = 4 };
+        \\const extern_struct = blk: {
+        \\    const parent: *const E = @alignCast(@fieldParentPtr("c", &e_val.c));
+        \\    break :blk parent.a;
+        \\};
+        \\const packed_struct = blk: {
+        \\    const parent: *const P = @fieldParentPtr("c", &p_val.c);
+        \\    break :blk parent.a;
+        \\};
+        \\const extern_union = blk: {
+        \\    const parent: *const EU = @fieldParentPtr("y", &eu_val.y);
+        \\    break :blk parent.y;
+        \\};
+        \\const extern_union_other = blk: {
+        \\    const parent: *const EU = @fieldParentPtr("x", &eu_val.y);
+        \\    break :blk parent.y;
+        \\};
+        \\const packed_union_other = blk: {
+        \\    const parent: *const PU = @fieldParentPtr("x", &pu_val.y);
+        \\    break :blk parent.y;
+        \\};
+    , &.{
+        .{ "extern_struct", "u32 = 100" },
+        .{ "packed_struct", "u4 = 1" },
+        .{ "extern_union", "u8 = 4" },
+        // Every field of an extern or packed union starts at the union's address
+        .{ "extern_union_other", "u8 = 4" },
+        .{ "packed_union_other", "u8 = 4" },
+    });
+}
 
 test "comptime evaluation: element-wise work is not limited by steps, but large copies hit the memory limit" {
     // The compiler counts only backward branches: a `@memcpy` writing hundreds of thousands of
