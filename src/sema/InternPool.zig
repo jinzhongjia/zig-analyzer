@@ -471,12 +471,16 @@ pub const Instance = struct {
     /// of its type, so arguments of different types are different instances.
     arg_types: []const Index = &.{},
     parent: ?Index = null,
-    /// The values a container defined in a loop of function `decl` (in its body, condition, or
-    /// continue expression) captured from the function's locals other than parameters when the
+    /// The values a container defined in a loop of member `decl` (in its body, condition, or
+    /// continue expression) captured from the member's locals other than parameters when the
     /// interpreter reached it, sorted by binding: the instance of that container. Each iteration
     /// that captures different values defines a different type, as in the compiler, where the
     /// identity of a container is its definition and its captured values (`getCaptures`); one
-    /// that captures the same values gets the same instance.
+    /// that captures the same values gets the same instance. For a function, the other fields
+    /// are those of the function's instance. A member that is not a function (the initializer of
+    /// a container-level declaration, a field's default value) has no instance of its own:
+    /// `args` is empty, `parent` is the instance the container has otherwise, and the instance
+    /// applies only to the containers in the member's body (see `queries.normalizeInst`).
     captured: []const CapturedLocal = &.{},
     /// When inferring per iteration, the instance that containers defined inside a loop body (or
     /// an `inline` switch prong) of member `decl` belong to: the instance of `decl` (when
@@ -510,7 +514,7 @@ pub const Instance = struct {
     };
 };
 
-/// A local of a function and the value a container captured for it; `val` is `unknown` when the
+/// A local of a member and the value a container captured for it; `val` is `unknown` when the
 /// value is not known
 pub const CapturedLocal = struct {
     binding: u32,
