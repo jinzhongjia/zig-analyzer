@@ -1342,6 +1342,210 @@ test "comptime float values" {
     });
 }
 
+test "comptime compound assignment evaluates like the binary operator" {
+    // Prevents giving up on compound assignment to anything but bool and integers: `a op= b` is
+    // `a = a op b` with `b` coerced to the type of `a`, so floats are computed and rounded as by
+    // the binary operator; expected values are the results of zig 0.17.0 and 0.17.1
+    try expectTypes(
+        \\fn floatAcc() f64 {
+        \\    var x: f64 = 1.0;
+        \\    x += 0.5;
+        \\    x *= 4;
+        \\    x -= 1;
+        \\    x /= 2;
+        \\    return x;
+        \\}
+        \\fn floatLoop() f32 {
+        \\    var s: f32 = 0;
+        \\    for (0..4) |i| s += @floatFromInt(i);
+        \\    return s;
+        \\}
+        \\fn ctFloatAcc() comptime_float {
+        \\    var x: comptime_float = 1.0;
+        \\    x += 0.25;
+        \\    return x;
+        \\}
+        \\fn opsF16() f16 {
+        \\    var x: f16 = 1.5;
+        \\    x += 0.25;
+        \\    x -= 0.5;
+        \\    x *= 3;
+        \\    x /= 2;
+        \\    return x;
+        \\}
+        \\fn opsF80() f80 {
+        \\    var x: f80 = 1;
+        \\    x /= 3;
+        \\    x *= 3;
+        \\    return x;
+        \\}
+        \\fn opsF128() f128 {
+        \\    var x: f128 = 1;
+        \\    x /= 3;
+        \\    x += 1;
+        \\    return x;
+        \\}
+        \\fn roundF32() f32 {
+        \\    var x: f32 = 0.1;
+        \\    x += 0.2;
+        \\    return x;
+        \\}
+        \\fn roundF16() f16 {
+        \\    var x: f16 = 0;
+        \\    for (0..10) |_| x += 0.1;
+        \\    return x;
+        \\}
+        \\fn ctPrec() comptime_float {
+        \\    var x: comptime_float = 0.1;
+        \\    x += 0.2;
+        \\    return x;
+        \\}
+        \\fn intToFloat() f32 {
+        \\    const i: usize = 3;
+        \\    var x: f32 = 0.5;
+        \\    x += i;
+        \\    return x;
+        \\}
+        \\fn places() f64 {
+        \\    var x: f64 = 1;
+        \\    const p = &x;
+        \\    p.* += 0.5;
+        \\    var o: ?f64 = 2;
+        \\    o.? *= 1.5;
+        \\    var s: struct { v: f64 } = .{ .v = 1 };
+        \\    s.v -= 0.25;
+        \\    var a = [_]f64{ 1, 2, 3 };
+        \\    a[1] /= 4;
+        \\    for (&a) |*e| e.* *= 2;
+        \\    return x + o.? + s.v + a[0] + a[1] + a[2];
+        \\}
+        \\fn others() i32 {
+        \\    var b = true;
+        \\    b &= false;
+        \\    b |= true;
+        \\    b ^= true;
+        \\    var w: u16 = 1;
+        \\    const y: u8 = 200;
+        \\    w += y;
+        \\    var x: i32 = -5;
+        \\    x += 3;
+        \\    x *= -4;
+        \\    x -= 100;
+        \\    return x + w + @intFromBool(b);
+        \\}
+        \\const float_acc = floatAcc();
+        \\const float_loop = floatLoop();
+        \\const ct_float_acc = ctFloatAcc();
+        \\const ops_f16 = opsF16();
+        \\const ops_f80 = opsF80();
+        \\const ops_f128 = opsF128();
+        \\const round_f32 = roundF32();
+        \\const round_f16 = roundF16();
+        \\const ct_prec = ctPrec();
+        \\const int_to_float = intToFloat();
+        \\const in_places = places();
+        \\const other_types = others();
+    , &.{
+        .{ "float_acc", "f64 = 2.5" },
+        .{ "float_loop", "f32 = 6" },
+        .{ "ct_float_acc", "comptime_float = 1.25" },
+        .{ "ops_f16", "f16 = 1.875" },
+        .{ "ops_f80", "f80 = 1" },
+        .{ "ops_f128", "f128 = 1.3333333333333333333333333333333333" },
+        .{ "round_f32", "f32 = 0.3" },
+        // Each `+=` rounds to f16
+        .{ "round_f16", "f16 = 1" },
+        .{ "ct_prec", "comptime_float = 0.30000000000000000000000000000000004" },
+        .{ "int_to_float", "f32 = 3.5" },
+        .{ "in_places", "f64 = 14.25" },
+        .{ "other_types", "i32 = 109" },
+    });
+}
+
+test "comptime compound assignment gives no value where the compiler reports an error" {
+    try expectTypes(
+        \\fn ctDivZero() comptime_float {
+        \\    var x: comptime_float = 1;
+        \\    x /= 0;
+        \\    return x;
+        \\}
+        \\fn fraction() comptime_int {
+        \\    var x: comptime_int = 7;
+        \\    x += 0.5;
+        \\    return x;
+        \\}
+        \\fn overflow() u8 {
+        \\    var x: u8 = 255;
+        \\    x += 1;
+        \\    return x;
+        \\}
+        \\fn boolAdd() bool {
+        \\    var x = true;
+        \\    x += true;
+        \\    return x;
+        \\}
+        \\const ct_div_zero = ctDivZero();
+        \\const fractional = fraction();
+        \\const overflowed = overflow();
+        \\const bool_add = boolAdd();
+    , &.{
+        .{ "ct_div_zero", "comptime_float" },
+        .{ "fractional", "comptime_int" },
+        .{ "overflowed", "u8" },
+        .{ "bool_add", "bool" },
+    });
+}
+
+test "comptime float remainder" {
+    // `%` on floats is `@rem` when no operand is negative, or when the remainder is zero; with a
+    // negative operand and a nonzero remainder the compiler reports an error; expected values
+    // are the results of zig 0.17.0 and 0.17.1
+    try expectTypes(
+        \\fn modAssign() f64 {
+        \\    var x: f64 = 7.5;
+        \\    x %= 2;
+        \\    return x;
+        \\}
+        \\fn modFrac() f32 {
+        \\    var x: f32 = 5.75;
+        \\    x %= 1.5;
+        \\    return x;
+        \\}
+        \\fn modCt() comptime_float {
+        \\    var x: comptime_float = 7.5;
+        \\    x %= 2;
+        \\    return x;
+        \\}
+        \\fn modNegZero() f64 {
+        \\    var x: f64 = -4.0;
+        \\    x %= 2;
+        \\    return x;
+        \\}
+        \\fn modNegRhs() f64 {
+        \\    var x: f64 = 5.5;
+        \\    x %= -2;
+        \\    return x;
+        \\}
+        \\const mod_f64 = @as(f64, 7.5) % 2;
+        \\const mod_ct = 7.5 % 2.0;
+        \\const mod_neg = @as(f64, -5.5) % 2;
+        \\const mod_assign = modAssign();
+        \\const mod_frac = modFrac();
+        \\const mod_ct_assign = modCt();
+        \\const mod_neg_zero = modNegZero();
+        \\const mod_neg_rhs = modNegRhs();
+    , &.{
+        .{ "mod_f64", "f64 = 1.5" },
+        .{ "mod_ct", "comptime_float = 1.5" },
+        .{ "mod_neg", "f64" },
+        .{ "mod_assign", "f64 = 1.5" },
+        .{ "mod_frac", "f32 = 1.25" },
+        .{ "mod_ct_assign", "comptime_float = 1.5" },
+        .{ "mod_neg_zero", "f64 = -0" },
+        .{ "mod_neg_rhs", "f64" },
+    });
+}
+
 test "instances of the same container compare by their captured values" {
     // Matches the compiler: the identity of a container = definition position + captured values
     try expectTypes(
