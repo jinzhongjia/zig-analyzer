@@ -4563,6 +4563,52 @@ test "switch on a type: unevaluable prong items do not hide a matching prong" {
     });
 }
 
+test "a switch on a comptime-known integer takes the prong whose range contains it" {
+    // A range item has no single value: no prong was chosen, and the switch took the peer type of
+    // all prongs (`[:0]const u8`) without a value.
+    try expectTypes(
+        \\const inside = switch (@as(u8, 42)) {
+        \\    0...9 => "a",
+        \\    10...99 => "bb",
+        \\    else => "ccc",
+        \\};
+        \\const at_low = switch (@as(u8, 10)) { 0...9 => "a", 10...99 => "bb", else => "ccc" };
+        \\const at_high = switch (@as(u8, 99)) { 0...9 => "a", 10...99 => "bb", else => "ccc" };
+        \\const past = switch (@as(u8, 200)) { 0...9 => "a", 10...99 => "bb", else => "ccc" };
+        \\const mixed_range = switch (@as(u8, 50)) { 1, 40...60, 99 => "mixed", else => "e" };
+        \\const mixed_scalar = switch (@as(u8, 99)) { 1, 40...60, 99 => "mixed", else => "e" };
+        \\const scalar_after = switch (@as(u8, 42)) { 0...9 => "a", 42 => "bb", else => "ccc" };
+        \\const char = switch (@as(u8, 'x')) { 'a'...'z' => "lower", 'A'...'Z' => "upper!", else => "?" };
+        \\const negative = switch (@as(i8, -5)) { -128...-1 => "neg", 0...127 => "nonneg" };
+        \\const untyped = switch (42) { 0...9 => "a", 10...99 => "bb", else => "ccc" };
+        \\const big = switch (1 << 100) { 0...(1 << 99) => "a", (1 << 99) + 1...(1 << 101) => "bb", else => "ccc" };
+        \\const high: u128 = 0xF000_0000_0000_0000_0000_0000_0000_0000;
+        \\const half = 0x8000_0000_0000_0000_0000_0000_0000_0000;
+        \\const max = 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
+        \\const wide = switch (high) { 0...9 => "a", half...max => "bb", else => "ccc" };
+        \\const lo: u8 = 30;
+        \\const hi = 50;
+        \\const named = switch (@as(u8, 42)) { lo...hi => "bb", else => "ccc" };
+    , &.{
+        .{ "inside", "*const [2:0]u8 = \"bb\"" },
+        // Both bounds are inclusive
+        .{ "at_low", "*const [2:0]u8 = \"bb\"" },
+        .{ "at_high", "*const [2:0]u8 = \"bb\"" },
+        .{ "past", "*const [3:0]u8 = \"ccc\"" },
+        .{ "mixed_range", "*const [5:0]u8 = \"mixed\"" },
+        .{ "mixed_scalar", "*const [5:0]u8 = \"mixed\"" },
+        .{ "scalar_after", "*const [2:0]u8 = \"bb\"" },
+        .{ "char", "*const [5:0]u8 = \"lower\"" },
+        .{ "negative", "*const [3:0]u8 = \"neg\"" },
+        .{ "untyped", "*const [2:0]u8 = \"bb\"" },
+        .{ "big", "*const [2:0]u8 = \"bb\"" },
+        // The `comptime_int` bounds are coerced to `u128`, so those above the range of i128 are
+        // compared as u128
+        .{ "wide", "*const [2:0]u8 = \"bb\"" },
+        .{ "named", "*const [2:0]u8 = \"bb\"" },
+    });
+}
+
 test "a comptime branch that is @compileError gives way to the other branch" {
     try expectTypes(
         \\const is_test = false;

@@ -4062,6 +4062,32 @@ test "switch prongs on a comptime-known tagged union are inactive unless they ma
     try testing.expectEqualStrings("return 0", text[ranges[0].start..ranges[0].end]);
 }
 
+test "switch prongs on a comptime-known integer are inactive unless a range item contains it" {
+    // A range item has no single value, so no prong was chosen and none was judged inactive
+    const text =
+        \\const n: u8 = 42;
+        \\fn f() u8 {
+        \\    return switch (n) {
+        \\        0...9 => 1,
+        \\        10...99 => 2,
+        \\        else => 3,
+        \\    };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const ranges = try inactive.ranges(&r, file);
+    try testing.expectEqual(2, ranges.len);
+    try testing.expectEqualStrings("1", text[ranges[0].start..ranges[0].end]);
+    try testing.expectEqualStrings("3", text[ranges[1].start..ranges[1].end]);
+}
+
 /// Uses the real standard library of the local zig (skipped when PATH has no zig): `@typeInfo`
 /// needs `std.builtin.Type`
 fn useRealStd(w: *World) !void {
