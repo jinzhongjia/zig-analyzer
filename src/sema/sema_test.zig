@@ -1045,6 +1045,50 @@ test "comptime name builtins produce string literal types" {
         .{ "v_tagname_rt", "[:0]const u8" },
     });
 }
+test "@tagName and @errorName of comptime-known operands without an inferred value are string literals" {
+    // Prevents typing them as the runtime `[:0]const u8`, which dropped the interpreter's value.
+    // Expected values: zig 0.17.0 and 0.17.1 give the same result for each name.
+    try expectTypes(
+        \\const U = union(enum) { a: u8, b: struct { x: u32 = 1 } };
+        \\const E = enum { x, y };
+        \\fn fail() anyerror {
+        \\    return error.Oops;
+        \\}
+        \\pub const union_name = @tagName(U{ .a = 1 });
+        \\pub const default_name = @tagName(U{ .b = .{} });
+        \\pub const coerced_name = @tagName(@as(U, .{ .a = 3 }));
+        \\pub const from_int_name = @tagName(@as(E, @enumFromInt(1)));
+        \\pub const block_name = blk: {
+        \\    const u: U = .{ .a = 2 };
+        \\    break :blk @tagName(u);
+        \\};
+        \\pub const error_name = @errorName(fail());
+        \\fn probe(u: U) void {
+        \\    const in_comptime = comptime @tagName(U{ .b = .{} });
+        \\    const in_comptime_block = comptime blk: {
+        \\        const name = @tagName(U{ .a = 1 });
+        \\        break :blk name;
+        \\    };
+        \\    const runtime_union = @tagName(u);
+        \\    _ = .{ in_comptime, in_comptime_block, runtime_union };
+        \\}
+        \\comptime {
+        \\    _ = &probe;
+        \\}
+    , &.{
+        .{ "union_name", "*const [1:0]u8 = \"a\"" },
+        .{ "default_name", "*const [1:0]u8 = \"b\"" },
+        .{ "coerced_name", "*const [1:0]u8 = \"a\"" },
+        .{ "from_int_name", "*const [1:0]u8 = \"y\"" },
+        .{ "block_name", "*const [1:0]u8 = \"a\"" },
+        .{ "error_name", "*const [4:0]u8 = \"Oops\"" },
+        .{ "in_comptime", "*const [1:0]u8 = \"b\"" },
+        .{ "name", "*const [1:0]u8 = \"a\"" },
+        .{ "in_comptime_block", "*const [1:0]u8 = \"a\"" },
+        // A runtime operand still gives a slice
+        .{ "runtime_union", "[:0]const u8" },
+    });
+}
 
 test "@typeName gives the compiler's fully qualified name" {
     // Prevents giving the hover display name (`"E"` instead of `"main.E"`)
@@ -3881,6 +3925,49 @@ test "@typeInfo and @Fn keep the calling convention and genericity of functions"
         .{ "r_eq", "u1 = 1" },
     });
 }
+test "@tagName of the C calling convention follows the target" {
+    // Expected values: `@compileLog` of each name with `zig build-obj -target <arch>-<os>-<abi>`;
+    // zig 0.17.0 and 0.17.1 agree except for m68k-netbsd, where the 0.17.1 standard library
+    // selects `m68k_sysv` and the 0.17.0 one `m68k_gnu`
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    const netbsd_m68k: []const u8 = if (std.mem.eql(u8, env.version, "0.17.0")) "m68k_gnu" else "m68k_sysv";
+    const src =
+        \\const std = @import("std");
+        \\const builtin = @import("builtin");
+        \\pub const cc = @tagName(builtin.target.cCallingConvention().?);
+        \\pub const cc_tag = @tagName(std.meta.activeTag(builtin.target.cCallingConvention().?));
+    ;
+    const targets = [_]struct { []const u8, []const u8, []const u8, []const u8, []const u8 }{
+        .{ "x86_64", "windows", "gnu", "coff", "x86_64_win" },
+        .{ "x86_64", "linux", "gnu", "elf", "x86_64_sysv" },
+        .{ "x86", "windows", "gnu", "coff", "x86_mingw" },
+        .{ "aarch64", "macos", "none", "macho", "aarch64_aapcs_darwin" },
+        .{ "aarch64", "windows", "msvc", "coff", "aarch64_aapcs_win" },
+        .{ "arm", "linux", "gnueabihf", "elf", "arm_aapcs_vfp" },
+        .{ "wasm32", "wasi", "musl", "wasm", "wasm_mvp" },
+        .{ "m68k", "linux", "gnu", "elf", "m68k_gnu" },
+        .{ "m68k", "netbsd", "none", "elf", netbsd_m68k },
+    };
+    for (targets) |t| {
+        var builtin_buf: [512]u8 = undefined;
+        const builtin_text = try std.fmt.bufPrint(&builtin_buf,
+            \\const std = @import("std");
+            \\pub const target: std.Target = .{{
+            \\    .cpu = .{{ .arch = .{s}, .model = undefined, .features = undefined }},
+            \\    .os = .{{ .tag = .{s}, .version_range = undefined }},
+            \\    .abi = .{s},
+            \\    .ofmt = .{s},
+            \\}};
+        , .{ t[0], t[1], t[2], t[3] });
+        var expected_buf: [64]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buf, "*const [{d}:0]u8 = \"{s}\"", .{ t[4].len, t[4] });
+        expectStdTypesBuiltin(builtin_text, src, &.{ .{ "cc", expected }, .{ "cc_tag", expected } }) catch |err| {
+            std.debug.print("target {s}-{s}-{s}\n", .{ t[0], t[1], t[2] });
+            return err;
+        };
+    }
+}
 
 test "@typeInfo, @Pointer and std results keep pointer attributes" {
     // Prevents default attributes in `@typeInfo` and std results losing their alignment
@@ -4351,6 +4438,34 @@ test "std.meta type functions" {
         .{ "field_ty", "type = i32" },
         // A type function whose body calls itself recursively (std.meta.Elem) terminates normally
         .{ "sliced", "type = [:0]const u8" },
+    });
+}
+test "@tagName of values only the interpreter computes in container-level constants" {
+    // Prevents typing the names of a call result and of reified enum values as the runtime
+    // `[:0]const u8`. Expected values: zig 0.17.0 and 0.17.1 give the same result for each name.
+    try expectStdTypesBuiltin(target_builtin,
+        \\const std = @import("std");
+        \\const U = union(enum) { a: u8, b: u16 };
+        \\pub const active = @tagName(std.meta.activeTag(U{ .b = 2 }));
+        \\pub const reified = blk: {
+        \\    const E = @Enum(u16, .exhaustive, &.{ "x", "y" }, &.{ 0, 1 });
+        \\    break :blk @tagName(@as(E, @enumFromInt(1)));
+        \\};
+        \\pub const generated = blk: {
+        \\    @setEvalBranchQuota(1_000_000);
+        \\    var names: [3][]const u8 = undefined;
+        \\    var values: [3]u16 = undefined;
+        \\    for (0..3) |i| {
+        \\        names[i] = std.fmt.comptimePrint("f{d}", .{i});
+        \\        values[i] = @intCast(i);
+        \\    }
+        \\    const E = @Enum(u16, .exhaustive, &names, &values);
+        \\    break :blk @tagName(@as(E, @enumFromInt(2)));
+        \\};
+    , &.{
+        .{ "active", "*const [1:0]u8 = \"b\"" },
+        .{ "reified", "*const [1:0]u8 = \"y\"" },
+        .{ "generated", "*const [2:0]u8 = \"f2\"" },
     });
 }
 

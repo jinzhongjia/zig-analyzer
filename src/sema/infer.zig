@@ -570,14 +570,21 @@ const Inferrer = struct {
     }
 
     /// Whether a condition whose value cannot be evaluated is comptime-known (e.g. because it
-    /// depends on an abstract parameter): in a comptime context, with a comptime-only result type,
-    /// in initializers of container-level constants and variables and in fields (evaluated at
-    /// comptime), or when the condition itself is comptime-known
+    /// depends on an abstract parameter): with a comptime-only result type, or when the condition
+    /// is comptime-known (see `comptimeKnown`)
     fn comptimeCond(inf: *Inferrer, cond: ExprId, result: Index) Error!bool {
-        if (inf.comptime_depth > 0 or value.isComptimeOnly(inf.ip, result)) return true;
+        if (value.isComptimeOnly(inf.ip, result)) return true;
+        return inf.comptimeKnown(cond);
+    }
+
+    /// Whether the value of `e` is comptime-known even when inference cannot compute it: in a
+    /// comptime context, in initializers of container-level constants and variables and in fields
+    /// (evaluated at comptime), or when `knownness` finds it comptime-known
+    fn comptimeKnown(inf: *Inferrer, e: ExprId) Error!bool {
+        if (inf.comptime_depth > 0) return true;
         const kind = (try inf.r.itemTree(inf.file)).items[inf.item].kind;
         if (kind != .@"fn" and kind != .@"test") return true;
-        return try inf.knownness(cond, 0) == .comptime_known;
+        return try inf.knownness(e, 0) == .comptime_known;
     }
 
     /// A comptime-known condition: a bool value, or whether an optional is null (the value of a
@@ -1946,6 +1953,15 @@ const Inferrer = struct {
             // The argument of `@typeName` is always a type: when the name cannot be evaluated,
             // there is no runtime slice form
             if (eq(u8, name, "@typeName")) return .unknown;
+            // Only a runtime operand gives `[:0]const u8`; a comptime-known one gives the string
+            // literal `*const [N:0]u8` (`Sema.zirTagName`, `Sema.zirErrorName`). When inference
+            // has no value for a comptime-known operand (a tagged union literal, `@enumFromInt`,
+            // a call in a container-level initializer), the interpreter evaluates the name; when
+            // it cannot, the length of the result is unknown.
+            if (args.len == 1 and inf.dead == 0 and !inf.r.ctx.incomplete() and try inf.comptimeKnown(args[0])) {
+                const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
+                return if (tv.val != null) tv else .unknown;
+            }
             const sentinel = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } });
             return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = .u8_type, .size = .slice, .is_const = true, .sentinel = sentinel } }) };
         }
