@@ -3,9 +3,11 @@
 //!
 //! Usage: zig build sema-corpus [-- <std dir>]
 //!
-//! All standard library files belong to the std module: `@import("std")` resolves; `builtin` is
-//! the builtin.zig for the native target, Debug, `zig test` (needs zig in PATH); `root` does not
-//! resolve.
+//! All standard library files belong to the std module of one compilation, the one the server
+//! puts files reached from no compile step in: `@import("std")` resolves to `<std dir>/std.zig`;
+//! `builtin` is the builtin.zig for the native target, Debug, `zig test` of the zig in PATH, whose
+//! target also sets the type layout; `root` does not resolve. Files are parsed and laid out by
+//! the rules of that zig's version.
 //! After each file, caches are evicted on demand as in the server; results must be the same as
 //! without eviction.
 
@@ -69,29 +71,43 @@ pub fn main(init: std.process.Init) !u8 {
     const std_root_path = try std.fs.path.join(gpa, &.{ std_dir, "std.zig" });
     defer gpa.free(std_root_path);
     const std_root = try vfs.intern(std_root_path);
-    // `@import("builtin")`: native target, Debug, `zig test` (needs zig in PATH)
-    const default_builtin: ?FileId = blk: {
-        var zig_env = za.project.ZigEnv.query(gpa, io, null) catch break :blk null;
-        defer zig_env.deinit(gpa);
-        const path = try za.project.builtin.generate(gpa, io, &zig_env, &.{"test"}) orelse break :blk null;
+    // The zig in PATH: `@import("builtin")` (native target, Debug, `zig test`) and the version
+    // whose syntax and layout rules apply
+    var zig_env: ?za.project.ZigEnv = za.project.ZigEnv.query(gpa, io, null) catch null;
+    defer if (zig_env) |*e| e.deinit(gpa);
+    const default_builtin: ?FileId = if (zig_env) |*e| blk: {
+        const path = try za.project.builtin.generate(gpa, io, e, &.{"test"}) orelse break :blk null;
         defer gpa.free(path);
         break :blk try vfs.intern(path);
-    };
+    } else null;
+    const dialect: za.syntax.Parse.Dialect = if (zig_env) |e| .of(e.version) else .latest;
+    // As in the server, the compilation uses the target of its builtin, and value computations
+    // outside it use the same one (it is the only compilation)
+    var compile_target: InternPool.Target = if (default_builtin) |f| try builtinTarget(gpa, io, vfs.path(f)) else .{};
+    compile_target.dialect = dialect;
     {
         const g = try gpa.create(ModuleGraph);
         var arena: std.heap.ArenaAllocator = .init(gpa);
+        // Compilation 0 is also `none`: the server merges equal compilations, and this one has
+        // the key (no root, the standard library, the default builtin) of `none`
+        const compiles = try arena.allocator().dupe(ModuleGraph.Compile, &.{.{ .root = null, .std_root = std_root, .builtin = default_builtin }});
         const entries = try arena.allocator().alloc(ModuleGraph.FileEntry, files.items.len);
-        for (files.items, entries) |f, *e| e.* = .{ .file = f, .module = ModuleGraph.std_module, .root_module = 0 };
+        for (files.items, entries) |f, *e| e.* = .{ .file = f, .module = ModuleGraph.std_module, .compile = 0 };
         std.mem.sort(ModuleGraph.FileEntry, entries, {}, struct {
             fn lt(_: void, a: ModuleGraph.FileEntry, b: ModuleGraph.FileEntry) bool {
                 return @backingInt(a.file) < @backingInt(b.file);
             }
         }.lt);
         const root_module = try arena.allocator().dupe(ModuleGraph.Module, &.{.{ .root = std_root, .imports = &.{} }});
-        g.* = .{ .arena = arena.state, .std_root = std_root, .modules = root_module, .files = entries, .default_builtin = default_builtin };
+        g.* = .{ .arena = arena.state, .std_root = std_root, .modules = root_module, .compiles = compiles, .none = 0, .files = entries, .default_builtin = default_builtin };
         db.beginWrite();
         defer db.endWrite();
         try db.set(ModuleGraph.Input, {}, g, .high);
+        try db.set(database.syntax.SyntaxDialect, {}, dialect, .high);
+        try db.set(queries.TargetAbi, {}, compile_target, .high);
+        try db.set(queries.ContextTarget, 0, compile_target, .high);
+        try ip.setTargets(&.{compile_target});
+        ip.setTarget(compile_target);
     }
 
     // Find references (cold cache): commonly used declarations of the standard library
@@ -218,6 +234,13 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}", .{w.buffered()});
     }
     return 0;
+}
+
+/// Target parameters of a builtin.zig, as the server reads them
+fn builtinTarget(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !InternPool.Target {
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4 * 1024 * 1024));
+    defer gpa.free(text);
+    return za.Server.targetOfBuiltin(text);
 }
 
 /// Generic function: has a comptime (including an implicit `T: type`) or anytype parameter, or
