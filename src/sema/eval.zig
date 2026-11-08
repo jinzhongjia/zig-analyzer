@@ -2982,6 +2982,19 @@ const Evaluator = struct {
             const t = try ev.evalType(f, args[0]);
             return ev.eval(f, args[1], t);
         }
+        if (eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast")) {
+            if (args.len != 1) return error.Abort;
+            // Merged with a cast below that takes the result type: that cast converts to the
+            // destination of the whole chain
+            if (infer.qualifierCastTakesResultType(f.body, args[0])) return ev.eval(f, args[0], want);
+            // Otherwise the destination comes from the operand, whose value is unchanged; `eval`
+            // then coerces it to the result type (`*u8` to `error{E}!*u8` or `*const [1]u8`)
+            const v = try ev.eval(f, args[0], null);
+            // An operand of unknown type gives an unknown value, which still takes the result type
+            if (v.ty == .unknown) return Val.unknown;
+            const t = try infer.qualifierCastDest(ip, v.ty, name) orelse return error.Abort;
+            return .{ .ty = t, .v = v.v };
+        }
         const vals = try ev.a.alloc(Val, args.len);
         // Result types of the arguments
         for (args, vals, 0..) |a, *o, i| o.* = try ev.eval(f, a, try ev.builtinArgType(name, i, vals[0..i]));
@@ -3122,11 +3135,11 @@ const Evaluator = struct {
                 .attrs_unknown = attrs.unknown,
             }));
         }
-        if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast") or eq(u8, name, "@enumFromInt") or eq(u8, name, "@fromBackingInt") or eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast") or eq(u8, name, "@errorCast") or eq(u8, name, "@errSetCast") or eq(u8, name, "@floatCast") or eq(u8, name, "@floatFromInt") or eq(u8, name, "@intFromFloat")) {
+        if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast") or eq(u8, name, "@enumFromInt") or eq(u8, name, "@fromBackingInt") or eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@errorCast") or eq(u8, name, "@errSetCast") or eq(u8, name, "@floatCast") or eq(u8, name, "@floatFromInt") or eq(u8, name, "@intFromFloat")) {
             if (vals.len != 1) return error.Abort;
             // Pointer casts do not change the value: without a result type (e.g. the nested
             // `@ptrCast(@alignCast(p))`), pass it through unchanged
-            const pointer_cast = eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast");
+            const pointer_cast = eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast");
             if (want == null and pointer_cast) return vals[0];
             const t = want orelse return error.Abort;
             if (pointer_cast and !try ev.keepsPointee(vals[0], t)) return .{ .ty = t };
