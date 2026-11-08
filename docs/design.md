@@ -385,5 +385,6 @@ Zig has no unwinding, so a panic ends the process, after logging the message, th
 - `zig build test-stress -Dstress-filter=<part of the full test name> [-Dstress-runs=<count>]`: runs the selected tests repeatedly, one after another, in server mode (50 times by default, each one actually run), to verify concurrency-related changes. A filter that matches no test fails.
 - `zig build sema-corpus`: runs full type inference over the standard library, checking that nothing crashes and reporting the share of known types.
 - When tests write logs to stderr, `zig build test` and `test-all` also print `failed command: ...`; exit code 0 means they passed. Real failures come with "N pass, M fail" and the test names.
+- The tests use the test runner bundled with Zig, patched by `tools/patch_test_runner.zig`: the testing allocator records 12 frames per allocation in every mode, so that leak reports have stack traces in ReleaseSafe too; tests that take 10 s or more are reported on stderr with their duration; and on aarch64 Darwin stack traces are unwound with frame pointers, because unwinding with the unwind info made stack capture most of the run time there (see `docs/zig-macos-stack-unwinding.md`).
 
 Benchmark commands and current acceptance results: see `docs/perf.md`. The definition of diagnostic consistency and the diagnostic pipelines: see `docs/diagnostics.md`.
