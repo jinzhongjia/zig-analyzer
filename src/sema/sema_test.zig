@@ -755,6 +755,237 @@ test "@constCast and @volatileCast take their destination type from the operand"
     });
 }
 
+test "a pointer erased to *anyopaque keeps its value when cast back from a parameter or a local" {
+    // A pointer coerced to `*anyopaque` in a parameter or a local had no value when cast back
+    // with `@ptrCast`; only container-level constants kept it.
+    try expectTypes(
+        \\const c: u8 = 3;
+        \\fn ptrCastPlain(p: *const anyopaque) *const u8 {
+        \\    return @ptrCast(p);
+        \\}
+        \\const from_param = ptrCastPlain(&c).*;
+        \\const erased: *const anyopaque = &c;
+        \\const from_coerced_global = ptrCastPlain(erased).*;
+        \\const erased_cast: *const anyopaque = @ptrCast(&c);
+        \\const from_cast_global = ptrCastPlain(erased_cast).*;
+        \\const from_local = blk: {
+        \\    const e: *const anyopaque = &c;
+        \\    const back: *const u8 = @ptrCast(e);
+        \\    break :blk back.*;
+        \\};
+        \\const from_var = blk: {
+        \\    var x: u8 = 1;
+        \\    const e: *anyopaque = &x;
+        \\    x = 8;
+        \\    const back: *u8 = @ptrCast(e);
+        \\    back.* += 1;
+        \\    break :blk x;
+        \\};
+        \\fn optBack(p: ?*const anyopaque) ?*const u8 {
+        \\    return @ptrCast(p);
+        \\}
+        \\const from_optional = optBack(&c).?.*;
+        \\const h: u16 = 513;
+        \\fn alignBack(p: *const anyopaque) *const u16 {
+        \\    return @ptrCast(@alignCast(p));
+        \\}
+        \\const from_align_cast = alignBack(&h).*;
+        \\const pc: *const u8 = &c;
+        \\fn ptrBack(p: *const anyopaque) *const *const u8 {
+        \\    return @ptrCast(@alignCast(p));
+        \\}
+        \\const from_double_pointer = ptrBack(@ptrCast(&pc)).*.*;
+        \\const big: u8 = 200;
+        \\fn asSigned(p: *const anyopaque) *const i8 {
+        \\    return @ptrCast(p);
+        \\}
+        \\const big_erased: *const anyopaque = &big;
+        \\const signed_param = asSigned(&big).*;
+        \\const signed_global = asSigned(big_erased).*;
+    , &.{
+        .{ "from_param", "u8 = 3" },
+        .{ "from_coerced_global", "u8 = 3" },
+        .{ "from_cast_global", "u8 = 3" },
+        .{ "from_local", "u8 = 3" },
+        // The pointer cast back points to the variable
+        .{ "from_var", "u8 = 9" },
+        .{ "from_optional", "u8 = 3" },
+        .{ "from_align_cast", "u16 = 513" },
+        .{ "from_double_pointer", "u8 = 3" },
+        // Another type: the compiler reinterprets the memory, which is not evaluated
+        .{ "signed_param", "i8" },
+        .{ "signed_global", "i8" },
+    });
+}
+
+test "a pointer erased to *anyopaque keeps its value when cast back: arrays, ranges, strings and structs" {
+    // Erased pointers represented by elements (array pointers, string literals) or to a range
+    // of storage were not recognized as the pointers they were erased from.
+    try expectTypes(
+        \\const arr: [3]u8 = .{ 1, 2, 3 };
+        \\fn arrBack(p: *const anyopaque) *const [3]u8 {
+        \\    return @ptrCast(p);
+        \\}
+        \\fn manyBack(p: *const anyopaque) [*]const u8 {
+        \\    return @ptrCast(p);
+        \\}
+        \\const arr_erased: *const anyopaque = &arr;
+        \\const many_erased: *const anyopaque = @as([*]const u8, &arr);
+        \\const elem_param = arrBack(&arr)[1];
+        \\const elem_global = arrBack(arr_erased)[2];
+        \\const many_param = manyBack(&arr)[1];
+        \\const many_global = manyBack(arr_erased)[0];
+        \\const many_many_global = manyBack(many_erased)[2];
+        \\const str_erased: *const anyopaque = "abc";
+        \\fn strBack(p: *const anyopaque) *const [3:0]u8 {
+        \\    return @ptrCast(p);
+        \\}
+        \\const str_global = strBack(str_erased)[0];
+        \\const str_param = strBack("xyz")[1];
+        \\const range_write = blk: {
+        \\    var buf: [4]u8 = .{ 1, 2, 3, 4 };
+        \\    const e: *anyopaque = buf[1..3];
+        \\    const q: *[2]u8 = @ptrCast(e);
+        \\    q[1] = 9;
+        \\    break :blk buf[2];
+        \\};
+        \\const range_ptr = blk: {
+        \\    const sl: []const u8 = arr[1..];
+        \\    const e: *const anyopaque = sl.ptr;
+        \\    const m: [*]const u8 = @ptrCast(e);
+        \\    break :blk m[1];
+        \\};
+        \\const slice_elem = blk: {
+        \\    const sl: []const u8 = &arr;
+        \\    const e: *const anyopaque = &sl[2];
+        \\    const q: *const u8 = @ptrCast(e);
+        \\    break :blk q.*;
+        \\};
+        \\const S = struct { a: u8, b: u16 };
+        \\const s: S = .{ .a = 1, .b = 2 };
+        \\fn structBack(p: *const anyopaque) *const S {
+        \\    return @ptrCast(@alignCast(p));
+        \\}
+        \\const s_erased: *const anyopaque = &s;
+        \\const field_param = structBack(&s).b;
+        \\const field_global = structBack(s_erased).b;
+        \\fn asFirst(p: *const anyopaque) *const u8 {
+        \\    return @ptrCast(p);
+        \\}
+        \\const first_of_array = asFirst(&arr).*;
+    , &.{
+        .{ "elem_param", "u8 = 2" },
+        .{ "elem_global", "u8 = 3" },
+        .{ "many_param", "u8 = 2" },
+        .{ "many_global", "u8 = 1" },
+        .{ "many_many_global", "u8 = 3" },
+        .{ "str_global", "u8 = 97" },
+        .{ "str_param", "u8 = 121" },
+        .{ "range_write", "u8 = 9" },
+        .{ "range_ptr", "u8 = 3" },
+        .{ "slice_elem", "u8 = 3" },
+        .{ "field_param", "u16 = 2" },
+        .{ "field_global", "u16 = 2" },
+        // An element of another shape: the compiler restructures the array, which is not
+        // evaluated
+        .{ "first_of_array", "u8" },
+    });
+}
+
+test "a pointer erased to *anyopaque keeps its value when cast back: optionals and error unions" {
+    // Optionals and error unions are represented by their payloads, so an erased pointer to one
+    // did not point to a value of the type cast back to.
+    try expectTypes(
+        \\const none: ?u8 = null;
+        \\const three: ?u8 = 3;
+        \\const yes: ?bool = true;
+        \\fn optBack(p: *const anyopaque) *const ?u8 {
+        \\    return @ptrCast(p);
+        \\}
+        \\fn boolBack(p: *const anyopaque) *const ?bool {
+        \\    return @ptrCast(p);
+        \\}
+        \\const none_erased: *const anyopaque = &none;
+        \\const yes_erased: *const anyopaque = &yes;
+        \\const none_param = optBack(&none).*;
+        \\const none_global = optBack(none_erased).*;
+        \\const three_param = optBack(&three).*;
+        \\const yes_param = boolBack(&yes).*;
+        \\const yes_global = boolBack(yes_erased).*;
+        \\const three_erased: ?*const anyopaque = &three;
+        \\fn optPtrBack(p: ?*const anyopaque) ?*const ?u8 {
+        \\    return @ptrCast(p);
+        \\}
+        \\const three_global = optPtrBack(three_erased).?.*;
+        \\const E = error{Bad};
+        \\const ok: E!bool = true;
+        \\const bad: E!u8 = error.Bad;
+        \\fn okBack(p: *const anyopaque) *const E!bool {
+        \\    return @ptrCast(@alignCast(p));
+        \\}
+        \\fn badBack(p: *const anyopaque) *const E!u8 {
+        \\    return @ptrCast(@alignCast(p));
+        \\}
+        \\const ok_erased: *const anyopaque = &ok;
+        \\const bad_erased: *const anyopaque = &bad;
+        \\const ok_param = okBack(&ok).*;
+        \\const ok_global = okBack(ok_erased).*;
+        \\const bad_global = badBack(bad_erased).*;
+        \\const err: anyerror = error.Bad;
+        \\const err_erased: *const anyopaque = &err;
+        \\fn errBack(p: *const anyopaque) *const anyerror {
+        \\    return @ptrCast(@alignCast(p));
+        \\}
+        \\const err_global = errBack(err_erased).*;
+        \\const payload = blk: {
+        \\    var opt: ?u8 = 4;
+        \\    if (opt) |*x| {
+        \\        const e: *anyopaque = x;
+        \\        const q: *u8 = @ptrCast(e);
+        \\        q.* += 1;
+        \\    }
+        \\    break :blk opt;
+        \\};
+    , &.{
+        .{ "none_param", "?u8 = null" },
+        .{ "none_global", "?u8 = null" },
+        .{ "three_param", "?u8 = 3" },
+        .{ "yes_param", "?bool = true" },
+        .{ "yes_global", "?bool = true" },
+        .{ "three_global", "?u8 = 3" },
+        .{ "ok_param", "error{Bad}!bool = true" },
+        .{ "ok_global", "error{Bad}!bool = true" },
+        .{ "bad_global", "error{Bad}!u8 = error.Bad" },
+        .{ "err_global", "anyerror = error.Bad" },
+        // The pointer to the payload points to the optional
+        .{ "payload", "?u8 = 5" },
+    });
+}
+
+test "a pointer erased to *anyopaque keeps its value when cast back: field default values" {
+    // `default_value_ptr` of a field of an optional type points to the payload representation of
+    // the default value, which did not have the type cast back to.
+    try expectStdTypes(
+        \\const E = error{Bad};
+        \\const Color = enum { red, green };
+        \\const D = struct { x: ?u8 = null, y: ?bool = true, z: u8 = 5, e: E!bool = true, f: E!u8 = error.Bad, g: Color = .green };
+        \\const fields = @typeInfo(D).@"struct".field_attrs;
+        \\const default_x = @as(*const ?u8, @ptrCast(fields[0].default_value_ptr.?)).*;
+        \\const default_y = @as(*const ?bool, @ptrCast(fields[1].default_value_ptr.?)).*;
+        \\const default_z = fields[2].defaultValue(u8).?;
+        \\const default_e = fields[3].defaultValue(E!bool).?;
+        \\const default_f = @as(*const E!u8, @ptrCast(@alignCast(fields[4].default_value_ptr.?))).*;
+        \\const default_g = fields[5].defaultValue(Color).?;
+    , &.{
+        .{ "default_x", "?u8 = null" },
+        .{ "default_y", "?bool = true" },
+        .{ "default_z", "u8 = 5" },
+        .{ "default_e", "error{Bad}!bool = true" },
+        .{ "default_f", "error{Bad}!u8 = error.Bad" },
+        .{ "default_g", "Color = .green" },
+    });
+}
+
 test "a function chosen by switching on an enum defined in the signature" {
     // The tag recorded by the instance kept the type of another instance, so no prong was chosen
     // and the error set became anyerror.
