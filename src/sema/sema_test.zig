@@ -2874,6 +2874,92 @@ test "comptime slices alias the sliced storage" {
     });
 }
 
+test "comptime @bitCast reinterprets arrays, vectors, enums and packed containers" {
+    // The compiler packs the operand in logical bit order (packed fields from the least
+    // significant bit, elements in index order), so the results do not depend on the target
+    try expectTypes(
+        \\const P1 = packed struct { a: u3, b: u5, c: u8 };
+        \\const P2 = packed struct(u32) { lo: u16, hi: u16 };
+        \\const PU = packed union(u16) { a: u16, b: i16, p: P1 };
+        \\const PF = packed struct(u8) { r: bool, w: bool, x: bool, _pad: u5 = 0 };
+        \\const E = enum(u8) { x = 1, y = 2, _ };
+        \\const EX = enum(u4) { a = 3, b = 5 };
+        \\const PE = packed struct { e: EX, f: u4 };
+        \\const PN = packed struct { inner: P1, top: u8 };
+        \\const flags: u8 = @bitCast(PF{ .r = true, .w = false, .x = true });
+        \\const flags_back: PF = @bitCast(@as(u8, 6));
+        \\const bool_arr: u4 = @bitCast([4]bool{ true, false, true, true });
+        \\const u4_arr: u8 = @bitCast([2]u4{ 1, 2 });
+        \\const i4_arr: [2]i4 = @bitCast(@as(u8, 0xF7));
+        \\const sentinel: u40 = @bitCast([4:0]u8{ 1, 2, 3, 4 });
+        \\const to_sentinel: [4:0]u8 = @bitCast(@as(u40, 0x0504030201));
+        \\const f32_arr: [2]f32 = @bitCast(@as(u64, 0x4000000040400000));
+        \\const f16_arr: u32 = @bitCast([2]f16{ 1.0, -2.0 });
+        \\const enum_bits: u8 = @bitCast(E.y);
+        \\const to_enum: E = @bitCast(@as(u8, 1));
+        \\const packed_enum: u8 = @bitCast(PE{ .e = .b, .f = 3 });
+        \\const to_packed_enum: PE = @bitCast(@as(u8, 0x35));
+        \\const nested: u24 = @bitCast(PN{ .inner = .{ .a = 7, .b = 31, .c = 0xAB }, .top = 0xCD });
+        \\const to_nested: PN = @bitCast(@as(u24, 0x123456));
+        \\const to_nested_b = to_nested.inner.b;
+        \\const to_nested_top = to_nested.top;
+        \\const arr_packed: u32 = @bitCast([2]P1{ .{ .a = 1, .b = 2, .c = 3 }, .{ .a = 4, .b = 5, .c = 6 } });
+        \\const to_arr_packed: [2]P1 = @bitCast(@as(u32, 0x06290311));
+        \\const to_arr_packed_b = to_arr_packed[1].b;
+        \\const arr2d: u32 = @bitCast([2][2]u8{ .{ 1, 2 }, .{ 3, 4 } });
+        \\const vec_to_arr: [2]u16 = @bitCast(@Vector(4, u8){ 1, 2, 3, 4 });
+        \\const arr_to_vec: @Vector(2, u16) = @bitCast([4]u8{ 1, 2, 3, 4 });
+        \\const vec_bool: u8 = @bitCast(@Vector(8, bool){ true, false, false, false, false, false, false, true });
+        \\const union_bits: u16 = @bitCast(PU{ .b = -2 });
+        \\const union_packed: u16 = @bitCast(PU{ .p = .{ .a = 1, .b = 2, .c = 3 } });
+        \\const wide: [4]u64 = @bitCast([_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32 });
+        \\const wide_last = wide[3];
+        \\const u128_arr: [2]u64 = @bitCast(@as(u128, 0x0102030405060708090a0b0c0d0e0f10));
+        \\const i128_bytes: [16]u8 = @bitCast(@as(i128, -2));
+        \\const undef_elem: u32 = @bitCast([4]u8{ 1, undefined, 3, 4 });
+        \\const i16_arr: [2]i16 = @bitCast(@as(u32, 0xFFFE8000));
+        \\const backing_union = @backingInt(PU{ .b = -2 });
+        \\const backing_flags = @backingInt(PF{ .r = true, .w = true, .x = false });
+        \\const from_backing: PF = @fromBackingInt(@as(u8, 5));
+        \\const from_backing_lit: P2 = @fromBackingInt(0x00030004);
+    , &.{
+        .{ "flags", "u8 = 5" },
+        .{ "flags_back", "PF = .{ .r = false, .w = true, .x = true, ._pad = 0 }" },
+        .{ "bool_arr", "u4 = 13" },
+        .{ "u4_arr", "u8 = 33" },
+        .{ "i4_arr", "[2]i4 = .{ 7, -1 }" },
+        .{ "sentinel", "u40 = 67305985" },
+        .{ "to_sentinel", "[4:0]u8 = \"\\x01\\x02\\x03\\x04\"" },
+        .{ "f32_arr", "[2]f32 = .{ 3, 2 }" },
+        .{ "f16_arr", "u32 = 3221240832" },
+        .{ "enum_bits", "u8 = 2" },
+        .{ "to_enum", "E = .x" },
+        .{ "packed_enum", "u8 = 53" },
+        .{ "to_packed_enum", "PE = .{ .e = .b, .f = 3 }" },
+        .{ "nested", "u24 = 13478911" },
+        .{ "to_nested_b", "u5 = 10" },
+        .{ "to_nested_top", "u8 = 18" },
+        .{ "arr_packed", "u32 = 103547665" },
+        .{ "to_arr_packed_b", "u5 = 5" },
+        .{ "arr2d", "u32 = 67305985" },
+        .{ "vec_to_arr", "[2]u16 = .{ 513, 1027 }" },
+        .{ "arr_to_vec", "@Vector(2, u16) = .{ 513, 1027 }" },
+        .{ "vec_bool", "u8 = 129" },
+        .{ "union_bits", "u16 = 65534" },
+        .{ "union_packed", "u16 = 785" },
+        .{ "wide_last", "u64 = 2314601843866147353" },
+        .{ "u128_arr", "[2]u64 = .{ 651345242494996240, 72623859790382856 }" },
+        .{ "i128_bytes", "[16]u8 = \"\\xfe\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\"" },
+        // An undefined byte element reads as 0, as in the compiler
+        .{ "undef_elem", "u32 = 67305473" },
+        .{ "i16_arr", "[2]i16 = .{ -32768, -2 }" },
+        .{ "backing_union", "u16 = 65534" },
+        .{ "backing_flags", "u8 = 3" },
+        .{ "from_backing", "PF = .{ .r = true, .w = false, .x = true, ._pad = 0 }" },
+        .{ "from_backing_lit", "P2 = .{ .lo = 4, .hi = 3 }" },
+    });
+}
+
 test "escaped identifiers name the same declaration as plain ones" {
     try expectTypes(
         \\const @"\x66oo": u8 = 7;

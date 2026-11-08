@@ -4578,6 +4578,10 @@ const Evaluator = struct {
         }
         if (eq(u8, name, "@intFromEnum") or eq(u8, name, "@backingInt")) {
             if (vals.len != 1) return error.Abort;
+            // A packed container: its bits as its backing integer
+            if (eq(u8, name, "@backingInt") and try ev.containerLayout(vals[0].ty) == .@"packed") {
+                return try ev.bitCast(vals[0], try ev.backingIntType(vals[0].ty) orelse return error.Abort);
+            }
             return try ev.enumInt(vals[0]);
         }
         if (eq(u8, name, "@offsetOf") or eq(u8, name, "@bitOffsetOf")) {
@@ -5128,15 +5132,11 @@ const Evaluator = struct {
     fn cast(ev: *Evaluator, name: []const u8, v: Val, t: Index) EvalError!Val {
         const ip = ev.ip;
         const eq = std.mem.eql;
-        if (eq(u8, name, "@bitCast")) if (try ev.floatBitCast(v, t)) |r| return r;
-        if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast")) {
+        if (eq(u8, name, "@bitCast")) return ev.bitCast(v, t);
+        if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate")) {
             if (ev.intOf(v)) |x| {
                 if (eq(u8, name, "@intCast")) return try ev.convertInt(v.ty, t, x) orelse error.Abort;
                 const info = value.intInfo(ip, t) orelse return error.Abort;
-                if (eq(u8, name, "@bitCast")) {
-                    const src = value.intInfo(ip, v.ty) orelse return error.Abort;
-                    if (src.bits != info.bits) return error.Abort;
-                }
                 if (info.bits > 128) return ev.intFromBig(t, try bigint.wrap(ev.a, try value.bigOfInt(ip, ev.a, v.ty, x), info));
                 const r = value.binaryInt(ip, .plus_percent, t, x, 0) orelse return error.Abort;
                 return ev.int(t, r);
@@ -5149,13 +5149,14 @@ const Evaluator = struct {
                     if (!bigint.fits(b, info)) return error.Abort;
                     return ev.intFromBig(t, b);
                 }
-                if (eq(u8, name, "@bitCast")) {
-                    const src = value.intInfo(ip, v.ty) orelse return error.Abort;
-                    if (src.bits != info.bits) return error.Abort;
-                }
                 return ev.intFromBig(t, try bigint.wrap(ev.a, b, info));
             }
             return .{ .ty = t };
+        }
+        // A packed container from the bits of its backing integer
+        if (eq(u8, name, "@fromBackingInt") and try ev.containerLayout(t) == .@"packed") {
+            const int_ty = try ev.backingIntType(t) orelse return error.Abort;
+            return ev.bitCast(try ev.coerce(v, int_ty), t);
         }
         if (eq(u8, name, "@enumFromInt") or eq(u8, name, "@fromBackingInt")) {
             const x = ev.intOf(v) orelse return .{ .ty = t };
@@ -5193,38 +5194,6 @@ const Evaluator = struct {
         return .{ .ty = t, .v = v.v };
     }
 
-    /// `@bitCast` between a float and an integer of the same bit width (as std.fmt.float does to
-    /// read the parts of a float); null when neither side is a float
-    fn floatBitCast(ev: *Evaluator, v: Val, t: Index) EvalError!?Val {
-        const ip = ev.ip;
-        if (ip.isFloat(v.ty) and ip.isInt(t)) {
-            const x = ev.floatOf(v) orelse return .{ .ty = t };
-            const bits = value.floatToBits(ip, v.ty, x) orelse return .{ .ty = t };
-            const info = value.intInfo(ip, t) orelse return error.Abort;
-            if (info.bits != value.floatBits(ip, v.ty)) return error.Abort;
-            const n: i128 = if (info.signed) switch (info.bits) {
-                16 => @as(i16, @bitCast(@as(u16, @truncate(bits)))),
-                32 => @as(i32, @bitCast(@as(u32, @truncate(bits)))),
-                64 => @as(i64, @bitCast(@as(u64, @truncate(bits)))),
-                80 => @as(i80, @bitCast(@as(u80, @truncate(bits)))),
-                128 => @bitCast(bits),
-                else => return error.Abort,
-            } else if (info.bits == 128) @bitCast(bits) else std.math.cast(i128, bits) orelse return .{ .ty = t };
-            return try ev.int(t, n);
-        }
-        if (ip.isInt(v.ty) and ip.isFloat(t)) {
-            const x = ev.intOf(v) orelse return .{ .ty = t };
-            const info = value.intInfo(ip, v.ty) orelse return error.Abort;
-            const width = value.floatBits(ip, t) orelse return .{ .ty = t };
-            if (info.bits != width) return error.Abort;
-            const mask: u128 = if (width == 128) std.math.maxInt(u128) else (@as(u128, 1) << @intCast(width)) - 1;
-            const bits = @as(u128, @bitCast(x)) & mask;
-            const f = value.floatFromBits(ip, t, bits) orelse return .{ .ty = t };
-            return Val.of(t, try value.floatValue(ip, t, f) orelse return error.Abort);
-        }
-        return null;
-    }
-
     fn enumInt(ev: *Evaluator, v: Val) EvalError!Val {
         const ip = ev.ip;
         const x = try ev.freeze(v) orelse return error.Abort;
@@ -5240,6 +5209,190 @@ const Evaluator = struct {
         const int_ty = try ev.enumTagType(enum_ty) orelse .comptime_int_type;
         for (names, values) |n, val| if (std.mem.eql(u8, n, tag_name)) return ev.int(int_ty, val);
         return error.Abort;
+    }
+
+    // ── Reinterpretation ─────────────────────────────────────────────
+
+    /// `@bitCast` (the compiler's `bitCastVal`): the operand is written to packed memory in the
+    /// logical bit order (array and vector elements and the fields of packed containers from the
+    /// least significant bit, `undefined` parts as zero bits) and the result is read back from
+    /// it, so the result does not depend on the target's byte order
+    fn bitCast(ev: *Evaluator, v: Val, t: Index) EvalError!Val {
+        const ip = ev.ip;
+        const unknown: Val = .{ .ty = t };
+        if (!value.isConcrete(ip, v.ty) or !value.isConcrete(ip, t)) return unknown;
+        // The compiler reports an error for a type without a bit representation and for
+        // different bit widths
+        const from = try ev.bitCastable(v.ty) orelse return unknown;
+        const to = try ev.bitCastable(t) orelse return unknown;
+        if (!from or !to) return error.Abort;
+        const bits = try ev.bitCastBits(v.ty) orelse return unknown;
+        const want_bits = try ev.bitCastBits(t) orelse return unknown;
+        if (bits != want_bits) return error.Abort;
+        switch (v.v) {
+            .unknown => return unknown,
+            .undef => return .{ .ty = t, .v = .undef },
+            else => {},
+        }
+        const buf = try ev.allocBytes(bits / 8 + @intFromBool(bits % 8 != 0));
+        if (!try ev.writeBits(v, buf, 0)) return unknown;
+        return try ev.readBits(t, buf, 0) orelse unknown;
+    }
+
+    /// Whether `@bitCast` accepts values of type `t` (the compiler's `hasBitRepresentation`,
+    /// without pointers, which `@bitCast` rejects): integers, floats, bool, void, enums with an
+    /// explicit tag type, packed containers, and arrays and vectors of them; null when it cannot
+    /// be determined
+    fn bitCastable(ev: *Evaluator, t: Index) EvalError!?bool {
+        const ip = ev.ip;
+        switch (ip.key(t)) {
+            .int_type => return true,
+            .simple_type => |s| return s == .void or s == .bool or (ip.isInt(t) and s != .comptime_int) or (ip.isFloat(t) and s != .comptime_float),
+            .array_type => |a| return ev.bitCastable(a.child),
+            .vector_type => |vt| return ev.bitCastable(vt.child),
+            .container_type, .reified_type, .union_tag_type => {
+                if (value.isEnumType(ip, t)) return try ev.hasBitRepr(t);
+                return try ev.containerLayout(t) == .@"packed";
+            },
+            else => return false,
+        }
+    }
+
+    /// Bit width of a type that `@bitCast` accepts (the compiler's `Type.bitSize`): array and
+    /// vector elements, and the sentinel after them, follow each other without padding, so the
+    /// width does not depend on the target's vector layout
+    fn bitCastBits(ev: *Evaluator, t: Index) EvalError!?u64 {
+        const n: u64, const elem: Index = switch (ev.ip.key(t)) {
+            .array_type => |a| .{ a.len + @intFromBool(a.sentinel != null), a.child },
+            .vector_type => |vt| .{ vt.len, vt.child },
+            else => return (try ev.typeLayout(t, 0) orelse return null).bits,
+        };
+        return std.math.mul(u64, n, try ev.bitCastBits(elem) orelse return null) catch null;
+    }
+
+    /// Writes `v` into the packed memory `buf` at bit `off`; bit `i` of the memory is bit `i % 8`
+    /// of byte `i / 8`. Returns false when a part of the value is unknown.
+    fn writeBits(ev: *Evaluator, v: Val, buf: []u8, off: u64) EvalError!bool {
+        const ip = ev.ip;
+        const t = v.ty;
+        switch (v.v) {
+            .unknown => return false,
+            // The memory starts zeroed: `undefined` is written as zero bits
+            .undef => return true,
+            else => {},
+        }
+        try ev.tick();
+        switch (ip.key(t)) {
+            .array_type, .vector_type => {
+                const n = try ev.typeElemCount(t) orelse return false;
+                const elem_bits = try ev.bitCastBits(ev.elemTypeOf(t, 0)) orelse return false;
+                // The sentinel follows the elements
+                const total = n + @intFromBool(ev.sentinelElem(t, n) != null);
+                for (0..total) |i| if (!try ev.writeBits(try ev.elemAt(v, i), buf, off + i * elem_bits)) return false;
+                return true;
+            },
+            else => {},
+        }
+        if (t == .void_type) return true;
+        if (t == .bool_type) {
+            writePacked(buf, off, 1, @intFromBool((try ev.freeze(v) orelse return false) == .true_value));
+            return true;
+        }
+        if (ip.isFloat(t)) {
+            const width = value.floatBits(ip, t) orelse return false;
+            writePacked(buf, off, width, value.floatToBits(ip, t, ev.floatOf(v) orelse return false) orelse return false);
+            return true;
+        }
+        if (ip.isInt(t)) {
+            const info = value.intInfo(ip, t) orelse return false;
+            if (info.bits > 128) return bigint.writePacked(try ev.bigOf(v) orelse return false, info, buf, off);
+            writePacked(buf, off, info.bits, @bitCast(ev.intOf(v) orelse return false));
+            return true;
+        }
+        if (value.isEnumType(ip, t)) return ev.writeBits(try ev.enumInt(v), buf, off);
+        if (ev.isUnion(t)) {
+            // A packed union: the bits of the active field
+            const u = switch (ip.key(try ev.freeze(v) orelse return false)) {
+                .union_value => |u| u,
+                else => return false,
+            };
+            return ev.writeBits(Val.of(try ev.unionFieldType(t, u.tag), u.payload), buf, off);
+        }
+        // A packed struct: the fields from the least significant bit
+        const fields = try ev.layoutFields(t, 0) orelse return false;
+        const sl = try ev.structLayoutOf(t, fields) orelse return false;
+        for (sl.bit_offsets, 0..) |bit_offset, i| if (!try ev.writeBits(try ev.elemAt(v, i), buf, off + (bit_offset orelse return false))) return false;
+        return true;
+    }
+
+    /// Reads a value of type `t` from the packed memory `buf` at bit `off` (see `writeBits`);
+    /// null when the value cannot be represented here: an enum value without a tag, or a packed
+    /// union, whose bits do not determine an active field
+    fn readBits(ev: *Evaluator, t: Index, buf: []const u8, off: u64) EvalError!?Val {
+        const ip = ev.ip;
+        try ev.tick();
+        switch (ip.key(t)) {
+            .array_type, .vector_type => {
+                const n = try ev.typeElemCount(t) orelse return null;
+                const elem_ty = ev.elemTypeOf(t, 0);
+                const elem_bits = try ev.bitCastBits(elem_ty) orelse return null;
+                const elems = try ev.allocElems(n);
+                for (elems, 0..) |*o, i| o.* = try ev.readBits(elem_ty, buf, off + i * elem_bits) orelse return null;
+                return try ev.makeAgg(t, elems);
+            },
+            else => {},
+        }
+        if (t == .void_type) return Val.void_val;
+        if (t == .bool_type) return boolVal(readPacked(buf, off, 1) != 0);
+        if (ip.isFloat(t)) {
+            const width = value.floatBits(ip, t) orelse return null;
+            const f = value.floatFromBits(ip, t, readPacked(buf, off, width)) orelse return null;
+            return Val.of(t, try value.floatValue(ip, t, f) orelse return null);
+        }
+        if (ip.isInt(t)) {
+            const info = value.intInfo(ip, t) orelse return null;
+            if (info.bits > 128) return ev.intFromBig(t, try bigint.readPacked(ev.a, info, buf, off));
+            return Val.ofInt(t, intFromBits(info, readPacked(buf, off, info.bits)));
+        }
+        if (value.isEnumType(ip, t)) {
+            const info = value.intInfo(ip, try ev.enumTagType(t) orelse return null) orelse return null;
+            if (info.bits > 128) return null;
+            return ev.enumWithValue(t, intFromBits(info, readPacked(buf, off, info.bits)));
+        }
+        if (ev.isUnion(t)) return null;
+        const fields = try ev.layoutFields(t, 0) orelse return null;
+        const sl = try ev.structLayoutOf(t, fields) orelse return null;
+        const elems = try ev.allocElems(fields.len);
+        for (elems, fields, sl.bit_offsets) |*o, fl, bit_offset| o.* = try ev.readBits(fl.ty, buf, off + (bit_offset orelse return null)) orelse return null;
+        return try ev.makeAgg(t, elems);
+    }
+
+    /// The tag of enum `t` with the integer value `x`; null when no tag has it
+    fn enumWithValue(ev: *Evaluator, t: Index, x: i128) EvalError!?Val {
+        const names = try ev.enumNames(t) orelse return null;
+        const values = try ev.enumValues(t);
+        for (names, values) |n, val| if (val == x) return Val.of(t, try ev.ip.get(.{ .enum_tag = .{ .ty = t, .name = n } }));
+        return null;
+    }
+
+    /// Zeroed memory of `len` bytes; checks this evaluation's memory limit first (see
+    /// `allocElems`)
+    fn allocBytes(ev: *Evaluator, len: u64) EvalError![]u8 {
+        const used = if (ev.arena) |arena| arena.queryCapacity() else 0;
+        if (len > max_eval_bytes - @min(used, max_eval_bytes)) return error.Abort;
+        const buf = try ev.a.alloc(u8, @intCast(len));
+        @memset(buf, 0);
+        return buf;
+    }
+
+    /// Layout of a struct or union declaration; null for other types
+    fn containerLayout(ev: *Evaluator, t: Index) EvalError!?InternPool.Reified.Layout {
+        switch (ev.ip.key(t)) {
+            .container_type, .reified_type => {},
+            else => return null,
+        }
+        if (value.isEnumType(ev.ip, t)) return null;
+        return (try ev.containerSyntax(t)).layout;
     }
 
     fn int(ev: *Evaluator, ty: Index, x: anytype) Error!Val {
@@ -6526,4 +6679,26 @@ fn vectorShape(ip: *InternPool, t: Index) ?struct { len: u64, child: Index } {
         .array_type => |a| .{ .len = a.len, .child = a.child },
         else => null,
     };
+}
+
+/// Writes the low `bits` bits of `x` into the packed memory `buf` at bit `off` (see
+/// `Evaluator.writeBits`)
+fn writePacked(buf: []u8, off: u64, bits: u16, x: u128) void {
+    if (bits == 0) return;
+    std.mem.writeVarPackedInt(buf, @intCast(off), bits, x, .little);
+}
+
+/// The `bits` bits of the packed memory `buf` at bit `off`
+fn readPacked(buf: []const u8, off: u64, bits: u16) u128 {
+    if (bits == 0) return 0;
+    return std.mem.readVarPackedInt(u128, buf, @intCast(off), bits, .little, .unsigned);
+}
+
+/// The integer of type `info` whose two's complement bits are the low `info.bits` bits of `raw`
+/// (a u128 is held as its bit pattern in i128)
+fn intFromBits(info: value.IntInfo, raw: u128) i128 {
+    if (info.bits == 0) return 0;
+    const shift: u7 = @intCast(128 - @as(u32, info.bits));
+    const x = raw << shift;
+    return if (info.signed) @as(i128, @bitCast(x)) >> shift else @bitCast(x >> shift);
 }

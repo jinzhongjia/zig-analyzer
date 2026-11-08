@@ -209,6 +209,22 @@ fn wrapBits(allocator: Allocator, a: Big, signedness: std.lang.Signedness, bits:
     return m.toConst();
 }
 
+/// Writes `a`, a value of type `t`, into the packed memory `buf` as the `t.bits` bits at bit
+/// `off` (bit `i` of the memory is bit `i % 8` of byte `i / 8`); false when `a` is not a value
+/// of `t`
+pub fn writePacked(a: Big, t: IntType, buf: []u8, off: u64) bool {
+    if (!fits(a, t)) return false;
+    a.writePackedTwosComplement(buf, @intCast(off), t.bits, .little);
+    return true;
+}
+/// The value of type `t` whose two's complement bits are the `t.bits` bits of the packed memory
+/// `buf` at bit `off` (see `writePacked`)
+pub fn readPacked(allocator: Allocator, t: IntType, buf: []const u8, off: u64) Allocator.Error!Big {
+    const limbs = try allocator.alloc(Limb, int.calcTwosCompLimbCount(t.bits));
+    var m: int.Mutable = .{ .limbs = limbs, .positive = undefined, .len = undefined };
+    m.readPackedTwosComplement(buf, @intCast(off), t.bits, .little, t.signedness());
+    return m.toConst();
+}
 pub const Overflow = enum { check, wrap, saturate };
 
 /// Fits an exact result into type `t`. When it is out of range: plain operations give null (the
