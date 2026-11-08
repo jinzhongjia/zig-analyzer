@@ -7609,10 +7609,10 @@ test "comptime evaluation: pointer identity of declarations, functions and tempo
         // A string literal carries its sentinel, for which `word` has no room
         .{ "r_word_lit", "bool = false" },
         .{ "r_wordz_lit", "bool" },
-        // A local variable is storage of its own; a constant local may be the same constant
-        // as an equal temporary
+        // A local variable is storage of its own; a constant local is the same constant as an
+        // equal temporary
         .{ "r_local_decl", "bool = false" },
-        .{ "r_local_temp", "bool" },
+        .{ "r_local_temp", "bool = true" },
         .{ "r_local_temp_other", "bool = false" },
         // `&p.*` is `p`
         .{ "r_deref", "bool = true" },
