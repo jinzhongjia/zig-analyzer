@@ -8695,6 +8695,137 @@ test "comptime evaluation: pointers to different declarations with equal values 
     });
 }
 
+test "comptime evaluation: vector operators, @reduce, @select and @shuffle" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both). Operators
+    // work element-wise with the scalar implementation; an array operand and differing element
+    // types coerce to the peer vector type, and a shift amount keeps its own type. Compound
+    // assignment `v op= x` applies the same operators.
+    try expectTypes(
+        \\fn splatted() @Vector(2, u8) {
+        \\    const v: @Vector(2, u8) = .{ 1, 2 };
+        \\    return v + @as(@Vector(2, u8), @splat(3));
+        \\}
+        \\fn vecAcc() @Vector(2, u8) {
+        \\    var v: @Vector(2, u8) = .{ 1, 2 };
+        \\    v += @splat(3);
+        \\    return v;
+        \\}
+        \\fn vecOps() @Vector(3, i32) {
+        \\    var v: @Vector(3, i32) = .{ 1, 2, 3 };
+        \\    v *= .{ 2, 3, 4 };
+        \\    v -= @splat(1);
+        \\    v |= @splat(8);
+        \\    for (0..2) |_| v +%= @splat(1);
+        \\    return v;
+        \\}
+        \\fn vecFloat() @Vector(2, f32) {
+        \\    var v: @Vector(2, f32) = .{ 1, 3 };
+        \\    v /= @splat(2);
+        \\    v += .{ 0.25, 0.5 };
+        \\    return v;
+        \\}
+        \\fn vecBool() @Vector(2, bool) {
+        \\    var b: @Vector(2, bool) = .{ true, false };
+        \\    b ^= @splat(true);
+        \\    return b;
+        \\}
+        \\fn vecOverflow() @Vector(2, u8) {
+        \\    var v: @Vector(2, u8) = .{ 1, 255 };
+        \\    v += @splat(1);
+        \\    return v;
+        \\}
+        \\const v_add = @as(@Vector(2, u8), .{ 1, 2 }) + @as(@Vector(2, u8), .{ 10, 20 });
+        \\const v_splat = splatted();
+        \\const v_peer = @as(@Vector(2, u8), .{ 10, 20 }) + @as(@Vector(2, u16), .{ 300, 4 });
+        \\const v_array = @as(@Vector(2, u8), .{ 10, 20 }) + [2]u8{ 1, 2 };
+        \\const v_float = @as(@Vector(2, f32), .{ 1.5, 2 }) * @as(@Vector(2, f32), .{ 2, 0.5 });
+        \\const v_div = @as(@Vector(2, u8), .{ 10, 20 }) / @as(@Vector(2, u8), .{ 3, 4 });
+        \\const v_rem = @as(@Vector(2, u8), .{ 7, 9 }) % @as(@Vector(2, u8), .{ 3, 4 });
+        \\const v_sat = @as(@Vector(2, u8), .{ 200, 1 }) +| @as(@Vector(2, u8), .{ 100, 1 });
+        \\const v_wrap = @as(@Vector(2, u8), .{ 200, 1 }) +% @as(@Vector(2, u8), .{ 100, 1 });
+        \\const v_shl = @as(@Vector(2, u8), .{ 1, 2 }) << @as(@Vector(2, u3), .{ 1, 2 });
+        \\const v_shr = @as(@Vector(2, i8), .{ -8, 64 }) >> @as(@Vector(2, u3), .{ 1, 3 });
+        \\const v_shl_sat = @as(@Vector(2, u8), .{ 0x80, 1 }) <<| @as(@Vector(2, u8), .{ 1, 1 });
+        \\const v_xor = @as(@Vector(2, u8), .{ 0xF0, 0x0F }) ^ @as(@Vector(2, u8), .{ 0xFF, 0xFF });
+        \\const v_and = @Vector(2, bool){ true, false } & @Vector(2, bool){ true, true };
+        \\const v_lt = @as(@Vector(2, u8), .{ 1, 5 }) < @as(@Vector(2, u8), .{ 3, 3 });
+        \\const v_ge = @as(@Vector(2, i8), .{ -1, 5 }) >= @as(@Vector(2, i8), .{ -1, 6 });
+        \\const v_eq = @as(@Vector(2, u8), .{ 1, 2 }) == @as(@Vector(2, u8), .{ 1, 3 });
+        \\const v_ne = @Vector(2, bool){ true, false } != @Vector(2, bool){ true, true };
+        \\const v_elem = (@as(@Vector(3, u8), .{ 5, 6, 7 }))[1];
+        \\const c_acc = vecAcc();
+        \\const c_ops = vecOps();
+        \\const c_float = vecFloat();
+        \\const c_bool = vecBool();
+        \\const r_all_eq = @reduce(.And, @as(@Vector(2, u8), .{ 1, 2 }) == @as(@Vector(2, u8), .{ 1, 2 }));
+        \\const r_add = @reduce(.Add, @as(@Vector(4, u32), .{ 1, 2, 3, 4 }));
+        \\const r_add_wrap = @reduce(.Add, @as(@Vector(2, u8), .{ 200, 100 }));
+        \\const r_mul_wrap = @reduce(.Mul, @as(@Vector(3, u8), .{ 2, 3, 50 }));
+        \\const r_mul_float = @reduce(.Mul, @as(@Vector(3, f64), .{ 1.5, 2, 4 }));
+        \\const r_min = @reduce(.Min, @as(@Vector(3, i8), .{ 4, -2, 7 }));
+        \\const r_max = @reduce(.Max, @as(@Vector(3, f32), .{ 4, -2, 7.5 }));
+        \\const r_and = @reduce(.And, @as(@Vector(2, u8), .{ 0xF3, 0x3F }));
+        \\const r_xor = @reduce(.Xor, @as(@Vector(3, u8), .{ 1, 3, 4 }));
+        \\const r_or = @reduce(.Or, @Vector(2, bool){ false, true });
+        \\const s_select = @select(u8, @Vector(2, bool){ true, false }, @Vector(2, u8){ 1, 2 }, @Vector(2, u8){ 3, 4 });
+        \\const s_arrays = @select(u8, [2]bool{ false, true }, [2]u8{ 1, 2 }, [2]u8{ 3, 4 });
+        \\const s_shuffle = @shuffle(u8, @Vector(2, u8){ 1, 2 }, @Vector(2, u8){ 3, 4 }, @Vector(3, i32){ 1, -1, 0 });
+        \\const s_undef_a = @shuffle(u16, undefined, @Vector(3, u16){ 7, 8, 9 }, [3]i32{ -3, -1, -2 });
+        \\const s_undef_b = @shuffle(u8, @Vector(2, u8){ 1, 2 }, undefined, [2]i32{ 1, 0 });
+        \\const e_overflow = @as(@Vector(2, u8), .{ 200, 1 }) + @as(@Vector(2, u8), .{ 100, 1 });
+        \\const e_length = @as(@Vector(2, u8), .{ 1, 2 }) + @as(@Vector(3, u8), .{ 1, 2, 3 });
+        \\const e_mask = @shuffle(u8, @Vector(2, u8){ 1, 2 }, @Vector(2, u8){ 3, 4 }, @Vector(1, i32){ 2 });
+        \\const e_compound = vecOverflow();
+    , &.{
+        .{ "v_add", "@Vector(2, u8) = .{ 11, 22 }" },
+        .{ "v_splat", "@Vector(2, u8) = .{ 4, 5 }" },
+        .{ "v_peer", "@Vector(2, u16) = .{ 310, 24 }" },
+        .{ "v_array", "@Vector(2, u8) = .{ 11, 22 }" },
+        .{ "v_float", "@Vector(2, f32) = .{ 3, 1 }" },
+        .{ "v_div", "@Vector(2, u8) = .{ 3, 5 }" },
+        .{ "v_rem", "@Vector(2, u8) = .{ 1, 1 }" },
+        .{ "v_sat", "@Vector(2, u8) = .{ 255, 2 }" },
+        .{ "v_wrap", "@Vector(2, u8) = .{ 44, 2 }" },
+        .{ "v_shl", "@Vector(2, u8) = .{ 2, 8 }" },
+        .{ "v_shr", "@Vector(2, i8) = .{ -4, 8 }" },
+        .{ "v_shl_sat", "@Vector(2, u8) = .{ 255, 2 }" },
+        .{ "v_xor", "@Vector(2, u8) = .{ 15, 240 }" },
+        .{ "v_and", "@Vector(2, bool) = .{ true, false }" },
+        .{ "v_lt", "@Vector(2, bool) = .{ true, false }" },
+        .{ "v_ge", "@Vector(2, bool) = .{ true, false }" },
+        .{ "v_eq", "@Vector(2, bool) = .{ true, false }" },
+        .{ "v_ne", "@Vector(2, bool) = .{ false, true }" },
+        .{ "v_elem", "u8 = 6" },
+        .{ "c_acc", "@Vector(2, u8) = .{ 4, 5 }" },
+        .{ "c_ops", "@Vector(3, i32) = .{ 11, 15, 13 }" },
+        .{ "c_float", "@Vector(2, f32) = .{ 0.75, 2 }" },
+        .{ "c_bool", "@Vector(2, bool) = .{ false, true }" },
+        .{ "r_all_eq", "bool = true" },
+        .{ "r_add", "u32 = 10" },
+        // Integer addition and multiplication wrap
+        .{ "r_add_wrap", "u8 = 44" },
+        .{ "r_mul_wrap", "u8 = 44" },
+        .{ "r_mul_float", "f64 = 12" },
+        .{ "r_min", "i8 = -2" },
+        .{ "r_max", "f32 = 7.5" },
+        .{ "r_and", "u8 = 51" },
+        .{ "r_xor", "u8 = 6" },
+        .{ "r_or", "bool = true" },
+        .{ "s_select", "@Vector(2, u8) = .{ 1, 4 }" },
+        .{ "s_arrays", "@Vector(2, u8) = .{ 3, 2 }" },
+        // A negative mask element `~i` selects element `i` of the second operand
+        .{ "s_shuffle", "@Vector(3, u8) = .{ 2, 3, 1 }" },
+        .{ "s_undef_a", "@Vector(3, u16) = .{ 9, 7, 8 }" },
+        .{ "s_undef_b", "@Vector(2, u8) = .{ 2, 1 }" },
+        // Compile errors: overflow, different lengths, a mask element out of bounds, overflow in
+        // `+=`
+        .{ "e_overflow", "@Vector(2, u8)" },
+        .{ "e_length", "unknown" },
+        .{ "e_mask", "@Vector(1, u8)" },
+        .{ "e_compound", "@Vector(2, u8)" },
+    });
+}
+
 test "comptime evaluation: element-wise work is not limited by steps, but large copies hit the memory limit" {
     // The compiler counts only backward branches: a `@memcpy` writing hundreds of thousands of
     // elements one by one is not limited. Evaluation gives up when a large array exceeding the
