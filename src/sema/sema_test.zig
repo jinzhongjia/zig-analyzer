@@ -7036,6 +7036,8 @@ test "comptime evaluation: pointer identity of declarations, functions and tempo
         \\fn bar() void {}
         \\const foo_alias = foo;
         \\const fp: *const fn () void = &foo;
+        \\const ch: u8 = 'a';
+        \\const gview: *const [1][4]u8 = &arr;
         \\fn eql(a: []const u8, b: []const u8) bool {
         \\    if (a.len != b.len) return false;
         \\    if (a.len == 0 or a.ptr == b.ptr) return true;
@@ -7140,6 +7142,25 @@ test "comptime evaluation: pointer identity of declarations, functions and tempo
         \\    const p = &arr;
         \\    return &p.* == p;
         \\}
+        \\fn viewSame() bool {
+        \\    return @as(*const [1]u8, &ch) == @as(*const [1]u8, &ch);
+        \\}
+        \\fn viewElem() bool {
+        \\    const v: *const [1]u8 = &ch;
+        \\    return &v[0] == &ch;
+        \\}
+        \\fn viewInterned() bool {
+        \\    return @as(*const [1][4]u8, &arr) == gview;
+        \\}
+        \\fn viewLit() bool {
+        \\    return @as([*]const u8, @as(*const [1]u8, &ch)) == @as([*]const u8, "a");
+        \\}
+        \\fn eqlView() bool {
+        \\    return eql(@as(*const [1]u8, &ch), "a");
+        \\}
+        \\fn eqlViewOther() bool {
+        \\    return eql(@as(*const [1]u8, &ch), "b");
+        \\}
         \\const p_gp_addr = gp == @as([*]const u8, &arr);
         \\const p_addr_addr = @as([*]const u8, &arr) == @as([*]const u8, &arr);
         \\const p_eql_addr = eql(&word, "abc");
@@ -7175,6 +7196,12 @@ test "comptime evaluation: pointer identity of declarations, functions and tempo
         \\const r_local_temp = localTemp();
         \\const r_local_temp_other = localTempOther();
         \\const r_deref = derefAddr();
+        \\const r_view_same = viewSame();
+        \\const r_view_elem = viewElem();
+        \\const r_view_interned = viewInterned();
+        \\const r_view_lit = viewLit();
+        \\const r_eql_view = eqlView();
+        \\const r_eql_view_other = eqlViewOther();
     , &.{
         // `&` of a declaration points to the declaration, as the pointer stored in `gp` does;
         // an interned pointer keeps no identity, so equal data gives no value instead of `false`
@@ -7223,6 +7250,15 @@ test "comptime evaluation: pointer identity of declarations, functions and tempo
         .{ "r_local_temp_other", "bool = false" },
         // `&p.*` is `p`
         .{ "r_deref", "bool = true" },
+        // A `*T` → `*[1]T` view of a declaration points to the declaration, its only element
+        // being the place: an interned pointer is compared with that one element (equal data
+        // gives no value, as for `gp`; a literal's sentinel has no room after it)
+        .{ "r_view_same", "bool = true" },
+        .{ "r_view_elem", "bool = true" },
+        .{ "r_view_interned", "bool" },
+        .{ "r_view_lit", "bool = false" },
+        .{ "r_eql_view", "bool = true" },
+        .{ "r_eql_view_other", "bool = false" },
     });
 }
 
