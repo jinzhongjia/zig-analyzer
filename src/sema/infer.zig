@@ -2381,8 +2381,11 @@ const Inferrer = struct {
                 else
                     null;
                 // When the loop body modifies an outer `comptime var`, at the start of iteration n
-                // it takes its value at the end of iteration n - 1
-                if (iteration) |n| if (n > 0) if (try inf.assignsOuterComptimeVar(l.body)) {
+                // it takes its value at the end of iteration n - 1. Inferring only up to a loop
+                // variable of this loop (see `runLocal`) does not read it: the compiler evaluates
+                // the operands once, before the loop (`AstGen.forExpr`), so the loop variables do
+                // not depend on what earlier iterations modify.
+                if (iteration) |n| if (n > 0) if (!inf.stopsAt(l.capture)) if (try inf.assignsOuterComptimeVar(l.body)) {
                     const prev = try inf.r.ctx.get(queries.Infer, .{
                         .owner = .{ .file = inf.file, .item = try inf.body_owner() },
                         .mode = inf.mode,
@@ -2430,10 +2433,15 @@ const Inferrer = struct {
         return .{ .ty = ty };
     }
 
+    /// Inferring only up to the capture `stop_at`, which is one of `caps`
+    fn stopsAt(inf: *const Inferrer, caps: []const Body.BindingId) bool {
+        const target = inf.stop_at orelse return false;
+        return std.mem.indexOfScalar(Body.BindingId, caps, target) != null;
+    }
+
     /// `caps` have just been bound: when inferring only up to the capture `stop_at`, stops there
     fn captureBound(inf: *Inferrer, caps: []const Body.BindingId) void {
-        const target = inf.stop_at orelse return;
-        if (std.mem.indexOfScalar(Body.BindingId, caps, target) != null) inf.stopped = true;
+        if (inf.stopsAt(caps)) inf.stopped = true;
     }
 
     /// Loop variables of a `for` loop; when inferring the `iteration`-th iteration, they take the
