@@ -1436,6 +1436,9 @@ const Evaluator = struct {
     }
 
     fn store(ev: *Evaluator, ref: Ref, v: Val) EvalError!void {
+        // Comptime code cannot write a container-level declaration: a constant, or a variable
+        // whose contents are known only at runtime
+        if (ev.cell_decls.contains(ref.cell)) return error.Abort;
         if (ref.window) |w| {
             // Write element by element: each element counts as one step
             for (0..w.len) |i| {
@@ -3414,11 +3417,12 @@ const Evaluator = struct {
     }
 
     /// Storage being sliced: the storage the pointer points to (or the place an interned pointer
-    /// records), or the local array variable itself; null when there is no storage to reference
+    /// records), or the array itself, a local variable or a container-level declaration (slicing
+    /// takes its address in the compiler); null when there is no storage to reference
     fn sliceTarget(ev: *Evaluator, f: *Frame, lhs: ExprId, base: Val) EvalError!?Ref {
         if (try ev.pointerPlace(base)) |r| return r;
         if (ev.ip.key(base.ty) != .array_type) return null;
-        return ev.place(f, lhs) catch |err| switch (err) {
+        return ev.placeFor(f, lhs, .address) catch |err| switch (err) {
             error.Abort => null,
             else => |x| x,
         };
