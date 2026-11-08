@@ -335,6 +335,7 @@ Reads run concurrently on snapshots and are canceled by `$/cancelRequest` and wr
 Edit-triggered publishing is debounced per file; live diagnostics are computed outside read transactions. During a compile the previous results are kept, then replaced atomically; compile results are immutable and reference counted.
 
 - The queue coalesces by file, and a file being computed is published once more after it finishes.
+- A publish interrupted by write transactions runs again until its result is sent, however often it is interrupted; it waits for each write to take the lock first (`waitPendingWrites`). When preparing the live diagnostics fails, the query computes them instead of the publish waiting for a preparation.
 - A file's diagnostics may depend on other files' text, so other open files are recomputed when a document is edited, opened, or closed or a file changes on disk, and sent only when they differ.
 - Edit-triggered publishes bypass the queue: each takes an increasing sequence number before reading state, and only results no older than the last sent are sent.
 
