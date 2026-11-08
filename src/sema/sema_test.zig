@@ -5107,6 +5107,263 @@ test "comptime evaluation: slices, pointers and error unions in interpreter stor
     });
 }
 
+test "comptime evaluation: anytype and comptime parameters write through pointers into the caller's storage" {
+    // Prevents running the callee on interned copies of such arguments, which lost its writes;
+    // expected values are the results of zig 0.17.0 and 0.17.1
+    try expectTypes(
+        \\const Ctx = struct {
+        \\    items: []u32,
+        \\    fn swap(ctx: Ctx, a: usize, b: usize) void {
+        \\        const t = ctx.items[a];
+        \\        ctx.items[a] = ctx.items[b];
+        \\        ctx.items[b] = t;
+        \\    }
+        \\};
+        \\fn viaAny(ctx: anytype) void {
+        \\    ctx.swap(0, 1);
+        \\}
+        \\fn anySlice(s: anytype) void {
+        \\    s[0] = 9;
+        \\}
+        \\fn anyPtr(p: anytype) void {
+        \\    p.* = 9;
+        \\}
+        \\fn anyArrPtr(p: anytype) void {
+        \\    p[1] = 9;
+        \\}
+        \\fn anyTuple(t: anytype) void {
+        \\    t[0].* = 9;
+        \\}
+        \\fn anyStruct(c: anytype) void {
+        \\    c.p.* = 9;
+        \\}
+        \\fn anyNested(t: anytype) void {
+        \\    t[0][0].* = 9;
+        \\}
+        \\fn idAny(p: anytype) @TypeOf(p) {
+        \\    return p;
+        \\}
+        \\fn readAny(s: anytype) u32 {
+        \\    return s[0] + s[1];
+        \\}
+        \\fn setCt(s: []comptime_int) void {
+        \\    s[0] = 9;
+        \\}
+        \\fn setType(p: *type) void {
+        \\    p.* = u8;
+        \\}
+        \\fn setCtPtr(comptime p: *u32) void {
+        \\    p.* = 9;
+        \\}
+        \\fn setCtAny(comptime p: anytype) void {
+        \\    p.* = 9;
+        \\}
+        \\fn lenCt(comptime s: []const u8) usize {
+        \\    return s.len;
+        \\}
+        \\fn setPtrPtr(pp: anytype) void {
+        \\    pp.*.* = 9;
+        \\}
+        \\const Field = struct { x: u32 };
+        \\const w_swap = blk: {
+        \\    var a = [_]u32{ 1, 2 };
+        \\    viaAny(Ctx{ .items = &a });
+        \\    break :blk a[0];
+        \\};
+        \\const w_slice = blk: {
+        \\    var a = [_]u32{ 1, 2 };
+        \\    anySlice(@as([]u32, &a));
+        \\    break :blk a[0];
+        \\};
+        \\const w_ptr = blk: {
+        \\    var x: u32 = 1;
+        \\    anyPtr(&x);
+        \\    break :blk x;
+        \\};
+        \\const w_arr_ptr = blk: {
+        \\    var a = [_]u32{ 1, 2 };
+        \\    anyArrPtr(&a);
+        \\    break :blk a[1];
+        \\};
+        \\const w_tuple = blk: {
+        \\    var x: u32 = 1;
+        \\    anyTuple(.{&x});
+        \\    break :blk x;
+        \\};
+        \\const w_struct = blk: {
+        \\    var x: u32 = 1;
+        \\    anyStruct(.{ .p = &x });
+        \\    break :blk x;
+        \\};
+        \\const w_nested = blk: {
+        \\    var x: u32 = 1;
+        \\    anyNested(.{.{&x}});
+        \\    break :blk x;
+        \\};
+        \\const w_builtin_call = blk: {
+        \\    var x: u32 = 1;
+        \\    @call(.auto, anyPtr, .{&x});
+        \\    break :blk x;
+        \\};
+        \\const w_alias = blk: {
+        \\    var a = [_]u32{ 1, 2 };
+        \\    const q = idAny(&a);
+        \\    a[0] = 7;
+        \\    break :blk q[0];
+        \\};
+        \\const w_read = blk: {
+        \\    var a = [_]u32{ 4, 5 };
+        \\    break :blk readAny(&a);
+        \\};
+        \\const w_twice = blk: {
+        \\    var a = [_]u32{ 1, 2 };
+        \\    anySlice(@as([]u32, &a));
+        \\    a[0] += 1;
+        \\    anyArrPtr(&a);
+        \\    break :blk a[0] * 100 + a[1];
+        \\};
+        \\const w_ct_slice = blk: {
+        \\    var a = [_]comptime_int{ 1, 2 };
+        \\    setCt(&a);
+        \\    break :blk a[0];
+        \\};
+        \\const w_ct_type = blk: {
+        \\    var T: type = u32;
+        \\    setType(&T);
+        \\    break :blk T;
+        \\};
+        \\const w_ct_ptr = blk: {
+        \\    var x: u32 = 1;
+        \\    setCtPtr(&x);
+        \\    break :blk x;
+        \\};
+        \\const w_ct_any = blk: {
+        \\    var x: u32 = 1;
+        \\    setCtAny(&x);
+        \\    break :blk x;
+        \\};
+        \\const w_const_local = blk: {
+        \\    const arr = "abc".*;
+        \\    break :blk lenCt(&arr);
+        \\};
+        \\const w_ptr_ptr = blk: {
+        \\    var x: u32 = 1;
+        \\    const p = &x;
+        \\    setPtrPtr(&p);
+        \\    break :blk x;
+        \\};
+        \\const w_alias_const = blk: {
+        \\    var a = [_]u32{ 1, 2 };
+        \\    const q = idAny(@as(*const [2]u32, &a));
+        \\    a[0] = 7;
+        \\    break :blk q[0];
+        \\};
+        \\const w_alias_field = blk: {
+        \\    var s: Field = .{ .x = 1 };
+        \\    const p: *const Field = &s;
+        \\    const q = idAny(&p.x);
+        \\    s.x = 7;
+        \\    break :blk q.*;
+        \\};
+    , &.{
+        // anytype parameters: a struct holding a slice, a slice, single-item and array
+        // pointers, and pointers inside tuples and anonymous structs
+        .{ "w_swap", "u32 = 2" },
+        .{ "w_slice", "u32 = 9" },
+        .{ "w_ptr", "u32 = 9" },
+        .{ "w_arr_ptr", "u32 = 9" },
+        .{ "w_tuple", "u32 = 9" },
+        .{ "w_struct", "u32 = 9" },
+        .{ "w_nested", "u32 = 9" },
+        .{ "w_builtin_call", "u32 = 9" },
+        // A returned pointer still points into the caller's storage
+        .{ "w_alias", "u32 = 7" },
+        .{ "w_read", "u32 = 9" },
+        .{ "w_twice", "u32 = 1009" },
+        // Parameters that are comptime because of their comptime-only type, and explicit
+        // comptime parameters
+        .{ "w_ct_slice", "comptime_int = 9" },
+        .{ "w_ct_type", "type = u8" },
+        .{ "w_ct_ptr", "u32 = 9" },
+        .{ "w_ct_any", "u32 = 9" },
+        // A pointer to a constant local is passed as an interned value; a constant holding a
+        // pointer to a variable, and `*const` pointers to a variable, still reach the variable
+        .{ "w_const_local", "usize = 3" },
+        .{ "w_ptr_ptr", "u32 = 9" },
+        .{ "w_alias_const", "u32 = 7" },
+        .{ "w_alias_field", "u32 = 7" },
+    });
+}
+
+test "comptime evaluation: std.sort and std.mem.sortUnstable sort in place" {
+    // Prevents leaving the array unsorted when the sort passes its context through anytype;
+    // expected values are the results of zig 0.17.0 and 0.17.1
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\fn lessThan(_: void, x: u32, y: u32) bool {
+        \\    return x < y;
+        \\}
+        \\fn lessThanCt(_: void, x: comptime_int, y: comptime_int) bool {
+        \\    return x < y;
+        \\}
+        \\fn gen(comptime n: usize) [n]u32 {
+        \\    var a: [n]u32 = undefined;
+        \\    var x: u32 = 12345;
+        \\    for (&a) |*e| {
+        \\        x = x *% 1103515245 +% 12345;
+        \\        e.* = x >> 16;
+        \\    }
+        \\    return a;
+        \\}
+        \\const s_insertion = blk: {
+        \\    var a = [_]u32{ 5, 3, 9, 1, 7, 2, 8 };
+        \\    std.sort.insertion(u32, &a, {}, lessThan);
+        \\    break :blk a[0] * 100 + a[3] * 10 + a[6];
+        \\};
+        \\const s_pdq = blk: {
+        \\    var a = [_]u32{ 5, 3, 9, 1, 7, 2, 8 };
+        \\    std.sort.pdq(u32, &a, {}, lessThan);
+        \\    break :blk a[0] * 100 + a[3] * 10 + a[6];
+        \\};
+        \\const s_heap = blk: {
+        \\    var a = [_]u32{ 5, 3, 9, 1, 7, 2, 8 };
+        \\    std.sort.heap(u32, &a, {}, lessThan);
+        \\    break :blk a[0] * 100 + a[3] * 10 + a[6];
+        \\};
+        \\const s_unstable = blk: {
+        \\    var a = [_]u32{ 5, 3, 9, 1, 7, 2, 8 };
+        \\    std.mem.sortUnstable(u32, &a, {}, lessThan);
+        \\    break :blk a[0] * 100 + a[3] * 10 + a[6];
+        \\};
+        \\const s_unstable_ct = blk: {
+        \\    var a = [_]comptime_int{ 3, 1, 2 };
+        \\    std.mem.sortUnstable(comptime_int, &a, {}, lessThanCt);
+        \\    break :blk a[0] * 100 + a[1] * 10 + a[2];
+        \\};
+        \\const s_pdq_sorted = blk: {
+        \\    @setEvalBranchQuota(100_000);
+        \\    var a = gen(100);
+        \\    std.sort.pdq(u32, &a, {}, lessThan);
+        \\    break :blk std.sort.isSorted(u32, &a, {}, lessThan);
+        \\};
+        \\const s_pdq_median = blk: {
+        \\    @setEvalBranchQuota(100_000);
+        \\    var a = gen(100);
+        \\    std.sort.pdq(u32, &a, {}, lessThan);
+        \\    break :blk a[50];
+        \\};
+    , &.{
+        .{ "s_insertion", "u32 = 159" },
+        .{ "s_pdq", "u32 = 159" },
+        .{ "s_heap", "u32 = 159" },
+        .{ "s_unstable", "u32 = 159" },
+        .{ "s_unstable_ct", "comptime_int = 123" },
+        // 100 elements take the partitioning path of pdqsort rather than insertion sort
+        .{ "s_pdq_sorted", "bool = true" },
+        .{ "s_pdq_median", "u32 = 32588" },
+    });
+}
+
 test "comptime evaluation: slices of interpreter storage read elements in place" {
     // Guards against copying the whole range when taking an element or the length of a slice:
     // a loop that slices repeatedly (a common pattern in comptime tokenizers) would allocate in
