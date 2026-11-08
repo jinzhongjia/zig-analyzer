@@ -139,19 +139,36 @@ pub const DeclType = struct {
                 // Parameters with bindings (including anytype and unnamed parameters) in order;
                 // `...` has no binding and can only come last (see `varargs` in ItemTree)
                 var params: std.ArrayList(Index) = .empty;
-                var is_generic = false;
-                for (b.params) |p| {
+                var comptime_bits: u32 = 0;
+                var noalias_bits: u32 = 0;
+                for (b.params, 0..) |p, i| {
                     try params.append(r.arena, res.bindings[@backingInt(p)].ty);
                     const binding = b.binding(p);
-                    if (binding.is_comptime or binding.ty == null) is_generic = true;
+                    const bit = InternPool.FnType.bitOf(i) orelse continue;
+                    if (binding.is_comptime) comptime_bits |= bit;
+                    if (binding.is_noalias) noalias_bits |= bit;
                 }
                 const flags = tree.items[item].flags;
+                // In an instance of the function itself, the parameter and return types are those
+                // of the instance
+                const generic: GenericParts = if (isOwnInstance(ip, key, dk.inst)) .{} else try genericParts(&r, key.file, item, b);
+                var ret = try returnType(&r, key, b, res, dk.inst);
+                // A generic `!T` is still an error union with the inferred error set when `T`
+                // cannot be inferred
+                if (generic.ret and ret == .unknown and flags.inferred_error_set) {
+                    const set = try ip.get(.{ .inferred_error_set = .{ .file = key.file, .decl = key.item, .inst = declaredInst(ip, key, dk.inst) } });
+                    ret = try ip.get(.{ .error_union_type = .{ .err = set, .payload = .unknown } });
+                }
                 const ty = try ip.get(.{ .fn_type = .{
                     .params = params.items,
-                    .ret = try returnType(&r, key, b, res, dk.inst),
+                    .ret = ret,
                     .varargs = flags.varargs,
                     .cc = try fnCallConv(&r, b, res, flags),
-                    .is_generic = is_generic,
+                    .comptime_bits = comptime_bits,
+                    .noalias_bits = noalias_bits,
+                    .generic_bits = generic.params,
+                    .generic_ret = generic.ret,
+                    .is_noinline = flags.is_noinline,
                 } });
                 return .{ .ty = ty, .val = try ip.get(.{ .fn_value = .{ .ty = ty, .file = key.file, .decl = key.item, .inst = dk.inst } }) };
             },
@@ -224,6 +241,65 @@ pub fn returnType(r: *Resolver, owner: hir.OwnerKey, body: *const Body, sig: *co
     return ip.get(.{ .error_union_type = .{ .err = set, .payload = ret } });
 }
 
+/// Whether `inst` is an instance of function `owner` itself with comptime or `anytype`
+/// arguments (see `declaredInst`)
+fn isOwnInstance(ip: *InternPool, owner: hir.OwnerKey, inst: ?Index) bool {
+    const i = switch (ip.key(inst orelse return false)) {
+        .instance => |i| i,
+        else => return false,
+    };
+    if (i.file != owner.file or i.decl != owner.item) return false;
+    for (i.args) |a| if (a != .runtime) return true;
+    return false;
+}
+const GenericParts = struct { params: u32 = 0, ret: bool = false };
+/// Which parameter types, and whether the return type, of the function `item` are generic
+/// (`InternPool.FnType.generic_bits`). As in the compiler (AstGen), a type is generic when the
+/// parameter is `anytype` or its type expression refers to a parameter, directly or from the
+/// members of a container defined in it.
+fn genericParts(r: *Resolver, file: FileId, item: u32, b: *const Body) resolve.Error!GenericParts {
+    var out: GenericParts = .{};
+    // The signature is lowered before the function body: its expressions come first
+    var end: u32 = 0;
+    for (b.params, 0..) |p, i| {
+        const t = b.binding(p).ty orelse {
+            if (InternPool.FnType.bitOf(i)) |bit| out.params |= bit;
+            continue;
+        };
+        end = @max(end, @backingInt(t) + 1);
+    }
+    if (b.type_expr) |t| end = @max(end, @backingInt(t) + 1);
+    for (0..end) |n| {
+        const e: Body.ExprId = @fromBackingInt(@as(u32, @intCast(n)));
+        const refers = switch (b.expr(e)) {
+            .name_ref => |name| !b.nameRefIsBuiltin(e) and if (b.lookup(b.expr_scopes[n], name)) |id| b.binding(id).kind == .param else false,
+            .container => refers: {
+                const ns = try r.containerAt(file, item, b.range(e).start) orelse break :refers false;
+                for (try eval.captures(r, ns)) |cap| {
+                    if (cap.item == item and b.binding(cap.binding).kind == .param) break :refers true;
+                }
+                break :refers false;
+            },
+            else => false,
+        };
+        if (!refers) continue;
+        const at = b.range(e);
+        if (b.type_expr) |t| if (within(at, b.range(t))) {
+            out.ret = true;
+            continue;
+        };
+        for (b.params, 0..) |p, i| {
+            const t = b.binding(p).ty orelse continue;
+            if (!within(at, b.range(t))) continue;
+            if (InternPool.FnType.bitOf(i)) |bit| out.params |= bit;
+            break;
+        }
+    }
+    return out;
+}
+fn within(inner: Body.Range, outer: Body.Range) bool {
+    return outer.start <= inner.start and inner.end <= outer.end;
+}
 /// The instance context of the declaration of a function, given an instance it runs in. A call of
 /// a non-generic function runs in an instance whose arguments are all runtime; it is the function
 /// as declared, so its return type must be the one in the type of the function.

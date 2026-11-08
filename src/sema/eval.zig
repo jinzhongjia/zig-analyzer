@@ -1523,10 +1523,11 @@ const Evaluator = struct {
             },
             .fn_type => |ft| {
                 const params = try ev.a.alloc(Index, ft.params.len);
-                for (ft.params, params) |p, *out| out.* = try ev.evalType(f, p);
+                for (ft.params, params) |p, *out| out.* = if (p.ty) |t| try ev.evalType(f, t) else .unknown;
                 const ret = if (ft.ret) |rt| try ev.evalType(f, rt) else .void_type;
                 const cc: InternPool.CallConv = if (ft.@"callconv") |x| try writtenCallConv(ev.r, f.body, x, try ev.callConvValue(f, x)) else .auto;
-                return Val.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret, .varargs = ft.varargs, .is_generic = ft.is_generic, .cc = cc } }));
+                const bits = fnTypeBits(ft.params);
+                return Val.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret, .varargs = ft.varargs, .cc = cc, .comptime_bits = bits.comptime_bits, .noalias_bits = bits.noalias_bits, .generic_bits = bits.generic_bits } }));
             },
             .@"return" => |x| {
                 ev.jump_value = if (x) |rv| try ev.eval(f, rv, f.ret_type) else Val.void_val;
@@ -4705,18 +4706,36 @@ const Evaluator = struct {
             .fn_type => |ft| blk: {
                 const fn_ty = try ev.member(type_ty, "Fn");
                 const cc = try ev.stdType(&.{ "builtin", "CallingConvention" });
+                // As in the compiler, a function is generic when it has comptime parameters, or
+                // parameter or return types that are generic or comptime-only; generic types are
+                // null. Whether a type that is not fully known is comptime-only is unknown.
+                var is_generic = ft.hasGenericParams() or ft.generic_ret;
+                var undecided = false;
                 const params = try ev.a.alloc(Index, ft.params.len);
-                @memcpy(params, ft.params);
+                for (ft.params, params, 0..) |p, *o, i| {
+                    if (InternPool.FnType.paramBit(ft.generic_bits, i)) {
+                        o.* = .null_value;
+                        continue;
+                    }
+                    o.* = p;
+                    if (is_generic) continue;
+                    if (try isComptimeOnly(ev.r, p)) is_generic = true else if (!value.isConcrete(ip, p)) undecided = true;
+                }
+                if (!is_generic) {
+                    if (try isComptimeOnly(ev.r, ft.ret)) is_generic = true else if (!value.isConcrete(ip, ft.ret)) undecided = true;
+                }
                 const param_attrs = try ev.a.alloc(Index, ft.params.len);
                 const pa_ty = try ev.member(fn_ty, "ParamAttributes");
-                for (param_attrs) |*o| o.* = try ev.structValue(pa_ty, &.{});
+                for (param_attrs, 0..) |*o, i| o.* = try ev.structValue(pa_ty, &.{
+                    .{ "noalias", if (InternPool.FnType.paramBit(ft.noalias_bits, i)) .true_value else .false_value },
+                });
                 break :blk .{ "fn", try ev.structValue(fn_ty, &.{
                     .{ "attrs", try ev.structValue(try ev.member(fn_ty, "Attributes"), &.{
                         .{ "callconv", try ev.callConvInfo(cc, ft.cc) },
                         .{ "varargs", if (ft.varargs) .true_value else .false_value },
                     }) },
-                    .{ "is_generic", if (ft.is_generic) .true_value else .false_value },
-                    .{ "return_type", ft.ret },
+                    .{ "is_generic", if (is_generic) .true_value else if (undecided) .unknown else .false_value },
+                    .{ "return_type", if (ft.generic_ret) .null_value else ft.ret },
                     .{ "param_types", try ev.sliceValue(try ip.optionalOf(.type_type), params) },
                     .{ "param_attrs", try ev.sliceValue(pa_ty, param_attrs) },
                 }) };
@@ -5251,6 +5270,20 @@ pub fn callConv(r: *Resolver, v: ?Index) Error!InternPool.CallConv {
     return if (c_val == val) .c else .{ .other = val };
 }
 
+pub const FnTypeBits = struct { comptime_bits: u32 = 0, noalias_bits: u32 = 0, generic_bits: u32 = 0 };
+/// The parameter attributes of a function type expression (`InternPool.FnType`). Its parameter
+/// types cannot refer to its parameters (their names are not in scope), so only `anytype`
+/// parameters are generic.
+pub fn fnTypeBits(params: []const Body.FnTypeParam) FnTypeBits {
+    var out: FnTypeBits = .{};
+    for (params, 0..) |p, i| {
+        const bit = InternPool.FnType.bitOf(i) orelse continue;
+        if (p.is_comptime) out.comptime_bits |= bit;
+        if (p.is_noalias) out.noalias_bits |= bit;
+        if (p.ty == null) out.generic_bits |= bit;
+    }
+    return out;
+}
 /// Calling convention written as `callconv(e)`, where `e` has the value `v`: `.c` and the tags
 /// without options are known from the syntax
 pub fn writtenCallConv(r: *Resolver, body: *const Body, e: ExprId, v: ?Index) Error!InternPool.CallConv {

@@ -1187,10 +1187,11 @@ const Inferrer = struct {
             },
             .fn_type => |f| {
                 const params = try inf.scratch.alloc(Index, f.params.len);
-                for (f.params, params) |p, *out| out.* = (try inf.infer(p, null)).asType() orelse .unknown;
+                for (f.params, params) |p, *out| out.* = if (p.ty) |t| (try inf.infer(t, null)).asType() orelse .unknown else .unknown;
                 const ret = if (f.ret) |r| (try inf.infer(r, null)).asType() orelse .unknown else .unknown;
                 const cc: InternPool.CallConv = if (f.@"callconv") |x| try eval.writtenCallConv(inf.r, inf.body, x, (try inf.inferComptime(x, try inf.clauseType(.@"callconv"))).val) else .auto;
-                return TypedValue.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret, .varargs = f.varargs, .is_generic = f.is_generic, .cc = cc } }));
+                const bits = eval.fnTypeBits(f.params);
+                return TypedValue.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret, .varargs = f.varargs, .cc = cc, .comptime_bits = bits.comptime_bits, .noalias_bits = bits.noalias_bits, .generic_bits = bits.generic_bits } }));
             },
             .@"return" => |v| {
                 const ret: TypedValue = if (v) |x| try inf.infer(x, inf.ret_type) else .{ .ty = .void_type };
