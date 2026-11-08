@@ -1965,6 +1965,10 @@ const Inferrer = struct {
             const sentinel = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } });
             return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = .u8_type, .size = .slice, .is_const = true, .sentinel = sentinel } }) };
         }
+        // With a result type, the rounding builtins convert to it (see `roundCast`); without one,
+        // they have the type of the operand like the other float math builtins below
+        const rounding = [_][]const u8{ "@floor", "@ceil", "@trunc", "@round" };
+        for (rounding) |n| if (eq(u8, name, n)) if (expected) |want| return inf.roundCast(name, args, want);
         // The result has the type of the first argument (for division and remainder, the
         // peer type of both sides)
         const same = [_][]const u8{ "@abs", "@sqrt", "@sin", "@cos", "@tan", "@exp", "@exp2", "@log", "@log2", "@log10", "@floor", "@ceil", "@trunc", "@round", "@byteSwap", "@bitReverse", "@min", "@max", "@mod", "@rem", "@divExact", "@divFloor", "@divTrunc", "@divCeil" };
@@ -2141,6 +2145,35 @@ const Inferrer = struct {
         }
         const info = value.intInfo(ip, t) orelse return null;
         return try ip.intType(.unsigned, if (info.bits == 0) 0 else std.math.log2_int(u16, info.bits) + 1);
+    }
+
+    /// `@floor` / `@ceil` / `@trunc` / `@round` with the result type `want` (matches the
+    /// compiler's `zirRoundCast`): the call has the result type without its error unions and
+    /// optionals, however deeply nested (`Type.optEuBaseType`), and an unknown result type gives
+    /// an unknown result. The operand must be a float: a float destination takes it coerced to
+    /// the destination before rounding, an integer destination takes it rounded in its own type
+    /// and converted to the integer.
+    fn roundCast(inf: *Inferrer, name: []const u8, args: []const ExprId, want: Index) Error!TypedValue {
+        const ip = inf.ip;
+        if (want == .unknown) return .unknown;
+        var dest = want;
+        while (true) dest = switch (ip.key(dest)) {
+            .optional_type => |child| child,
+            .error_union_type => |eu| eu.payload,
+            else => break,
+        };
+        const result: TypedValue = .{ .ty = dest };
+        if (args.len != 1 or inf.dead > 0 or inf.r.ctx.incomplete()) return result;
+        const operand = inf.get(args[0]);
+        const v = operand.val orelse return result;
+        if (!ip.isFloat(operand.ty)) return result;
+        if (ip.isFloat(dest)) {
+            const x = try value.coerceValue(ip, v, dest) orelse return result;
+            return try eval.builtinValue(inf.r, name, &.{.{ .ty = dest, .val = x }}) orelse result;
+        }
+        if (!ip.isInt(dest)) return result;
+        const rounded = try eval.builtinValue(inf.r, name, &.{operand}) orelse return result;
+        return .{ .ty = dest, .val = try value.coerceValue(ip, rounded.val.?, dest) };
     }
 
     /// Return type of a function (or function pointer); unknown when it depends on the parameters

@@ -7231,6 +7231,11 @@ test "builtin hover combines official documentation and inferred values" {
     const cases = [_]struct { text: []const u8, signature: []const u8, value: ?[]const u8 }{
         .{ .text = "const n = @si<|>zeOf(u32);", .signature = "@sizeOf(comptime T: type) comptime_int", .value = "comptime_int = 4" },
         .{ .text = "const n = @a<|>s(u32, 1);", .signature = "@as(comptime T: type, expression) T", .value = "u32 = 1" },
+        // A rounding builtin has its result type; the call itself is the payload of the optionals,
+        // however deeply they are nested
+        .{ .text = "fn f(x: f32) u32 { return @ro<|>und(x); }", .signature = "@round(value: anytype) @TypeOf(value)", .value = "Inferred result:\n\n```zig\nu32\n```" },
+        .{ .text = "fn f() void { const o: ?u8 = @ce<|>il(@as(f64, 2.25)); _ = o; }", .signature = "@ceil(value: anytype) @TypeOf(value)", .value = "Inferred result:\n\n```zig\nu8 = 3\n```" },
+        .{ .text = "fn f() void { const o: ??u8 = @ce<|>il(@as(f32, 1.5)); _ = o; }", .signature = "@ceil(value: anytype) @TypeOf(value)", .value = "Inferred result:\n\n```zig\nu8 = 2\n```" },
         .{ .text = "@si<|>zeOf", .signature = "@sizeOf(comptime T: type) comptime_int", .value = null },
         .{ .text = "const n = @si<|>zeOf(", .signature = "@sizeOf(comptime T: type) comptime_int", .value = null },
     };
