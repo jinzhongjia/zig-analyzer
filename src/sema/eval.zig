@@ -1088,6 +1088,7 @@ const Evaluator = struct {
             .window = if (b.window) |w| .{ .start = w.start, .len = w.len } else null,
             .is_const = true,
             .as_array = b.as_array,
+            .immutable = decl.immutable,
         };
     }
 
@@ -3156,7 +3157,10 @@ const Evaluator = struct {
 
     /// The storage of container-level declaration `item` (in instance context `inst`): one cell
     /// per declaration in this evaluation, holding its value. Not a place when the declaration
-    /// is not a constant, variable or function.
+    /// is not a constant, variable or function. The cell never changes (`store` aborts on it), and
+    /// its value is interned, so it holds no pointer to storage that can change: as in the
+    /// compiler (`Value.canMutateComptimeVarState` of a `nav` pointer), a call passed a pointer
+    /// into it may be memoized.
     fn declPlace(ev: *Evaluator, file: FileId, item: u32, inst: ?Index) EvalError!Ref {
         const it = (try ev.r.itemTree(file)).items[item];
         switch (it.kind) {
