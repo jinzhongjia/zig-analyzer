@@ -1366,6 +1366,124 @@ test "instances of the same container compare by their captured values" {
     });
 }
 
+test "containers in a type function capture the values its body computed" {
+    // Prevents members from seeing only a re-inference of a captured constant's initializer,
+    // which has no value for local arrays and for values derived from local variables
+    try expectTypes(
+        \\fn LocalArray(comptime n: comptime_int) type {
+        \\    const arr = [_]comptime_int{ n, 2 };
+        \\    const min = arr[0];
+        \\    return struct { pub const v: comptime_int = min; };
+        \\}
+        \\fn ArrayDirect(comptime n: comptime_int) type {
+        \\    const arr = [_]comptime_int{ n, 2 };
+        \\    return struct { pub const v: comptime_int = arr[0]; };
+        \\}
+        \\fn VarOnly(comptime n: comptime_int) type {
+        \\    var x = n;
+        \\    _ = &x;
+        \\    const y = x;
+        \\    return struct { pub const v: comptime_int = y; };
+        \\}
+        \\fn VarModified(comptime n: comptime_int) type {
+        \\    var x = n;
+        \\    x += 1;
+        \\    const y = x;
+        \\    return struct { pub const v: comptime_int = y; };
+        \\}
+        \\fn Branch(comptime b: bool) type {
+        \\    var x: u32 = 1;
+        \\    if (b) x = 10;
+        \\    const y = x;
+        \\    return struct { pub const v = y; };
+        \\}
+        \\fn Loop(comptime n: u32) type {
+        \\    var sum: u32 = 0;
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) sum += i;
+        \\    const total = sum;
+        \\    return struct { pub const v = total; };
+        \\}
+        \\fn Destructure(comptime n: comptime_int) type {
+        \\    var x = n;
+        \\    x += 1;
+        \\    const a, const b = .{ x, x * 2 };
+        \\    return struct { pub const v: comptime_int = a + b; };
+        \\}
+        \\fn Nested(comptime n: comptime_int) type {
+        \\    var x = n;
+        \\    x *= 3;
+        \\    const y = x;
+        \\    return struct {
+        \\        pub fn Inner() type {
+        \\            return struct { pub const w: comptime_int = y; };
+        \\        }
+        \\    };
+        \\}
+        \\fn ReadBeforeReturn(comptime n: comptime_int) type {
+        \\    var x = n;
+        \\    x += 1;
+        \\    const y = x;
+        \\    const S = struct { pub const v: comptime_int = y; };
+        \\    if (S.v != n + 1) @compileError("unreachable");
+        \\    return S;
+        \\}
+        \\fn OutsideLoop(comptime n: comptime_int) type {
+        \\    var x = n;
+        \\    x += 1;
+        \\    const y = x;
+        \\    var T: type = void;
+        \\    inline for (0..2) |_| T = struct { pub const v: comptime_int = y; };
+        \\    return T;
+        \\}
+        \\fn PerIteration(comptime n: comptime_int) type {
+        \\    var T: type = void;
+        \\    for (0..n) |i| {
+        \\        const k = i * 2;
+        \\        T = struct { pub const v = k; };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn AnyCapture(x: anytype) type {
+        \\    const y = x;
+        \\    return struct { pub const v = y; };
+        \\}
+        \\fn g() void {
+        \\    const local_array = LocalArray(7).v;
+        \\    const array_direct = ArrayDirect(9).v;
+        \\    const var_only = VarOnly(4).v;
+        \\    const var_modified = VarModified(4).v;
+        \\    const branch_true = Branch(true).v;
+        \\    const branch_false = Branch(false).v;
+        \\    const loop = Loop(5).v;
+        \\    const destructure = Destructure(1).v;
+        \\    const nested = Nested(2).Inner().w;
+        \\    const read_before_return = ReadBeforeReturn(6).v;
+        \\    const outside_loop = OutsideLoop(1).v;
+        \\    const per_iteration = PerIteration(3).v;
+        \\    const any_capture = AnyCapture(@as(u8, 3)).v;
+        \\    _ = .{ local_array, array_direct, var_only, var_modified, branch_true, branch_false, loop, destructure, nested, read_before_return, outside_loop, per_iteration, any_capture };
+        \\}
+    , &.{
+        .{ "local_array", "comptime_int = 7" },
+        .{ "array_direct", "comptime_int = 9" },
+        .{ "var_only", "comptime_int = 4" },
+        .{ "var_modified", "comptime_int = 5" },
+        .{ "branch_true", "u32 = 10" },
+        .{ "branch_false", "u32 = 1" },
+        .{ "loop", "u32 = 10" },
+        .{ "destructure", "comptime_int = 6" },
+        .{ "nested", "comptime_int = 6" },
+        .{ "read_before_return", "comptime_int = 7" },
+        .{ "outside_loop", "comptime_int = 2" },
+        // A constant in a loop body has a value per iteration, while the containers of all
+        // iterations share one instance (the compiler gives 4)
+        .{ "per_iteration", "usize" },
+        // The instance records only the type of an anytype argument (the compiler gives 3)
+        .{ "any_capture", "u8" },
+    });
+}
+
 test "inferred error sets from function bodies" {
     try expectTypes(
         \\fn wrap(x: anytype) !@TypeOf(x) { return x; }
@@ -3950,6 +4068,40 @@ test "type reflection and reification" {
         // Matches the compiler: comptime-known fields in a literal are comptime fields
         .{ "tuple", "struct { comptime u8 = 1, comptime bool = true } = .{ 1, true }" },
         .{ "first", "u8 = 1" },
+    });
+}
+
+test "containers in a type function capture locals derived from @typeInfo arrays" {
+    // The shapes of std.enums.EnumIndexer without its sort: a local copy of the field values
+    // and constants indexed out of it
+    try expectStdTypes(
+        \\const Color = enum { red, green, blue };
+        \\fn ConstCapture(comptime E: type) type {
+        \\    const fields_len = @typeInfo(E).@"enum".field_names.len;
+        \\    const field_values = @typeInfo(E).@"enum".field_values[0..fields_len].*;
+        \\    const min = field_values[0];
+        \\    return struct {
+        \\        pub const count: comptime_int = min + fields_len;
+        \\        pub fn indexOf(e: E) usize {
+        \\            return @as(usize, @intCast(@backingInt(e) - min));
+        \\        }
+        \\    };
+        \\}
+        \\fn SliceIndex(comptime E: type) type {
+        \\    const fv = @typeInfo(E).@"enum".field_values;
+        \\    const second = fv[1];
+        \\    return struct { pub const v: comptime_int = second; };
+        \\}
+        \\fn g() void {
+        \\    const indexer_count = ConstCapture(Color).count;
+        \\    const index = comptime ConstCapture(Color).indexOf(.blue);
+        \\    const slice_index = SliceIndex(Color).v;
+        \\    _ = .{ indexer_count, index, slice_index };
+        \\}
+    , &.{
+        .{ "indexer_count", "comptime_int = 3" },
+        .{ "index", "usize = 2" },
+        .{ "slice_index", "comptime_int = 1" },
     });
 }
 
