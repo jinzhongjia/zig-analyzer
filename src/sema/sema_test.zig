@@ -6459,6 +6459,91 @@ test "function pointers are runtime values, not comptime-only" {
     });
 }
 
+test "cast destination types at comptime: the result type without its error union and optional" {
+    // A cast converted to a result type such as `?u8` itself (`return @intCast(x);` in a function
+    // returning `?u8`) and had no value.
+    try expectTypes(
+        \\const Color = enum { red, green, blue };
+        \\fn optIntCast(x: u32) ?u8 { return @intCast(x); }
+        \\fn optTruncate(x: u32) ?u8 { return @truncate(x); }
+        \\fn optEnumFromInt(x: u32) ?Color { return @enumFromInt(x); }
+        \\fn euFloatFromInt(x: u32) error{Bad}!f32 { return @floatFromInt(x); }
+        \\fn optBitCast(x: i8) ?u8 { return @bitCast(x); }
+        \\fn euOptIntCast(x: u32) error{Bad}!?u8 { return @intCast(x); }
+        \\fn optFloatCast(x: f64) ?f32 { return @floatCast(x); }
+        \\fn euIntFromFloat(x: f32) error{Bad}!i32 { return @intFromFloat(x); }
+        \\fn optBitCastFloat(x: u32) ?f32 { return @bitCast(x); }
+        \\fn optEuIntCast(x: u32) ?(error{Bad}!u8) { return @intCast(x); }
+        \\const opt_intcast = optIntCast(7);
+        \\const opt_truncate = optTruncate(0x105);
+        \\const opt_enumfromint = optEnumFromInt(2);
+        \\const eu_floatfromint = euFloatFromInt(3) catch unreachable;
+        \\const opt_bitcast = optBitCast(-1);
+        \\const eu_opt_intcast = euOptIntCast(9) catch unreachable;
+        \\const opt_floatcast = optFloatCast(1.5);
+        \\const eu_intfromfloat = euIntFromFloat(-2.75) catch unreachable;
+        \\const opt_bitcast_float = optBitCastFloat(0x3f800000);
+        \\const opt_eu_intcast = optEuIntCast(6);
+        \\const local_opt: ?u8 = @intCast(@as(u32, 200));
+        \\const local_eu: error{X}!u16 = @truncate(@as(u32, 0x10002));
+    , &.{
+        .{ "opt_intcast", "?u8 = 7" },
+        .{ "opt_truncate", "?u8 = 5" },
+        .{ "opt_enumfromint", "?Color = .blue" },
+        .{ "eu_floatfromint", "f32 = 3" },
+        .{ "opt_bitcast", "?u8 = 255" },
+        // The error union is stripped first, then the optional
+        .{ "eu_opt_intcast", "?u8 = 9" },
+        .{ "opt_floatcast", "?f32 = 1.5" },
+        .{ "eu_intfromfloat", "i32 = -2" },
+        .{ "opt_bitcast_float", "?f32 = 1" },
+        // Only the optional around the error union is stripped: casting to `error{Bad}!u8` is a
+        // compile error
+        .{ "opt_eu_intcast", "?error{Bad}!u8" },
+        .{ "local_opt", "?u8 = 200" },
+        .{ "local_eu", "error{X}!u16 = 2" },
+    });
+}
+
+test "cast destination types at comptime: pointer casts strip only the error union, @errorCast only the optional, @splat both" {
+    try expectTypes(
+        \\const zero: u8 = 0;
+        \\const erased: *const anyopaque = @ptrCast(&zero);
+        \\fn euPtrCast() error{Bad}!*const u8 { return @ptrCast(erased); }
+        \\fn euOptPtrCast(p: ?*const anyopaque) error{Bad}!?*const u8 { return @ptrCast(@alignCast(p)); }
+        \\fn euAlignCast(p: *align(1) const u8) error{Bad}!*const u8 { return @alignCast(p); }
+        \\const E = error{ A, B };
+        \\fn optErrorCast(e: anyerror) ?E { return @errorCast(e); }
+        \\fn narrow(x: anyerror!u8) error{A}!u8 { return @errorCast(x); }
+        \\fn optSplat(x: u8) ?@Vector(2, u8) { return @splat(x); }
+        \\fn euSplat(x: u8) error{Bad}![3]u8 { return @splat(x); }
+        \\const eu_ptr = euPtrCast();
+        \\const eu_ptr_load = (euPtrCast() catch unreachable).*;
+        \\const eu_opt_ptr = euOptPtrCast(erased);
+        \\const eu_opt_ptr_null = euOptPtrCast(null);
+        \\const eu_align = (euAlignCast(&zero) catch unreachable).*;
+        \\const opt_error = optErrorCast(error.A);
+        \\const eu_error = narrow(5);
+        \\const eu_error_err = narrow(error.A);
+        \\const opt_splat = optSplat(4);
+        \\const eu_splat = euSplat(5);
+    , &.{
+        .{ "eu_ptr", "error{Bad}!*const u8 = &0" },
+        .{ "eu_ptr_load", "u8 = 0" },
+        // The optional pointer stays the destination type
+        .{ "eu_opt_ptr", "error{Bad}!?*const u8 = &0" },
+        .{ "eu_opt_ptr_null", "error{Bad}!?*const u8 = null" },
+        .{ "eu_align", "u8 = 0" },
+        .{ "opt_error", "?error{A,B} = error.A" },
+        // The error union stays the destination type
+        .{ "eu_error", "error{A}!u8 = 5" },
+        .{ "eu_error_err", "error{A}!u8 = error.A" },
+        // `@splat` strips the error union and the optional
+        .{ "opt_splat", "?@Vector(2, u8) = .{ 4, 4 }" },
+        .{ "eu_splat", "error{Bad}![3]u8 = .{ 5, 5, 5 }" },
+    });
+}
+
 test "comptime evaluation of integer builtins, @memset, @memmove and @call" {
     try expectTypes(
         \\const ov = @addWithOverflow(@as(u8, 250), 10);
