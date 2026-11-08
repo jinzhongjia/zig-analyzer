@@ -2593,7 +2593,8 @@ const Evaluator = struct {
         switch (op) {
             .bang => return boolVal(!(try ev.condition(try ev.eval(f, operand_e, .bool_type))).yes),
             .minus, .minus_percent, .tilde => {
-                const v = try ev.eval(f, operand_e, if (f.body.expr(operand_e) == .literal) null else want);
+                // Matches the compiler: the operand has no result type
+                const v = try ev.eval(f, operand_e, null);
                 if (op == .minus and ip.isFloat(v.ty)) {
                     const x = ev.floatOf(v) orelse return error.Abort;
                     return Val.of(v.ty, try value.floatValue(ip, v.ty, -x) orelse return error.Abort);

@@ -3073,9 +3073,9 @@ const Inferrer = struct {
                 return .{ .ty = ty };
             },
             .minus, .minus_percent, .tilde => {
-                // Number literals are computed as comptime_int first, and the result is then
-                // converted to the expected type (`const x: i8 = -128`)
-                const v = try inf.infer(operand_e, if (inf.body.expr(operand_e) == .literal) null else expected);
+                // Matches the compiler: the operand has no result type, and the result is then
+                // converted to the expected type (`const x: i8 = -128`, `@as(i8, -(1 << 7))`)
+                const v = try inf.infer(operand_e, null);
                 if (op == .minus and ip.isFloat(v.ty)) {
                     const x = value.floatOf(ip, v.val) orelse return .{ .ty = v.ty };
                     return .{ .ty = v.ty, .val = try value.floatValue(ip, v.ty, -x) };
