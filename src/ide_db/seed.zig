@@ -806,7 +806,7 @@ const Closure = struct {
             .union_value => |u| (try c.reaches(u.ty)) or try c.reaches(u.payload),
             .ptr_value => |p| (try c.reaches(p.ty)) or try c.reaches(p.pointee),
             .instance => |i| blk: {
-                if (try c.anyReaches(i.args, &.{})) break :blk true;
+                if (try c.anyReaches(i.args, i.arg_types)) break :blk true;
                 break :blk if (i.parent) |p| try c.reaches(p) else false;
             },
         };
@@ -965,7 +965,7 @@ fn depthExceeds(ip: *InternPool, x: Index, limit: u32) bool {
         .aggregate => |a| anyExceeds(ip, a.elems, sub),
         .ptr_value => |p| depthExceeds(ip, p.pointee, sub),
         .union_value => |u| depthExceeds(ip, u.payload, sub),
-        .instance => |i| anyExceeds(ip, i.args, sub) or (if (i.parent) |p| depthExceeds(ip, p, sub) else false),
+        .instance => |i| anyExceeds(ip, i.args, sub) or anyExceeds(ip, i.arg_types, sub) or (if (i.parent) |p| depthExceeds(ip, p, sub) else false),
         else => false,
     };
 }

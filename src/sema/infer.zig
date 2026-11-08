@@ -222,7 +222,7 @@ pub fn runLocal(ctx: *Db.Ctx, owner: hir.OwnerKey, target_ref: @FieldType(querie
     @memset(inf.members, null);
     if (tree.items[item].kind == .@"fn") {
         const own = inf.ownInstance();
-        for (body.params, 0..) |p, i| inf.bindings[@backingInt(p)] = try inf.paramValue(p, if (own) |o| (if (i < o.args.len) o.args[i] else .unknown) else null);
+        for (body.params, 0..) |p, i| inf.bindings[@backingInt(p)] = try inf.paramValue(p, own, i);
     }
     const binding = switch (target_ref) {
         .binding => |id| id,
@@ -359,7 +359,7 @@ const Inferrer = struct {
         switch (kind) {
             .@"fn" => {
                 const own = inf.ownInstance();
-                for (b.params, 0..) |p, i| inf.bindings[@backingInt(p)] = try inf.paramValue(p, if (own) |o| (if (i < o.args.len) o.args[i] else .unknown) else null);
+                for (b.params, 0..) |p, i| inf.bindings[@backingInt(p)] = try inf.paramValue(p, own, i);
                 if (b.type_expr) |t| inf.ret_type = (try inf.inferComptime(t, null)).asType();
                 // The calling convention belongs to the signature: the function type reads it
                 for (b.clauses) |c| if (c.kind == .@"callconv") {
@@ -487,18 +487,26 @@ const Inferrer = struct {
         return if (key.decl == tree.items[inf.item].ast_id) key else null;
     }
 
-    /// Value of a parameter: in an instance, a comptime parameter takes the argument value
-    /// (coerced to the parameter type), a comptime anytype parameter takes the argument value, and
-    /// an anytype parameter takes the type of the argument;
+    /// Value of the `i`-th parameter `p` in the function's own instance `own`: in an instance, a
+    /// comptime parameter takes the argument value (coerced to the parameter type), a comptime
+    /// anytype parameter takes the argument value and the argument type the instance records
+    /// (`InternPool.Instance.arg_types`), and an anytype parameter takes the type of the argument;
     /// without a concrete argument, a type parameter (`comptime T: type`, or `T: type` without
     /// comptime) is an abstract parameter
-    fn paramValue(inf: *Inferrer, p: Body.BindingId, arg: ?Index) Error!TypedValue {
+    fn paramValue(inf: *Inferrer, p: Body.BindingId, own: ?InternPool.Instance, i: usize) Error!TypedValue {
+        const arg: ?Index = if (own) |o| (if (i < o.args.len) o.args[i] else .unknown) else null;
         const binding = inf.body.binding(p);
         const ty_e = binding.ty orelse {
             const a = arg orelse return .unknown;
+            if (binding.is_comptime) {
+                // The value does not always give back the argument type (a non-null optional is
+                // its payload): without a recorded type the parameter is unknown
+                const t = own.?.argType(i);
+                if (t == .unknown) return .unknown;
+                return .{ .ty = t, .val = if (a == .unknown or a == .runtime) null else a };
+            }
             if (a == .runtime or a == .unknown) return .unknown;
-            // comptime anytype: the instance records the argument value; anytype: the argument type
-            if (binding.is_comptime) return .{ .ty = value.typeOfValue(inf.ip, a), .val = a };
+            // anytype: the instance records the argument type
             return .{ .ty = a, .val = try value.comptimeFieldsValue(inf.ip, inf.scratch, a) };
         };
         const ty: Index = (try inf.inferComptime(ty_e, null)).asType() orelse .unknown;
@@ -4420,8 +4428,8 @@ fn literalFieldValue(ip: *InternPool, t: Index, name: []const u8) ?Index {
     return if (v == .runtime or v == .unknown) null else v;
 }
 
-/// `comptime_anytype` (`comptime x: anytype`) records the argument value in the instance, and
-/// the parameter type is given by the value; `anytype_type` records the argument type
+/// `comptime_anytype` (`comptime x: anytype`) records the argument value in the instance, and its
+/// type in `InternPool.Instance.arg_types`; `anytype_type` records the argument type
 pub const ParamKind = enum { runtime, comptime_value, comptime_anytype, anytype_type };
 
 /// A callee that needs instantiation: it has comptime parameters (including implicit ones of
@@ -4473,13 +4481,22 @@ pub fn genericCallee(r: *Resolver, scratch: Allocator, callee: TypedValue, f: Fn
 pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args: []const TypedValue) Error!Index {
     const ip = r.ctx.db.env.ip;
     const inst_args = try scratch.alloc(Index, g.body.params.len);
+    const arg_types: []Index = for (g.kinds) |k| {
+        if (k == .comptime_anytype) break try scratch.alloc(Index, inst_args.len);
+    } else &.{};
+    @memset(arg_types, .runtime);
     var dependent = false;
     for (inst_args, 0..) |*out, i| {
         const tv: TypedValue = if (i < args.len) args[i] else .unknown;
         switch (g.kinds[i]) {
             .runtime => out.* = .runtime,
             .anytype_type => out.* = tv.ty,
-            .comptime_anytype => out.* = tv.val orelse .unknown,
+            // As in the compiler, the argument is a value of its type: values of different types
+            // can have the same representation (`@as(?u8, 3)` and `@as(u8, 3)`)
+            .comptime_anytype => {
+                out.* = tv.val orelse .unknown;
+                arg_types[i] = tv.ty;
+            },
             .comptime_value => {
                 out.* = tv.val orelse .unknown;
                 if (out.* == .unknown) continue;
@@ -4490,7 +4507,7 @@ pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args:
             },
         }
     }
-    var inst = try ip.get(.{ .instance = .{ .file = g.owner.file, .decl = g.owner.item, .args = inst_args, .parent = g.parent } });
+    var inst = try ip.get(.{ .instance = .{ .file = g.owner.file, .decl = g.owner.item, .args = inst_args, .arg_types = arg_types, .parent = g.parent } });
     if (!dependent) return inst;
     const sig = try r.ctx.get(queries.Infer, .{ .owner = g.owner, .mode = .signature, .inst = inst });
     var changed = false;
@@ -4503,7 +4520,7 @@ pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args:
             changed = true;
         }
     }
-    if (changed) inst = try ip.get(.{ .instance = .{ .file = g.owner.file, .decl = g.owner.item, .args = inst_args, .parent = g.parent } });
+    if (changed) inst = try ip.get(.{ .instance = .{ .file = g.owner.file, .decl = g.owner.item, .args = inst_args, .arg_types = arg_types, .parent = g.parent } });
     return inst;
 }
 

@@ -203,6 +203,7 @@ Bidirectional inference mirrors Zig's result type semantics, with peer type reso
 - As in the compiler, a branch whose condition or `switch` operand is comptime-known gives the type and value of the branch that executes, and the other branches are inactive. `switch` items are coerced to the operand type (the tag type for a tagged union); a scalar item matches by value and a range `a...b` by both bounds inclusive.
 - The capture of an `inline` prong on a tagged union is inferred per payload, like a loop over types.
 - `@tagName` and `@errorName` of a comptime-known operand are string literals `*const [N:0]u8`, as in the compiler (`Sema.zirTagName`); when inference has no value for the operand (a tagged union literal, `@enumFromInt`, a call in a container-level initializer), the interpreter evaluates the name, and the type is `unknown` when it cannot. Only a runtime operand gives `[:0]const u8`.
+- A `comptime x: anytype` parameter takes the type of the argument, which the instance records with the value, as the compiler records the argument as a value of its type: arguments of different types are different instances even when their values have the same representation (`@as(?u8, 3)` and `@as(u8, 3)`, `null` of different optional types), and a parameter whose argument type is not known is `unknown`.
 
 ### `.zon` files
 

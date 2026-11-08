@@ -983,6 +983,7 @@ pub fn isPrecise(ip: *InternPool, v: Index) bool {
         .enum_tag => |t| isPrecise(ip, t.ty),
         .instance => |i| blk: {
             for (i.args) |a| if (!isPrecise(ip, a)) break :blk false;
+            if (!allPrecise(ip, i.arg_types)) break :blk false;
             break :blk i.parent == null or isPrecise(ip, i.parent.?);
         },
         else => true,
@@ -1030,6 +1031,7 @@ fn concrete(ip: *InternPool, t: Index, unknown_len: bool) bool {
         .instance => |i| blk: {
             if (i.iteration) |it| if (it.index == InternPool.Instance.Iteration.unknown_index) break :blk false;
             for (i.args) |a| if (a != .runtime and !concrete(ip, a, unknown_len)) break :blk false;
+            if (!allConcrete(ip, i.arg_types, unknown_len)) break :blk false;
             break :blk i.parent == null or concrete(ip, i.parent.?, unknown_len);
         },
         else => true,

@@ -533,7 +533,9 @@ fn abortToNull(err: EvalError) Error!?TypedValue {
 /// Whether two values are equal: beyond `value.eqlValues`, two containers at the same location
 /// in different instances are compared by the values they capture (in Zig the identity of a
 /// container = definition location + captured values: a container that captures no arguments
-/// is the same type across instances)
+/// is the same type across instances). Captured values are compared as the compiler interns
+/// them: values of different types are different captures even when `==` holds for them
+/// (`@as(u8, 3)` and `@as(u16, 3)`).
 pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
     const ip = r.ctx.db.env.ip;
     if (value.eqlValues(ip, a, b)) |eq| return eq;
@@ -552,13 +554,14 @@ pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
     var unknown = false;
     for (try captures(r, ns)) |cap| {
         const def: resolve.Def = .{ .local = .{ .file = ns.file, .item = cap.item, .binding = cap.binding } };
-        const va = (try queries.defType(r, def, null, ia)).val orelse return null;
-        const vb = (try queries.defType(r, def, null, ib)).val orelse return null;
-        const eq = value.eqlValues(ip, va, vb) orelse {
-            unknown = true;
-            continue;
-        };
-        if (!eq) return false;
+        const ta = try queries.defType(r, def, null, ia);
+        const tb = try queries.defType(r, def, null, ib);
+        const va = ta.val orelse return null;
+        const vb = tb.val orelse return null;
+        const same_value = value.eqlValues(ip, va, vb);
+        const same_type = value.eqlTypes(ip, ta.ty, tb.ty);
+        if (same_value == false or same_type == false) return false;
+        if (same_value == null or same_type == null) unknown = true;
     }
     return if (unknown) null else true;
 }
@@ -1992,7 +1995,8 @@ const Evaluator = struct {
         const item = try ev.itemIndex(owner) orelse return error.Abort;
         const body = try ev.r.ctx.get(hir.ItemBody, owner);
         const sig = try ev.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .signature, .inst = inst });
-        const inst_args = ip.key(inst).instance.args;
+        const inst_key = ip.key(inst).instance;
+        const inst_args = inst_key.args;
         var frame = try ev.newFrame(owner.file, item, body, inst);
         if (ev.stop) |s| if (s.frame == null) {
             s.frame = &frame;
@@ -2000,12 +2004,23 @@ const Evaluator = struct {
         for (body.params, 0..) |p, i| {
             const arg: Val = if (i < args.len) args[i] else .unknown;
             // The type of an anytype parameter is the type of the argument (also what the instance
-            // records; for comptime anytype the instance records the argument's value)
+            // records; for comptime anytype the instance records the argument's value, and its
+            // type in `arg_types`)
             const binding = body.binding(p);
+            const comptime_anytype = binding.ty == null and binding.is_comptime;
             const recorded = i < inst_args.len and inst_args[i] != .unknown and inst_args[i] != .runtime;
-            const ty: Index = if (binding.ty == null)
-                (if (!recorded) arg.ty else if (binding.is_comptime) value.typeOfValue(ip, inst_args[i]) else inst_args[i])
+            const ty: Index = if (comptime_anytype)
+                inst_key.argType(i)
+            else if (binding.ty == null)
+                (if (!recorded) arg.ty else inst_args[i])
             else if (@backingInt(p) < sig.bindings.len) sig.bindings[@backingInt(p)].ty else .unknown;
+            // The type of a `CallEval` argument is taken from its value, which does not always give
+            // back the argument type (a non-null optional is its payload): without a recorded type
+            // the parameter is unknown
+            if (comptime_anytype and ty == .unknown) {
+                frame.slots[@backingInt(p)] = .unknown;
+                continue;
+            }
             frame.slots[@backingInt(p)] = try ev.copy(try ev.coerce(.{ .ty = if (arg.ty == .unknown) ty else arg.ty, .v = arg.v }, if (ty != .unknown) ty else null));
         }
         frame.ret_type = try queries.returnType(ev.r, owner, body, sig, inst);
