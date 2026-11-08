@@ -9218,6 +9218,104 @@ test "comptime evaluation: anytype and comptime parameters write through pointer
     });
 }
 
+test "comptime evaluation: writes through pointers next to anytype arguments recorded by value" {
+    // Prevents the arguments of comptime-only types, which the instance records by value, from
+    // making a call that writes through a pointer argument reuse an earlier result; expected
+    // values are the results of zig 0.17.0 and 0.17.1
+    try expectTypes(
+        \\fn incAny(p: anytype) void {
+        \\    p.* += 1;
+        \\}
+        \\fn setTypeAny(p: anytype) void {
+        \\    p.* = u16;
+        \\}
+        \\fn addN(p: anytype, n: anytype) void {
+        \\    p.* += n;
+        \\}
+        \\fn incTuple(t: anytype) void {
+        \\    t[0].* += 1;
+        \\}
+        \\fn setTo(p: anytype, v: anytype) void {
+        \\    p.* = v;
+        \\}
+        \\fn retAny(p: anytype, n: anytype) @TypeOf(p) {
+        \\    p.* += n;
+        \\    return p;
+        \\}
+        \\const w_ct_int = blk: {
+        \\    var x: comptime_int = 1;
+        \\    incAny(&x);
+        \\    incAny(&x);
+        \\    break :blk x;
+        \\};
+        \\const w_type = blk: {
+        \\    var t: type = u8;
+        \\    setTypeAny(&t);
+        \\    break :blk t;
+        \\};
+        \\const w_mixed = blk: {
+        \\    var x: u32 = 1;
+        \\    addN(&x, 2);
+        \\    addN(&x, 3);
+        \\    break :blk x;
+        \\};
+        \\const w_mixed_ct = blk: {
+        \\    var x: comptime_int = 1;
+        \\    addN(&x, 2);
+        \\    addN(&x, 3);
+        \\    break :blk x;
+        \\};
+        \\const w_same_twice = blk: {
+        \\    var x: comptime_int = 10;
+        \\    addN(&x, 5);
+        \\    addN(&x, 5);
+        \\    break :blk x;
+        \\};
+        \\const w_tuple = blk: {
+        \\    var x: comptime_int = 1;
+        \\    incTuple(.{&x});
+        \\    incTuple(.{&x});
+        \\    break :blk x;
+        \\};
+        \\const w_set_type = blk: {
+        \\    var x: type = void;
+        \\    setTo(&x, [2]u8);
+        \\    break :blk x;
+        \\};
+        \\const w_set_int = blk: {
+        \\    var x: comptime_int = 0;
+        \\    setTo(&x, 7);
+        \\    setTo(&x, 8);
+        \\    break :blk x;
+        \\};
+        \\const w_ret = blk: {
+        \\    var x: comptime_int = 1;
+        \\    const q = retAny(&x, 4);
+        \\    q.* += 10;
+        \\    break :blk x;
+        \\};
+        \\const w_loop = blk: {
+        \\    var x: comptime_int = 0;
+        \\    for (0..4) |i| addN(&x, i + 1);
+        \\    break :blk x;
+        \\};
+    , &.{
+        // Pointers to variables of comptime-only types, directly and inside a tuple
+        .{ "w_ct_int", "comptime_int = 3" },
+        .{ "w_type", "type = u16" },
+        .{ "w_tuple", "comptime_int = 3" },
+        // A pointer next to a comptime_int or type argument, with different and equal values
+        .{ "w_mixed", "u32 = 6" },
+        .{ "w_mixed_ct", "comptime_int = 6" },
+        .{ "w_same_twice", "comptime_int = 20" },
+        .{ "w_set_type", "type = [2]u8" },
+        .{ "w_set_int", "comptime_int = 8" },
+        // A returned pointer, and a comptime_int argument that changes per iteration
+        .{ "w_ret", "comptime_int = 15" },
+        .{ "w_loop", "comptime_int = 10" },
+    });
+}
+
 test "comptime evaluation: std.sort and std.mem.sortUnstable sort in place" {
     // Prevents leaving the array unsorted when the sort passes its context through anytype;
     // expected values are the results of zig 0.17.0 and 0.17.1
