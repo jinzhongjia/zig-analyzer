@@ -4662,6 +4662,49 @@ test "publishFiles: requests for a file being published coalesce into one more r
     try std.testing.expectEqual(0, server.publish_files.count());
 }
 
+// Prevents a publish from giving up after a fixed number of attempts interrupted by write
+// transactions: the clearing of a file deleted on disk and closed was lost, and its compile errors
+// stayed published
+test "publishFiles: a publish interrupted by write transactions again and again still sends its result" {
+    const gpa = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, gpa, &writer);
+    defer server.deinit();
+    const native = @import("../util/test_path.zig").native;
+    const file = try server.vfs.intern(native("/tmp/zig-analyzer-publish-interrupted.zig"));
+    {
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        try server.db.set(FileText, file, try gpa.dupe(u8, "fn f() void {\n    var x = 1;\n}\n"), .low);
+    }
+    server.publishFiles(&.{file}, true);
+    // Write transactions follow each other for a while, canceling the reads the publish begins
+    // meanwhile
+    const t0 = Io.Clock.awake.now(server.io);
+    var writes: usize = 0;
+    while (writes < 1000 or t0.durationTo(Io.Clock.awake.now(server.io)).nanoseconds < 200 * std.time.ns_per_ms) : (writes += 1) {
+        server.db.beginWrite();
+        server.db.endWrite();
+    }
+    server.waitIdle();
+    var reader: Io.Reader = .fixed(out.written());
+    var diagnostics: std.ArrayList(usize) = .empty;
+    defer diagnostics.deinit(gpa);
+    while (transport.readMessage(&reader, gpa)) |body| {
+        defer gpa.free(body);
+        const msg = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+        defer msg.deinit();
+        const method = msg.value.object.get("method") orelse continue;
+        if (!std.mem.eql(u8, method.string, "textDocument/publishDiagnostics")) continue;
+        try diagnostics.append(gpa, msg.value.object.get("params").?.object.get("diagnostics").?.array.items.len);
+    } else |err| if (err != error.EndOfStream) return err;
+    try std.testing.expectEqual(1, diagnostics.items.len);
+    try std.testing.expect(diagnostics.items[0] > 0);
+}
+
 // Prevents ignoring a build.zig created or saved through another spelling of a root directory on a
 // case-insensitive file system: roots are compared by file identity, not byte by byte
 test "refreshRoot: a root directory spelled with another case is the same root" {
