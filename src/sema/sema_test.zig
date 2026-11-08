@@ -3148,6 +3148,61 @@ test "containers in a loop of a type function capture the values of each iterati
     });
 }
 
+test "the types of captured values compare by their own captures" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1. Prevents comparing the types of
+    // captured values without looking at their captures: a local struct that captures nothing
+    // is the same type in every instance (no result was given), one that captures a parameter
+    // or a loop capture is a different type in each.
+    try expectTypes(
+        \\fn RecEq(comptime n: usize) type {
+        \\    _ = n;
+        \\    const S = struct {
+        \\        a: u8 = 0,
+        \\    };
+        \\    const s: S = .{};
+        \\    return struct {
+        \\        pub const v = s;
+        \\    };
+        \\}
+        \\fn RecNe(comptime n: usize) type {
+        \\    const S = struct {
+        \\        pub const k = n;
+        \\        a: u8 = 0,
+        \\    };
+        \\    const s: S = .{};
+        \\    return struct {
+        \\        pub const v = s;
+        \\    };
+        \\}
+        \\fn LoopRec(comptime n: usize) type {
+        \\    var T: type = void;
+        \\    for (0..2) |i| {
+        \\        const S = struct {
+        \\            pub const k = i * n;
+        \\            a: u8 = 0,
+        \\        };
+        \\        const s: S = .{};
+        \\        T = struct {
+        \\            pub const v = s;
+        \\        };
+        \\    }
+        \\    return T;
+        \\}
+        \\const rec_same = RecEq(1) == RecEq(2);
+        \\const rec_different = RecNe(1) == RecNe(2);
+        \\const rec_k = @TypeOf(RecNe(2).v).k;
+        \\const loop_different = LoopRec(1) == LoopRec(2);
+        \\const loop_last = LoopRec(0) == LoopRec(5);
+    , &.{
+        .{ "rec_same", "bool = true" },
+        .{ "rec_different", "bool = false" },
+        .{ "rec_k", "usize = 2" },
+        .{ "loop_different", "bool = false" },
+        // The last iteration captures k = 0 and k = 5
+        .{ "loop_last", "bool = false" },
+    });
+}
+
 test "captured comptime vars of different types are different captures" {
     // Expected values are the results of zig 0.17.0 and 0.17.1, where a captured value is
     // interned with its type. Prevents comparing the value of a captured `comptime var` alone:
