@@ -3478,6 +3478,62 @@ test "containers in a loop of a container-level initializer capture the values o
     });
 }
 
+test "loop containers of a container-level initializer compare their captures by value and type" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1. Prevents comparing the captures
+    // of such containers by value alone: `@as(u8, 3)` and `@as(u16, 3)` gave the same type, as
+    // did captured values whose types are different structs of one location.
+    try expectTypes(
+        \\const VsEq = blk: {
+        \\    var vs: [2]type = undefined;
+        \\    for (0..2) |i| {
+        \\        const S = struct {
+        \\            a: u8 = 0,
+        \\        };
+        \\        const s: S = .{};
+        \\        vs[i] = struct {
+        \\            pub const v = s;
+        \\        };
+        \\    }
+        \\    break :blk vs;
+        \\};
+        \\const VsNe = blk: {
+        \\    var vs: [2]type = undefined;
+        \\    for (0..2) |i| {
+        \\        const S = struct {
+        \\            pub const k = i;
+        \\            a: u8 = 0,
+        \\        };
+        \\        const s: S = .{};
+        \\        vs[i] = struct {
+        \\            pub const v = s;
+        \\        };
+        \\    }
+        \\    break :blk vs;
+        \\};
+        \\const VsTy = blk: {
+        \\    var vs: [2]type = undefined;
+        \\    for (0..2) |i| {
+        \\        const x = if (i == 0) @as(u8, 3) else @as(u16, 3);
+        \\        vs[i] = struct {
+        \\            pub const v = x;
+        \\        };
+        \\    }
+        \\    break :blk vs;
+        \\};
+        \\const decl_same = VsEq[0] == VsEq[1];
+        \\const decl_different = VsNe[0] == VsNe[1];
+        \\const decl_k = @TypeOf(VsNe[1].v).k;
+        \\const decl_types = VsTy[0] == VsTy[1];
+        \\const decl_types_v = VsTy[1].v;
+    , &.{
+        .{ "decl_same", "bool = true" },
+        .{ "decl_different", "bool = false" },
+        .{ "decl_k", "usize = 1" },
+        .{ "decl_types", "bool = false" },
+        .{ "decl_types_v", "u16 = 3" },
+    });
+}
+
 test "inferred error sets from function bodies" {
     try expectTypes(
         \\fn wrap(x: anytype) !@TypeOf(x) { return x; }
