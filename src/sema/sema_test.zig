@@ -1764,6 +1764,51 @@ test "float math builtins use the precision of the operand type" {
     });
 }
 
+test "rounding builtins have their result type" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 (`Sema.zirRoundCast`): with a
+    // result type, the call has that type without error unions and optionals. An integer result
+    // type takes the rounded operand converted to it; a float result type takes the operand
+    // coerced to it before rounding (0.4999999 as an f16 is 0.5, which rounds to 1).
+    try expectTypes(
+        \\fn ret(r: f32) u32 {
+        \\    return @floor(r);
+        \\}
+        \\fn f(x: f32, y: f32, z: f32, v: @Vector(2, f32), comptime T: type) void {
+        \\    const i: u32 = @round(x);
+        \\    const k: u8 = @round(@as(f32, 2.5));
+        \\    const w: f64 = @floor(@as(f32, 1.5));
+        \\    const half: f16 = @round(0.4999999);
+        \\    const t: i8 = @trunc(-1.5);
+        \\    const c: comptime_int = @ceil(2.25);
+        \\    const o: ?u8 = @ceil(@as(f64, 2.25));
+        \\    const e: anyerror!u8 = @floor(@as(f64, 7.75));
+        \\    const a = @as(u16, @round(@as(f32, 9.5)));
+        \\    const vi: @Vector(2, i32) = @trunc(v);
+        \\    const g: T = @round(y);
+        \\    const n = @round(z);
+        \\    _ = .{ i, k, w, half, t, c, o, e, a, vi, g, n };
+        \\}
+    , &.{
+        .{ "@floor(r)", "u32" },
+        .{ "@round(x)", "u32" },
+        .{ "@round(@as(f32, 2.5))", "u8 = 3" },
+        .{ "k", "u8 = 3" },
+        .{ "@floor(@as(f32, 1.5))", "f64 = 1" },
+        .{ "@round(0.4999999)", "f16 = 1" },
+        .{ "half", "f16 = 1" },
+        .{ "@trunc(-1.5)", "i8 = -1" },
+        .{ "@ceil(2.25)", "comptime_int = 3" },
+        // The call gives the payload, which is then coerced to the optional or error union
+        .{ "@ceil(@as(f64, 2.25))", "?u8 = 3" },
+        .{ "@floor(@as(f64, 7.75))", "anyerror!u8 = 7" },
+        .{ "@round(@as(f32, 9.5))", "u16 = 10" },
+        .{ "@trunc(v)", "@Vector(2, i32)" },
+        .{ "@round(y)", "T" },
+        // Without a result type, the result has the type of the operand
+        .{ "@round(z)", "f32" },
+    });
+}
+
 test "@abs maps signed integer types to their unsigned counterparts" {
     // Expected values are the results of zig 0.17.0 (`@compileLog(@TypeOf(@abs(v)), ...)` prints
     // `@Vector(4, u32)`, `usize`, `c_uint`, `c_ulong`, `c_ushort`, `c_ulonglong`, `u32`,
