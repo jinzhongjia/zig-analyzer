@@ -3187,13 +3187,14 @@ const Evaluator = struct {
         const ty = try ip.get(.{ .ptr_type = moved });
         if (lhs.v == .undef) return .{ .ty = ty, .v = .undef };
         const r = try ev.pointerRef(lhs) orelse return error.Abort;
-        // A pointer may move anywhere within the array it points into, up to just past its end
-        const total = try ev.elemCount(try ev.loadPath(r)) orelse return error.Abort;
+        // A pointer may move anywhere within the array it points into, up to just past its end;
+        // a `*T` → `*[1]T` view points into an array holding only the place
+        const total = if (r.as_array) 1 else try ev.elemCount(try ev.loadPath(r)) orelse return error.Abort;
         const start: u64 = if (r.window) |w| w.start else 0;
         const at = if (op == .plus) std.math.add(u64, start, n) catch return error.Abort else std.math.sub(u64, start, n) catch return error.Abort;
         if (at > total) return error.Abort;
         const window: Ref.Window = .{ .start = std.math.cast(u32, at) orelse return error.Abort, .len = std.math.cast(u32, total - at) orelse return error.Abort };
-        return .{ .ty = ty, .v = .{ .ref = .{ .cell = r.cell, .path = r.path, .window = window, .is_const = r.is_const, .immutable = r.immutable } } };
+        return .{ .ty = ty, .v = .{ .ref = .{ .cell = r.cell, .path = r.path, .window = window, .is_const = r.is_const, .as_array = r.as_array, .immutable = r.immutable } } };
     }
 
     /// `lhs - rhs` on pointers that are not slices: the number of elements from `rhs` to `lhs`,

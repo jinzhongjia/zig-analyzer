@@ -8965,6 +8965,34 @@ test "comptime evaluation: pointer arithmetic on many-item and C pointers" {
         \\const pa_before = gp - 1;
         \\const pa_negative = (gp + 1) - (gp + 3);
         \\const pa_compound_before = compoundBefore();
+        \\fn viewDiff() usize {
+        \\    var x: [4]u8 = .{ 1, 2, 3, 4 };
+        \\    const m: [*][4]u8 = @as(*[1][4]u8, &x);
+        \\    const end = m + 1;
+        \\    return end - m;
+        \\}
+        \\fn viewBack() u8 {
+        \\    var x: [4]u8 = .{ 1, 2, 3, 4 };
+        \\    const m: [*][4]u8 = @as(*[1][4]u8, &x);
+        \\    const q = m + 1;
+        \\    return (q - 1)[0][2];
+        \\}
+        \\fn viewScalar() u8 {
+        \\    var x: u8 = 7;
+        \\    const m: [*]u8 = @as(*[1]u8, &x);
+        \\    const q = m + 1;
+        \\    return (q - 1)[0];
+        \\}
+        \\fn viewWrite() u8 {
+        \\    var x: u8 = 7;
+        \\    const m: [*]u8 = @as(*[1]u8, &x);
+        \\    (m + 1 - 1)[0] = 9;
+        \\    return x;
+        \\}
+        \\const pa_view_diff = viewDiff();
+        \\const pa_view_back = viewBack();
+        \\const pa_view_scalar = viewScalar();
+        \\const pa_view_write = viewWrite();
     , &.{
         .{ "pa_reads", "u8 = 7" },
         .{ "pa_walk", "usize = 360" },
@@ -9012,6 +9040,12 @@ test "comptime evaluation: pointer arithmetic on many-item and C pointers" {
         .{ "pa_before", "[*]const u8" },
         .{ "pa_negative", "usize" },
         .{ "pa_compound_before", "u8" },
+        // A pointer from a `*T` → `*[1]T` view moves within the one-element array holding the
+        // place, by elements of type T
+        .{ "pa_view_diff", "usize = 1" },
+        .{ "pa_view_back", "u8 = 3" },
+        .{ "pa_view_scalar", "u8 = 7" },
+        .{ "pa_view_write", "u8 = 9" },
     });
 }
 
