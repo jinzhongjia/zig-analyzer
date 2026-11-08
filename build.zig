@@ -164,7 +164,8 @@ pub fn build(b: *std.Build) void {
     check.dependOn(&bench.step);
 
     // Test runner: the runner bundled with Zig, with stack trace recording enabled for the testing
-    // allocator (so that leaks can be located under ReleaseSafe too)
+    // allocator (so that leaks can be located under ReleaseSafe too), unwound with frame pointers
+    // on aarch64 Darwin (see tools/patch_test_runner.zig)
     const patch_runner = b.addExecutable(.{
         .name = "patch_test_runner",
         .root_module = b.createModule(.{
@@ -270,7 +271,8 @@ fn analyzerTests(
         .root_source_file = b.path("src/zig_analyzer.zig"),
         .target = target,
         .optimize = optimize,
-        // Keep frame pointers so that leak report stack traces are complete in optimized modes
+        // Keep frame pointers so that leak report stack traces are complete in optimized modes, and
+        // so that the test runner can unwind with them on aarch64 Darwin
         .omit_frame_pointer = false,
     });
     module.addOptions("build_options", options);
