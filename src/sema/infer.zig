@@ -694,6 +694,17 @@ const Inferrer = struct {
     }
 
     pub fn infer(inf: *Inferrer, e: ExprId, expected: ?Index) Error!TypedValue {
+        return inf.inferWith(e, expected, true);
+    }
+
+    /// Infers `e` with the result type `expected` without coercing the result to it, for operands
+    /// the compiler type-checks as written before coercing them (the operand of a rounding
+    /// builtin, see `roundCast`)
+    fn inferUncoerced(inf: *Inferrer, e: ExprId, expected: ?Index) Error!TypedValue {
+        return inf.inferWith(e, expected, false);
+    }
+
+    fn inferWith(inf: *Inferrer, e: ExprId, expected: ?Index, comptime coerce_result: bool) Error!TypedValue {
         const i = @backingInt(e);
         if (inf.done.isSet(i)) return inf.exprs[i];
         inf.done.set(i);
@@ -706,7 +717,7 @@ const Inferrer = struct {
         const want = if (inf.zon) try inf.zonExpected(e, expected) else expected;
         const raw = try inf.inferInner(e, want);
         if (inf.var_levels.len != 0) if (try inf.indirectlyModifiedVar(inf.body.expr(e))) |v| inf.untrackComptimeVar(v);
-        const tv = try inf.coerce(raw, want);
+        const tv = if (coerce_result) try inf.coerce(raw, want) else raw;
         inf.exprs[i] = tv;
         // Enum literals coerced to an enum / union (`.red`, `.a =>` in a `switch`) refer to the
         // corresponding member
@@ -1821,6 +1832,8 @@ const Inferrer = struct {
             if (sign.? == .signed and n.? == 0) return typeUnknown();
             return TypedValue.ofType(try ip.intType(sign.?, n.?));
         }
+        // The length of `@Vector` is a u32
+        if (eq(u8, name, "@Vector") and args.len == 2) _ = try inf.infer(args[0], try ip.intType(.unsigned, 32));
         // Builtins that construct types: evaluated by the interpreter (their arguments are
         // all comptime-known values)
         const reifying = [_][]const u8{ "@Pointer", "@Tuple", "@Enum", "@Struct", "@Union", "@Fn", "@Vector", "@EnumLiteral" };
@@ -1894,6 +1907,13 @@ const Inferrer = struct {
                 _ = try inf.infer(args[0], inf.destType(expected, .eu));
             },
             else => {},
+        };
+        // The operand of a float math builtin has the float or float vector in the result type
+        // (`float_op_result_ty` / `round_op_ty`). The compiler checks that the operand of a
+        // rounding builtin is a float before coercing it (see `roundCast`), so that operand is
+        // not coerced: `3` in `@ceil(3)` stays a comptime_int, a compile error with any result type.
+        if (args.len == 1 and isFloatMath(name)) if (expected) |t| if (value.floatOperandType(ip, t)) |ft| {
+            _ = if (isRounding(name)) try inf.inferUncoerced(args[0], ft) else try inf.infer(args[0], ft);
         };
         for (args) |a| _ = try inf.infer(a, null);
         // Casts: the result type is determined by the expected type (with error union / optional
@@ -2001,8 +2021,7 @@ const Inferrer = struct {
         }
         // With a result type, the rounding builtins convert to it (see `roundCast`); without one,
         // they have the type of the operand like the other float math builtins below
-        const rounding = [_][]const u8{ "@floor", "@ceil", "@trunc", "@round" };
-        for (rounding) |n| if (eq(u8, name, n)) if (expected) |want| return inf.roundCast(name, args, want);
+        if (isRounding(name)) if (expected) |want| return inf.roundCast(name, args, want);
         // The result has the type of the first argument (for division and remainder, the
         // peer type of both sides)
         const same = [_][]const u8{ "@abs", "@sqrt", "@sin", "@cos", "@tan", "@exp", "@exp2", "@log", "@log2", "@log10", "@floor", "@ceil", "@trunc", "@round", "@byteSwap", "@bitReverse", "@min", "@max", "@mod", "@rem", "@divExact", "@divFloor", "@divTrunc", "@divCeil" };
@@ -4213,6 +4232,25 @@ pub fn qualifierCastDest(ip: *InternPool, t: Index, name: []const u8) Allocator.
         else => {},
     }
     return null;
+}
+
+/// Builtins whose operand has the float in the result type as its result type: the unary float
+/// math builtins and the rounding builtins
+fn isFloatMath(name: []const u8) bool {
+    if (isRounding(name)) return true;
+    for ([_][]const u8{ "@sqrt", "@sin", "@cos", "@tan", "@exp", "@exp2", "@log", "@log2", "@log10" }) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
+}
+
+/// `@floor` / `@ceil` / `@trunc` / `@round`, whose result type converts the rounded value (see
+/// `Inferrer.roundCast`)
+fn isRounding(name: []const u8) bool {
+    for ([_][]const u8{ "@floor", "@ceil", "@trunc", "@round" }) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
 }
 
 fn isErrorSet(ip: *InternPool, t: Index) bool {
