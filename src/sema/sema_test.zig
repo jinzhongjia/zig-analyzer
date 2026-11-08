@@ -4346,6 +4346,46 @@ test "a prong capture read through a container in an inline prong has the value 
     try testing.expectEqualStrings(direct, try iterationTypeAt(&w, f.file, text, "kind", "q", 1));
 }
 
+test "a capture read through a container has the value of the chosen iteration when the loop modifies a comptime var" {
+    // Prevents the capture from losing the iteration's value when the loop body modifies a
+    // `comptime var` declared before the loop (later iterations start from the values the
+    // previous one leaves); expected values are the results of zig 0.17.0 and 0.17.1
+    const text =
+        \\fn counted() void {
+        \\    comptime var acc: usize = 10;
+        \\    inline for (.{ u8, u16, u32 }) |T| {
+        \\        acc += @sizeOf(T);
+        \\        const C = struct {
+        \\            const t = T;
+        \\            const sz = @sizeOf(T);
+        \\        };
+        \\        const via = C.t;
+        \\        const via_size = C.sz;
+        \\        const direct = T;
+        \\        _ = .{ via, via_size, direct };
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", text);
+    const cases = [_]struct { []const u8, u32, []const u8 }{
+        .{ "via", 0, "type = u8" },
+        .{ "via", 1, "type = u16" },
+        .{ "via", 2, "type = u32" },
+        .{ "via_size", 2, "comptime_int = 4" },
+        .{ "direct", 2, "type = u32" },
+    };
+    for (cases) |c| {
+        testing.expectEqualStrings(c[2], try iterationTypeAt(&w, f.file, text, c[0], "T", c[1])) catch |err| {
+            std.debug.print("type of `{s}` in iteration {d}\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+}
+
 test "comptime evaluation runs loops, mutation and calls" {
     try expectTypes(
         \\fn double(n: usize) usize { return n * 2; }
