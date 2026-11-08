@@ -116,6 +116,9 @@ env_mutex: Io.Mutex = .init,
 /// configuration applied (see `applyZigPaths`). Queried in the background after startup; null
 /// until the query completes
 zig_env: ?*const ZigEnv = null,
+/// `childEnviron` of `zig_env`, set together with it: the environment of the zig child processes
+/// that queries start (`zig ast-check` of live diagnostics, read through `Env`)
+zig_environ: std.atomic.Value(?*const std.process.Environ.Map) = .init(null),
 /// The environment detected by `zig env`; null until the query completes
 detected_env: ?*const ZigEnv = null,
 /// All environments created so far: a replaced environment may still be in use by in-flight
@@ -466,7 +469,7 @@ pub const HandlerError = error{
 pub fn init(server: *Server, io: Io, gpa: Allocator, out: *transport.Writer) Allocator.Error!void {
     server.* = .{ .io = io, .gpa = gpa, .db = undefined, .vfs = .init(io, gpa), .ip = try .init(gpa, io), .env = undefined, .out = out };
     server.live_prepared = .{ .gpa = gpa };
-    server.env = .{ .vfs = &server.vfs, .ip = &server.ip, .callsite_seeding = &server.callsite_seeding, .live_prepared = &server.live_prepared };
+    server.env = .{ .vfs = &server.vfs, .ip = &server.ip, .callsite_seeding = &server.callsite_seeding, .live_prepared = &server.live_prepared, .zig_environ = &server.zig_environ };
     server.db = .init(io, gpa, &server.env);
 }
 
@@ -3400,6 +3403,7 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
         defer server.env_mutex.unlock(io);
         change.env = server.zig_env != env;
         server.zig_env = env;
+        server.zig_environ.store(env.childEnviron(), .release);
         if (!eqlOptionalStr(server.default_builtin, default_builtin)) {
             change.builtin = true;
             // The default builtin.zig is read only while holding the lock (see
@@ -4642,7 +4646,7 @@ fn prepareLive(server: *Server, file: Vfs.FileId) bool {
     };
     const mode = live.modeOf(server.vfs.path(file));
     if (!server.live_prepared.claim(server.io, file, live.Prepared.hash(r.text, mode, r.backend))) return true;
-    const result = live.checkWith(server.gpa, server.io, r.backend, r.text, mode) catch return false;
+    const result = live.checkWith(server.gpa, server.io, r.backend, server.zig_environ.load(.acquire), r.text, mode) catch return false;
     server.live_prepared.put(server.io, file, r.text, mode, r.backend, result) catch return false;
     return true;
 }
