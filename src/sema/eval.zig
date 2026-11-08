@@ -3184,7 +3184,7 @@ const Evaluator = struct {
             // The destination of `@fromBackingInt` is the result type without error union and
             // optional (the compiler's `resolveDestType` with `.remove_eu_opt`); the result is
             // coerced to the result type afterwards
-            const t = (if (eq(u8, name, "@fromBackingInt")) destType(ip, want) else want) orelse return error.Abort;
+            const t = (if (eq(u8, name, "@fromBackingInt")) destType(ip, want, .eu_opt) else want) orelse return error.Abort;
             if (pointer_cast and !try ev.keepsPointee(vals[0], t)) return .{ .ty = t };
             return ev.cast(name, vals[0], t);
         }
@@ -3479,7 +3479,7 @@ const Evaluator = struct {
         // `from_backing_int_arg_ty`): the tag type of an enum, the backing integer of a packed
         // struct or union. `@fromBackingInt(@intCast(i))` needs it.
         if (eq(u8, name, "@fromBackingInt") and i == 0) {
-            const dest = destType(ev.ip, want) orelse return null;
+            const dest = destType(ev.ip, want, .eu_opt) orelse return null;
             return ev.backingIntType(dest) catch |err| switch (err) {
                 error.Abort => null,
                 else => |x| return x,
@@ -4643,19 +4643,39 @@ fn peerFloatType(ip: *InternPool, a: Index, b: Index) ?Index {
     return null;
 }
 
-/// Destination type of a cast builtin with result type `want`: without error union and optional,
-/// as in the compiler's `resolveDestType` with `.remove_eu_opt`; null without a result type
-fn destType(ip: *InternPool, want: ?Index) ?Index {
+/// What a builtin whose destination type is its result type strips from the result type: the
+/// strategies of the compiler's `resolveDestType`
+pub const DestStrip = enum { eu_opt, eu, opt };
+
+/// Cast builtins whose destination type is their result type, and what they strip from it (the
+/// `resolveDestType` calls in the compiler's Sema); null for other builtins. `@splat` and
+/// `@fromBackingInt` also strip `.eu_opt`, but give their operands result types derived from the
+/// destination type, so their callers handle them.
+pub fn castDestStrip(name: []const u8) ?DestStrip {
+    const casts = [_]struct { []const u8, DestStrip }{
+        .{ "@intCast", .eu_opt },      .{ "@truncate", .eu_opt },    .{ "@floatCast", .eu_opt }, .{ "@floatFromInt", .eu_opt },
+        .{ "@intFromFloat", .eu_opt }, .{ "@enumFromInt", .eu_opt }, .{ "@bitCast", .eu_opt },   .{ "@ptrCast", .eu },
+        .{ "@alignCast", .eu },        .{ "@addrSpaceCast", .eu },   .{ "@ptrFromInt", .eu },    .{ "@fieldParentPtr", .eu },
+        .{ "@errorCast", .opt },
+    };
+    for (casts) |c| if (std.mem.eql(u8, name, c[0])) return c[1];
+    return null;
+}
+
+/// Destination type of a builtin with result type `want`, as in the compiler's
+/// `resolveDestType`: an error union is replaced by its payload (unless `strip` is `.opt`), then
+/// an optional by its child (unless `strip` is `.eu`); null without a known result type
+pub fn destType(ip: *InternPool, want: ?Index, strip: DestStrip) ?Index {
     var t = want orelse return null;
     if (t == .unknown) return null;
-    switch (ip.key(t)) {
+    if (strip != .opt) switch (ip.key(t)) {
         .error_union_type => |eu| t = eu.payload,
         else => {},
-    }
-    switch (ip.key(t)) {
+    };
+    if (strip != .eu) switch (ip.key(t)) {
         .optional_type => |c| t = c,
         else => {},
-    }
+    };
     return t;
 }
 

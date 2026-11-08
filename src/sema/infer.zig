@@ -1854,19 +1854,13 @@ const Inferrer = struct {
         for (args) |a| _ = try inf.infer(a, null);
         // Casts: the result type is determined by the expected type (with error union / optional
         // stripped as in the compiler's `resolveDestType`)
-        const casts = [_]struct { []const u8, DestStrip }{
-            .{ "@intCast", .eu_opt },      .{ "@truncate", .eu_opt },    .{ "@floatCast", .eu_opt }, .{ "@floatFromInt", .eu_opt },
-            .{ "@intFromFloat", .eu_opt }, .{ "@enumFromInt", .eu_opt }, .{ "@bitCast", .eu_opt },   .{ "@ptrCast", .eu },
-            .{ "@alignCast", .eu },        .{ "@addrSpaceCast", .eu },   .{ "@ptrFromInt", .eu },    .{ "@fieldParentPtr", .eu },
-            .{ "@errorCast", .opt },
-        };
-        for (casts) |c| if (eq(u8, name, c[0])) {
-            if (inf.destType(expected, c[1])) |t| return .{ .ty = t };
+        if (eval.castDestStrip(name)) |strip| {
+            if (inf.destType(expected, strip)) |t| return .{ .ty = t };
             // `@alignCast` / `@addrSpaceCast` without a result type (an error in the compiler)
             // take the type of the argument
             if ((eq(u8, name, "@alignCast") or eq(u8, name, "@addrSpaceCast")) and args.len == 1) return .{ .ty = inf.get(args[0]).ty };
             return .unknown;
-        };
+        }
         // Stripping const / volatile: the result depends only on the argument's type
         // (matches the compiler)
         if (eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast")) {
@@ -2078,23 +2072,10 @@ const Inferrer = struct {
         return .{ .ty = .void_type };
     }
 
-    const DestStrip = enum { eu_opt, eu, opt };
-
     /// Destination type of cast builtins: the expected type, with error union / optional stripped
-    /// as in the compiler's `resolveDestType`
-    fn destType(inf: *Inferrer, expected: ?Index, strip: DestStrip) ?Index {
-        const ip = inf.ip;
-        var t = expected orelse return null;
-        if (t == .unknown) return null;
-        if (strip != .opt) switch (ip.key(t)) {
-            .error_union_type => |eu| t = eu.payload,
-            else => {},
-        };
-        if (strip != .eu) switch (ip.key(t)) {
-            .optional_type => |c| t = c,
-            else => {},
-        };
-        return t;
+    /// as in the compiler's `resolveDestType`; null without an expected type
+    fn destType(inf: *Inferrer, expected: ?Index, strip: eval.DestStrip) ?Index {
+        return eval.destType(inf.ip, expected, strip);
     }
 
     /// Strips const from a pointer (including an optional pointer)
