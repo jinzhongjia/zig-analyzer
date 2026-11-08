@@ -1845,13 +1845,27 @@ const Evaluator = struct {
             const n = try ev.elemCount(v) orelse return .{ .ty = .usize_type };
             return Val.of(.usize_type, try ip.get(.{ .int_value = .{ .ty = .usize_type, .value = n } }));
         };
-        // `ptr` of a slice: a many-item pointer that shares the slice's representation (used for
-        // pointer comparison; see `pointerEql`)
+        // `ptr` of a slice or a pointer to an array: a many-item pointer that shares its
+        // representation (used for pointer comparison; see `pointerEql`), with the sentinel of
+        // the array
         if (std.mem.eql(u8, name, "ptr")) switch (ip.key(v.ty)) {
-            .ptr_type => |p| if (p.size == .slice) {
-                var q = p;
-                q.size = .many;
-                return .{ .ty = try ip.get(.{ .ptr_type = q }), .v = v.v };
+            .ptr_type => |p| switch (p.size) {
+                .slice => {
+                    var q = p;
+                    q.size = .many;
+                    return .{ .ty = try ip.get(.{ .ptr_type = q }), .v = v.v };
+                },
+                .one => switch (ip.key(p.child)) {
+                    .array_type => |arr| {
+                        var q = p;
+                        q.size = .many;
+                        q.child = arr.child;
+                        q.sentinel = arr.sentinel;
+                        return .{ .ty = try ip.get(.{ .ptr_type = q }), .v = v.v };
+                    },
+                    else => {},
+                },
+                else => {},
             },
             else => {},
         };
