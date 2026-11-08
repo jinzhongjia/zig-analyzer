@@ -4829,8 +4829,11 @@ test "comptime_int values outside i128" {
         \\const shl = @shlExact(3, 100);
         \\const shr = @shrExact(1 << 100, 50);
         \\const mul = (1 << 200) * (1 << 200);
+        \\const or_neg = -(1 << 70) | (1 << 210);
+        \\const xor = (1 << 200) ^ -1;
+        \\const and_neg = -(1 << 200) & ((1 << 210) - 1);
         \\fn g() void {
-        \\    _ = .{ a, b, c, n, folded, cmp, trunc, cast, floor, mod, rem, min, max, abs, shl, shr, mul };
+        \\    _ = .{ a, b, c, n, folded, cmp, trunc, cast, floor, mod, rem, min, max, abs, shl, shr, mul, or_neg, xor, and_neg };
         \\}
     , &.{
         .{ "a", "comptime_int = 340282366920938463463374607431768211456" },
@@ -4850,6 +4853,302 @@ test "comptime_int values outside i128" {
         .{ "shl", "comptime_int = 3802951800684688204490109616128" },
         .{ "shr", "comptime_int = 1125899906842624" },
         .{ "mul", "comptime_int = 2582249878086908589655919172003011874329705792829223512830659356540647622016841194629645353280137831435903171972747493376" },
+        .{ "or_neg", "comptime_int = -1180591620717411303424" },
+        .{ "xor", "comptime_int = -1606938044258990275541962092341162602522202993782792835301377" },
+        .{ "and_neg", "comptime_int = 1643897619276947051879427220465009342380213662639797070513307648" },
+    });
+}
+
+test "integer types wider than 128 bits are computed at arbitrary precision" {
+    // Values of types wider than 128 bits had no value, and neither did any operation on them.
+    // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both).
+    try expectTypes(
+        \\const small = @as(u256, 5) + 7;
+        \\const big_arith: u256 = (1 << 200) + 5;
+        \\const big_arith_wrap = @as(u256, 1 << 255) *% 2;
+        \\const neg_mul = @as(i256, -5) * 3;
+        \\const max: u256 = (1 << 256) - 1;
+        \\const min: i256 = -(1 << 255);
+        \\const shl = @as(u256, 1) << 200;
+        \\const shl_wrap = @as(u256, 3) << 255;
+        \\const shr = (@as(u256, 1) << 255) >> 250;
+        \\const shl_sat = @as(i256, -3) <<| 300;
+        \\const add_sat = @as(u256, (1 << 256) - 1) +| 1;
+        \\const sub_wrap = @as(u256, 0) -% 1;
+        \\const sub_sat = @as(i200, -(1 << 199)) -| 1;
+        \\const mul_wrap = @as(i256, 1 << 200) *% (1 << 60);
+        \\const div = (@as(u256, 1) << 200) / 3;
+        \\const rem = (@as(u256, 1) << 200) % 7;
+        \\const or_neg = @as(i256, -(1 << 200)) | (1 << 210);
+        \\const or_short = @as(i256, -(1 << 70)) | (1 << 210);
+        \\const and_neg = @as(i256, -(1 << 200)) & ((1 << 210) - 1);
+        \\const xor_neg = @as(i256, -1) ^ (1 << 254);
+        \\const comptime_or = @as(u256, (1 << 200) | 0xab);
+        \\const not = ~@as(u256, 0);
+        \\const not_signed = ~@as(i256, 1 << 200);
+        \\const negate = -@as(i256, 1 << 200);
+        \\const neg_wrap = -%@as(u256, 1);
+        \\const cmp = @as(u256, 1 << 200) > @as(u8, 3);
+        \\const eq = @as(u256, 1 << 200) == (1 << 200);
+        \\const literal: u256 = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF;
+        \\fn g() void {
+        \\    _ = .{ small, big_arith, big_arith_wrap, neg_mul, max, min, shl, shl_wrap, shr, shl_sat, add_sat, sub_wrap, sub_sat, mul_wrap, div, rem, or_neg, or_short, and_neg, xor_neg, comptime_or, not, not_signed, negate, neg_wrap, cmp, eq, literal };
+        \\}
+    , &.{
+        .{ "small", "u256 = 12" },
+        .{ "big_arith", "u256 = 1606938044258990275541962092341162602522202993782792835301381" },
+        .{ "big_arith_wrap", "u256 = 0" },
+        .{ "neg_mul", "i256 = -15" },
+        .{ "max", "u256 = 115792089237316195423570985008687907853269984665640564039457584007913129639935" },
+        .{ "min", "i256 = -57896044618658097711785492504343953926634992332820282019728792003956564819968" },
+        .{ "shl", "u256 = 1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "shl_wrap", "u256 = 57896044618658097711785492504343953926634992332820282019728792003956564819968" },
+        .{ "shr", "u256 = 32" },
+        .{ "shl_sat", "i256 = -57896044618658097711785492504343953926634992332820282019728792003956564819968" },
+        .{ "add_sat", "u256 = 115792089237316195423570985008687907853269984665640564039457584007913129639935" },
+        .{ "sub_wrap", "u256 = 115792089237316195423570985008687907853269984665640564039457584007913129639935" },
+        .{ "sub_sat", "i200 = -803469022129495137770981046170581301261101496891396417650688" },
+        .{ "mul_wrap", "i256 = 0" },
+        .{ "div", "u256 = 535646014752996758513987364113720867507400997927597611767125" },
+        .{ "rem", "u256 = 4" },
+        .{ "or_neg", "i256 = -1606938044258990275541962092341162602522202993782792835301376" },
+        // `|` of a negative and a longer nonnegative operand, which std.math.big of zig 0.17.0
+        // computes with unset high limbs
+        .{ "or_short", "i256 = -1180591620717411303424" },
+        .{ "and_neg", "i256 = 1643897619276947051879427220465009342380213662639797070513307648" },
+        .{ "xor_neg", "i256 = -28948022309329048855892746252171976963317496166410141009864396001978282409985" },
+        .{ "comptime_or", "u256 = 1606938044258990275541962092341162602522202993782792835301547" },
+        .{ "not", "u256 = 115792089237316195423570985008687907853269984665640564039457584007913129639935" },
+        .{ "not_signed", "i256 = -1606938044258990275541962092341162602522202993782792835301377" },
+        .{ "negate", "i256 = -1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "neg_wrap", "u256 = 115792089237316195423570985008687907853269984665640564039457584007913129639935" },
+        .{ "cmp", "bool = true" },
+        .{ "eq", "bool = true" },
+        .{ "literal", "u256 = 115792089210356248762697446949407573530086143415290314195533631308867097853951" },
+    });
+}
+
+test "builtins on integer types wider than 128 bits" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both)
+    try expectTypes(
+        \\const div_trunc = @divTrunc(@as(i256, -(1 << 200)), 3);
+        \\const div_floor = @divFloor(@as(i256, -(1 << 200)), 3);
+        \\const div_ceil = @divCeil(@as(i256, 1 << 200), 3);
+        \\const div_exact = @divExact(@as(i256, -(1 << 200)), 1 << 100);
+        \\const mod = @mod(@as(i256, -(1 << 200)), 7);
+        \\const rem = @rem(@as(i256, -(1 << 200)), 7);
+        \\const cast_down = @as(u64, @intCast(@as(u256, 1 << 40)));
+        \\const cast_up: u256 = @intCast(@as(u128, (1 << 128) - 1));
+        \\const coerce_up: i256 = @as(u128, (1 << 128) - 1);
+        \\const truncate = @as(u8, @truncate(@as(u256, (1 << 200) | 0xab)));
+        \\const truncate_wide = @as(u200, @truncate(@as(u256, (1 << 255) | (1 << 199))));
+        \\const truncate_signed = @as(i200, @truncate(@as(i256, -(1 << 255) | (1 << 199))));
+        \\const bitcast = @as(i256, @bitCast(@as(u256, (1 << 256) - 1)));
+        \\const bitcast_back = @as(u256, @bitCast(@as(i256, -1)));
+        \\const add_ov = @addWithOverflow(@as(u256, (1 << 256) - 1), 2);
+        \\const mul_ov = @mulWithOverflow(@as(u256, 1 << 200), 1 << 60);
+        \\const sub_ov = @subWithOverflow(@as(i256, -(1 << 254)), 1);
+        \\const clz = @clz(@as(u256, 1 << 200));
+        \\const ctz = @ctz(@as(u256, 1 << 200));
+        \\const pop_count = @popCount(@as(i256, -1));
+        \\const clz_zero = @clz(@as(u1000, 0));
+        \\const byte_swap = @byteSwap(@as(u256, 0xab));
+        \\const byte_swap_neg = @byteSwap(@as(i256, -2));
+        \\const bit_reverse = @bitReverse(@as(i256, 1));
+        \\const min = @min(@as(u256, 1 << 200), @as(u256, 1 << 201));
+        \\const min_narrow = @min(@as(u256, 1 << 200), @as(u8, 3));
+        \\const min_signed = @min(@as(i256, -5), @as(u8, 3));
+        \\const max = @max(@as(u256, 1 << 200), 5);
+        \\const float = @as(f64, @floatFromInt(@as(u256, 1 << 200)));
+        \\const from_float = @as(u256, @intFromFloat(@as(f64, 0x1p200)));
+        \\const abs = @abs(@as(i256, -(1 << 200)));
+        \\const abs_min = @abs(@as(i256, -(1 << 255)));
+        \\const shl_exact = @shlExact(@as(u256, 1), 200);
+        \\const shr_exact = @shrExact(@as(u256, 1 << 200), 200);
+        \\fn g() void {
+        \\    _ = .{ div_trunc, div_floor, div_ceil, div_exact, mod, rem, cast_down, cast_up, coerce_up, truncate, truncate_wide, truncate_signed, bitcast, bitcast_back, add_ov, mul_ov, sub_ov, clz, ctz, pop_count, clz_zero, byte_swap, byte_swap_neg, bit_reverse, min, min_narrow, min_signed, max, float, from_float, abs, abs_min, shl_exact, shr_exact };
+        \\}
+    , &.{
+        .{ "div_trunc", "i256 = -535646014752996758513987364113720867507400997927597611767125" },
+        .{ "div_floor", "i256 = -535646014752996758513987364113720867507400997927597611767126" },
+        .{ "div_ceil", "i256 = 535646014752996758513987364113720867507400997927597611767126" },
+        .{ "div_exact", "i256 = -1267650600228229401496703205376" },
+        .{ "mod", "i256 = 3" },
+        .{ "rem", "i256 = -4" },
+        .{ "cast_down", "u64 = 1099511627776" },
+        .{ "cast_up", "u256 = 340282366920938463463374607431768211455" },
+        .{ "coerce_up", "i256 = 340282366920938463463374607431768211455" },
+        .{ "truncate", "u8 = 171" },
+        .{ "truncate_wide", "u200 = 803469022129495137770981046170581301261101496891396417650688" },
+        .{ "truncate_signed", "i200 = -803469022129495137770981046170581301261101496891396417650688" },
+        .{ "bitcast", "i256 = -1" },
+        .{ "bitcast_back", "u256 = 115792089237316195423570985008687907853269984665640564039457584007913129639935" },
+        .{ "add_ov", "struct { u256, u1 } = .{ 1, 1 }" },
+        .{ "mul_ov", "struct { u256, u1 } = .{ 0, 1 }" },
+        .{ "sub_ov", "struct { i256, u1 } = .{ -28948022309329048855892746252171976963317496166410141009864396001978282409985, 0 }" },
+        .{ "clz", "u9 = 55" },
+        .{ "ctz", "u9 = 200" },
+        .{ "pop_count", "u9 = 256" },
+        .{ "clz_zero", "u10 = 1000" },
+        .{ "byte_swap", "u256 = 77345497107738552411838431392522000948863935069627095510731433067785723314176" },
+        .{ "byte_swap_neg", "i256 = -452312848583266388373324160190187140051835877600158453279131187530910662657" },
+        .{ "bit_reverse", "i256 = -57896044618658097711785492504343953926634992332820282019728792003956564819968" },
+        // The result type is the smallest type that holds the result, as for narrower types
+        .{ "min", "u201 = 1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "min_narrow", "u2 = 3" },
+        .{ "min_signed", "i4 = -5" },
+        .{ "max", "u201 = 1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "float", "f64 = 1606938044258990300000000000000000000000000000000000000000000" },
+        .{ "from_float", "u256 = 1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "abs", "u256 = 1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "abs_min", "u256 = 57896044618658097711785492504343953926634992332820282019728792003956564819968" },
+        .{ "shl_exact", "u256 = 1606938044258990275541962092341162602522202993782792835301376" },
+        .{ "shr_exact", "u256 = 1" },
+    });
+}
+
+test "comptime evaluation with integer types wider than 128 bits" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both)
+    try expectTypes(
+        \\fn fib(n: u32) u256 {
+        \\    var a: u256 = 0;
+        \\    var b: u256 = 1;
+        \\    for (0..n) |_| {
+        \\        const t = a +% b;
+        \\        a = b;
+        \\        b = t;
+        \\    }
+        \\    return a;
+        \\}
+        \\const fib300 = fib(300);
+        \\const loop = blk: {
+        \\    var x: u256 = 1;
+        \\    for (0..10) |_| x = x *% 1000003;
+        \\    break :blk x;
+        \\};
+        \\const compound = blk: {
+        \\    var x: u256 = 1 << 200;
+        \\    x += 1;
+        \\    x <<= 2;
+        \\    x *%= 3;
+        \\    x -%= 1 << 255;
+        \\    x |= 1;
+        \\    break :blk x;
+        \\};
+        \\const binary = blk: {
+        \\    var a: i256 = -(1 << 200);
+        \\    _ = &a;
+        \\    break :blk (a | (1 << 210)) +% (a << 50);
+        \\};
+        \\const prefix = blk: {
+        \\    var a: i256 = 1 << 200;
+        \\    _ = &a;
+        \\    break :blk ~(-%a);
+        \\};
+        \\const cmp = blk: {
+        \\    var a: u256 = 1 << 200;
+        \\    _ = &a;
+        \\    break :blk a > (1 << 199) and a != 0;
+        \\};
+        \\const literal = blk: {
+        \\    var a: u256 = 0x1_0000_0000_0000_0000_0000_0000_0000_0000_0000;
+        \\    _ = &a;
+        \\    break :blk a + 1;
+        \\};
+        \\const compound_all = blk: {
+        \\    var x: u256 = 1;
+        \\    x <<= 200;
+        \\    x += 5;
+        \\    x *%= 3;
+        \\    x -= 1;
+        \\    x |= 1 << 255;
+        \\    x >>= 1;
+        \\    x ^= 0xff;
+        \\    x &= (1 << 256) - 2;
+        \\    x /= 7;
+        \\    x %= 1 << 210;
+        \\    x +|= 1 << 255;
+        \\    x -%= (1 << 255) + (1 << 254);
+        \\    break :blk x;
+        \\};
+        \\fn classify(x: u256) u8 {
+        \\    return switch (x) {
+        \\        0...(1 << 200) => 1,
+        \\        (1 << 200) + 1...(1 << 255) => 2,
+        \\        else => 3,
+        \\    };
+        \\}
+        \\fn classifySigned(x: i256) u8 {
+        \\    return switch (x) {
+        \\        -(1 << 255)...-(1 << 200) => 1,
+        \\        -(1 << 200) + 1...(1 << 200) => 2,
+        \\        else => 3,
+        \\    };
+        \\}
+        \\const range_lo = classify(1 << 199);
+        \\const range_mid = classify((1 << 200) + 1);
+        \\const range_hi = classify((1 << 255) + 1);
+        \\const range_neg = classifySigned(-(1 << 254));
+        \\const range_zero = classifySigned(0);
+        \\const range_pos = classifySigned(1 << 254);
+        \\const range_inline = switch (@as(u256, 1 << 201)) {
+        \\    0...(1 << 200) => 1,
+        \\    else => 2,
+        \\};
+        \\fn g() void {
+        \\    _ = .{ fib300, loop, compound, binary, prefix, cmp, literal, compound_all, range_lo, range_mid, range_hi, range_neg, range_zero, range_pos, range_inline };
+        \\}
+    , &.{
+        .{ "fib300", "u256 = 222232244629420445529739893461909967206666939096499764990979600" },
+        .{ "loop", "u256 = 1000030000405003240017010061236153090262440295245196830059049" },
+        .{ "compound", "u256 = 57896044618658116995042023612227260430180100426771512286164717397470588436493" },
+        .{ "binary", "i256 = -1809251394333067160431340899751024102169435851563236335319518532916477952000" },
+        .{ "prefix", "i256 = 1606938044258990275541962092341162602522202993782792835301375" },
+        .{ "cmp", "bool = true" },
+        .{ "literal", "u256 = 22300745198530623141535718272648361505980417" },
+        .{ "compound_all", "u256 = 86844066927988087200340574644037935631334398201196685133417048719312368285438" },
+        .{ "range_lo", "u8 = 1" },
+        .{ "range_mid", "u8 = 2" },
+        .{ "range_hi", "u8 = 3" },
+        .{ "range_neg", "u8 = 1" },
+        .{ "range_zero", "u8 = 2" },
+        .{ "range_pos", "u8 = 3" },
+        .{ "range_inline", "comptime_int = 2" },
+    });
+}
+
+test "u128 values above i128's range in builtins and conversions" {
+    // The bit pattern of a u128 value at or above 2^127 was read back as a negative number (a
+    // wrong quotient, a signed @min result type, a negative float, a switch range compared as
+    // signed), and the minimum of i128 had no @abs. Expected values are the results of zig 0.17.0
+    // and 0.17.1 (the same in both).
+    try expectTypes(
+        \\const div = @divTrunc(@as(u128, (1 << 128) - 1), 3);
+        \\const min = @min(@as(u128, (1 << 128) - 1), @as(u128, 1 << 127));
+        \\const abs = @abs(@as(i128, -(1 << 127)));
+        \\const min_i128 = @as(i128, -(1 << 127));
+        \\const float = @as(f64, @floatFromInt(@as(u128, 1 << 127)));
+        \\const cmp = @as(u128, 1 << 127) > @as(i8, -1);
+        \\fn spans(x: u128) u8 {
+        \\    return switch (x) {
+        \\        100...(1 << 127) + 10 => 1,
+        \\        else => 2,
+        \\    };
+        \\}
+        \\const span = spans((1 << 127) + 5);
+        \\const span_out = spans((1 << 127) + 11);
+        \\fn g() void {
+        \\    _ = .{ div, min, abs, min_i128, float, cmp, span, span_out };
+        \\}
+    , &.{
+        .{ "div", "u128 = 113427455640312821154458202477256070485" },
+        .{ "min", "u128 = 170141183460469231731687303715884105728" },
+        .{ "abs", "u128 = 170141183460469231731687303715884105728" },
+        .{ "min_i128", "i128 = -170141183460469231731687303715884105728" },
+        .{ "float", "f64 = 170141183460469230000000000000000000000" },
+        .{ "cmp", "bool = true" },
+        .{ "span", "u8 = 1" },
+        .{ "span_out", "u8 = 2" },
     });
 }
 
