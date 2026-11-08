@@ -189,13 +189,18 @@ pub const DeclType = struct {
                 // that of a variable too (its initial value must be comptime-known): when
                 // inference cannot compute the value of a constant, or the type of a variable
                 // without a type annotation, the interpreter executes the initializer expression.
-                // A variable takes only the type of the result, since its value can change at
-                // runtime. For a variable with an annotation, or one whose type inference knows,
-                // the result could not change the type.
-                const run = if (is_const) value.val == null else annotation == null and value.ty == .unknown;
+                // It does too when inference gives a constant without an annotation a type with
+                // unknown parts (an array whose length a loop computes: inference does not execute
+                // non-inline loops). Without an annotation, the result is taken only when it fills
+                // in the unknown parts of the inferred type and value and agrees with every part
+                // inference knows. A variable takes only the type of the result, since its value
+                // can change at runtime. For a variable with an annotation, or one whose type
+                // inference knows, the result could not change the type.
+                const partial = annotation == null and !@import("value.zig").isPrecise(ip, value.ty);
+                const run = if (is_const) value.val == null or partial else annotation == null and value.ty == .unknown;
                 if (run and b.value != null and !ctx.incomplete()) {
                     const ev = try eval.ownerValue(&r, key, dk.inst, annotation);
-                    if (ev.val != null and (value.ty == .unknown or ev.ty == value.ty or annotation != null)) value = ev;
+                    if (ev.val != null and (annotation != null or completesInferred(ip, value, ev))) value = ev;
                 }
                 if (annotation) |t| return .{ .ty = t, .val = if (is_const and value.ty == t) value.val else null };
                 return if (is_const) value else .{ .ty = value.ty };
@@ -223,6 +228,16 @@ pub const DeclType = struct {
         return .unknown;
     }
 };
+
+/// Whether `ev`, the interpreter's result for the initializer of a declaration, fills in what
+/// inference gives for it (`inferred`): its type completes the inferred type, and its value the
+/// inferred value when inference computes one
+fn completesInferred(ip: *InternPool, inferred: TypedValue, ev: TypedValue) bool {
+    const values = @import("value.zig");
+    if (!values.completes(ip, inferred.ty, ev.ty)) return false;
+    const v = inferred.val orelse return true;
+    return values.completes(ip, v, ev.val orelse return false);
+}
 
 /// Calling convention of a function declaration with body `body` and signature inference result
 /// `sig`: its `callconv(...)`, otherwise (matching the compiler) `.c` for `export` and `extern`

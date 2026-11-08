@@ -5996,6 +5996,55 @@ test "comptime evaluation runs loops, mutation and calls" {
     });
 }
 
+test "constants whose inferred type has unknown parts take the type and value of the interpreter" {
+    // Inference does not execute non-inline loops, so a length computed in one is unknown to it,
+    // and the interpreter's result was dropped because its type differed from the inferred one.
+    try expectTypes(
+        \\fn Box(comptime T: type) type { return struct { v: T }; }
+        \\fn Arr(comptime len: usize) type { return struct { v: [len]u8 }; }
+        \\fn G(comptime T: type) type {
+        \\    return struct {
+        \\        const member = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk @as([n]T, @splat(0)); };
+        \\    };
+        \\}
+        \\extern fn ext() [3]u8;
+        \\const array = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk @as([n]u8, @splat(0)); };
+        \\const sentinel = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk @as([n:0]u8, @splat(1)); };
+        \\const nested = blk: { var n: usize = 0; for (0..3) |_| n += 1; const row: [n]u8 = @splat(1); break :blk @as([2][n]u8, .{ row, row }); };
+        \\const ptr = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk &@as([n]u8, @splat(1)); };
+        \\const slice = blk: { var n: usize = 0; for (0..3) |_| n += 1; const row: [n]u8 = @splat(1); const rows: []const [n]u8 = &.{row}; break :blk rows; };
+        \\const optional = blk: { var n: usize = 0; for (0..3) |_| n += 1; const row: [n]u8 = @splat(2); break :blk @as(?[n]u8, row); };
+        \\const optional_null = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk @as(?[n]u8, null); };
+        \\const error_union = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk @as(error{Oops}![n]u8, error.Oops); };
+        \\const anon = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk .{ .a = @as([n]u8, @splat(1)), .b = @as(u8, 2) }; };
+        \\const tuple = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk .{ @as([n]u8, @splat(1)), @as(u8, 2) }; };
+        \\const box = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk Box([n]u8){ .v = @splat(1) }; };
+        \\const arr = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk Arr(n){ .v = @splat(1) }; };
+        \\const generic = G(u16).member;
+        \\const array_len = array.len;
+        \\const field = @TypeOf(arr.v);
+        \\const gives_up = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk @as([n]u8, ext()); };
+    , &.{
+        .{ "array", "[3]u8 = \"\\x00\\x00\\x00\"" },
+        .{ "sentinel", "[3:0]u8 = \"\\x01\\x01\\x01\"" },
+        .{ "nested", "[2][3]u8 = .{ \"\\x01\\x01\\x01\", \"\\x01\\x01\\x01\" }" },
+        .{ "ptr", "*const [3]u8 = \"\\x01\\x01\\x01\"" },
+        .{ "slice", "[]const [3]u8 = &.{ \"\\x01\\x01\\x01\" }" },
+        .{ "optional", "?[3]u8 = .{ 2, 2, 2 }" },
+        .{ "optional_null", "?[3]u8 = null" },
+        .{ "error_union", "error{Oops}![3]u8 = error.Oops" },
+        .{ "anon", "struct { comptime a: [3]u8 = \"\\x01\\x01\\x01\", comptime b: u8 = 2 } = .{ .a = \"\\x01\\x01\\x01\", .b = 2 }" },
+        .{ "tuple", "struct { comptime [3]u8 = \"\\x01\\x01\\x01\", comptime u8 = 2 } = .{ \"\\x01\\x01\\x01\", 2 }" },
+        .{ "box", "Box([3]u8) = .{ .v = \"\\x01\\x01\\x01\" }" },
+        .{ "arr", "Arr(3) = .{ .v = \"\\x01\\x01\\x01\" }" },
+        .{ "generic", "[3]u16 = .{ 0, 0, 0 }" },
+        .{ "array_len", "usize = 3" },
+        .{ "field", "type = [3]u8" },
+        // The interpreter cannot call an extern function, so the length stays unknown
+        .{ "gives_up", "[_]u8" },
+    });
+}
+
 test "anytype arguments do not expand large arrays" {
     // Previously: anytype arguments were evaluated as a comptime context,
     // and slicing a huge array expanded its elements one by one in the interpreter
