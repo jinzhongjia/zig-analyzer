@@ -1096,15 +1096,21 @@ fn builtinTarget(server: *Server, file: Vfs.FileId) Allocator.Error!za.sema.Inte
         else => return server.builtin_targets.get(file) orelse .{ .pointer_bits = null, .scalar_abi = .unknown },
     };
     defer server.gpa.free(text);
+    const result = targetOfBuiltin(text);
+    try server.builtin_targets.put(server.gpa, file, result);
+    return result;
+}
+
+/// Target parameters given by the contents of a builtin.zig: pointer bit width and the layout rules
+/// of vector and scalar types (unknown where the contents do not tell)
+pub fn targetOfBuiltin(text: []const u8) za.sema.InternPool.Target {
     const backend = za.project.builtin.backend(text);
     const target = za.project.builtin.target(text);
-    const result: za.sema.InternPool.Target = .{
+    return .{
         .pointer_bits = za.project.builtin.pointerBits(text),
         .vector_abi = if (backend) |b| if (target) |*t| .of(b, t) else .unknown else .unknown,
         .scalar_abi = if (target) |*t| .of(t) else .unknown,
     };
-    try server.builtin_targets.put(server.gpa, file, result);
-    return result;
 }
 
 /// Combines the build graphs and compile sets of all projects and updates the module graph input
