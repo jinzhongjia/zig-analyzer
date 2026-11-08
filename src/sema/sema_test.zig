@@ -565,6 +565,58 @@ test "pointer casts keep the value only when the elements are unchanged" {
         .{ "none_back", "?*const u8 = null" },
     });
 }
+test "@constCast and @volatileCast take their destination type from the operand" {
+    // The casts converted to the result type themselves, so a result type such as
+    // `error{Bad}!*u8` or `*const [1]u8` lost the value, and `@volatileCast` kept `volatile`.
+    try expectTypes(
+        \\const three: u8 = 3;
+        \\const four: u8 = 4;
+        \\const vp: *const volatile u8 = &four;
+        \\const ovp: ?*const volatile u8 = &four;
+        \\const ocp: ?*const u8 = &three;
+        \\const erased: *const anyopaque = @ptrCast(&three);
+        \\fn euConstCast(p: *const u8) error{Bad}!*u8 { return @constCast(p); }
+        \\fn euVolatileCast(p: *const volatile u8) error{Bad}!*const u8 { return @volatileCast(p); }
+        \\fn arrConstCast(p: *const u8) *const [1]u8 { return @constCast(p); }
+        \\fn euOptConstCast(p: ?*const u8) error{Bad}!?*u8 { return @constCast(p); }
+        \\fn fullChain(p: *const anyopaque) *u8 { return @constCast(@ptrCast(p)); }
+        \\fn fullChainAlign(p: *align(1) const u8) *u8 { return @volatileCast(@constCast(@alignCast(p))); }
+        \\const eu_constcast = (euConstCast(&three) catch unreachable).*;
+        \\const eu_volatilecast = (euVolatileCast(&four) catch unreachable).*;
+        \\const arr_constcast = arrConstCast(&three)[0];
+        \\const eu_opt_constcast = (euOptConstCast(&three) catch unreachable).?.*;
+        \\const eu_opt_null = euOptConstCast(null) catch unreachable;
+        \\const typeof_constcast = @TypeOf(@constCast(&three));
+        \\const typeof_volatilecast = @TypeOf(@volatileCast(vp));
+        \\const typeof_both = @TypeOf(@constCast(@volatileCast(vp)));
+        \\const typeof_opt_volatilecast = @TypeOf(@volatileCast(ovp));
+        \\const typeof_opt_constcast = @TypeOf(@constCast(ocp));
+        \\const full_chain = fullChain(erased).*;
+        \\const full_chain_align = fullChainAlign(&three).*;
+        \\fn runtime(p: *const volatile u8, op: ?*const volatile u8) void {
+        \\    const r1 = @volatileCast(p);
+        \\    const r2 = @constCast(@volatileCast(op));
+        \\    _ = .{ r1, r2 };
+        \\}
+    , &.{
+        .{ "eu_constcast", "u8 = 3" },
+        .{ "eu_volatilecast", "u8 = 4" },
+        .{ "arr_constcast", "u8 = 3" },
+        .{ "eu_opt_constcast", "u8 = 3" },
+        .{ "eu_opt_null", "?*u8 = null" },
+        .{ "typeof_constcast", "type = *u8" },
+        .{ "typeof_volatilecast", "type = *const u8" },
+        .{ "typeof_both", "type = *u8" },
+        // An optional pointer stays optional
+        .{ "typeof_opt_volatilecast", "type = ?*const u8" },
+        .{ "typeof_opt_constcast", "type = ?*u8" },
+        // Merged with `@ptrCast` / `@alignCast`, the destination is the result type
+        .{ "full_chain", "u8 = 3" },
+        .{ "full_chain_align", "u8 = 3" },
+        .{ "r1", "*const u8" },
+        .{ "r2", "?*u8" },
+    });
+}
 
 test "a function chosen by switching on an enum defined in the signature" {
     // The tag recorded by the instance kept the type of another instance, so no prong was chosen
