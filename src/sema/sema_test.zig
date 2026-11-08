@@ -7628,6 +7628,301 @@ test "comptime evaluation: pointer identity of declarations, functions and tempo
     });
 }
 
+test "comptime evaluation: pointer identity of constants and concatenations" {
+    try expectTypes(
+        \\const S = struct {
+        \\    a: u32,
+        \\    b: u32 = 0,
+        \\    fn addr(self: *const S) *const S {
+        \\        return self;
+        \\    }
+        \\};
+        \\const arr = [_]u8{ 1, 2 };
+        \\fn eql(a: []const u8, b: []const u8) bool {
+        \\    if (a.len != b.len) return false;
+        \\    if (a.len == 0 or a.ptr == b.ptr) return true;
+        \\    for (a, b) |x, y| if (x != y) return false;
+        \\    return true;
+        \\}
+        \\fn startsWith(haystack: []const u8, needle: []const u8) bool {
+        \\    return haystack.len >= needle.len and eql(haystack[0..needle.len], needle);
+        \\}
+        \\fn indexOf(haystack: []const u8, needle: []const u8) ?usize {
+        \\    var i: usize = 0;
+        \\    while (i + needle.len <= haystack.len) : (i += 1) {
+        \\        if (eql(haystack[i..][0..needle.len], needle)) return i;
+        \\    }
+        \\    return null;
+        \\}
+        \\const word = "ab";
+        \\fn locals() bool {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    const b = [_]u8{ 1, 2 };
+        \\    return &a == &b;
+        \\}
+        \\fn localsOther() bool {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    const b = [_]u8{ 1, 3 };
+        \\    return &a == &b;
+        \\}
+        \\fn localsType() bool {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    const b = [_]i8{ 1, 2 };
+        \\    return @as(*const anyopaque, &a) == @as(*const anyopaque, &b);
+        \\}
+        \\fn typedInit() bool {
+        \\    const a: [2]u8 = .{ 1, 2 };
+        \\    const b = [_]u8{ 1, 2 };
+        \\    return &a == &b;
+        \\}
+        \\fn structs() bool {
+        \\    const a = S{ .a = 1 };
+        \\    const b: S = .{ .a = 1 };
+        \\    return &a == &b;
+        \\}
+        \\fn ints() bool {
+        \\    const x: u32 = 5;
+        \\    return &x == &@as(u32, 5);
+        \\}
+        \\fn elems() bool {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    const b = [_]u8{ 1, 2 };
+        \\    return &a[1] == &b[1];
+        \\}
+        \\fn elemsOther() bool {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    const b = [_]u8{ 1, 2 };
+        \\    return &a[0] == &b[1];
+        \\}
+        \\fn fields() bool {
+        \\    const a = S{ .a = 1 };
+        \\    const b = S{ .a = 1 };
+        \\    return &a.b == &b.b;
+        \\}
+        \\fn slices() bool {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    const b = [_]u8{ 1, 2 };
+        \\    const sa: []const u8 = a[0..];
+        \\    const sb: []const u8 = b[0..];
+        \\    return sa.ptr == sb.ptr;
+        \\}
+        \\fn params(a: [2]u8, b: [2]u8) bool {
+        \\    return &a == &b;
+        \\}
+        \\fn captures() bool {
+        \\    const o: ?[2]u8 = .{ 1, 2 };
+        \\    if (o) |x| return &x == &[_]u8{ 1, 2 };
+        \\    return false;
+        \\}
+        \\fn receivers() bool {
+        \\    const a = S{ .a = 1 };
+        \\    const b = S{ .a = 1 };
+        \\    return a.addr() == b.addr();
+        \\}
+        \\fn variable() bool {
+        \\    var a = [_]u8{ 1, 2 };
+        \\    _ = &a;
+        \\    const b = [_]u8{ 1, 2 };
+        \\    return &a == &b;
+        \\}
+        \\fn variableVoid() bool {
+        \\    var x: void = {};
+        \\    _ = &x;
+        \\    const y: void = {};
+        \\    return &x == &y;
+        \\}
+        \\fn eqlVariable() bool {
+        \\    var buf = [_]u8{ 'a', 'b' };
+        \\    _ = &buf;
+        \\    const c = [_]u8{ 'a', 'b' };
+        \\    return eql(&buf, &c);
+        \\}
+        \\fn eqlConcat() bool {
+        \\    var buf = [_]u8{ 'a', 'b' };
+        \\    _ = &buf;
+        \\    return eql(&buf, "a" ++ "b");
+        \\}
+        \\fn constDecl() bool {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    return &a == &arr;
+        \\}
+        \\fn pointers() bool {
+        \\    var x: u8 = 1;
+        \\    _ = &x;
+        \\    const p = &x;
+        \\    const q = &x;
+        \\    return &p == &q;
+        \\}
+        \\fn pointerSelf() bool {
+        \\    var x: u8 = 1;
+        \\    _ = &x;
+        \\    const p = &x;
+        \\    return &p == &p;
+        \\}
+        \\fn heldSlice() bool {
+        \\    const s: []const u8 = "abc";
+        \\    return &s[1] == &s[1];
+        \\}
+        \\fn aligned() bool {
+        \\    const a align(4) = [_]u8{ 1, 2 };
+        \\    const b align(4) = [_]u8{ 1, 2 };
+        \\    return &a == &b;
+        \\}
+        \\fn alignedOther() bool {
+        \\    const a align(4) = [_]u8{ 1, 2 };
+        \\    const b align(4) = [_]u8{ 1, 3 };
+        \\    return &a == &b;
+        \\}
+        \\fn loop() bool {
+        \\    var ptrs: [2]*const [1]u8 = undefined;
+        \\    for (0..2) |i| {
+        \\        const a = [_]u8{@intCast(i)};
+        \\        ptrs[i] = &a;
+        \\    }
+        \\    return ptrs[0] == ptrs[1];
+        \\}
+        \\fn loopEqual() bool {
+        \\    var ptrs: [2]*const [1]u8 = undefined;
+        \\    for (0..2) |i| {
+        \\        const a = [_]u8{7};
+        \\        ptrs[i] = &a;
+        \\    }
+        \\    return ptrs[0] == ptrs[1];
+        \\}
+        \\fn loopRead() u8 {
+        \\    var ptrs: [2]*const [1]u8 = undefined;
+        \\    for (0..2) |i| {
+        \\        const a = [_]u8{@intCast(i)};
+        \\        ptrs[i] = &a;
+        \\    }
+        \\    return ptrs[0][0];
+        \\}
+        \\fn concat() bool {
+        \\    return @as([*]const u8, "a" ++ "b") == @as([*]const u8, "a" ++ "b");
+        \\}
+        \\fn concatOther() bool {
+        \\    return @as([*]const u8, "a" ++ "b") == @as([*]const u8, "a" ++ "c");
+        \\}
+        \\fn concatLiteral() bool {
+        \\    return @as([*]const u8, "a" ++ "b") == @as([*]const u8, "ab");
+        \\}
+        \\fn concatEmpty() bool {
+        \\    return @as([*]const u8, "" ++ "") == @as([*]const u8, "");
+        \\}
+        \\fn concatDecl() bool {
+        \\    return @as([*]const u8, word ++ "c") == @as([*]const u8, "abc");
+        \\}
+        \\fn eqlConcatLiteral() bool {
+        \\    return eql("a" ++ "b", "ab");
+        \\}
+        \\fn startsWithConcat() bool {
+        \\    return startsWith("a" ++ "bc", "ab");
+        \\}
+        \\fn indexOfConcat() ?usize {
+        \\    return indexOf("x" ++ "abc", "bc");
+        \\}
+        \\fn concatLocal() bool {
+        \\    const a = [_:0]u8{ 'a', 'b' };
+        \\    return @as([*]const u8, "a" ++ "b") == @as([*]const u8, &a);
+        \\}
+        \\const p_block = blk: {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    const b = [_]u8{ 1, 2 };
+        \\    break :blk &a == &b;
+        \\};
+        \\const p_concat = @as([*]const u8, "a" ++ "b") == @as([*]const u8, "a" ++ "b");
+        \\const r_locals = locals();
+        \\const r_locals_other = localsOther();
+        \\const r_locals_type = localsType();
+        \\const r_typed_init = typedInit();
+        \\const r_structs = structs();
+        \\const r_ints = ints();
+        \\const r_elems = elems();
+        \\const r_elems_other = elemsOther();
+        \\const r_fields = fields();
+        \\const r_slices = slices();
+        \\const r_params = params(.{ 1, 2 }, .{ 1, 2 });
+        \\const r_params_other = params(.{ 1, 2 }, .{ 1, 3 });
+        \\const r_captures = captures();
+        \\const r_receivers = receivers();
+        \\const r_variable = variable();
+        \\const r_variable_void = variableVoid();
+        \\const r_eql_variable = eqlVariable();
+        \\const r_eql_concat = eqlConcat();
+        \\const r_const_decl = constDecl();
+        \\const r_pointers = pointers();
+        \\const r_pointer_self = pointerSelf();
+        \\const r_held_slice = heldSlice();
+        \\const r_aligned = aligned();
+        \\const r_aligned_other = alignedOther();
+        \\const r_loop = loop();
+        \\const r_loop_equal = loopEqual();
+        \\const r_loop_read = loopRead();
+        \\const r_concat = concat();
+        \\const r_concat_other = concatOther();
+        \\const r_concat_literal = concatLiteral();
+        \\const r_concat_empty = concatEmpty();
+        \\const r_concat_decl = concatDecl();
+        \\const r_eql_concat_literal = eqlConcatLiteral();
+        \\const r_starts_with_concat = startsWithConcat();
+        \\const r_index_of_concat = indexOfConcat();
+        \\const r_concat_local = concatLocal();
+    , &.{
+        // Constants with equal values (of the same type) are one anonymous constant, whether
+        // initialized by value or through a result type
+        .{ "p_block", "bool = true" },
+        .{ "r_locals", "bool = true" },
+        .{ "r_locals_other", "bool = false" },
+        .{ "r_locals_type", "bool = false" },
+        .{ "r_typed_init", "bool = true" },
+        .{ "r_structs", "bool = true" },
+        .{ "r_ints", "bool = true" },
+        .{ "r_elems", "bool = true" },
+        .{ "r_elems_other", "bool = false" },
+        .{ "r_fields", "bool = true" },
+        .{ "r_slices", "bool = true" },
+        // Parameters, captures, and the receiver of a method are constants too
+        .{ "r_params", "bool = true" },
+        .{ "r_params_other", "bool = false" },
+        .{ "r_captures", "bool = true" },
+        .{ "r_receivers", "bool = true" },
+        // A variable is storage of its own unless it has no bits, and a declaration is not an
+        // anonymous constant
+        .{ "r_variable", "bool = false" },
+        .{ "r_variable_void", "bool" },
+        .{ "r_eql_variable", "bool = true" },
+        .{ "r_eql_concat", "bool = true" },
+        .{ "r_const_decl", "bool = false" },
+        // Constants holding pointers are not compared by value, only with themselves; element
+        // pointers through an interned slice held by a constant are one place
+        .{ "r_pointers", "bool" },
+        .{ "r_pointer_self", "bool = true" },
+        .{ "r_held_slice", "bool = true" },
+        // The alignment of an aligned constant is part of its identity and is not tracked
+        .{ "r_aligned", "bool" },
+        .{ "r_aligned_other", "bool = false" },
+        // Each iteration of a loop has its own constant
+        .{ "r_loop", "bool = false" },
+        .{ "r_loop_equal", "bool = true" },
+        .{ "r_loop_read", "u8 = 0" },
+        // A `++` result that is a pointer points to an anonymous constant; with interned operands
+        // it is interned, the same value as an equal string literal, and string functions that
+        // compare pointers before elements keep their results
+        .{ "p_concat", "bool = true" },
+        .{ "r_concat", "bool = true" },
+        .{ "r_concat_other", "bool = false" },
+        .{ "r_concat_literal", "bool = true" },
+        .{ "r_concat_empty", "bool = true" },
+        .{ "r_concat_decl", "bool = true" },
+        .{ "r_eql_concat_literal", "bool = true" },
+        .{ "r_starts_with_concat", "bool = true" },
+        .{ "r_index_of_concat", "?usize = 2" },
+        // Whether an interned value is the same anonymous constant as a constant local is not
+        // known
+        .{ "r_concat_local", "bool" },
+    });
+}
+
 test "comptime evaluation: slices of interpreter storage read elements in place" {
     // Guards against copying the whole range when taking an element or the length of a slice:
     // a loop that slices repeatedly (a common pattern in comptime tokenizers) would allocate in
