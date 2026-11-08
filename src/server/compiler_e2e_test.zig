@@ -538,6 +538,22 @@ fn openGate(h: *Harness, project: *fixture.Project) !void {
     try gate.writeStreamingAll(testing.io, "x");
 }
 
+/// Waits until `build()` of a gated project has created the file `name` in the project
+fn awaitFile(h: *Harness, project: *fixture.Project, name: []const u8) !void {
+    const path = try project.path(h.arena.allocator(), name);
+    const started = std.Io.Clock.Timestamp.now(testing.io, .awake);
+    while (true) {
+        std.Io.Dir.cwd().access(testing.io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                try awaitGate(h, started, name);
+                continue;
+            },
+            else => |e| return e,
+        };
+        return;
+    }
+}
+
 fn sendHover(h: *Harness, uri: []const u8, line: u32, character: u32) !i64 {
     return h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } });
 }
@@ -619,16 +635,15 @@ test "wait_for_project: a restart during the first load does not end the wait" {
     try h.start();
     defer h.finish();
     const a = h.arena.allocator();
-    // `build()` also says when it has reached the gate, through a second FIFO: rewriting build.zig
-    // earlier would only change what the first instance compiles
+    // `build()` also says when it has reached the gate, by creating the file `reached`: rewriting
+    // build.zig earlier would only change what the first instance compiles
     const gate_line = "    _ = std.Io.Dir.cwd().readFileAlloc(b.graph.io, \"gate\", b.allocator, .limited(16)) catch unreachable;\n";
     const reached_line = "    std.Io.Dir.cwd().writeFile(b.graph.io, .{ .sub_path = \"reached\", .data = \"x\" }) catch unreachable;\n";
-    try createFifo(&project, "reached");
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "build.zig", .data = try std.mem.replaceOwned(u8, a, gated_build, gate_line, reached_line ++ gate_line) });
     try initializeWith(&h, project.root, false, try jsonValue(&h, wait_options));
     const uri = try open(&h, try project.path(a, "main.zig"), gated_main);
     const held = try sendHover(&h, uri, 2, 12);
-    _ = try std.Io.Dir.cwd().readFileAlloc(testing.io, try project.path(a, "reached"), a, .limited(16));
+    try awaitFile(&h, &project, "reached");
     try expectHeld(&h, uri, held);
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "build.zig", .data = try std.mem.replaceOwned(u8, a, gated_build, gate_line, "") });
     const text = hoverValue(try h.response(held));
