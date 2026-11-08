@@ -3434,8 +3434,9 @@ const Evaluator = struct {
                 destType(ip, want, strip) orelse want orelse return error.Abort
             else
                 want orelse return error.Abort;
-            if (pointer_cast and !try ev.keepsPointee(vals[0], t)) return .{ .ty = t };
-            return ev.cast(name, vals[0], t);
+            const src = if (pointer_cast) try ev.unerase(vals[0], t) else vals[0];
+            if (pointer_cast and !try ev.keepsPointee(src, t)) return .{ .ty = t };
+            return ev.cast(name, src, t);
         }
         if (eq(u8, name, "@intFromBool")) {
             if (vals.len != 1) return error.Abort;
@@ -3760,23 +3761,16 @@ const Evaluator = struct {
     /// Whether pointer `v` cast to type `to` points to the same elements: values are not
     /// reinterpreted in memory, so a cast that changes the element type (`*const [2][1]u8` to
     /// `*const [2]u8` in std.mem.asBytes) gives an unknown value. A cast to `*anyopaque` keeps
-    /// the value, which cannot be read through it; a cast back from it keeps the value when the
-    /// pointed-to value has the target type (`sentinel_ptr` of `@typeInfo`).
+    /// the value, which cannot be read through it; a cast back from it is checked on the pointer
+    /// it was erased from (`unerase`).
     fn keepsPointee(ev: *Evaluator, v: Val, to: Index) EvalError!bool {
         const ip = ev.ip;
-        const x_v = try ev.ipOf(v);
-        if (x_v == .null_value) return true;
+        if (v.is(.null_value)) return true;
         const a = pointerType(ip, v.ty) orelse return false;
         const b = pointerType(ip, to) orelse return false;
         if (b.child == .anyopaque_type) return true;
-        if (a.child == .anyopaque_type) {
-            if (b.size != .one) return false;
-            const pv = switch (ip.key(x_v orelse return false)) {
-                .ptr_value => |pv| pv,
-                else => return false,
-            };
-            return value.eqlTypes(ip, value.typeOfValue(ip, pv.pointee), b.child) == true;
-        }
+        // An erased pointer `unerase` left as it is: what it points to is unknown
+        if (a.child == .anyopaque_type) return false;
         const x = castPointee(ip, a);
         const y = castPointee(ip, b);
         // Pointers to arrays, slices and many-pointers are represented by the elements, other
@@ -3784,6 +3778,85 @@ const Evaluator = struct {
         if (x.single != y.single) return false;
         if (x.len != null and y.len != null and x.len.? != y.len.?) return false;
         return value.eqlTypes(ip, x.elem, y.elem) == true;
+    }
+
+    /// Pointer `v` erased to `*anyopaque` (or `?*anyopaque`), typed as the pointer it was erased
+    /// from, for a pointer cast to `to`. The compiler's comptime pointers keep what they point to
+    /// when coercion or `@ptrCast` changes their type, and a load compares the loaded type with
+    /// the value there, so a cast back from `*anyopaque` is checked as a cast of the original
+    /// pointer. The type comes from the representation: the value in the storage (`.ref`; a
+    /// range is an array), the pointer type an interned pointer was created with, or the type of
+    /// the pointed-to value (`sentinel_ptr` and `default_value_ptr` of `@typeInfo`). The child of
+    /// `to` only chooses between the types the representation leaves open: an interned value of
+    /// an optional or an error union is its payload, and a pointer to the payload of an optional
+    /// (`if (opt) |*x|`) points to where the optional is. Other values are returned unchanged.
+    fn unerase(ev: *Evaluator, v: Val, to: Index) EvalError!Val {
+        const ip = ev.ip;
+        const a = pointerType(ip, v.ty) orelse return v;
+        const b = pointerType(ip, to) orelse return v;
+        if (a.child != .anyopaque_type or b.child == .anyopaque_type) return v;
+        var from: InternPool.PtrType = .{ .child = .unknown, .size = .one, .is_const = a.is_const, .attrs = a.attrs };
+        var repr = v.v;
+        switch (v.v) {
+            .ref => |r| {
+                const target = ev.loadPath(r) catch |err| switch (err) {
+                    error.Abort => return v,
+                    else => |e| return e,
+                };
+                if (r.window) |w| {
+                    const elem = ev.elemTypeOf(target.ty, w.start);
+                    if (elem == .unknown) return v;
+                    from.child = try ip.get(.{ .array_type = .{ .len = w.len, .child = elem } });
+                } else {
+                    from.child = target.ty;
+                    // A pointer to the payload of an optional points to the optional and is read
+                    // as the payload (see `deref`)
+                    switch (ip.key(target.ty)) {
+                        .optional_type => |c| if (c == b.child and !target.is(.null_value)) {
+                            from.child = c;
+                        },
+                        else => {},
+                    }
+                }
+            },
+            .ip => |x| switch (ip.key(x)) {
+                .ptr_value => |pv| {
+                    const p = pointerType(ip, pv.ty) orelse return v;
+                    if (p.child != .anyopaque_type) {
+                        from = p;
+                    } else {
+                        if (pv.pointee == .unknown) return v;
+                        from.child = if (valueOfType(ip, pv.pointee, b.child)) b.child else value.typeOfValue(ip, pv.pointee);
+                        if (from.child == .unknown) return v;
+                        repr = .{ .ip = try ev.pointerTo(try ip.get(.{ .ptr_type = from }), pv.pointee) };
+                    }
+                },
+                .aggregate => |agg| from = pointerType(ip, agg.ty) orelse return v,
+                .bytes => |bytes| from = pointerType(ip, bytes.ty) orelse return v,
+                else => return v,
+            },
+            else => return v,
+        }
+        if (from.child == .unknown) return v;
+        // Slices cannot be erased; the elements of one are erased through its `ptr`
+        if (from.size == .slice) from.size = .many;
+        const ptr = try ip.get(.{ .ptr_type = from });
+        return .{ .ty = if (ip.key(v.ty) == .optional_type) try ip.optionalOf(ptr) else ptr, .v = repr };
+    }
+
+    /// Whether interned value `x` is a value of type `t`: optionals and error unions are
+    /// represented by their payloads (or `null` / the error), errors have no type of their own,
+    /// and `undefined` is a value of every type
+    fn valueOfType(ip: *InternPool, x: Index, t: Index) bool {
+        if (x == .undefined_value) return true;
+        if (value.eqlTypes(ip, value.typeOfValue(ip, x), t) == true) return true;
+        const is_error = ip.key(x) == .error_value;
+        return switch (ip.key(t)) {
+            .optional_type => |c| x == .null_value or valueOfType(ip, x, c),
+            .error_union_type => |eu| is_error or valueOfType(ip, x, eu.payload),
+            .error_set_type, .inferred_error_set => is_error,
+            else => t == .anyerror_type and is_error,
+        };
     }
 
     /// The pointer type of a pointer or an optional pointer
