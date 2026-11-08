@@ -3085,10 +3085,17 @@ test "comptime-known slices in tuple literals are comptime fields that anytype c
         \\const ret_type_arg = @TypeOf(retTypeUsesArg(.{@as([]const u8, "abc")}));
         \\const ret_type_direct = RetArr(.{@as([]const u8, "abc")});
         \\const ret_type_inline = @TypeOf(retTypeInline(.{@as([]const u8, "abc")}));
+        \\const var_field_t = blk: {
+        \\    var buf: [2]u8 = "ab".*;
+        \\    const t = .{@as([]u8, &buf)};
+        \\    break :blk @TypeOf(t);
+        \\};
         \\fn g(p: []const u8) void {
         \\    const with_runtime = .{ @as([]const u8, "xy"), p };
         \\    const in_fn = retTypeUsesArg(.{@as([]const u8, "ab")});
-        \\    _ = .{ with_runtime, in_fn };
+        \\    comptime var buf: [2]u8 = "ab".*;
+        \\    const with_var = .{@as([]u8, &buf)};
+        \\    _ = .{ with_runtime, in_fn, with_var };
         \\}
     , &.{
         .{ "slice_t", "type = struct { comptime []const u8 = \"abc\" }" },
@@ -3099,6 +3106,9 @@ test "comptime-known slices in tuple literals are comptime fields that anytype c
         .{ "ret_type_inline", "type = [3]u8" },
         .{ "with_runtime", "struct { comptime []const u8 = \"xy\", []const u8 }" },
         .{ "in_fn", "[2]u8" },
+        // A field that refers to a comptime var is not a comptime field (zig 0.17.0 and 0.17.1)
+        .{ "var_field_t", "type = struct { []u8 }" },
+        .{ "with_var", "struct { []u8 }" },
     });
 }
 
@@ -3112,11 +3122,25 @@ test "a comptime call evaluates its anytype arguments at comptime" {
         \\fn RetArrSlice(s: []const u8) type {
         \\    return [s.len]u8;
         \\}
+        \\fn writeAndLen(s: anytype) type {
+        \\    s[0] = 'z';
+        \\    return [s.len]u8;
+        \\}
         \\const name: []const u8 = "abc";
         \\const any_slice = RetArrAny(@as([]const u8, "abcd"));
         \\const any_decl = RetArrAny(name);
         \\const any_lit = RetArrAny("abcd");
         \\const slice_param = RetArrSlice("abcd");
+        \\const write_len = blk: {
+        \\    var buf: [3]u8 = "abc".*;
+        \\    const T = writeAndLen(@as([]u8, &buf));
+        \\    break :blk @sizeOf(T);
+        \\};
+        \\const write_byte = blk: {
+        \\    var buf: [3]u8 = "abc".*;
+        \\    _ = writeAndLen(@as([]u8, &buf));
+        \\    break :blk buf[0];
+        \\};
         \\fn g() void {
         \\    const in_fn = RetArrAny(@as([]const u8, "abcde"));
         \\    const in_fn_decl = RetArrAny(name);
@@ -3129,6 +3153,9 @@ test "a comptime call evaluates its anytype arguments at comptime" {
         .{ "slice_param", "type = [4]u8" },
         .{ "in_fn", "type = [5]u8" },
         .{ "in_fn_decl", "type = [3]u8" },
+        // The callee both reads the slice's length and writes through it into the caller's var
+        .{ "write_len", "comptime_int = 3" },
+        .{ "write_byte", "u8 = 122" },
     });
 }
 
