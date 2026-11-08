@@ -565,6 +565,7 @@ fn hoverValue(resp: std.json.Value) []const u8 {
 
 /// The text of a hover answered during the load. The writes of startup may cancel a read in
 /// progress, as they may for a client, which asks again; the gate keeps the load from ending.
+/// A text without the loading note from a load that has ended fails as `expectLoading` does.
 fn hoverDuringLoad(h: *Harness, uri: []const u8, line: u32, character: u32) ![]const u8 {
     while (true) {
         const resp = try h.response(try sendHover(h, uri, line, character));
@@ -572,7 +573,9 @@ fn hoverDuringLoad(h: *Harness, uri: []const u8, line: u32, character: u32) ![]c
             try testing.expectEqual(-32801, e.object.get("code").?.integer);
             continue;
         }
-        return hoverValue(resp);
+        const text = hoverValue(resp);
+        if (std.mem.indexOf(u8, text, loading_note) == null) try expectLoading(h);
+        return text;
     }
 }
 
@@ -585,9 +588,11 @@ fn answered(h: *Harness, id: i64) bool {
 }
 
 /// A syntax request gets its response during the load (the writes of startup may cancel it, which
-/// is a response too), and the request `id` has not got one by then
+/// is a response too), and the request `id` has not got one by then. An answer from a load that
+/// has ended fails as `expectLoading` does.
 fn expectHeld(h: *Harness, uri: []const u8, id: i64) !void {
     _ = try h.request("textDocument/documentSymbol", .{ .textDocument = .{ .uri = uri } });
+    if (answered(h, id)) try expectLoading(h);
     try testing.expect(!answered(h, id));
 }
 
