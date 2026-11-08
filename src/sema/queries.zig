@@ -727,6 +727,35 @@ pub const LocalEval = struct {
     }
 };
 
+/// A local variable of a function as a container defined in the function body captures it
+pub const CaptureKey = struct {
+    owner: hir.OwnerKey,
+    binding: Body.BindingId,
+    /// The container (an index into `ItemTree.containers`) defined directly in the body of `owner`
+    container: u32,
+    inst: ?Index = null,
+};
+
+/// Value of a local variable of a function as a container defined in its body captures it: the
+/// value the variable has when the body reaches the container, which the compiler's
+/// `getCaptures` loads there (`comptime var`, or a `var` in a comptime scope). Containers
+/// defined before and after a modification capture different values, so the value belongs to
+/// the container rather than to the variable. The interpreter executes the function in its
+/// instance `inst` up to the container (see `eval.capturedValue`).
+pub const CapturedVar = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = CaptureKey;
+    pub const Value = TypedValue;
+
+    pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
+        return eval.capturedValue(ctx, key);
+    }
+
+    pub fn cycleFallback(_: Key) Value {
+        return .unknown;
+    }
+};
+
 pub const LocalScope = struct {
     file: FileId,
     item: u32,
@@ -734,7 +763,7 @@ pub const LocalScope = struct {
 };
 
 /// Type of a name resolution result. `inst` is the instance context where the resolution takes
-/// place.
+/// place, and `current` the member it takes place in, when known.
 pub fn defType(r: *Resolver, def: resolve.Def, current: ?LocalScope, inst: ?Index) resolve.Error!TypedValue {
     switch (def) {
         .item => |it| {
@@ -742,17 +771,57 @@ pub fn defType(r: *Resolver, def: resolve.Def, current: ?LocalScope, inst: ?Inde
             return r.ctx.get(DeclType, .{ .owner = .{ .file = it.file, .item = tree.items[it.item].ast_id }, .inst = try declInst(r, it.file, it.item, inst) });
         },
         .local => |l| {
-            if (current) |c| if (c.file == l.file and c.item == l.item) return c.bindings[@backingInt(l.binding)];
-            const key: LocalKey = .{ .owner = try r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = try normalizeInst(r, l.file, l.item, inst) };
-            const tv = try r.ctx.get(LocalValue, key);
-            if (tv.val != null or r.ctx.incomplete()) return tv;
-            // A local of another member is read from a container defined in its function body,
-            // which captured the value the body computed for a constant
-            if ((try r.body(l.file, l.item)).binding(l.binding).kind != .local_const) return tv;
-            const run = try r.ctx.get(LocalEval, key);
-            return if (run.val != null and (tv.ty == .unknown or run.ty == tv.ty)) run else tv;
+            const c = current orelse return outerLocal(r, l, null, inst);
+            if (c.file == l.file and c.item == l.item) return c.bindings[@backingInt(l.binding)];
+            return outerLocal(r, l, try memberNamespace(r, c.file, c.item), inst);
         },
         .file => |f| return importValue(r, f),
+    }
+}
+
+pub const Local = @FieldType(resolve.Def, "local");
+
+/// Type of local `l` of another member, read from a member of container `from` (null when not
+/// known) in instance context `inst`. Such a read comes from a container defined in the body of
+/// the function `l.item`, which captured the values the body computed for the locals it refers
+/// to when the body reached the container (the compiler's `getCaptures`):
+/// - a constant has one value: `LocalValue` infers its initializer, and when that gives no value,
+///   `LocalEval` takes it from an execution of the function;
+/// - a variable can change between containers, so its value is the one the container defined
+///   directly in the body around `from` captured (`CapturedVar`); without `from`, only its type
+///   is known.
+pub fn outerLocal(r: *Resolver, l: Local, from: ?Namespace, inst: ?Index) resolve.Error!TypedValue {
+    const key: LocalKey = .{ .owner = try r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = try normalizeInst(r, l.file, l.item, inst) };
+    const tv = try r.ctx.get(LocalValue, key);
+    if (tv.val != null or r.ctx.incomplete()) return tv;
+    const run = switch ((try r.body(l.file, l.item)).binding(l.binding).kind) {
+        .local_const => try r.ctx.get(LocalEval, key),
+        .local_var => blk: {
+            const ns = from orelse return tv;
+            if (ns.file != l.file) return tv;
+            const site = try captureSite(r, ns, l.item) orelse return tv;
+            break :blk try r.ctx.get(CapturedVar, .{ .owner = key.owner, .binding = l.binding, .container = site, .inst = key.inst });
+        },
+        .param, .capture => return tv,
+    };
+    return if (run.val != null and (tv.ty == .unknown or run.ty == tv.ty)) run else tv;
+}
+
+/// The container a member of the file belongs to
+pub fn memberNamespace(r: *Resolver, file: FileId, item: u32) resolve.Error!Namespace {
+    return .{ .file = file, .container = (try r.itemTree(file)).items[item].container };
+}
+
+/// The container defined directly in the body of member `item` that is or encloses container `ns`
+/// (through the members of nested containers): the one whose definition captures the locals of
+/// `item` that `ns` refers to. Null when `ns` is not inside `item`.
+fn captureSite(r: *Resolver, ns: Namespace, item: u32) resolve.Error!?u32 {
+    const tree = try r.itemTree(ns.file);
+    var c = ns.container;
+    while (true) {
+        const parent = tree.containers[c].parent_item orelse return null;
+        if (parent == item) return c;
+        c = tree.items[parent].container;
     }
 }
 
