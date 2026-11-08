@@ -1395,6 +1395,32 @@ test "a non-null optional holding a null optional is not null" {
         \\    if (o) |*p| p.* = null;
         \\    break :blk o.? == null;
         \\};
+        \\const view_payload = blk: {
+        \\    var o: ??u8 = @as(?u8, null);
+        \\    _ = &o;
+        \\    if (o) |*p| {
+        \\        const v: *[1]?u8 = p;
+        \\        break :blk v[0] == null;
+        \\    }
+        \\    break :blk false;
+        \\};
+        \\const view_payload_deref = blk: {
+        \\    var o: ??u8 = @as(?u8, null);
+        \\    _ = &o;
+        \\    if (o) |*p| {
+        \\        const v: *[1]?u8 = p;
+        \\        break :blk v.*[0] == null;
+        \\    }
+        \\    break :blk false;
+        \\};
+        \\const view_payload_write = blk: {
+        \\    var o: ??u8 = @as(?u8, null);
+        \\    if (o) |*p| {
+        \\        const v: *[1]?u8 = p;
+        \\        v[0] = 5;
+        \\    }
+        \\    break :blk o.?.?;
+        \\};
         \\const assign_unwrap = blk: {
         \\    var o: ??u8 = @as(?u8, 5);
         \\    o.? = null;
@@ -1461,6 +1487,10 @@ test "a non-null optional holding a null optional is not null" {
         .{ "mixed_rev", "bool = true" },
         .{ "ptr_payload", "bool = false" },
         .{ "ptr_payload_inner", "bool = true" },
+        // A payload pointer coerced to `*[1]?u8` reads and writes the payload through the view
+        .{ "view_payload", "bool = true" },
+        .{ "view_payload_deref", "bool = true" },
+        .{ "view_payload_write", "u8 = 5" },
         .{ "assign_unwrap", "bool = false" },
         .{ "eu_payload", "bool = false" },
         .{ "opt_eu", "bool = false" },
