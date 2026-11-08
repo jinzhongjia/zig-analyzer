@@ -6074,6 +6074,24 @@ test "comptime evaluation: @fieldParentPtr goes back from a field pointer to its
         \\    parent.a = 9;
         \\    break :blk s.a;
         \\};
+        \\const const_cast = blk: {
+        \\    const parent: *S = @constCast(@fieldParentPtr("b", &s_val.b));
+        \\    break :blk parent.a;
+        \\};
+        \\const const_cast_write = blk: {
+        \\    var s: S = .{ .a = 3, .b = 4 };
+        \\    const fp: *const u8 = &s.b;
+        \\    const parent: *S = @constCast(@fieldParentPtr("b", fp));
+        \\    parent.a = 9;
+        \\    break :blk s.a;
+        \\};
+        \\const volatile_const_cast = blk: {
+        \\    var s: S = .{ .a = 3, .b = 4 };
+        \\    const fp: *const u8 = &s.b;
+        \\    const parent: *S = @volatileCast(@constCast(@fieldParentPtr("b", fp)));
+        \\    parent.a = 7;
+        \\    break :blk s.a;
+        \\};
         \\const nested = blk: {
         \\    const inner: *const Inner = @alignCast(@fieldParentPtr("y", &o_val.inner.y));
         \\    const outer: *const Outer = @alignCast(@fieldParentPtr("inner", inner));
@@ -6125,6 +6143,11 @@ test "comptime evaluation: @fieldParentPtr goes back from a field pointer to its
         .{ "via_union", "u8 = 7" },
         // Writes through the parent pointer reach the variable
         .{ "via_var", "u8 = 9" },
+        // `@constCast` / `@volatileCast` are merged with `@fieldParentPtr` too: the parent
+        // pointer of a `*const` field pointer can be written through
+        .{ "const_cast", "u8 = 1" },
+        .{ "const_cast_write", "u8 = 9" },
+        .{ "volatile_const_cast", "u8 = 7" },
         .{ "nested", "u16 = 15" },
         // The destination type may be an optional pointer; the result type's error union is dropped
         .{ "optional", "u8 = 1" },
