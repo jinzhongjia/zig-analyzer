@@ -5714,6 +5714,25 @@ test "unsigned 128-bit integers above i128's range" {
     });
 }
 
+test "integer literals wider than 64 bits in evaluated code" {
+    // The interpreter gave up on integer literals that do not fit in 64 bits.
+    try expectTypes(
+        \\fn shifted(comptime n: u7) u128 {
+        \\    const v: u128 = 0x0102030405060708090a0b0c0d0e0f10;
+        \\    return v >> n;
+        \\}
+        \\const in_fn = shifted(64);
+        \\const assigned = blk: {
+        \\    var x: u128 = 0;
+        \\    x = 18446744073709551616;
+        \\    break :blk x;
+        \\};
+    , &.{
+        .{ "in_fn", "u128 = 72623859790382856" },
+        .{ "assigned", "u128 = 18446744073709551616" },
+    });
+}
+
 test "comptime_int values outside i128" {
     // `comptime_int` is arbitrary precision: a value beyond i128 was unknown, and so was the
     // arithmetic on it
