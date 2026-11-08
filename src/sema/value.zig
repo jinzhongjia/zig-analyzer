@@ -354,6 +354,7 @@ pub fn typeOfValue(ip: *InternPool, v: Index) Index {
         .bytes => |b| b.ty,
         .union_value => |u| u.ty,
         .ptr_value => |p| p.ty,
+        .opt_payload => |o| o.ty,
         else => |k| if (isTypeKey(k)) .type_type else .unknown,
     };
 }
@@ -1001,6 +1002,7 @@ pub fn isPrecise(ip: *InternPool, v: Index) bool {
         .aggregate => |agg| allPrecise(ip, agg.elems),
         .union_value => |u| isPrecise(ip, u.payload),
         .ptr_value => |p| isPrecise(ip, p.pointee),
+        .opt_payload => |o| isPrecise(ip, o.payload),
         .fn_value => |f| f.inst == null or isPrecise(ip, f.inst.?),
         .enum_tag => |t| isPrecise(ip, t.ty),
         .enum_unnamed => |u| isPrecise(ip, u.ty),
@@ -1224,12 +1226,23 @@ pub fn eqlValues(ip: *InternPool, a: Index, b: Index) ?bool {
         if (!isTypeKey(ka) or !isTypeKey(kb)) return null;
         return eqlTypes(ip, a, b);
     }
-    // A non-null optional value is its payload: compared with null, it is unequal as soon as
-    // the other side is a known non-null value
+    // A non-null optional value is its payload (see `InternPool.Key.opt_payload`): compared with
+    // null, it is unequal as soon as the other side is a known non-null value. Both sides are
+    // values of the same type: a null of `?u8` and a `??u8` holding it are compared after
+    // coercing to `??u8` (see `optionalCoercion`).
     if (a == .null_value or b == .null_value) {
         if (a == b) return true;
         const other = if (a == .null_value) kb else ka;
         return switch (other) {
+            .simple_value => |s| if (s == .undefined) null else false,
+            .unknown, .runtime => null,
+            else => false,
+        };
+    }
+    // A non-null optional with a null payload equals only another one with an equal payload
+    if (ka == .opt_payload or kb == .opt_payload) {
+        if (ka == .opt_payload and kb == .opt_payload) return eqlValues(ip, ka.opt_payload.payload, kb.opt_payload.payload);
+        return switch (if (ka == .opt_payload) kb else ka) {
             .simple_value => |s| if (s == .undefined) null else false,
             .unknown, .runtime => null,
             else => false,
@@ -1350,7 +1363,12 @@ fn eqlAggregates(ip: *InternPool, a: Index, b: Index) ?bool {
 pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index {
     if (to == .unknown or v == .unknown or v == .undefined_value) return v;
     switch (ip.key(to)) {
-        .optional_type => |child| return if (v == .null_value) v else coerceValue(ip, v, child),
+        .optional_type => |child| {
+            if (v == .null_value) return v;
+            // A non-null optional with a null payload carries its type
+            if (ip.key(v) == .opt_payload) return coerceValueFrom(ip, v, ip.key(v).opt_payload.ty, to);
+            return coerceValue(ip, v, child);
+        },
         else => if (isEnumType(ip, to)) switch (ip.key(v)) {
             .enum_literal => |name| return try ip.get(.{ .enum_tag = .{ .ty = to, .name = name } }),
             else => {},
@@ -1389,6 +1407,129 @@ pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index 
         else => {},
     };
     return v;
+}
+
+/// `coerceValue` for a value of type `from` (unknown when it is not known): an optional payload
+/// is told apart from the optional itself (see `optionalCoercion`), so a null of `?u8` coerced to
+/// `??u8` is a non-null optional, while `null` itself is the null of every optional type. Null
+/// when the coercion is not possible or cannot be decided.
+pub fn coerceValueFrom(ip: *InternPool, v: Index, from: Index, to: Index) Allocator.Error!?Index {
+    if (from == to or to == .unknown or v == .unknown or v == .undefined_value) return v;
+    switch (ip.key(to)) {
+        .optional_type => |child| {
+            const route = optionalCoercion(ip, from, to) orelse {
+                if (isNullRepr(ip, v)) return null;
+                return coerceValue(ip, v, to);
+            };
+            switch (route) {
+                .keep => {
+                    const payload = optionalPayload(ip, v) orelse return .null_value;
+                    const payload_ty = switch (ip.key(from)) {
+                        .optional_type => |c| c,
+                        else => from,
+                    };
+                    return try wrapOptional(ip, to, try coerceValueFrom(ip, payload, payload_ty, child) orelse return null);
+                },
+                .wrap => return try wrapOptional(ip, to, try coerceValueFrom(ip, v, from, child) orelse return null),
+            }
+        },
+        .error_union_type => |eu| {
+            if (ip.key(v) == .error_value) return v;
+            const payload_ty = switch (ip.key(from)) {
+                .error_union_type => |e| e.payload,
+                else => from,
+            };
+            return coerceValueFrom(ip, v, payload_ty, eu.payload);
+        },
+        else => return coerceValue(ip, v, to),
+    }
+}
+
+// ── Optionals ────────────────────────────────────────────────────────
+
+/// Whether `v` is represented as null: `null_value`, or a non-null optional whose payload is
+/// (`InternPool.Key.opt_payload`). Only such a payload makes a non-null optional an
+/// `opt_payload`.
+pub fn isNullRepr(ip: *InternPool, v: Index) bool {
+    return v == .null_value or ip.key(v) == .opt_payload;
+}
+
+/// The value of a non-null optional of type `ty` with payload `payload`: the payload itself,
+/// unless the payload is represented as null
+pub fn wrapOptional(ip: *InternPool, ty: Index, payload: Index) Allocator.Error!Index {
+    if (!isNullRepr(ip, payload)) return payload;
+    return ip.get(.{ .opt_payload = .{ .ty = ty, .payload = payload } });
+}
+
+/// The payload of optional value `v`; null when `v` is null
+pub fn optionalPayload(ip: *InternPool, v: Index) ?Index {
+    if (v == .null_value) return null;
+    return switch (ip.key(v)) {
+        .opt_payload => |o| o.payload,
+        else => v,
+    };
+}
+
+/// Which operand of a comparison has the deeper optional type when both are optionals of
+/// different depths (`??u8` and `?u8`): the other operand is compared after coercing to it, as
+/// the compiler does with their peer type. A non-optional operand is never represented as null,
+/// so it needs no coercion.
+pub fn deeperOptional(ip: *InternPool, lhs: Index, rhs: Index) enum { lhs, rhs, neither } {
+    const a = optionalDepth(ip, lhs);
+    const b = optionalDepth(ip, rhs);
+    if (a == 0 or b == 0 or a == b) return .neither;
+    return if (a > b) .lhs else .rhs;
+}
+
+/// Number of optional types nested in `t` (`??u8` has 2)
+fn optionalDepth(ip: *InternPool, t: Index) u32 {
+    var n: u32 = 0;
+    var x = t;
+    while (true) switch (ip.key(x)) {
+        .optional_type => |c| {
+            n += 1;
+            x = c;
+        },
+        else => return n,
+    };
+}
+
+/// How a value of type `from` coerces to a different optional type `to`, matching the compiler's
+/// `coerceExtra`. `keep`: `from` is `@TypeOf(null)` or an optional that coerces in memory (`?*T`
+/// to `?*const T`), so null stays null. `wrap`: the whole value coerces to the payload type of
+/// `to` (`?u8` to `??u8`, `E!?u8` to `?(E!?u8)`), so a null becomes a non-null optional with a
+/// null payload. A null C pointer is also wrapped: the compiler represents it as a pointer to
+/// address 0, which `InternPool.getCoerced` wraps as the payload of a non-null `?[*]T`. Null when
+/// the types do not tell (unknown parts).
+pub const OptionalCoercion = enum { keep, wrap };
+
+pub fn optionalCoercion(ip: *InternPool, from: Index, to: Index) ?OptionalCoercion {
+    const b = switch (ip.key(to)) {
+        .optional_type => |c| c,
+        else => return null,
+    };
+    if (from == .null_type) return .keep;
+    const a = switch (ip.key(from)) {
+        .optional_type => |c| c,
+        .unknown => return null,
+        else => return .wrap,
+    };
+    if (a == b) return .keep;
+    return switch (ip.key(b)) {
+        // `??u8` to `???u8`: wrapped as soon as the payload types wrap
+        .optional_type => switch (ip.key(a)) {
+            .optional_type => optionalCoercion(ip, a, b),
+            .unknown => null,
+            else => .wrap,
+        },
+        .error_union_type => switch (ip.key(a)) {
+            .error_union_type => .keep,
+            .unknown => null,
+            else => .wrap,
+        },
+        .unknown => null,
+        else => if (a == .unknown) null else .keep,
+    };
 }
 
 /// The value of pointer-to-array `tv` coerced to slice type `to` (`*const [2]u16` to

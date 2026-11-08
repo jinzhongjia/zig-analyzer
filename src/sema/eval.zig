@@ -1284,15 +1284,11 @@ const Evaluator = struct {
     }
 
     /// Value read through a pointer to `child` from a place holding `v`. A pointer to the payload
-    /// of an optional (`if (opt) |*x|`) points to where the optional is, and an optional is
-    /// represented by its payload: it is read as the payload type.
-    fn readAs(ev: *Evaluator, v: Val, child: Index) Val {
+    /// of an optional (`if (opt) |*x|`) points to where the optional is: it reads the optional's
+    /// payload.
+    fn readAs(ev: *Evaluator, v: Val, child: Index) EvalError!Val {
         if (child != .unknown and v.ty != child) switch (ev.ip.key(v.ty)) {
-            .optional_type => |c| if (c == child) {
-                var out = v;
-                out.ty = child;
-                return out;
-            },
+            .optional_type => |c| if (c == child) return try ev.unwrapOptional(v, child) orelse error.Abort,
             else => {},
         };
         return v;
@@ -1512,8 +1508,7 @@ const Evaluator = struct {
                     .optional_type => |c| c,
                     else => return error.Abort,
                 };
-                if (v.is(.null_value) or v.v == .unknown or v.v == .undef) return error.Abort;
-                return .{ .ty = child, .v = v.v };
+                return try ev.unwrapOptional(v, child) orelse error.Abort;
             },
             .init => |x| return ev.initExpr(f, x.ty, x.fields, want),
             .container => |c| {
@@ -2214,9 +2209,8 @@ const Evaluator = struct {
                 return error.Abort;
             },
             .optional_type => |child| {
-                if (x == .null_value) return .{ .yes = false };
-                if (v.v == .unknown or v.v == .undef) return error.Abort;
-                return .{ .yes = true, .payload = .{ .ty = child, .v = v.v } };
+                const payload = try ev.unwrapOptional(v, child) orelse return .{ .yes = false };
+                return .{ .yes = true, .payload = payload };
             },
             .error_union_type => |eu| {
                 if (v.v == .unknown or v.v == .undef) return error.Abort;
@@ -2480,6 +2474,13 @@ const Evaluator = struct {
                 var rhs = try ev.eval(f, rhs_e, null);
                 if (ev.peerOperand(lhs.ty, rhs.ty)) lhs = try ev.coerce(lhs, rhs.ty);
                 if (ev.peerOperand(rhs.ty, lhs.ty)) rhs = try ev.coerce(rhs, lhs.ty);
+                // Optionals of different depths are compared at the deeper one, their peer type:
+                // a null `?u8` equals a `??u8` holding it
+                switch (value.deeperOptional(ip, lhs.ty, rhs.ty)) {
+                    .lhs => rhs = try ev.coerce(rhs, lhs.ty),
+                    .rhs => lhs = try ev.coerce(lhs, rhs.ty),
+                    .neither => {},
+                }
                 if ((op == .equal_equal or op == .bang_equal) and ip.key(lhs.ty) == .ptr_type and ip.key(rhs.ty) == .ptr_type) {
                     const eq = pointerEql(lhs, rhs) orelse return error.Abort;
                     return boolVal(eq == (op == .equal_equal));
@@ -2875,8 +2876,7 @@ const Evaluator = struct {
                     .optional_type => |c| c,
                     else => return error.Abort,
                 };
-                if (opt.is(.null_value) or opt.v == .unknown or opt.v == .undef) return error.Abort;
-                old = .{ .ty = child, .v = opt.v };
+                old = try ev.unwrapOptional(opt, child) orelse return error.Abort;
             },
             else => {
                 ref = try ev.place(f, lhs_e);
@@ -3073,7 +3073,7 @@ const Evaluator = struct {
         switch (ip.key(target)) {
             .optional_type => |child| {
                 const inner = try ev.initExpr(f, null, fields, child);
-                return .{ .ty = target, .v = inner.v };
+                return ev.wrapOptional(target, inner);
             },
             .error_union_type => |eu| {
                 const inner = try ev.initExpr(f, null, fields, eu.payload);
@@ -3183,13 +3183,29 @@ const Evaluator = struct {
         if (v.v == .undef) return .{ .ty = t, .v = .undef };
         switch (ip.key(t)) {
             .optional_type => |child| {
-                if (v.is(.null_value)) return Val.of(t, .null_value);
-                const inner = try ev.coerce(v, child);
-                return .{ .ty = t, .v = inner.v };
+                if (v.v == .unknown) return .{ .ty = t };
+                // `null` itself, or an optional that coerces in memory (`?*T` to `?*const T`),
+                // keeps its null; other values become the payload (`?u8` to `??u8`, where a
+                // null becomes a non-null optional with a null payload)
+                const route = value.optionalCoercion(ip, v.ty, t) orelse if (ev.isNullRepr(v)) return error.Abort else .wrap;
+                const payload: Val = switch (route) {
+                    .wrap => v,
+                    .keep => switch (ip.key(v.ty)) {
+                        .optional_type => |c| try ev.unwrapOptional(v, c) orelse return Val.of(t, .null_value),
+                        else => if (v.is(.null_value)) return Val.of(t, .null_value) else v,
+                    },
+                };
+                return ev.wrapOptional(t, try ev.coerce(payload, child));
             },
             .error_union_type => |eu| {
                 if (v.v == .ip and ip.key(v.v.ip) == .error_value) return Val.of(t, v.v.ip);
-                const inner = try ev.coerce(v, eu.payload);
+                // An error union coerced to another one (`E!?u8` to `anyerror!?u8`) has its
+                // payload coerced; any other value is the payload
+                const payload: Val = switch (ip.key(v.ty)) {
+                    .error_union_type => |from| .{ .ty = from.payload, .v = v.v },
+                    else => v,
+                };
+                const inner = try ev.coerce(payload, eu.payload);
                 return .{ .ty = t, .v = inner.v };
             },
             else => {},
@@ -3307,6 +3323,34 @@ const Evaluator = struct {
             else => {},
         }
         return .{ .ty = t, .v = v.v };
+    }
+
+    /// Whether `v` is represented as null (see `value.isNullRepr`)
+    fn isNullRepr(ev: *Evaluator, v: Val) bool {
+        return v.v == .ip and value.isNullRepr(ev.ip, v.v.ip);
+    }
+
+    /// The payload (of type `child`) of optional `v`; null when `v` is null
+    fn unwrapOptional(ev: *Evaluator, v: Val, child: Index) EvalError!?Val {
+        switch (v.v) {
+            .unknown, .undef => return error.Abort,
+            .ip => |x| {
+                if (x == .null_value) return null;
+                switch (ev.ip.key(x)) {
+                    .opt_payload => |o| return Val.of(child, o.payload),
+                    else => {},
+                }
+            },
+            else => {},
+        }
+        return .{ .ty = child, .v = v.v };
+    }
+
+    /// The non-null value of optional type `ty` with payload `payload` (see
+    /// `value.wrapOptional`)
+    fn wrapOptional(ev: *Evaluator, ty: Index, payload: Val) Error!Val {
+        if (ev.isNullRepr(payload)) return Val.of(ty, try value.wrapOptional(ev.ip, ty, payload.v.ip));
+        return .{ .ty = ty, .v = payload.v };
     }
 
     fn isAnon(ev: *Evaluator, t: Index) bool {
