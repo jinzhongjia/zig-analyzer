@@ -8642,6 +8642,57 @@ test "an iteration that leaves the loop before a declaration is not used for it"
     try testing.expectEqualStrings("```zig\nconst F: type = u8\n```\n\ninferred from iteration 2 of the loop at main.zig:4", info.text);
 }
 
+test "hover on a capture read through a container in the body shows the value of the chosen iteration" {
+    // Prevents the capture read by the container from staying unknown in the iteration hover
+    // infers (`p_via` was shown as the abstract `T`); expected values are the results of zig 0.17.0
+    // and 0.17.1
+    const text =
+        \\pub fn g() void {
+        \\    inline for (.{ u8, u16 }) |T| {
+        \\        const S = struct {
+        \\            pub const t = T;
+        \\            pub const u = ?T;
+        \\        };
+        \\        const p_via = S.t;
+        \\        const p_opt = S.u;
+        \\        _ = .{ p_via, p_opt };
+        \\    }
+        \\}
+        \\const P = union(enum) { a: u8, b: u16 };
+        \\pub fn h(p: P) void {
+        \\    switch (p) {
+        \\        inline else => |q| {
+        \\            const W = struct {
+        \\                const Q = @TypeOf(q);
+        \\            };
+        \\            const p_payload = W.Q;
+        \\            _ = p_payload;
+        \\        },
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "p_via =", "```zig\nconst p_via: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:2" },
+        .{ "p_opt =", "```zig\nconst p_opt: type = ?u8\n```\n\ninferred from iteration 1 of the loop at main.zig:2" },
+        .{ "p_payload =", "```zig\nconst p_payload: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:14" },
+    };
+    for (cases) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "try on a call whose error set depends on an abstract parameter gives the payload type" {
     // When the error set `B.Error` could not be resolved, the whole `Error!Event` used to be
     // unknown, and the result of `try` had no type

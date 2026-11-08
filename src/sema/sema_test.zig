@@ -4237,6 +4237,115 @@ test "containers in an inline loop body read the loop variables without a value"
     });
 }
 
+test "a capture read through a container in the loop body has the value of the chosen iteration" {
+    // Prevents the capture from being unknown when the container reads it during the inference of
+    // the iteration itself (`S.t` stayed the abstract `T`); expected values are the results of
+    // zig 0.17.0 and 0.17.1
+    const text =
+        \\fn types() void {
+        \\    inline for (.{ u8, u16 }) |T| {
+        \\        const U = ?T;
+        \\        const S = struct {
+        \\            const t = T;
+        \\            const u = U;
+        \\            fn get() type {
+        \\                return T;
+        \\            }
+        \\        };
+        \\        const via = S.t;
+        \\        const via_local = S.u;
+        \\        const via_fn = S.get();
+        \\        const direct = T;
+        \\        _ = .{ via, via_local, via_fn, direct };
+        \\    }
+        \\}
+        \\fn values() void {
+        \\    inline for (.{ 3, 4 }, 0..) |x, i| {
+        \\        const V = struct {
+        \\            const v = x;
+        \\            const n = i;
+        \\        };
+        \\        const sel_v = V.v;
+        \\        const sel_n = V.n;
+        \\        const direct_v = x;
+        \\        _ = .{ sel_v, sel_n, direct_v };
+        \\    }
+        \\}
+        \\fn outer(o: ?u32) void {
+        \\    if (o) |m| {
+        \\        inline for (.{ u8, u16 }) |E| {
+        \\            const Z = struct {
+        \\                const M = @TypeOf(m);
+        \\                const e = E;
+        \\            };
+        \\            const m_ty = Z.M;
+        \\            const e_ty = Z.e;
+        \\            _ = .{ m_ty, e_ty };
+        \\        }
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", text);
+    const cases = [_]struct { []const u8, []const u8, u32, []const u8 }{
+        .{ "via", "T", 0, "type = u8" },
+        .{ "via", "T", 1, "type = u16" },
+        .{ "via_local", "T", 1, "type = ?u16" },
+        .{ "via_fn", "T", 1, "type = u16" },
+        .{ "direct", "T", 1, "type = u16" },
+        .{ "sel_v", "x", 1, "comptime_int = 4" },
+        .{ "sel_n", "x", 1, "usize = 1" },
+        .{ "direct_v", "x", 1, "comptime_int = 4" },
+        .{ "m_ty", "E", 1, "type = u32" },
+        .{ "e_ty", "E", 1, "type = u16" },
+    };
+    for (cases) |c| {
+        testing.expectEqualStrings(c[3], try iterationTypeAt(&w, f.file, text, c[0], c[1], c[2])) catch |err| {
+            std.debug.print("type of `{s}` in iteration {d} of `{s}`\n", .{ c[0], c[2], c[1] });
+            return err;
+        };
+    }
+    // Without a chosen iteration the loop variable stays abstract
+    try testing.expectEqualStrings("type = T", try typeAt(&w, f.file, text, "via", 0));
+    try testing.expectEqualStrings("type = T", try typeAt(&w, f.file, text, "direct", 0));
+}
+
+test "a prong capture read through a container in an inline prong has the value of the chosen payload" {
+    // Prevents the capture and the tag capture from being unknown when the container reads them
+    // during the inference of that payload; expected values are the results of zig 0.17.0 and
+    // 0.17.1
+    const text =
+        \\const P = union(enum) { a: u8, b: u16 };
+        \\fn prongs(p: P) void {
+        \\    switch (p) {
+        \\        inline else => |q, tag| {
+        \\            const W = struct {
+        \\                const Q = @TypeOf(q);
+        \\                const k = tag;
+        \\            };
+        \\            const payload = W.Q;
+        \\            const kind = W.k;
+        \\            const direct_kind = tag;
+        \\            _ = .{ payload, kind, direct_kind };
+        \\        },
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", text);
+    try testing.expectEqualStrings("type = u8", try iterationTypeAt(&w, f.file, text, "payload", "q", 0));
+    try testing.expectEqualStrings("type = u16", try iterationTypeAt(&w, f.file, text, "payload", "q", 1));
+    const direct = try iterationTypeAt(&w, f.file, text, "direct_kind", "q", 1);
+    try testing.expect(std.mem.endsWith(u8, direct, " = .b"));
+    try testing.expectEqualStrings(direct, try iterationTypeAt(&w, f.file, text, "kind", "q", 1));
+}
+
 test "comptime evaluation runs loops, mutation and calls" {
     try expectTypes(
         \\fn double(n: usize) usize { return n * 2; }
