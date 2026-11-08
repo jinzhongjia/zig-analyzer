@@ -840,11 +840,17 @@ const Evaluator = struct {
     calls: ?*CallMemo = null,
     /// `calls` is created by this interpreter and freed in `deinit`
     owns_calls: bool = false,
+    /// Storage cells of the container-level declarations whose address is taken in this
+    /// evaluation (see `declCell`): each address of a declaration, or of a field or element of
+    /// it, points into its one cell
+    decls: std.AutoHashMapUnmanaged(DeclCell, *Val) = .empty,
     /// Target (index into `Frame.labels`) and value of break / continue; the value of return
     jump_target: usize = 0,
     jump_value: Val = .unknown,
     /// Stops the evaluation at the definition of a local constant (see `localValue`)
     stop: ?*Stop = null,
+
+    const DeclCell = struct { file: FileId, item: u32, inst: ?Index };
 
     fn deinit(ev: *Evaluator) void {
         if (!ev.owns_calls) return;
@@ -1190,7 +1196,12 @@ const Evaluator = struct {
                 // value of `struct { short: ?u8 }`): use the declared type of the element
                 .bytes => |b| return if (i < b.bytes.len) Val.of(if (ty != .unknown) ty else .u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else ev.elemPastEnd(v.ty, b.ty, i, b.bytes.len),
                 .ptr_value => |p| return ev.elemAt(Val.of(ev.pointeeType(v.ty), p.pointee), i),
-                .union_value => |u| return if (i == 0) Val.of(ty, u.payload) else error.Abort,
+                // Field `i` of a union (the place of `&u.y`): only the active field has a value
+                .union_value => |u| {
+                    const fields = try ev.fieldsOf(u.ty) orelse return error.Abort;
+                    if (i >= fields.len or !std.mem.eql(u8, fields[i].name, u.tag)) return error.Abort;
+                    return Val.of(fields[i].ty, u.payload);
+                },
                 else => return error.Abort,
             },
         }
@@ -1529,7 +1540,12 @@ const Evaluator = struct {
             .local => |l| if (l.file == f.file and l.item == f.item) return f.slots[@backingInt(l.binding)],
             else => {},
         }
-        const tv = try queries.defType(ev.r, def, null, f.inst);
+        return ev.declValue(def, f.inst);
+    }
+
+    /// Value of a name that is not a local of the current frame
+    fn declValue(ev: *Evaluator, def: resolve.Def, inst: ?Index) EvalError!Val {
+        const tv = try queries.defType(ev.r, def, null, inst);
         if (ev.track != null) if (try ev.trackedDecl(def, tv)) |v| return v;
         return thaw(tv);
     }
@@ -2635,10 +2651,10 @@ const Evaluator = struct {
         return if (v.ty == elem) v else ev.coerce(v, t);
     }
 
-    /// `&x`: points to x when x is a local variable (or an element of one), otherwise to a
-    /// temporary storage cell
+    /// `&x`: points to x when x is a local variable or a container-level declaration (or an
+    /// element of one), otherwise to a temporary storage cell
     fn addressOf(ev: *Evaluator, f: *Frame, e: ExprId, v: Val) EvalError!Val {
-        const ref = ev.place(f, e) catch |err| switch (err) {
+        const ref = ev.placeIn(f, e, true) catch |err| switch (err) {
             error.Abort => blk: {
                 const cell = try ev.a.create(Val);
                 cell.* = try ev.copy(v);
@@ -2649,8 +2665,30 @@ const Evaluator = struct {
         return .{ .ty = try ev.ip.ptrTo(v.ty, .one, ref.is_const), .v = .{ .ref = ref } };
     }
 
-    /// Place of assignment targets and address-of operands
+    /// Storage cell of a container-level declaration: one per declaration and instance in this
+    /// evaluation, shared by every address taken of the declaration or of a field or element of
+    /// it, so that these addresses compare equal and `@fieldParentPtr` goes back from a field to
+    /// the value containing it. The cell is never written: assignment targets do not take
+    /// declarations as places. A pointer in a declaration's value is interned without the place
+    /// it points to, so places are not followed through it.
+    fn declCell(ev: *Evaluator, def: resolve.Def, key: DeclCell) EvalError!Ref {
+        const cell = ev.decls.get(key) orelse blk: {
+            const new = try ev.a.create(Val);
+            new.* = try ev.copy(try ev.declValue(def, key.inst));
+            try ev.decls.put(ev.a, key, new);
+            break :blk new;
+        };
+        return .{ .cell = cell, .path = &.{}, .is_const = true, .immutable = true };
+    }
+
+    /// Place of assignment targets
     fn place(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!Ref {
+        return ev.placeIn(f, e, false);
+    }
+
+    /// Place of assignment targets and, with `decls`, of address-of operands, which may also be
+    /// inside a container-level declaration (`&s.b`, `&table[1]`; see `declCell`)
+    fn placeIn(ev: *Evaluator, f: *Frame, e: ExprId, decls: bool) EvalError!Ref {
         switch (f.body.expr(e)) {
             .name_ref => |name| {
                 const def = try ev.r.resolveName(f.file, f.item, f.body, f.body.expr_scopes[@backingInt(e)], name) orelse return error.Abort;
@@ -2664,19 +2702,23 @@ const Evaluator = struct {
                             .immutable = !is_var,
                         };
                     },
+                    .item => |it| if (decls) {
+                        if (!f.body.nameRefIsEscaped(e)) if ((try infer.primitive(ev.ip, name)) != null) return error.Abort;
+                        return ev.declCell(def, .{ .file = it.file, .item = it.item, .inst = f.inst });
+                    },
                     else => {},
                 }
                 return error.Abort;
             },
             .field_access => |fa| {
                 const name = fa.field orelse return error.Abort;
-                const base = try ev.placeOrPointee(f, fa.lhs);
+                const base = try ev.placeOrPointee(f, fa.lhs, decls);
                 const target = try ev.load(base);
                 const i = try ev.fieldIndex(target.ty, name) orelse return error.Abort;
                 return ev.extend(base, @intCast(i));
             },
             .index => |x| {
-                const base = try ev.placeOrPointee(f, x.lhs);
+                const base = try ev.placeOrPointee(f, x.lhs, decls);
                 const i = try ev.evalInt(f, x.index, .usize_type);
                 return ev.extend(base, std.math.cast(u32, i) orelse return error.Abort);
             },
@@ -2687,15 +2729,15 @@ const Evaluator = struct {
                     else => error.Abort,
                 };
             },
-            .@"comptime" => |x| return ev.place(f, x),
+            .@"comptime" => |x| return ev.placeIn(f, x, decls),
             else => return error.Abort,
         }
     }
 
     /// Place; when its value is a pointer to local storage, the place it points to instead
     /// (automatic dereferencing)
-    fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!Ref {
-        const ref = try ev.place(f, e);
+    fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId, decls: bool) EvalError!Ref {
+        const ref = try ev.placeIn(f, e, decls);
         // The value of a range, or of a `*T` → `*[1]T` view, is an array, not a pointer
         if (ref.window != null or ref.as_array) return ref;
         const v = try ev.load(ref);
