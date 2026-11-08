@@ -677,7 +677,7 @@ test "a format-style length in a signature and a comptime block filling a sentin
     });
 }
 
-test "pointer casts keep the value only when the elements are unchanged" {
+test "pointer casts rearrange or reinterpret the pointee instead of relabeling it" {
     // Relabeling `*const [2][1]u8` as `*const [2]u8` showed array elements as bytes.
     try expectTypes(
         \\const nested: [2][1]u8 = .{ "a".*, "b".* };
@@ -694,9 +694,9 @@ test "pointer casts keep the value only when the elements are unchanged" {
         \\const none_back: ?*const u8 = @ptrCast(none);
         \\fn g() void { _ = .{ flat, first, signed, back, wrong, none_back }; }
     , &.{
-        .{ "flat", "*const [2]u8" },
+        .{ "flat", "*const [2]u8 = \"ab\"" },
         .{ "first", "u8 = 97" },
-        .{ "signed", "*const [2]i8" },
+        .{ "signed", "*const [2]i8 = &.{ 97, 98 }" },
         .{ "back", "?*const u8 = &0" },
         .{ "wrong", "?*const u16" },
         .{ "none_back", "?*const u8 = null" },
@@ -2981,6 +2981,128 @@ test "comptime @bitCast reinterprets arrays, vectors, enums and packed container
         .{ "backing_flags", "u8 = 3" },
         .{ "from_backing", "PF = .{ .r = true, .w = false, .x = true, ._pad = 0 }" },
         .{ "from_backing_lit", "P2 = .{ .lo = 4, .hi = 3 }" },
+    });
+}
+
+test "comptime memory reinterpretation through @ptrCast follows the target's byte order" {
+    const src =
+        \\const X = extern struct { a: u8, b: u16, c: u8 };
+        \\const P1 = packed struct { a: u3, b: u5, c: u8 };
+        \\const P2 = packed struct(u32) { lo: u16, hi: u16 };
+        \\const EX = enum(u4) { a = 3, b = 5 };
+        \\fn view(p: anytype) *[4]u8 {
+        \\    return @ptrCast(p);
+        \\}
+        \\const bytes_u32 = @as(*const [4]u8, @ptrCast(&@as(u32, 0x01020304))).*;
+        \\const bytes_x = @as(*const [6]u8, @ptrCast(&X{ .a = 1, .b = 0x0203, .c = 4 }))[2..5].*;
+        \\const x_from_bytes = @as(*align(1) const X, @ptrCast(&[_]u8{ 1, 0, 3, 2, 4, 0 })).*;
+        \\const x_field = @as(*align(1) const X, @ptrCast(&[_]u8{ 1, 0, 3, 2, 4, 0 })).b;
+        \\const packed_bytes = @as(*const [4]u8, @ptrCast(&P2{ .lo = 1, .hi = 2 })).*;
+        \\const packed_from_bytes = @as(*align(1) const P1, @ptrCast(&[_]u8{ 0x11, 0x03 })).*;
+        \\const u24_bytes = @as(*const [4]u8, @ptrCast(&@as(u24, 0x010203))).*;
+        \\const i24_bytes = @as(*const [4]u8, @ptrCast(&@as(i24, -2))).*;
+        \\const f32_bytes = @as(*const [4]u8, @ptrCast(&@as(f32, 1.0))).*;
+        \\const enum_from_bytes = @as(*const EX, @ptrCast(&[_]u8{5})).*;
+        \\const i16_from_bytes = @as(*align(1) const i16, @ptrCast(&[_]u8{ 0xFE, 0xFF })).*;
+        \\const elem_offset = blk: {
+        \\    const arr = [_]u16{ 0x0102, 0x0304 };
+        \\    const p: *const [2]u8 = @ptrCast(&arr[1]);
+        \\    break :blk p.*;
+        \\};
+        \\const cross = blk: {
+        \\    const arr = [_]u8{ 1, 2, 3, 4 };
+        \\    const p: *align(1) const u16 = @ptrCast(&arr[1]);
+        \\    break :blk p.*;
+        \\};
+        \\const many = blk: {
+        \\    const arr = [_]u16{ 0x0102, 0x0304 };
+        \\    const p: [*]const u8 = @ptrCast(&arr);
+        \\    break :blk p[3];
+        \\};
+        \\const restructure = @as(*const [2][2]u8, @ptrCast(&[_]u8{ 1, 2, 3, 4 })).*[1];
+        \\const write_byte = blk: {
+        \\    var x: u32 = 0x01020304;
+        \\    view(&x)[0] = 9;
+        \\    break :blk x;
+        \\};
+        \\const write_value = blk: {
+        \\    var buf = [_]u8{ 0, 0, 0, 0 };
+        \\    const p: *align(1) u32 = @ptrCast(&buf);
+        \\    p.* = 0x01020304;
+        \\    break :blk buf;
+        \\};
+        \\const write_field = blk: {
+        \\    var s: X = .{ .a = 1, .b = 0x0203, .c = 4 };
+        \\    const p: *[6]u8 = @ptrCast(&s);
+        \\    p[3] = 9;
+        \\    break :blk s.b;
+        \\};
+        \\const alias = blk: {
+        \\    var x: u32 = 1;
+        \\    const b = view(&x);
+        \\    x = 0x0A0B0C0D;
+        \\    break :blk b[0];
+        \\};
+        \\const loop_write = blk: {
+        \\    var x: u32 = 0x01020304;
+        \\    for (view(&x)) |*b| b.* +%= 1;
+        \\    break :blk x;
+        \\};
+        \\const padding = @as(*const [6]u8, @ptrCast(&X{ .a = 1, .b = 0x0203, .c = 4 }))[1];
+    ;
+    // Results that do not depend on the byte order
+    const common = [_]struct { []const u8, []const u8 }{
+        .{ "enum_from_bytes", "EX = .b" },
+        .{ "restructure", "[2]u8 = \"\\x03\\x04\"" },
+        .{ "loop_write", "u32 = 33752069" },
+        // Padding bytes are undefined
+        .{ "padding", "u8 = undefined" },
+    };
+    try expectTypesTargeted(try targetOf("x86_64-linux-musl", null), src, &(common ++ [_]struct { []const u8, []const u8 }{
+        .{ "bytes_u32", "[4]u8 = \"\\x04\\x03\\x02\\x01\"" },
+        .{ "bytes_x", "[3]u8 = \"\\x03\\x02\\x04\"" },
+        .{ "x_from_bytes", "X = .{ .a = 1, .b = 515, .c = 4 }" },
+        .{ "x_field", "u16 = 515" },
+        .{ "packed_bytes", "[4]u8 = \"\\x01\\x00\\x02\\x00\"" },
+        .{ "packed_from_bytes", "P1 = .{ .a = 1, .b = 2, .c = 3 }" },
+        // The bytes beyond the bits of an integer extend its value
+        .{ "u24_bytes", "[4]u8 = \"\\x03\\x02\\x01\\x00\"" },
+        .{ "i24_bytes", "[4]u8 = \"\\xfe\\xff\\xff\\xff\"" },
+        .{ "f32_bytes", "[4]u8 = \"\\x00\\x00\\x80?\"" },
+        .{ "i16_from_bytes", "i16 = -2" },
+        .{ "elem_offset", "[2]u8 = \"\\x04\\x03\"" },
+        .{ "cross", "u16 = 770" },
+        .{ "many", "u8 = 3" },
+        .{ "write_byte", "u32 = 16909065" },
+        .{ "write_value", "[4]u8 = \"\\x04\\x03\\x02\\x01\"" },
+        .{ "write_field", "u16 = 2307" },
+        .{ "alias", "u8 = 13" },
+    }));
+    try expectTypesTargeted(try targetOf("powerpc64-linux-musl", null), src, &(common ++ [_]struct { []const u8, []const u8 }{
+        .{ "bytes_u32", "[4]u8 = \"\\x01\\x02\\x03\\x04\"" },
+        .{ "bytes_x", "[3]u8 = \"\\x02\\x03\\x04\"" },
+        .{ "x_from_bytes", "X = .{ .a = 1, .b = 770, .c = 4 }" },
+        .{ "x_field", "u16 = 770" },
+        .{ "packed_bytes", "[4]u8 = \"\\x00\\x02\\x00\\x01\"" },
+        .{ "packed_from_bytes", "P1 = .{ .a = 3, .b = 0, .c = 17 }" },
+        .{ "u24_bytes", "[4]u8 = \"\\x00\\x01\\x02\\x03\"" },
+        .{ "i24_bytes", "[4]u8 = \"\\xff\\xff\\xff\\xfe\"" },
+        .{ "f32_bytes", "[4]u8 = \"?\\x80\\x00\\x00\"" },
+        .{ "i16_from_bytes", "i16 = -257" },
+        .{ "elem_offset", "[2]u8 = \"\\x03\\x04\"" },
+        .{ "cross", "u16 = 515" },
+        .{ "many", "u8 = 4" },
+        .{ "write_byte", "u32 = 151126788" },
+        .{ "write_value", "[4]u8 = \"\\x01\\x02\\x03\\x04\"" },
+        .{ "write_field", "u16 = 521" },
+        .{ "alias", "u8 = 10" },
+    }));
+    // Targets that disagree on the byte order leave memory reinterpretation without a value
+    var mixed = try targetOf("x86_64-linux-musl", null);
+    mixed.endian = null;
+    try expectTypesTargeted(mixed, src, &.{
+        .{ "bytes_u32", "[4]u8" },
+        .{ "write_byte", "u32" },
     });
 }
 
@@ -5800,6 +5922,110 @@ test "std.math.gcd and std.math.lcm at comptime" {
     });
 }
 
+test "std.mem byte views and integer reads at comptime follow the target's byte order" {
+    const src =
+        \\const std = @import("std");
+        \\const X = extern struct { a: u8, b: u16, c: u8 };
+        \\const P1 = packed struct { a: u3, b: u5, c: u8 };
+        \\pub const as_bytes = std.mem.asBytes(&@as(u32, 0x01020304)).*;
+        \\pub const to_bytes = std.mem.toBytes(@as(u32, 0x01020304));
+        \\pub const to_bytes_x = std.mem.toBytes(X{ .a = 1, .b = 0x0203, .c = 4 })[2..5].*;
+        \\pub const to_bytes_arr16 = std.mem.toBytes([2]u16{ 0x0102, 0x0304 });
+        \\pub const bytes_to_x = std.mem.bytesToValue(X, &[_]u8{ 1, 0, 3, 2, 4, 0 });
+        \\pub const bytes_to_u32 = std.mem.bytesToValue(u32, &[_]u8{ 1, 2, 3, 4 });
+        \\pub const bytes_to_packed = std.mem.bytesToValue(P1, &[_]u8{ 0x11, 0x03 });
+        \\pub const bytes_as_slice = std.mem.bytesAsSlice(u16, &[_]u8{ 1, 2, 3, 4 })[1];
+        \\pub const slice_as_bytes = std.mem.sliceAsBytes(@as([]const u16, &.{ 0x0102, 0x0304 }))[3];
+        \\pub const read_be = std.mem.readInt(u32, &[_]u8{ 1, 2, 3, 4 }, .big);
+        \\pub const read_le = std.mem.readInt(u24, &[_]u8{ 1, 2, 3 }, .little);
+        \\pub const read_i16 = std.mem.readInt(i16, &[_]u8{ 0xFF, 0xFE }, .big);
+        \\pub const write_int = blk: {
+        \\    var buf: [4]u8 = undefined;
+        \\    std.mem.writeInt(u32, &buf, 0x01020304, .big);
+        \\    break :blk buf;
+        \\};
+        \\pub const loop_write = blk: {
+        \\    var x: u32 = 0x01020304;
+        \\    for (std.mem.asBytes(&x)) |*b| b.* +%= 1;
+        \\    break :blk x;
+        \\};
+        \\pub const index_write = blk: {
+        \\    var x: u32 = 0;
+        \\    std.mem.asBytes(&x)[1] = 0xAA;
+        \\    break :blk x;
+        \\};
+        \\pub const value_write = blk: {
+        \\    var buf = [_]u8{ 0, 0, 0, 0 };
+        \\    std.mem.bytesAsValue(u32, &buf).* = 0x01020304;
+        \\    break :blk buf;
+        \\};
+        \\pub const alias = blk: {
+        \\    var x: u32 = 1;
+        \\    const b = std.mem.asBytes(&x);
+        \\    x = 0x0A0B0C0D;
+        \\    break :blk b[0];
+        \\};
+        \\pub const field_write = blk: {
+        \\    var s: struct { a: u8, b: u32 } = .{ .a = 1, .b = 0x01020304 };
+        \\    std.mem.asBytes(&s.b)[0] = 9;
+        \\    break :blk s.b;
+        \\};
+        \\pub const eql_bytes = std.mem.eql(u8, std.mem.asBytes(&@as(u32, 0xDEADBEEF)), "\xEF\xBE\xAD\xDE");
+    ;
+    const Case = struct { []const u8, []const u8 };
+    // Results that do not depend on the byte order
+    const common = [_]Case{
+        .{ "read_be", "u32 = 16909060" },
+        .{ "read_le", "u24 = 197121" },
+        .{ "read_i16", "i16 = -2" },
+        .{ "write_int", "[4]u8 = \"\\x01\\x02\\x03\\x04\"" },
+        .{ "loop_write", "u32 = 33752069" },
+    };
+    try expectStdTypesTargeted(try targetOf("x86_64-linux-musl", null), target_builtin, src, &(common ++ [_]Case{
+        .{ "as_bytes", "[4]u8 = \"\\x04\\x03\\x02\\x01\"" },
+        .{ "to_bytes", "[4]u8 = \"\\x04\\x03\\x02\\x01\"" },
+        .{ "to_bytes_x", "[3]u8 = \"\\x03\\x02\\x04\"" },
+        .{ "to_bytes_arr16", "[4]u8 = \"\\x02\\x01\\x04\\x03\"" },
+        .{ "bytes_to_x", "X = .{ .a = 1, .b = 515, .c = 4 }" },
+        .{ "bytes_to_u32", "u32 = 67305985" },
+        .{ "bytes_to_packed", "P1 = .{ .a = 1, .b = 2, .c = 3 }" },
+        .{ "bytes_as_slice", "u16 = 1027" },
+        .{ "slice_as_bytes", "u8 = 3" },
+        .{ "index_write", "u32 = 43520" },
+        .{ "value_write", "[4]u8 = \"\\x04\\x03\\x02\\x01\"" },
+        .{ "alias", "u8 = 13" },
+        .{ "field_write", "u32 = 16909065" },
+        .{ "eql_bytes", "bool = true" },
+    }));
+    try expectStdTypesTargeted(try targetOf("powerpc64-linux-musl", null),
+        \\const std = @import("std");
+        \\pub const mode: std.lang.Optimize = .debug;
+        \\pub const cpu: std.Target.Cpu = .{ .arch = .powerpc64, .model = undefined, .features = undefined };
+        \\pub const os: std.Target.Os = .{ .tag = .linux, .version_range = undefined };
+        \\pub const abi: std.Target.Abi = .musl;
+        \\pub const object_format: std.Target.ObjectFormat = .elf;
+        \\pub const link_libc = false;
+        \\pub const single_threaded = false;
+        \\pub const zig_backend: std.lang.CompilerBackend = .stage2_llvm;
+        \\pub const fuzz = false;
+    , src, &(common ++ [_]Case{
+        .{ "as_bytes", "[4]u8 = \"\\x01\\x02\\x03\\x04\"" },
+        .{ "to_bytes", "[4]u8 = \"\\x01\\x02\\x03\\x04\"" },
+        .{ "to_bytes_x", "[3]u8 = \"\\x02\\x03\\x04\"" },
+        .{ "to_bytes_arr16", "[4]u8 = \"\\x01\\x02\\x03\\x04\"" },
+        .{ "bytes_to_x", "X = .{ .a = 1, .b = 770, .c = 4 }" },
+        .{ "bytes_to_u32", "u32 = 16909060" },
+        .{ "bytes_to_packed", "P1 = .{ .a = 3, .b = 0, .c = 17 }" },
+        .{ "bytes_as_slice", "u16 = 772" },
+        .{ "slice_as_bytes", "u8 = 4" },
+        .{ "index_write", "u32 = 11141120" },
+        .{ "value_write", "[4]u8 = \"\\x01\\x02\\x03\\x04\"" },
+        .{ "alias", "u8 = 10" },
+        .{ "field_write", "u32 = 151126788" },
+        .{ "eql_bytes", "bool = false" },
+    }));
+}
+
 test "unsigned 128-bit integers above i128's range" {
     // The bit pattern of a u128 value at or above 2^127 was read back as a negative number.
     try expectStdTypes(
@@ -6245,11 +6471,18 @@ fn expectStdTypesOptimized(optimize: ?[]const u8, src: []const u8, cases: []cons
 /// Same as `expectStdTypes`; when `builtin_text` is not null, it is the source of the builtin
 /// module
 fn expectStdTypesBuiltin(builtin_text: ?[]const u8, src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
+    return expectStdTypesTargeted(null, builtin_text, src, cases);
+}
+
+/// Same as `expectStdTypesBuiltin`; when `target` is not null, it gives the target parameters
+/// for value operations
+fn expectStdTypesTargeted(target: ?InternPool.Target, builtin_text: ?[]const u8, src: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
     var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
     defer env.deinit(testing.allocator);
     var w: World = undefined;
     try w.init();
     defer w.deinit();
+    if (target) |t| try w.setTarget(t);
     const std_root_path = try std.fs.path.join(testing.allocator, &.{ env.std_dir, "std.zig" });
     defer testing.allocator.free(std_root_path);
     const std_root = try w.vfs.intern(std_root_path);
