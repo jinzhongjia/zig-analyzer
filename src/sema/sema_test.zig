@@ -8826,6 +8826,195 @@ test "comptime evaluation: vector operators, @reduce, @select and @shuffle" {
     });
 }
 
+test "comptime evaluation: pointer arithmetic on many-item and C pointers" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both). `p + n` and
+    // `p - n` move by `n` elements within the array, `p - q` is the number of elements between
+    // two pointers into the same array, and writes go through the moved pointer. `p += n` and
+    // `p -= n` move `p` the same way.
+    try expectTypes(
+        \\const arr = [_]u8{ 1, 2, 3, 4 };
+        \\const gp: [*]const u8 = &arr;
+        \\const arr16 = [_]u16{ 10, 20, 30, 40 };
+        \\const gp16: [*]const u16 = &arr16;
+        \\const cp: [*c]const u8 = &arr;
+        \\const sp: [*:0]const u8 = "abc";
+        \\const nested = [_][2]u8{ .{ 1, 2 }, .{ 3, 4 }, .{ 5, 6 } };
+        \\const np: [*]const [2]u8 = &nested;
+        \\const voids = [_]void{ {}, {}, {} };
+        \\const vp: [*]const void = &voids;
+        \\const aligned: [4]u8 align(4) = .{ 1, 2, 3, 4 };
+        \\const ap: [*]align(4) const u8 = &aligned;
+        \\const moved_gp = gp + 2;
+        \\const moved_sp = sp + 1;
+        \\const tail = arr[1..];
+        \\fn twoReads() u8 {
+        \\    const a = [_]u8{ 1, 2, 3, 4 };
+        \\    const p: [*]const u8 = &a;
+        \\    const q = p + 3;
+        \\    return q[0] + (q - 1)[0];
+        \\}
+        \\fn walk() usize {
+        \\    var a = [_]u8{ 5, 6, 7, 8 };
+        \\    var p: [*]u8 = &a;
+        \\    const start = p;
+        \\    p = p + 1;
+        \\    p[0] = 60;
+        \\    p = p + 2;
+        \\    return (p - start) * 100 + a[1];
+        \\}
+        \\fn set(p: [*]u8) void {
+        \\    (p + 1)[0] = 7;
+        \\}
+        \\fn get(p: [*]const u8) u8 {
+        \\    return (p + 2)[0];
+        \\}
+        \\fn throughParams() u8 {
+        \\    var a = [_]u8{ 1, 2, 3 };
+        \\    set(&a);
+        \\    return a[1] + get(&a);
+        \\}
+        \\fn backToStart() bool {
+        \\    const p: [*]const u8 = &arr;
+        \\    return (p + 2) - 2 == p;
+        \\}
+        \\fn moved() bool {
+        \\    const a = [_]u8{ 1, 2, 3 };
+        \\    const p: [*]const u8 = &a;
+        \\    return (p + 1) == (p + 1) and (p + 1) != p;
+        \\}
+        \\fn distance(p: [*]const u8, q: [*]const u8) usize {
+        \\    return q - p;
+        \\}
+        \\fn compound() u8 {
+        \\    const a = [_]u8{ 1, 2, 3, 4 };
+        \\    var p: [*]const u8 = &a;
+        \\    p += 2;
+        \\    return p[0];
+        \\}
+        \\fn compoundBack() u8 {
+        \\    const a = [_]u8{ 1, 2, 3, 4 };
+        \\    var p: [*]const u8 = &a;
+        \\    p += 3;
+        \\    p -= 2;
+        \\    return p[0] + p[2];
+        \\}
+        \\fn compoundWalk() u32 {
+        \\    const a = [_]u32{ 10, 20, 30, 40 };
+        \\    var p: [*]const u32 = &a;
+        \\    var sum: u32 = 0;
+        \\    for (0..4) |_| {
+        \\        sum += p[0];
+        \\        p += 1;
+        \\    }
+        \\    return sum;
+        \\}
+        \\fn compoundWrite() u8 {
+        \\    var a = [_]u8{ 1, 2, 3, 4 };
+        \\    var p: [*]u8 = &a;
+        \\    p += 1;
+        \\    p[0] += 10;
+        \\    p += 2;
+        \\    p[0] *= 2;
+        \\    return a[1] + a[3];
+        \\}
+        \\fn compoundC() u8 {
+        \\    var p: [*c]const u8 = &arr;
+        \\    p += 3;
+        \\    p -= 1;
+        \\    return p[0];
+        \\}
+        \\fn compoundBefore() u8 {
+        \\    var p: [*]const u8 = &arr;
+        \\    p -= 1;
+        \\    return p[1];
+        \\}
+        \\const pa_reads = twoReads();
+        \\const pa_walk = walk();
+        \\const pa_params = throughParams();
+        \\const pa_global = get(&arr);
+        \\const pa_back = backToStart();
+        \\const pa_moved = moved();
+        \\const pa_distance = distance(gp, gp + 3);
+        \\const pa_compound = compound();
+        \\const pa_compound_back = compoundBack();
+        \\const pa_compound_walk = compoundWalk();
+        \\const pa_compound_write = compoundWrite();
+        \\const pa_compound_c = compoundC();
+        \\const pa_diff = (gp + 3) - (gp + 1);
+        \\const pa_diff16 = (gp16 + 3) - gp16;
+        \\const pa_back_read = (gp + 4 - 2)[0];
+        \\const pa_u16 = (gp16 + 2)[1];
+        \\const pa_c = (cp + 2)[0];
+        \\const pa_c_diff = (cp + 2) - cp;
+        \\const pa_sentinel = (sp + 1)[1];
+        \\const pa_nested = (np + 1)[0][1];
+        \\const pa_end = (gp + 4) == (gp + 2) + 2;
+        \\const pa_zero_bit = (vp + 1) == vp;
+        \\const pa_align = (ap + 1)[0];
+        \\const pa_align_ty = @TypeOf(ap + 1);
+        \\const pa_align_keep = @TypeOf(ap + 4);
+        \\const pa_frozen_read = (moved_gp + 1)[0];
+        \\const pa_frozen_eq = (moved_gp + 1) == (gp + 3);
+        \\const pa_frozen_back = (moved_gp - 2)[0];
+        \\const pa_frozen_diff = moved_gp - gp;
+        \\const pa_slice_eq = (gp + 1) == tail.ptr;
+        \\const pa_slice_back = (tail.ptr - 1)[0];
+        \\const pa_slice_diff = (tail.ptr + 2) - gp;
+        \\const pa_frozen_lit_read = (moved_sp + 1)[0];
+        \\const pa_frozen_lit_eq = (moved_sp + 1) == (sp + 2);
+        \\const pa_before = gp - 1;
+        \\const pa_negative = (gp + 1) - (gp + 3);
+        \\const pa_compound_before = compoundBefore();
+    , &.{
+        .{ "pa_reads", "u8 = 7" },
+        .{ "pa_walk", "usize = 360" },
+        .{ "pa_params", "u8 = 10" },
+        .{ "pa_global", "u8 = 3" },
+        .{ "pa_back", "bool = true" },
+        .{ "pa_moved", "bool = true" },
+        .{ "pa_distance", "usize = 3" },
+        .{ "pa_compound", "u8 = 3" },
+        .{ "pa_compound_back", "u8 = 6" },
+        .{ "pa_compound_walk", "u32 = 100" },
+        .{ "pa_compound_write", "u8 = 20" },
+        .{ "pa_compound_c", "u8 = 3" },
+        .{ "pa_diff", "usize = 2" },
+        // The difference counts elements, not bytes
+        .{ "pa_diff16", "usize = 3" },
+        .{ "pa_back_read", "u8 = 3" },
+        .{ "pa_u16", "u16 = 40" },
+        .{ "pa_c", "u8 = 3" },
+        .{ "pa_c_diff", "usize = 2" },
+        .{ "pa_sentinel", "u8 = 99" },
+        .{ "pa_nested", "u8 = 4" },
+        .{ "pa_end", "bool = true" },
+        // Elements without runtime bits share one address
+        .{ "pa_zero_bit", "bool = true" },
+        .{ "pa_align", "u8 = 2" },
+        .{ "pa_align_ty", "type = [*]align(1) const u8" },
+        .{ "pa_align_keep", "type = [*]align(4) const u8" },
+        // A pointer into a container-level declaration keeps its place when it is frozen
+        // (`InternPool.Key.ptr_base`), so it moves within the declaration's array
+        .{ "pa_frozen_read", "u8 = 4" },
+        .{ "pa_frozen_eq", "bool = true" },
+        .{ "pa_frozen_back", "u8 = 1" },
+        .{ "pa_frozen_diff", "usize = 2" },
+        .{ "pa_slice_eq", "bool = true" },
+        .{ "pa_slice_back", "u8 = 1" },
+        .{ "pa_slice_diff", "usize = 3" },
+        // A frozen pointer into a literal holds only the elements from it on, so it is not
+        // known where it points in the literal: no value rather than false (the compiler
+        // gives true)
+        .{ "pa_frozen_lit_read", "u8 = 99" },
+        .{ "pa_frozen_lit_eq", "bool" },
+        // Compile errors: before the start of the array (also through `-=`), a negative
+        // difference
+        .{ "pa_before", "[*]const u8" },
+        .{ "pa_negative", "usize" },
+        .{ "pa_compound_before", "u8" },
+    });
+}
+
 test "comptime evaluation: element-wise work is not limited by steps, but large copies hit the memory limit" {
     // The compiler counts only backward branches: a `@memcpy` writing hundreds of thousands of
     // elements one by one is not limited. Evaluation gives up when a large array exceeding the
