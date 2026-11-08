@@ -7230,6 +7230,117 @@ test "cast destination types at comptime: pointer casts strip only the error uni
     });
 }
 
+test "comptime evaluation gives builtin operands the compiler's result types" {
+    // Without these result types, a result-type builtin in the operand (`@intCast(n)`,
+    // `@floatFromInt(n)`) could not be evaluated, and the call had no value
+    try expectTypes(
+        \\const U = union(enum) { a: u8, s: struct { x: u8, y: u8 = 4 } };
+        \\fn fill(n: u32) u8 {
+        \\    var buf: [4]u8 = undefined;
+        \\    @memset(&buf, @intCast(n));
+        \\    return buf[3];
+        \\}
+        \\fn fillSlice(n: u32) u16 {
+        \\    var buf: [4]u16 = undefined;
+        \\    const s: []u16 = &buf;
+        \\    @memset(s, @truncate(n));
+        \\    return buf[1];
+        \\}
+        \\fn splatLast(n: u32) u8 {
+        \\    const v: [3]u8 = @splat(@intCast(n));
+        \\    return v[2];
+        \\}
+        \\fn root(n: u32) f64 {
+        \\    return @sqrt(@floatFromInt(n));
+        \\}
+        \\fn ceilInt() f32 {
+        \\    return @ceil(3);
+        \\}
+        \\fn halfRet() f16 {
+        \\    return @round(0.4999999);
+        \\}
+        \\fn halfInt() u8 {
+        \\    return @round(0.4999999);
+        \\}
+        \\const union_init_cast = @unionInit(U, "a", @intCast(@as(u32, 5))).a;
+        \\const union_init_struct = @unionInit(U, "s", .{ .x = 1 }).s.y;
+        \\const memset_cast = fill(9);
+        \\const memset_slice_truncate = fillSlice(0x10007);
+        \\const splat_cast = splatLast(6);
+        \\const sqrt_int: f32 = @sqrt(16);
+        \\const sqrt_cast = root(9);
+        \\const sqrt_optional: ?f64 = @sqrt(@floatFromInt(@as(u32, 25)));
+        \\const exp2_int: f32 = @exp2(3);
+        \\const log2_cast: f64 = @log2(@floatFromInt(@as(u32, 8)));
+        \\const floor_cast: f64 = @floor(@floatFromInt(@as(u32, 9)));
+        \\const ceil_branch: f32 = @ceil(if (true) 3 else 4);
+        \\const ceil_int = ceilInt();
+        \\const ceil_int_top: f32 = @ceil(3);
+        \\const half_ret = halfRet();
+        \\const half_int = halfInt();
+        \\const round_to_int: u32 = @round(@as(f32, 2.5));
+        \\const floor_int_dest: u32 = @floor(@floatFromInt(@as(u8, 3)));
+        \\const muladd_cast = @mulAdd(f64, @floatFromInt(@as(u32, 2)), 3.0, 1.0);
+        \\const muladd_addend_cast = @mulAdd(f32, 2, 3, @floatFromInt(@as(u8, 5)));
+        \\const int_cast = @Int(.unsigned, @intCast(@as(usize, 12)));
+        \\const vector_cast = @Vector(@intCast(@as(usize, 3)), u8);
+    , &.{
+        .{ "union_init_cast", "u8 = 5" },
+        .{ "union_init_struct", "u8 = 4" },
+        .{ "memset_cast", "u8 = 9" },
+        .{ "memset_slice_truncate", "u16 = 7" },
+        .{ "splat_cast", "u8 = 6" },
+        .{ "sqrt_int", "f32 = 4" },
+        .{ "sqrt_cast", "f64 = 3" },
+        // The operand's result type is the call's without the optional
+        .{ "sqrt_optional", "?f64 = 5" },
+        .{ "exp2_int", "f32 = 8" },
+        .{ "log2_cast", "f64 = 3" },
+        .{ "floor_cast", "f64 = 9" },
+        // The branches of the operand are coerced to the result type; an integer operand itself
+        // is not, and a rounding builtin rejects it: a compile error, no value
+        .{ "ceil_branch", "f32 = 3" },
+        .{ "ceil_int", "f32" },
+        .{ "ceil_int_top", "f32" },
+        // A float operand is coerced to a float result type before rounding (0.4999999 is 0.5 in
+        // f16); with an integer result type it is rounded in its own type
+        .{ "half_ret", "f16 = 1" },
+        .{ "half_int", "u8 = 0" },
+        // With an integer result type, the rounding builtin converts its float operand, which
+        // has no result type: `@floatFromInt` without one is a compile error, no value
+        .{ "round_to_int", "u32 = 3" },
+        .{ "floor_int_dest", "u32" },
+        .{ "muladd_cast", "f64 = 7" },
+        .{ "muladd_addend_cast", "f32 = 11" },
+        .{ "int_cast", "type = u12" },
+        .{ "vector_cast", "type = @Vector(3, u8)" },
+    });
+}
+
+test "operands of float math builtins and @Vector get their result types" {
+    try expectTypes(
+        \\fn f(n: u32) void {
+        \\    const s: f64 = @sqrt(@floatFromInt(n));
+        \\    const r: ?f32 = @floor(@floatFromInt(n + 1));
+        \\    const v: @Vector(2, f32) = @sqrt(@splat(4));
+        \\    const V = @Vector(@intCast(@as(usize, 2)), u8);
+        \\    const c: f32 = @ceil(7);
+        \\    _ = .{ s, r, v, V, c };
+        \\}
+    , &.{
+        .{ "@floatFromInt(n)", "f64" },
+        // The result type without the optional
+        .{ "@floatFromInt(n + 1)", "f32" },
+        .{ "@splat(4)", "@Vector(2, f32) = .{ 4, 4 }" },
+        .{ "@intCast(@as(usize, 2))", "u32" },
+        .{ "V", "type = @Vector(2, u8)" },
+        // The operand of a rounding builtin is not coerced to its result type: an integer operand
+        // is a compile error, and the call has no value
+        .{ "7", "comptime_int = 7" },
+        .{ "@ceil(7)", "f32" },
+    });
+}
+
 test "comptime evaluation of integer builtins, @memset, @memmove and @call" {
     try expectTypes(
         \\const ov = @addWithOverflow(@as(u8, 250), 10);
