@@ -21,6 +21,9 @@
 //! directories are created or deleted, or notifications are lost. Source files created in watched
 //! directories that are not files of interest yet, and directories created or deleted, make the
 //! server scan the root directories for source files again (see `Server.scheduleScan`).
+//! A file becomes of interest when it is interned, and the server may read it before this task
+//! watches it: once it is watched, its known text is compared with the disk, so a change in
+//! between is not lost.
 //!
 //! Polling (periodically checking size and modification time) is only the last resort: when
 //! native notifications are unavailable (other platforms, initialization failure), or some
@@ -354,7 +357,8 @@ pub const Watcher = struct {
     /// Recomputes the files of interest and the watched directories for `scope`; with
     /// `.outside_roots`, also registers the client's additional file watchers. Files of interest
     /// that already exist in directories that did not exist before but have appeared now are
-    /// recorded in `pending`.
+    /// recorded in `pending`, and so are the files that were not of interest before, to be
+    /// compared with the disk.
     fn resync(w: *Watcher, a: Allocator, scope: Server.WatchScope, pending: *Pending) Allocator.Error!void {
         const server = w.server;
         const gpa = w.gpa;
@@ -456,6 +460,13 @@ pub const Watcher = struct {
                 const dir_key = std.fs.path.dirname(k) orelse continue;
                 if (appeared.contains(dir_key)) try pending.add(a, path, .created);
             };
+        }
+        // Files that were not of interest before: the server may have read them before they were
+        // watched (they are interned and read first, and recomputing the watched directories
+        // follows in this task), and a change in between was not notified. Now that later changes
+        // are notified or polled, their known text is compared with the disk.
+        for (files.keys(), files.values()) |k, path| {
+            if (!w.files.contains(k) and !entry_dirs.contains(k)) try pending.add(a, path, .verify);
         }
 
         w.spellings.reset(gpa);

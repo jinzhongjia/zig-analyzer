@@ -311,8 +311,9 @@ watched_built: std.AutoHashMapUnmanaged(Vfs.FileId, ?u64) = .empty,
 watcher: ?*watch.Watcher = null,
 /// Minimum polling interval (ms) when native file watching is unavailable
 poll_interval_ms: std.atomic.Value(u32) = .init(1000),
-/// Number of processed batches of external changes discovered by the server; tests wait on it
-/// (protected by `watch_mutex`; `watch_cond` is broadcast when it changes)
+/// Number of processed batches of external changes discovered by the server (comparisons with the
+/// disk that find nothing changed do not count); tests wait on it (protected by `watch_mutex`;
+/// `watch_cond` is broadcast when it changes)
 watch_batches: u64 = 0,
 watch_mutex: Io.Mutex = .init,
 watch_cond: Io.Condition = .init,
@@ -2246,15 +2247,16 @@ fn projectStartedWith(server: *Server, path: []const u8, disk: ?u64) bool {
 }
 
 fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
-    return server.applyFileChanges(arena, params.changes, .notified);
+    _ = try server.applyFileChanges(arena, params.changes, .notified);
 }
 
 /// How changes on disk were found
 pub const ChangeSource = enum {
     /// Reported by a file watcher (the client's or the server's)
     notified,
-    /// Files compared with the disk because nobody watched them for a while (see
-    /// `watch.Watcher`): only a known file whose known text differs from the disk changed; open
+    /// Files compared with the disk because a change to them may not have been notified: nobody
+    /// watched them for a while, or they were read before they were watched (see
+    /// `watch.Watcher`). Only a known file whose known text differs from the disk changed; open
     /// documents and files never loaded are skipped
     verified,
 };
@@ -2267,7 +2269,9 @@ pub const ChangeSource = enum {
 /// script restarts that project; creating or deleting build.zig in a root directory starts or
 /// stops the project; changes to other files rebuild projects and recompile single files; nothing
 /// is rebuilt when the disk contents equal those the last rebuild was based on (see `didSave`).
-fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const types.FileEvent, source: ChangeSource) !void {
+/// Returns whether anything changed: a known file's text or rebuild basis, or a project started
+/// or stopped.
+fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const types.FileEvent, source: ChangeSource) !bool {
     const Change = struct {
         file: Vfs.FileId,
         path: []const u8,
@@ -2336,6 +2340,9 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
             break :blk server.open_docs.contains(file);
         };
         if (is_open and source == .verified) continue;
+        // Nothing was computed from a file never read: it cannot differ (see `sameText`), so the
+        // disk is not read for it
+        if (source == .verified and !server.hasKnownText(arena, file)) continue;
         const read = if (kind == .Deleted) null else server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
@@ -2412,6 +2419,7 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
     // that were just started need not be restarted
     var refreshed: std.ArrayList([]const u8) = .empty;
     for (build_zig_dirs.items) |dir| if (try server.refreshRoot(dir)) try refreshed.append(arena, dir);
+    const changed = changes.items.len != 0 or build_files.items.len != 0 or refreshed.items.len != 0;
 
     const list = try server.workspaceList(arena);
     defer server.releaseList(arena, list);
@@ -2449,7 +2457,7 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
         server.requestRefresh();
         server.scheduleCompileSetRefresh(edited.items);
     }
-    if (rebuilt.items.len == 0) return;
+    if (rebuilt.items.len == 0) return changed;
     // Single-file mode: files imported by open files may have changed
     server.docs_mutex.lockUncancelable(server.io);
     const open = try arena.dupe(Vfs.FileId, server.open_docs.keys());
@@ -2457,6 +2465,7 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
     server.recompileSingle(open, rebuilt.items);
     // If it cannot be recorded, the next change rebuilds as usual
     for (changes.items) |c| if (c.rebuild) server.watched_built.put(server.gpa, c.file, c.disk) catch {};
+    return changed;
 }
 
 /// Clients report a folder created, deleted, moved or renamed by its own path, without the files
@@ -2544,16 +2553,26 @@ fn sameText(ctx: *Db.Ctx, file: Vfs.FileId, text: ?[]const u8) bool {
     };
 }
 
+/// The file has a known text that `sameText` compares: its text was set, or it was read from disk
+/// (or is being read)
+fn hasKnownText(server: *Server, arena: Allocator, file: Vfs.FileId) bool {
+    var ctx = server.db.beginRead(arena);
+    defer ctx.end();
+    return ctx.isSet(FileText, file) or ctx.memoized(syntax_q.SourceText, file) != .none;
+}
+
 /// External changes discovered by the server: handled the same way as the client's
 /// `workspace/didChangeWatchedFiles` notification (see `applyFileChanges`), serialized with main
 /// loop message handling
 pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const types.FileEvent, source: ChangeSource) void {
-    defer {
+    // A comparison with the disk that finds nothing changed is not a batch of external changes
+    var counted = true;
+    defer if (counted) {
         server.watch_mutex.lockUncancelable(server.io);
         server.watch_batches += 1;
         server.watch_mutex.unlock(server.io);
         server.watch_cond.broadcast(server.io);
-    }
+    };
     server.write_mutex.lockUncancelable(server.io);
     defer server.write_mutex.unlock(server.io);
     if (server.state != .running or server.isShuttingDown()) return;
@@ -2562,7 +2581,11 @@ pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const t
     // waits for idle (waitIdle, shutdown) must not be allowed to return in between
     server.busyBegin();
     defer server.busyEnd();
-    server.applyFileChanges(arena, changes, source) catch |err| log.err("applying changes on disk failed: {t}", .{err});
+    const changed = server.applyFileChanges(arena, changes, source) catch |err| blk: {
+        log.err("applying changes on disk failed: {t}", .{err});
+        break :blk true;
+    };
+    counted = changed or source == .notified;
 }
 
 /// Files watched when the server discovers external changes (besides the project files of each
