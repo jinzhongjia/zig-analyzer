@@ -1371,7 +1371,7 @@ fn eqlSentinel(ip: *InternPool, a: ?Index, b: ?Index) ?bool {
 }
 
 /// Whether two comptime values are equal (the semantics of `==`; types are compared by
-/// `eqlTypes`)
+/// `eqlTypes`, pointers by `eqlPointers`)
 pub fn eqlValues(ip: *InternPool, a: Index, b: Index) ?bool {
     if (a == .unknown or b == .unknown) return null;
     const ka = ip.key(a);
@@ -1402,6 +1402,7 @@ pub fn eqlValues(ip: *InternPool, a: Index, b: Index) ?bool {
             else => false,
         };
     }
+    if (isPointerValue(ip, ka) or isPointerValue(ip, kb)) return eqlPointers(ip, a, b);
     return switch (ka) {
         .int_value => |x| switch (kb) {
             .int_value => |y| x.value == y.value,
@@ -1471,6 +1472,67 @@ fn eqlUnsigned128(ip: *InternPool, x: @FieldType(InternPool.Key, "int_value"), y
     if (x.value >= 0 or !y.positive or !isUnsigned128(ip, x.ty)) return false;
     const b: bigint.Big = .{ .limbs = y.limbs, .positive = y.positive };
     return (b.toInt(u128) catch return false) == @as(u128, @bitCast(x.value));
+}
+
+/// Whether an interned value is a pointer: a single-item pointer (`ptr_value`), or a slice or
+/// pointer to several elements, represented by the elements it points to
+fn isPointerValue(ip: *InternPool, k: InternPool.Key) bool {
+    return switch (k) {
+        .ptr_value => true,
+        .aggregate => |x| ip.key(x.ty) == .ptr_type,
+        .bytes => |x| ip.key(x.ty) == .ptr_type,
+        else => false,
+    };
+}
+
+/// Whether two comptime pointers are equal, from their interned values alone. As in the
+/// compiler, pointers are equal when they point to the same location, not when they point to
+/// equal data, which may be stored in different places. The same interned value is the same
+/// location when it records one (`base`, or the function a function pointer points to); without
+/// it, it may stand for pointers to two declarations with equal values. Pointers through which
+/// different data is visible point to different locations. Otherwise the result is unknown.
+fn eqlPointers(ip: *InternPool, a: Index, b: Index) ?bool {
+    if (a == b) return if (recordsPlace(ip, ip.key(a))) true else null;
+    return if (pointeesDiffer(ip, ip.key(a), ip.key(b))) false else null;
+}
+
+/// Whether pointer value `k` records the location it points to. A function is the identity of
+/// pointers to it once its instance is fully known.
+fn recordsPlace(ip: *InternPool, k: InternPool.Key) bool {
+    return switch (k) {
+        .ptr_value => |p| p.base != null or (ip.key(p.pointee) == .fn_value and isPrecise(ip, p.pointee)),
+        .aggregate => |x| x.base != null,
+        .bytes => |x| x.base != null,
+        else => false,
+    };
+}
+
+/// Whether pointers `a` and `b` show different data at a position both of them reach
+fn pointeesDiffer(ip: *InternPool, a: InternPool.Key, b: InternPool.Key) bool {
+    switch (a) {
+        .ptr_value => |x| switch (b) {
+            .ptr_value => |y| return eqlValues(ip, x.pointee, y.pointee) == false,
+            else => return false,
+        },
+        .bytes => |x| switch (b) {
+            .bytes => |y| {
+                if (ip.key(x.ty) != .ptr_type or ip.key(y.ty) != .ptr_type) return false;
+                const n = @min(x.bytes.len, y.bytes.len);
+                return !std.mem.eql(u8, x.bytes[0..n], y.bytes[0..n]);
+            },
+            else => return false,
+        },
+        .aggregate => |x| switch (b) {
+            .aggregate => |y| {
+                if (ip.key(x.ty) != .ptr_type or ip.key(y.ty) != .ptr_type) return false;
+                const n = @min(x.elems.len, y.elems.len);
+                for (x.elems[0..n], y.elems[0..n]) |p, q| if (eqlValues(ip, p, q) == false) return true;
+                return false;
+            },
+            else => return false,
+        },
+        else => return false,
+    }
 }
 
 /// Interns an aggregate value: when all elements are u8 integers it is represented as a string
@@ -1816,4 +1878,28 @@ test "equality is unknown when identity depends on unknown parts" {
     try testing.expectEqual(@as(?bool, true), eqlValues(&ip, e, e));
     try testing.expectEqual(@as(?bool, false), eqlValues(&ip, try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 3 } }), .null_value));
     try testing.expectEqual(@as(?bool, true), eqlValues(&ip, try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 3 } }), try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = 3 } })));
+}
+
+test "pointer values are equal by the place they point to, not by the data" {
+    var ip: InternPool = try .init(testing.allocator, testing.io);
+    defer ip.deinit();
+    const many = try ip.ptrTo(.u8_type, .many, true);
+    const data = try ip.get(.{ .bytes = .{ .ty = many, .bytes = "abc" } });
+    const other = try ip.get(.{ .bytes = .{ .ty = many, .bytes = "abd" } });
+    const prefix = try ip.get(.{ .bytes = .{ .ty = many, .bytes = "ab" } });
+    const base = try ip.get(.{ .ptr_base = .{ .file = @fromBackingInt(0), .item = 0, .inst = null, .path = &.{} } });
+    const placed = try ip.get(.{ .bytes = .{ .ty = many, .bytes = "abc", .base = base } });
+    // Without a recorded place, one value may stand for two declarations with equal data
+    try testing.expectEqual(@as(?bool, null), eqlValues(&ip, data, data));
+    try testing.expectEqual(@as(?bool, true), eqlValues(&ip, placed, placed));
+    // Different data at a position both pointers reach
+    try testing.expectEqual(@as(?bool, false), eqlValues(&ip, data, other));
+    try testing.expectEqual(@as(?bool, false), eqlValues(&ip, placed, other));
+    // The shorter data may be the start of the longer
+    try testing.expectEqual(@as(?bool, null), eqlValues(&ip, data, prefix));
+    const one = try ip.ptrTo(.u8_type, .one, true);
+    const to3 = try ip.get(.{ .ptr_value = .{ .ty = one, .pointee = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 3 } }) } });
+    const to4 = try ip.get(.{ .ptr_value = .{ .ty = one, .pointee = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 4 } }) } });
+    try testing.expectEqual(@as(?bool, null), eqlValues(&ip, to3, to3));
+    try testing.expectEqual(@as(?bool, false), eqlValues(&ip, to3, to4));
 }
