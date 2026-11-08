@@ -2618,8 +2618,10 @@ const Evaluator = struct {
                     },
                     else => {},
                 }
+                // The operand takes the child of the result type, except `anyopaque`: the pointer
+                // is coerced instead (the compiler's `coerce_ptr_elem_ty`)
                 const child_want: ?Index = if (want) |w| switch (ip.key(w)) {
-                    .ptr_type => |p| if (p.size == .one) p.child else null,
+                    .ptr_type => |p| if (p.size == .one and p.child != .anyopaque_type) p.child else null,
                     else => null,
                 } else null;
                 return ev.addressOf(f, operand_e, try ev.addressOperand(f, operand_e, child_want));
