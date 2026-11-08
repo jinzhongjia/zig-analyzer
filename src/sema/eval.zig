@@ -64,8 +64,10 @@ pub const CallKey = struct {
     /// Same as the instance in type inference (comptime parameters take the value, anytype takes
     /// the type, others are `runtime`); determines the identity of containers defined in the body
     inst: Index,
-    /// Values of the arguments: an `aggregate` (of type unknown) whose elements correspond
-    /// one-to-one to the parameters, with unknown for unknown values
+    /// Values of the arguments: an `aggregate` whose elements correspond one-to-one to the
+    /// parameters, with unknown for unknown values. Its type is the tuple of the argument types:
+    /// a value does not always give back its type (a null `?u8` passed to a `??u8` parameter is
+    /// a non-null `??u8`, while `null` itself is the null of `??u8`).
     values: Index,
     /// Backward branch quota: the current quota at the call site. In the compiler the callee shares
     /// the backward branch count with the caller; here the callee starts counting anew, so it never
@@ -78,8 +80,13 @@ pub const CallKey = struct {
 pub fn call(r: *Resolver, inst: Index, args: []const TypedValue, quota: u32) Error!TypedValue {
     const ip = r.ctx.db.env.ip;
     const values = try r.arena.alloc(Index, args.len);
-    for (args, values) |a, *v| v.* = a.val orelse .unknown;
-    const key: CallKey = .{ .inst = inst, .values = try ip.get(.{ .aggregate = .{ .ty = .unknown, .elems = values } }), .quota = quota };
+    const types = try r.arena.alloc(Index, args.len);
+    for (args, values, types) |a, *v, *t| {
+        v.* = a.val orelse .unknown;
+        t.* = a.ty;
+    }
+    const types_ty = try ip.get(.{ .tuple_type = .{ .types = types } });
+    const key: CallKey = .{ .inst = inst, .values = try ip.get(.{ .aggregate = .{ .ty = types_ty, .elems = values } }), .quota = quota };
     return r.ctx.get(queries.CallEval, key);
 }
 
@@ -122,12 +129,18 @@ pub fn compute(ctx: *Db.Ctx, key: CallKey) Error!TypedValue {
     defer scope.leave();
     var ev: Evaluator = .{ .r = &r, .ip = ip, .a = scratch.allocator(), .arena = &scratch, .quota = key.quota };
     defer ev.deinit();
-    const args = switch (ip.key(key.values)) {
-        .aggregate => |agg| agg.elems,
-        else => &.{},
+    const args, const types = switch (ip.key(key.values)) {
+        .aggregate => |agg| .{ agg.elems, switch (ip.key(agg.ty)) {
+            .tuple_type => |t| t.types,
+            else => &.{},
+        } },
+        else => .{ &.{}, &.{} },
     };
     const vals = try ev.a.alloc(Val, args.len);
-    for (args, vals) |x, *v| v.* = if (x == .unknown) .unknown else Val.of(value.typeOfValue(ip, x), x);
+    for (args, vals, 0..) |x, *v, i| {
+        const ty = if (i < types.len and types[i] != .unknown) types[i] else value.typeOfValue(ip, x);
+        v.* = if (x == .unknown) .unknown else Val.of(ty, x);
+    }
     const result = ev.runFunction(.{ .file = inst.file, .item = inst.decl }, key.inst, vals) catch |err| return giveUp(err);
     return ev.toTyped(result) catch |err| giveUp(err);
 }
