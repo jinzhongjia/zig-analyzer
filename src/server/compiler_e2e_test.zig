@@ -434,8 +434,9 @@ fn slowZig(h: *Harness, project: *fixture.Project) !std.json.Value {
     return jsonValue(h, try std.fmt.allocPrint(h.arena.allocator(), "{{\"zig\": {{\"path\": \"{s}/zigw\"}}}}", .{project.root}));
 }
 
-/// `build()` blocks reading the FIFO `gate` until the test writes to it, so the project stays loading
-/// for as long as the test needs. `@import("foo")` only resolves once the build graph is known.
+/// `build()` blocks reading the FIFO `gate` until the test writes to it (see `openGate`), so the
+/// project stays loading for as long as the test needs. `@import("foo")` only resolves once the
+/// build graph is known.
 const gated_build =
     \\const std = @import("std");
     \\pub fn build(b: *std.Build) void {
@@ -473,9 +474,68 @@ fn createGatedProject() !fixture.Project {
     return project;
 }
 
-/// Lets `build()` continue; blocks until it has opened the FIFO
+/// How long `build()` of a gated project may take to reach the gate while the project is loading:
+/// far more than a first load takes on a slow machine, compiling the build runner included. A load
+/// that ends without reaching the gate fails the wait at once instead (see `expectLoading`).
+const gate_timeout_s = 300;
+
+/// The first load of a gated project cannot end before `build()` has passed the gate. When the
+/// server is not loading the project any more (or never started it), the build ended before the
+/// gate (zig cannot write its global cache, cannot compile build.zig, ...) and will never reach it:
+/// fails, printing what the server reported.
+fn expectLoading(h: *Harness) !void {
+    if (h.server.projectsPending()) return;
+    std.debug.print("the server is not loading the project, but build() has not reached the gate\n", .{});
+    // Lets the server publish what it has to say about the load
+    waitIdle(h) catch |err| std.debug.print("zig-analyzer/waitIdle failed: {t}\n", .{err});
+    var reported = false;
+    for (try shownMessages(h)) |m| {
+        std.debug.print("shown: {s}\n", .{m});
+        reported = true;
+    }
+    if ((try h.diagnostics()).get("build.zig")) |lines| for (lines) |l| {
+        std.debug.print("build.zig: {s}\n", .{l});
+        reported = true;
+    };
+    if (!reported) std.debug.print("the server reported no cause\n", .{});
+    return error.ProjectLoadEnded;
+}
+
+/// Called while `build()` of a gated project has not reached `what` yet: fails when it never will
+/// (see `expectLoading`) or once `gate_timeout_s` have passed since `started`; otherwise sleeps
+/// briefly
+fn awaitGate(h: *Harness, started: std.Io.Clock.Timestamp, what: []const u8) !void {
+    try expectLoading(h);
+    if (started.untilNow(testing.io).raw.toSeconds() >= gate_timeout_s) {
+        std.debug.print("build() has not reached {s} within {d} s while the project is loading\n", .{ what, gate_timeout_s });
+        for (try shownMessages(h)) |m| std.debug.print("shown: {s}\n", .{m});
+        return error.Timeout;
+    }
+    try testing.io.sleep(.fromMilliseconds(10), .awake);
+}
+
+/// Lets `build()` continue once it has opened the FIFO `gate`. A blocking open for writing would
+/// wait for a reader, forever when `build()` never gets there; with O_NONBLOCK, the open fails with
+/// ENXIO while there is no reader, and a reader blocked in its own open counts as one.
 fn openGate(h: *Harness, project: *fixture.Project) !void {
-    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(h.arena.allocator(), "gate"), .data = "x" });
+    const posix = std.posix;
+    const path = try project.path(h.arena.allocator(), "gate");
+    // Close-on-exec: a copy of the write end in a process the server starts meanwhile would keep
+    // `build()` from reading the end of the file
+    const flags: posix.O = .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true };
+    const started = std.Io.Clock.Timestamp.now(testing.io, .awake);
+    const fd = while (true) {
+        break posix.openat(posix.AT.FDCWD, path, flags, 0) catch |err| switch (err) {
+            error.NoDevice => {
+                try awaitGate(h, started, "the gate");
+                continue;
+            },
+            else => |e| return e,
+        };
+    };
+    const gate: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    defer gate.close(testing.io);
+    try gate.writeStreamingAll(testing.io, "x");
 }
 
 fn sendHover(h: *Harness, uri: []const u8, line: u32, character: u32) !i64 {

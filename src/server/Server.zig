@@ -3367,7 +3367,7 @@ fn projectsLoading(server: *Server) bool {
 
 /// The zig environment or a project's first load is still pending: name resolution and types may
 /// be incomplete. A restart does not end a first load: it goes on in the new instance.
-fn projectsPending(server: *Server) bool {
+pub fn projectsPending(server: *Server) bool {
     if (!server.startup_ended.load(.acquire) or server.first_load_restarts.load(.acquire) != 0) return true;
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
