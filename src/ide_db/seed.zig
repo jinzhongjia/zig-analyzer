@@ -941,6 +941,7 @@ const Closure = struct {
             .ptr_base => |b| c.importers.contains(b.file) or (if (b.inst) |i| try c.reaches(i) else false),
             .instance => |i| blk: {
                 if (try c.anyReaches(i.args, i.arg_types)) break :blk true;
+                for (i.captured) |cap| if ((try c.reaches(cap.ty)) or try c.reaches(cap.val)) break :blk true;
                 break :blk if (i.parent) |p| try c.reaches(p) else false;
             },
         };
@@ -1100,7 +1101,10 @@ fn depthExceeds(ip: *InternPool, x: Index, limit: u32) bool {
         .ptr_value => |p| depthExceeds(ip, p.pointee, sub),
         .union_value => |u| depthExceeds(ip, u.payload, sub),
         .opt_payload => |o| depthExceeds(ip, o.payload, sub),
-        .instance => |i| anyExceeds(ip, i.args, sub) or anyExceeds(ip, i.arg_types, sub) or (if (i.parent) |p| depthExceeds(ip, p, sub) else false),
+        .instance => |i| blk: {
+            for (i.captured) |cap| if (depthExceeds(ip, cap.ty, sub) or depthExceeds(ip, cap.val, sub)) break :blk true;
+            break :blk anyExceeds(ip, i.args, sub) or anyExceeds(ip, i.arg_types, sub) or (if (i.parent) |p| depthExceeds(ip, p, sub) else false);
+        },
         else => false,
     };
 }

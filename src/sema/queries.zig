@@ -790,8 +790,20 @@ pub const Local = @FieldType(resolve.Def, "local");
 /// - a variable can change between containers, so its value is the one the container defined
 ///   directly in the body around `from` captured (`CapturedVar`); without `from`, only its type
 ///   is known.
+/// A container in a loop of the function has the values it captured in its instance
+/// (`InternPool.Instance.captured`), one set per iteration; the locals it did not capture, and
+/// those whose captured value is unknown, are computed as above in the instance of the function.
 pub fn outerLocal(r: *Resolver, l: Local, from: ?Namespace, inst: ?Index) resolve.Error!TypedValue {
-    const key: LocalKey = .{ .owner = try r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = try normalizeInst(r, l.file, l.item, inst) };
+    const owner = try r.ownerKey(l.file, l.item);
+    var fn_inst = try normalizeInst(r, l.file, l.item, inst);
+    if (fn_inst) |i| switch (r.ctx.db.env.ip.key(i)) {
+        .instance => |k| if (k.captured.len != 0 and k.file == owner.file and k.decl == owner.item) {
+            for (k.captured) |c| if (c.binding == @backingInt(l.binding) and c.val != .unknown) return .{ .ty = c.ty, .val = c.val };
+            fn_inst = try withoutCaptured(r.ctx.db.env.ip, i);
+        },
+        else => {},
+    };
+    const key: LocalKey = .{ .owner = owner, .target = .{ .binding = l.binding }, .inst = fn_inst };
     const tv = try r.ctx.get(LocalValue, key);
     if (tv.val != null or r.ctx.incomplete()) return tv;
     const run = switch ((try r.body(l.file, l.item)).binding(l.binding).kind) {
@@ -805,6 +817,18 @@ pub fn outerLocal(r: *Resolver, l: Local, from: ?Namespace, inst: ?Index) resolv
         .param, .capture => return tv,
     };
     return if (run.val != null and (tv.ty == .unknown or run.ty == tv.ty)) run else tv;
+}
+
+/// Instance `inst` of a function without the values a container in one of its loops captured:
+/// the instance the function body runs in
+pub fn withoutCaptured(ip: *InternPool, inst: Index) Allocator.Error!Index {
+    var k = switch (ip.key(inst)) {
+        .instance => |x| x,
+        else => return inst,
+    };
+    if (k.captured.len == 0) return inst;
+    k.captured = &.{};
+    return ip.get(.{ .instance = k });
 }
 
 /// The container a member of the file belongs to

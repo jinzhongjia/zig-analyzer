@@ -471,6 +471,13 @@ pub const Instance = struct {
     /// of its type, so arguments of different types are different instances.
     arg_types: []const Index = &.{},
     parent: ?Index = null,
+    /// The values a container defined in a loop of function `decl` (in its body, condition, or
+    /// continue expression) captured from the function's locals other than parameters when the
+    /// interpreter reached it, sorted by binding: the instance of that container. Each iteration
+    /// that captures different values defines a different type, as in the compiler, where the
+    /// identity of a container is its definition and its captured values (`getCaptures`); one
+    /// that captures the same values gets the same instance.
+    captured: []const CapturedLocal = &.{},
     /// When inferring per iteration, the instance that containers defined inside a loop body (or
     /// an `inline` switch prong) of member `decl` belong to: the instance of `decl` (when
     /// `abstract`, `decl` has no instance, `args` is empty, and the enclosing instance is
@@ -501,6 +508,14 @@ pub const Instance = struct {
 
         pub const unknown_index = std.math.maxInt(u32);
     };
+};
+
+/// A local of a function and the value a container captured for it; `val` is `unknown` when the
+/// value is not known
+pub const CapturedLocal = struct {
+    binding: u32,
+    ty: Index,
+    val: Index,
 };
 
 /// Container type constructed by a builtin. Identity = construction location (member +
@@ -960,7 +975,7 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
         .abstract_array_type => |t| .{ .abstract_array_type = .{ .len = if (t.len) |l| try a.dupe(u8, l) else null, .child = t.child, .sentinel = t.sentinel } },
         .enum_tag => |t| .{ .enum_tag = .{ .ty = t.ty, .name = try a.dupe(u8, t.name) } },
         .error_value => |n| .{ .error_value = try a.dupe(u8, n) },
-        .instance => |i| .{ .instance = .{ .file = i.file, .decl = i.decl, .args = try a.dupe(Index, i.args), .arg_types = try a.dupe(Index, i.arg_types), .parent = i.parent, .iteration = i.iteration } },
+        .instance => |i| .{ .instance = .{ .file = i.file, .decl = i.decl, .args = try a.dupe(Index, i.args), .arg_types = try a.dupe(Index, i.arg_types), .parent = i.parent, .captured = try a.dupe(CapturedLocal, i.captured), .iteration = i.iteration } },
         .tuple_type => |t| .{ .tuple_type = .{ .types = try a.dupe(Index, t.types), .values = try a.dupe(Index, t.values) } },
         .anon_struct_type => |t| .{ .anon_struct_type = .{ .names = try dupeNames(a, t.names), .types = try a.dupe(Index, t.types), .values = try a.dupe(Index, t.values), .origin = if (t.origin) |o| .{ .file = o.file, .path = try a.dupe(u32, o.path) } else null } },
         .reified_type => |t| blk: {
