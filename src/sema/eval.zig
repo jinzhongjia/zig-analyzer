@@ -4684,7 +4684,7 @@ fn packedHostSize(ip: *InternPool, l: value.Layout) ?u64 {
     if (bytes == l.size) return bytes;
     return switch (ip.vectorAbi()) {
         .x86_64, .x86_64_avx, .x86_64_avx512 => l.size,
-        .llvm, .llvm_aarch64 => bytes,
+        .llvm, .llvm_stack_align_8, .llvm_stack_align_16 => bytes,
         // The C and wasm backends share a vector layout but not this rule
         .elem, .unknown => null,
     };
