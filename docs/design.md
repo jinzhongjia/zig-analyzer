@@ -308,7 +308,7 @@ The maker and its children are a process group led by a watchdog `sh` on POSIX a
 
 At startup `zig env` gives the lib, std, and global cache directories; when it fails the user is warned, since nothing works without them.
 
-- `zig.lib_path` and `zig.global_cache_path` override them after validation and are passed through `ZIG_LIB_DIR` and `ZIG_GLOBAL_CACHE_DIR` to every zig process, so all use the same standard library as name resolution.
+- `zig.lib_path` and `zig.global_cache_path` override them after validation and are passed through `ZIG_LIB_DIR` and `ZIG_GLOBAL_CACHE_DIR` to every zig process started after `zig env` (the build runner, single-file compiles, the builtin.zig generation, and the `zig ast-check` of live diagnostics), so all use the same standard library as name resolution.
 - `zig.builtin_path` replaces `builtin` only for files in no project.
 - Changes are applied again, restarting projects when the directories change. A replaced environment is freed only at exit, since running tasks may still use it.
 
