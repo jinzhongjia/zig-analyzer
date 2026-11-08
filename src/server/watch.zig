@@ -85,6 +85,9 @@ pub const Watcher = struct {
     /// interned, roots were added or removed)
     resync_requested: std.atomic.Value(bool) = .init(true),
     stopping: std.atomic.Value(bool) = .init(false),
+    /// Test hook (null outside tests): the background task stops before its next round until the
+    /// pause is released, so that a test can change files before the task gets to them
+    test_pause: std.atomic.Value(?*TestPause) = .init(null),
 
     // ── The following fields are accessed only by the background task ──
     /// What is being watched (see `Server.WatchScope`); `.none` while not watching
@@ -120,6 +123,13 @@ pub const Watcher = struct {
 
     /// Ids of the requests sent by `registerClientGlobs` start with this
     pub const registration_prefix = "zig-analyzer/didChangeWatchedFiles/";
+
+    /// See `test_pause`
+    pub const TestPause = struct {
+        /// Set when the background task has stopped
+        entered: Io.Event = .unset,
+        release: Io.Event = .unset,
+    };
 
     /// Created on the main loop, so later `wake` / `stop` calls are not lost. Falls back to polling
     /// when native notifications are unavailable.
@@ -178,10 +188,22 @@ pub const Watcher = struct {
         if (!w.resync_requested.swap(true, .acq_rel)) w.backend.wake();
     }
 
+    fn testPause(w: *Watcher) void {
+        if (!builtin.is_test) return;
+        const pause = w.test_pause.load(.acquire) orelse return;
+        const io = w.server.io;
+        pause.entered.set(io);
+        while (!w.stopping.load(.acquire)) {
+            pause.release.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }) catch continue;
+            return;
+        }
+    }
+
     /// Background task: ends when the server shuts down
     pub fn run(w: *Watcher) Io.Cancelable!void {
         defer w.deactivate();
         while (!w.stopping.load(.acquire)) {
+            w.testPause();
             const scope = w.server.watchScope();
             // Files the server starts watching may have changed while nobody watched them: they
             // are compared with the disk. At startup, they were all just read.
