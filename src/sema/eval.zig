@@ -1417,6 +1417,17 @@ const Evaluator = struct {
         return ev.coerce(try ev.evalInner(f, e, want), want);
     }
 
+    /// Operand of a rounding builtin with the result type `want` (matches the compiler's
+    /// `zirRoundCast`): Sema checks that the operand is a float before coercing it, so `@ceil(3)`
+    /// is a compile error even with the result type f32, and coerces a float operand to a float
+    /// destination before rounding, so `const h: f16 = @round(0.4999999)` rounds the f16 0.5
+    fn roundOperand(ev: *Evaluator, f: *Frame, e: ExprId, want: ?Index) EvalError!Val {
+        try ev.tick();
+        const v = try ev.evalInner(f, e, want);
+        const dest = want orelse return v;
+        return if (ev.ip.isFloat(v.ty)) ev.coerce(v, dest) else v;
+    }
+
     /// Evaluates to a type
     fn evalType(ev: *Evaluator, f: *Frame, e: ExprId) EvalError!Index {
         const v = try ev.eval(f, e, null);
@@ -3389,7 +3400,11 @@ const Evaluator = struct {
         if (eq(u8, name, "@Fn")) return ev.reifyFn(f, args);
         const vals = try ev.a.alloc(Val, args.len);
         // Result types of the arguments
-        for (args, vals, 0..) |a, *o, i| o.* = try ev.eval(f, a, try ev.builtinArgType(name, i, vals[0..i], want));
+        const operand = operand_results.get(name);
+        for (args, vals, 0..) |a, *o, i| {
+            const t = try ev.builtinArgType(name, operand, i, vals[0..i], want);
+            o.* = if (operand == .round_op) try ev.roundOperand(f, a, t) else try ev.eval(f, a, t);
+        }
         if (try ev.pureBuiltin(name, vals)) |v| return v;
         if (eq(u8, name, "@TypeOf")) {
             if (vals.len == 0) return error.Abort;
@@ -3865,21 +3880,12 @@ const Evaluator = struct {
         return Val.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret, .varargs = varargs, .cc = cc, .noalias_bits = noalias_bits } }));
     }
 
-    /// Result type of argument `i` of a builtin (`prev` holds the preceding arguments, `want` is
-    /// the result type of the call). In builtins that construct types, arguments given per field
-    /// get `*const [n]T`, which forms such as `&@splat(.{})` need.
-    fn builtinArgType(ev: *Evaluator, name: []const u8, i: usize, prev: []const Val, want: ?Index) EvalError!?Index {
+    /// Result type of argument `i` of a builtin (matches the compiler's `AstGen.builtinCall`):
+    /// `operand` classifies the builtin, `prev` holds the preceding arguments and `want` is the
+    /// result type of the call. In builtins that construct types, arguments given per field get
+    /// `*const [n]T`, which forms such as `&@splat(.{})` need.
+    fn builtinArgType(ev: *Evaluator, name: []const u8, operand: ?OperandResult, i: usize, prev: []const Val, want: ?Index) EvalError!?Index {
         const eq = std.mem.eql;
-        // The operand is coerced to the backing integer of the destination type (the compiler's
-        // `from_backing_int_arg_ty`): the tag type of an enum, the backing integer of a packed
-        // struct or union. `@fromBackingInt(@intCast(i))` needs it.
-        if (eq(u8, name, "@fromBackingInt") and i == 0) {
-            const dest = destType(ev.ip, want, .eu_opt) orelse return null;
-            return ev.backingIntType(dest) catch |err| switch (err) {
-                error.Abort => null,
-                else => |x| return x,
-            };
-        }
         const is_struct = eq(u8, name, "@Struct");
         const elem: ?Index = if ((is_struct or eq(u8, name, "@Union")) and (i == 3 or i == 4)) blk: {
             if (i == 3) break :blk .type_type;
@@ -3892,16 +3898,105 @@ const Evaluator = struct {
             const n = try ev.elemCount(prev[2]) orelse return null;
             return try ev.ip.ptrTo(try ev.ip.get(.{ .array_type = .{ .len = n, .child = t } }), .one, true);
         }
-        // The shift amount of `@shlExact` / `@shrExact` has the result type `Log2Int(T)` of the
-        // shifted operand's type
-        if (i == 1 and (eq(u8, name, "@shlExact") or eq(u8, name, "@shrExact"))) return value.log2IntType(ev.ip, prev[0].ty);
+        if (operand) |kind| {
+            const t = try ev.operandResultType(kind, i, prev, want) orelse return null;
+            return if (t == .unknown) null else t;
+        }
         return builtinParamType(name, i);
+    }
+
+    /// Builtins whose arguments have result types given by the result type of the call or by the
+    /// preceding arguments (see `operandResultType`)
+    const OperandResult = enum { from_backing_int, union_init, memset, splat, float_op, round_op, mul_add, int, vector, shift_exact };
+
+    const operand_results = std.StaticStringMap(OperandResult).initComptime(.{
+        .{ "@fromBackingInt", .from_backing_int },
+        .{ "@unionInit", .union_init },
+        .{ "@memset", .memset },
+        .{ "@splat", .splat },
+        .{ "@sqrt", .float_op },
+        .{ "@sin", .float_op },
+        .{ "@cos", .float_op },
+        .{ "@tan", .float_op },
+        .{ "@exp", .float_op },
+        .{ "@exp2", .float_op },
+        .{ "@log", .float_op },
+        .{ "@log2", .float_op },
+        .{ "@log10", .float_op },
+        .{ "@floor", .round_op },
+        .{ "@ceil", .round_op },
+        .{ "@trunc", .round_op },
+        .{ "@round", .round_op },
+        .{ "@mulAdd", .mul_add },
+        .{ "@Int", .int },
+        .{ "@Vector", .vector },
+        .{ "@shlExact", .shift_exact },
+        .{ "@shrExact", .shift_exact },
+    });
+
+    /// Result type of argument `i` of a builtin classified as `kind`; null when it has none
+    fn operandResultType(ev: *Evaluator, kind: OperandResult, i: usize, prev: []const Val, want: ?Index) EvalError!?Index {
+        const ip = ev.ip;
+        switch (kind) {
+            // The operand is coerced to the backing integer of the destination type, which is the
+            // result type without one error union and one optional (`destType` with `.eu_opt`;
+            // the compiler's `from_backing_int_arg_ty`): the tag type of an enum, the backing
+            // integer of a packed struct or union. `@fromBackingInt(@intCast(i))` needs it.
+            .from_backing_int => if (i == 0) {
+                const dest = destType(ip, want, .eu_opt) orelse return null;
+                return ev.backingIntType(dest) catch |err| switch (err) {
+                    error.Abort => null,
+                    else => |x| return x,
+                };
+            },
+            // The init value has the type of the named field
+            .union_init => if (i == 2) return try ev.unionFieldType(try asType(prev[0]), try ev.stringOf(prev[1])),
+            // The fill value has the element type of the destination
+            .memset => if (i == 1) return indexablePtrElemType(ip, prev[0].ty),
+            // The scalar has the element type of the array or vector the result type holds, with
+            // error unions and optionals removed however deeply nested (`splat_op_result_ty`)
+            .splat => if (i == 0) return switch (ip.key(value.optEuBaseType(ip, want orelse return null))) {
+                .array_type => |a| a.child,
+                .vector_type => |v| v.child,
+                else => null,
+            },
+            // A float or a vector of floats in the result type (`float_op_result_ty` /
+            // `round_op_ty`). With an integer result type, a rounding builtin converts its float
+            // operand to the integer, and the operand has no result type; for the other builtins
+            // a result type that is not a float is a compile error.
+            .float_op, .round_op => if (i == 0) return value.floatOperandType(ip, want orelse return null),
+            // The multiplicands and the addend have the float type given by the first argument
+            .mul_add => if (i == 0) return .type_type else if (i <= 3) return try asType(prev[0]),
+            // The bit count of `@Int` is a u16, the length of `@Vector` a u32
+            .int => if (i == 1) return try ip.intType(.unsigned, 16),
+            .vector => if (i == 0) return try ip.intType(.unsigned, 32),
+            // The shift amount of `@shlExact` / `@shrExact` has the result type `Log2Int(T)` of the
+            // shifted operand's type
+            .shift_exact => if (i == 1) return value.log2IntType(ip, prev[0].ty),
+        }
+        return null;
+    }
+
+    /// Element type of the destination of `@memset` (matches the compiler's
+    /// `zirIndexablePtrElemType`): the child of a slice or many-item pointer, the element of the
+    /// array or vector a single-item pointer points to; null for other types
+    fn indexablePtrElemType(ip: *InternPool, t: Index) ?Index {
+        const p = switch (ip.key(t)) {
+            .ptr_type => |p| p,
+            else => return null,
+        };
+        if (p.size != .one) return p.child;
+        return switch (ip.key(p.child)) {
+            .array_type => |a| a.child,
+            .vector_type => |v| v.child,
+            else => null,
+        };
     }
 
     /// Result type of a builtin parameter
     fn builtinParamType(name: []const u8, i: usize) ?Index {
         const eq = std.mem.eql;
-        if (i == 0 and (eq(u8, name, "@as") or eq(u8, name, "@typeInfo") or eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf") or eq(u8, name, "@offsetOf") or eq(u8, name, "@bitOffsetOf") or eq(u8, name, "@mulAdd"))) return .type_type;
+        if (i == 0 and (eq(u8, name, "@as") or eq(u8, name, "@typeInfo") or eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf") or eq(u8, name, "@offsetOf") or eq(u8, name, "@bitOffsetOf"))) return .type_type;
         return null;
     }
 
