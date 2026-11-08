@@ -95,7 +95,7 @@ const Lowering = struct {
             .pos_inf, .neg_inf, .nan => return .unknown,
             .int_literal => |int| switch (int) {
                 .small => |x| return l.comptimeInt(x),
-                .big => |b| return if (b.toInt(i128)) |x| l.comptimeInt(x) else |_| .{ .ty = .comptime_int_type, .val = try value.internComptimeInt(ip, l.arena, .{ .limbs = b.limbs, .positive = b.positive }) },
+                .big => |b| return if (b.toInt(i128)) |x| l.comptimeInt(x) else |_| .{ .ty = .comptime_int_type, .val = try value.internInt(ip, l.arena, .comptime_int_type, .{ .limbs = b.limbs, .positive = b.positive }) },
             },
             .char_literal => |c| return l.comptimeInt(c),
             .float_literal => |x| return .{ .ty = .comptime_float_type, .val = try value.floatValue(ip, .comptime_float_type, x) },

@@ -289,9 +289,10 @@ pub const Key = union(enum) {
 
     simple_value: SimpleValue,
     int_value: struct { ty: Index, value: i128 },
-    /// A `comptime_int` value outside the range of i128 (little-endian limbs with a sign);
-    /// `decimal` is the magnitude in decimal, for display
-    big_int: struct { positive: bool, limbs: []const std.math.big.Limb, decimal: []const u8 },
+    /// An integer value outside the range of i128 (little-endian limbs with a sign) of type `ty`:
+    /// comptime_int, or a fixed-width integer type wider than 128 bits (u128 values are stored as
+    /// the bit pattern in `int_value`); `decimal` is the magnitude in decimal, for display
+    big_int: struct { ty: Index, positive: bool, limbs: []const std.math.big.Limb, decimal: []const u8 },
     /// Float value (the bit representation as f128, already rounded to the precision of the type)
     float_value: struct { ty: Index, bits: u128 },
     enum_literal: []const u8,
@@ -892,7 +893,7 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
         },
         .aggregate => |v| .{ .aggregate = .{ .ty = v.ty, .elems = try a.dupe(Index, v.elems) } },
         .bytes => |v| .{ .bytes = .{ .ty = v.ty, .bytes = try a.dupe(u8, v.bytes) } },
-        .big_int => |v| .{ .big_int = .{ .positive = v.positive, .limbs = try a.dupe(std.math.big.Limb, v.limbs), .decimal = try a.dupe(u8, v.decimal) } },
+        .big_int => |v| .{ .big_int = .{ .ty = v.ty, .positive = v.positive, .limbs = try a.dupe(std.math.big.Limb, v.limbs), .decimal = try a.dupe(u8, v.decimal) } },
         .union_value => |v| .{ .union_value = .{ .ty = v.ty, .tag = try a.dupe(u8, v.tag), .payload = v.payload } },
         .opaque_param => |o| .{ .opaque_param = .{ .file = o.file, .owner = o.owner, .binding = o.binding, .name = try a.dupe(u8, o.name) } },
         else => k,

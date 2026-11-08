@@ -1507,8 +1507,7 @@ test "wide integer shift by more than 255 bits does not panic" {
         \\const E = enum(u1000) { a = 5 };
         \\const v = @intFromEnum(E.a) >> 300;
     , &.{
-        // Values wider than 128 bits are not folded
-        .{ "v", "u1000" },
+        .{ "v", "u1000 = 0" },
     });
 }
 
