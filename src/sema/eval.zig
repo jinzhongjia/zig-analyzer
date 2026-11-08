@@ -631,7 +631,9 @@ fn abortToNull(err: EvalError) Error!?TypedValue {
 /// container = definition location + captured values: a container that captures no arguments
 /// is the same type across instances). Captured values are compared as the compiler interns
 /// them: values of different types are different captures even when `==` holds for them
-/// (`@as(u8, 3)` and `@as(u16, 3)`).
+/// (`@as(u8, 3)` and `@as(u16, 3)`). Captured containers, and the types of captured values, are
+/// compared the same way; a container's captured values exist before it, so the comparison
+/// terminates.
 pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
     const ip = r.ctx.db.env.ip;
     if (value.eqlValues(ip, a, b)) |eq| return eq;
@@ -654,8 +656,8 @@ pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
         const tb = try queries.outerLocal(r, local, ns, ib);
         const va = ta.val orelse return null;
         const vb = tb.val orelse return null;
-        const same_value = value.eqlValues(ip, va, vb);
-        const same_type = value.eqlTypes(ip, ta.ty, tb.ty);
+        const same_value = try eqlValues(r, va, vb);
+        const same_type = try eqlValues(r, ta.ty, tb.ty);
         if (same_value == false or same_type == false) return false;
         if (same_value == null or same_type == null) unknown = true;
     }
