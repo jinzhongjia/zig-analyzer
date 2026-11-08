@@ -592,6 +592,86 @@ test "functions with an inferred error set are evaluated in constants" {
     });
 }
 
+test "container-level variables have the type the comptime execution of their initializer gives" {
+    // The interpreter ran only for constants, so a variable whose type comes from executing a loop
+    // in its initializer had no type.
+    try expectTypes(
+        \\var loop_type = blk: { var t: type = u8; for (0..1) |_| t = u16; break :blk @as(t, 0); };
+        \\var container = blk: {
+        \\    var T: type = void;
+        \\    for (0..3) |_| T = struct { pub const v: usize = 0; };
+        \\    break :blk T.v;
+        \\};
+        \\const const_loop_type = blk: { var t: type = u8; for (0..1) |_| t = u16; break :blk @as(t, 0); };
+        \\var loop_int = blk: { var x: usize = 0; for (0..3) |_| x += 1; break :blk x; };
+        \\threadlocal var thread_local = blk: { var t: type = u8; for (0..1) |_| t = u16; break :blk @as(t, 0); };
+        \\export var exported = blk: { var t: type = u8; for (0..1) |_| t = u16; break :blk @as(t, 0); };
+        \\var annotated: u32 = blk: { var t: type = u8; for (0..1) |_| t = u16; break :blk @as(t, 0); };
+        \\extern var external: u32;
+        \\const S = struct {
+        \\    var in_struct = blk: { var t: type = u8; for (0..1) |_| t = u16; break :blk @as(t, 0); };
+        \\};
+        \\const U = union {
+        \\    a: u8,
+        \\    var in_union = blk: { var t: type = u8; for (0..1) |_| t = u16; break :blk @as(t, 0); };
+        \\};
+        \\const E = enum {
+        \\    a,
+        \\    var in_enum = blk: { var t: type = u8; for (0..1) |_| t = u16; break :blk @as(t, 0); };
+        \\};
+        \\fn G(comptime T: type) type {
+        \\    return struct {
+        \\        var v = blk: { var t: type = T; for (0..1) |_| t = ?t; break :blk @as(t, null); };
+        \\    };
+        \\}
+        \\const generic = @TypeOf(G(u8).v);
+        \\var ptr = &loop_type;
+        \\var tuple = .{blk: { var t: type = u8; for (0..1) |_| t = u16; break :blk @as(t, 0); }};
+        \\var optional = blk: { var t: type = u8; for (0..1) |_| t = u16; break :blk @as(?t, null); };
+    , &.{
+        .{ "loop_type", "u16" },
+        .{ "container", "usize" },
+        .{ "const_loop_type", "u16 = 0" },
+        .{ "loop_int", "usize" },
+        .{ "thread_local", "u16" },
+        .{ "exported", "u16" },
+        .{ "annotated", "u32" },
+        .{ "external", "u32" },
+        .{ "in_struct", "u16" },
+        .{ "in_union", "u16" },
+        .{ "in_enum", "u16" },
+        .{ "generic", "type = ?u8" },
+        .{ "ptr", "*u16" },
+        .{ "tuple", "struct { comptime u16 = 0 }" },
+        .{ "optional", "?u16" },
+    });
+}
+
+test "comptime reads of a container-level variable get no value" {
+    // The value of a variable can change at runtime, so the compiler rejects every comptime read
+    // of it: the type taken from the initializer does not bring the initial value along.
+    try expectTypes(
+        \\var loop_type = blk: { var t: type = u8; for (0..1) |_| t = u16; break :blk @as(t, 3); };
+        \\const read = loop_type;
+        \\extern fn ext() u16;
+        \\var gives_up = blk: { var t: type = u8; for (0..1) |_| t = u16; break :blk @as(t, ext()); };
+        \\fn g() void {
+        \\    const len = [loop_type]u8;
+        \\    const copy = loop_type;
+        \\    const sum = comptime loop_type + 1;
+        \\    _ = .{ len, copy, sum };
+        \\}
+    , &.{
+        .{ "loop_type", "u16" },
+        .{ "read", "u16" },
+        .{ "len", "type = [loop_type]u8" },
+        .{ "copy", "u16" },
+        .{ "sum", "u16" },
+        // The interpreter cannot call an extern function, so the type stays unknown
+        .{ "gives_up", "unknown" },
+    });
+}
+
 test "struct literals with an error union or optional result type" {
     // A literal whose result type is an error union was given up on, unlike an optional one.
     try expectTypes(
