@@ -15,12 +15,17 @@ const slow_seconds = 10;
 
 const Patch = struct { anchor: []const u8, replacement: []const u8, what: []const u8 };
 
+/// Applied independently of each other
 const patches = [_]Patch{
     .{
         .anchor = ".check_write_after_free = true,",
         .replacement = ".check_write_after_free = true, .stack_trace_frames = 12,",
         .what = "stack traces of leaks stay disabled",
     },
+};
+
+/// The two parts of the slow test report: applied only together
+const timing_patches = [_]Patch{
     .{
         .anchor = "try server.serveStringMessage(.test_started, &.{});",
         .replacement = "try server.serveStringMessage(.test_started, &.{});\n" ++
@@ -44,20 +49,19 @@ const patches = [_]Patch{
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const a = init.arena.allocator();
-    var text = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], a, .unlimited);
-    // The two parts of the slow test report only work together
-    var timing = true;
-    for (patches[1..]) |p| {
-        if (std.mem.indexOf(u8, text, p.anchor) == null) timing = false;
-    }
-    for (patches, 0..) |p, i| {
-        if (i > 0 and !timing) {
-            if (i == 1) std.log.warn("test runner code not found, {s}", .{p.what});
-            continue;
-        }
-        const patched = try std.mem.replaceOwned(u8, a, text, p.anchor, p.replacement);
-        if (std.mem.eql(u8, patched, text)) std.log.warn("test runner code not found, {s}", .{p.what});
-        text = patched;
-    }
+    var text: []const u8 = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], a, .unlimited);
+    for (patches) |p| text = try apply(a, text, p);
+    const timing = for (timing_patches) |p| {
+        if (std.mem.indexOf(u8, text, p.anchor) == null) break false;
+    } else true;
+    if (timing) {
+        for (timing_patches) |p| text = try apply(a, text, p);
+    } else std.log.warn("test runner code not found, {s}", .{timing_patches[0].what});
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = args[2], .data = text });
+}
+
+fn apply(a: std.mem.Allocator, text: []const u8, p: Patch) ![]const u8 {
+    const patched = try std.mem.replaceOwned(u8, a, text, p.anchor, p.replacement);
+    if (std.mem.eql(u8, patched, text)) std.log.warn("test runner code not found, {s}", .{p.what});
+    return patched;
 }
