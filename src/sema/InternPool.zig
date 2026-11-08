@@ -395,7 +395,8 @@ pub const Instance = struct {
     iteration: ?Iteration = null,
 
     /// When `index` is `unknown_index`, the iteration is undetermined (containers in a loop body
-    /// when not inferring per iteration): the type is not concrete
+    /// when not inferring per iteration): the type is not concrete, and the loop variables have
+    /// no value in this instance, which is no particular iteration (see `infer.LoopSeed`)
     pub const Iteration = struct {
         binding: u32,
         index: u32,

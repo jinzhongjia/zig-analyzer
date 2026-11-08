@@ -135,7 +135,15 @@ pub const Mode = enum {
 
 /// Per-iteration inference: the loop variable `binding` of a loop (`inline for`, or `for` at
 /// comptime) takes the `index`-th element of the list, and the capture `binding` of an `inline`
-/// switch prong takes the value of the `index`-th prong item (see `queries.InferKey.loop`)
+/// switch prong takes the value of the `index`-th prong item (see `queries.InferKey.loop`).
+///
+/// In an instance with an undetermined iteration (that of the containers in a loop body when not
+/// inferring per iteration, see `splitIteration`), `index` is
+/// `InternPool.Instance.Iteration.unknown_index`. That is no iteration: the loop is inferred as
+/// without a seed, so its loop variables have their types and no values (the compiler gives them
+/// a value only in each unrolled iteration), see `Inferrer.iterationSeed`. The seed still keeps
+/// the inference apart from the member's own one, which is in progress when a container in the
+/// loop body reads a loop variable.
 pub const LoopSeed = struct { binding: u32, index: u32 };
 
 pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_seed: ?LoopSeed, zon_type: ?Index) Error!Result {
@@ -433,12 +441,21 @@ const Inferrer = struct {
         return q;
     }
 
-    /// Instance of the owner itself (a function)
     /// Instance of this member when inferred per iteration (`loop_seed`), see
-    /// `InternPool.Instance.iteration`; null when not inferred per iteration
+    /// `InternPool.Instance.iteration`; null when not inferred per iteration. For an undetermined
+    /// iteration, the instance with `unknown_index`: the locals it queries on demand stay apart
+    /// from the member's own inference too (see `LoopSeed`).
     fn iterationInstance(inf: *Inferrer) Error!?Index {
         const seed = inf.loop_seed orelse return null;
         return try inf.instanceAt(seed.binding, seed.index);
+    }
+
+    /// The loop seed when inferring one actual iteration; null when not inferred per iteration
+    /// and for an undetermined iteration, which has no particular value of the loop variable
+    /// (see `LoopSeed`)
+    fn iterationSeed(inf: *const Inferrer) ?LoopSeed {
+        const seed = inf.loop_seed orelse return null;
+        return if (seed.index == InternPool.Instance.Iteration.unknown_index) null else seed;
     }
 
     /// Instance of this member at the `index`-th iteration of the loop variable `binding`
@@ -458,7 +475,7 @@ const Inferrer = struct {
     /// otherwise the instance with an undetermined iteration is used (its types are not concrete).
     fn containerInst(inf: *Inferrer, e: ExprId) Error!?Index {
         const at = inf.body.range(e).start;
-        if (inf.loop_seed) |seed| if (seedRegion(inf.body, seed.binding)) |rg| if (rg.contains(at)) return try inf.instanceAt(seed.binding, seed.index);
+        if (inf.iterationSeed()) |seed| if (seedRegion(inf.body, seed.binding)) |rg| if (rg.contains(at)) return try inf.instanceAt(seed.binding, seed.index);
         var best: ?struct { binding: u32, len: u32 } = null;
         for (inf.body.exprs) |x| {
             const binding: Body.BindingId, const rg = switch (x) {
@@ -2303,9 +2320,11 @@ const Inferrer = struct {
             },
             .@"for" => {
                 // Inferring this loop for one iteration (see `LoopSeed`): every loop variable
-                // takes its value in this iteration
-                iteration = if (inf.loop_seed) |seed|
-                    (if (std.mem.indexOfScalar(Body.BindingId, l.capture, @fromBackingInt(seed.binding)) != null) seed.index else null)
+                // takes its value in this iteration. An undetermined iteration is inferred as the
+                // whole loop.
+                const seed = inf.iterationSeed();
+                iteration = if (seed) |s|
+                    (if (std.mem.indexOfScalar(Body.BindingId, l.capture, @fromBackingInt(s.binding)) != null) s.index else null)
                 else
                     null;
                 // When the loop body modifies an outer `comptime var`, at the start of iteration n
@@ -2315,7 +2334,7 @@ const Inferrer = struct {
                         .owner = .{ .file = inf.file, .item = try inf.body_owner() },
                         .mode = inf.mode,
                         .inst = inf.inst,
-                        .loop = .{ .binding = inf.loop_seed.?.binding, .index = n - 1 },
+                        .loop = .{ .binding = seed.?.binding, .index = n - 1 },
                     });
                     for (prev.iteration_vars) |v| inf.bindings[@backingInt(v.binding)].val = v.val;
                 };
@@ -2710,7 +2729,7 @@ const Inferrer = struct {
         var inline_tag: ?[]const u8 = null;
         var t: Index = if (is_union and prong.is_inline) blk: {
             const payloads = try inlineUnionPayloads(inf.r, inf.body, inf.exprs, prongs, pi, operand) orelse break :blk .unknown;
-            if (inf.loop_seed) |seed| if (seed.binding == @backingInt(cap)) {
+            if (inf.iterationSeed()) |seed| if (seed.binding == @backingInt(cap)) {
                 if (seed.index >= payloads.len) break :blk .unknown;
                 inline_tag = payloads[seed.index].name;
                 break :blk payloads[seed.index].ty;
@@ -2740,7 +2759,7 @@ const Inferrer = struct {
         if (is_ptr and inf.var_levels.len != 0) if (try inf.comptimeVarPlace(operand_e)) |v| inf.untrackComptimeVar(v);
         // Inferring for one value of an inline prong (see `LoopSeed`): the capture takes the value
         // of this prong item
-        if (prong.is_inline and !is_union and !is_error_set and !is_ptr) if (inf.loop_seed) |seed| if (seed.binding == @backingInt(cap)) {
+        if (prong.is_inline and !is_union and !is_error_set and !is_ptr) if (inf.iterationSeed()) |seed| if (seed.binding == @backingInt(cap)) {
             if ((try inlineProngValues(ip, inf.body, inf.exprs, prong, operand, seed.index)).value) |v| val = v;
         };
         if (is_ptr) {
@@ -4507,11 +4526,10 @@ pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args:
     return inst;
 }
 
-/// Instance used when a non-generic function is executed as a comptime call (it does not
-/// distinguish arguments; argument values are passed separately)
 /// When the instance is used for the member `owner` it belongs to: an instance with an iteration
 /// (see `InternPool.Instance.iteration`) is split into the outer instance and the loop seed;
-/// other instances are returned as is
+/// other instances are returned as is. An undetermined iteration gives a seed with
+/// `unknown_index` (see `LoopSeed`).
 fn splitIteration(ip: *InternPool, owner: hir.OwnerKey, inst: ?Index) Error!struct { inst: ?Index, seed: ?LoopSeed } {
     const i = inst orelse return .{ .inst = null, .seed = null };
     const key = switch (ip.key(i)) {
