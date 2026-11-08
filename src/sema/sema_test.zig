@@ -2874,6 +2874,30 @@ test "comptime slices alias the sliced storage" {
     });
 }
 
+test "a call that returns a pointer is the base of an assignment at comptime" {
+    // Assigning to an element or a field of the pointee of a call's result gave up, since a call
+    // is not a place.
+    try expectTypes(
+        \\fn id(p: anytype) @TypeOf(p) {
+        \\    return p;
+        \\}
+        \\const S = struct { x: u8, y: u8 };
+        \\const index_call = blk: {
+        \\    var a = [_]u8{ 1, 2 };
+        \\    id(&a)[1] = 5;
+        \\    break :blk a;
+        \\};
+        \\const field_call = blk: {
+        \\    var s: S = .{ .x = 1, .y = 2 };
+        \\    id(&s).y = 7;
+        \\    break :blk s.y;
+        \\};
+    , &.{
+        .{ "index_call", "[2]u8 = \"\\x01\\x05\"" },
+        .{ "field_call", "u8 = 7" },
+    });
+}
+
 test "comptime @bitCast reinterprets arrays, vectors, enums and packed containers" {
     // The compiler packs the operand in logical bit order (packed fields from the least
     // significant bit, elements in index order), so the results do not depend on the target

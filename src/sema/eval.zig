@@ -3586,14 +3586,18 @@ const Evaluator = struct {
     /// interned pointer records (`basePlace`), the place it points to instead (automatic
     /// dereferencing)
     fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId, use: PlaceUse) EvalError!Ref {
-        // A pointer computed by pointer arithmetic (`(p + 1)[0] = x`) is not a place: the
-        // compiler takes the element pointer of the value
-        if (f.body.expr(e) == .binary) {
-            const p = try ev.eval(f, e, null);
-            return switch (p.v) {
-                .ref => |r| ev.through(r, p.ty),
-                else => error.Abort,
-            };
+        // A pointer computed by pointer arithmetic (`(p + 1)[0] = x`) or returned by a call
+        // (`std.mem.asBytes(&x)[i] = b`) is not a place: the compiler takes the element pointer
+        // of the value, so the place is the one it points to
+        switch (f.body.expr(e)) {
+            .binary, .call, .builtin_call => {
+                const p = try ev.eval(f, e, null);
+                return switch (p.v) {
+                    .ref => |r| ev.through(r, p.ty),
+                    else => error.Abort,
+                };
+            },
+            else => {},
         }
         const ref = try ev.placeFor(f, e, use);
         // The value of a range, or of a `*T` → `*[1]T` view, is an array, not a pointer
