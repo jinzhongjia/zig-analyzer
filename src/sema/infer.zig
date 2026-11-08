@@ -331,6 +331,11 @@ const Inferrer = struct {
     /// Greater than 0 inside a comptime context (type expressions, array lengths, comptime
     /// arguments, etc.): function calls there are evaluated by the interpreter
     comptime_depth: u32 = 0,
+    /// Inside the operands of `@TypeOf` and not in a comptime context nested in them: the
+    /// compiler analyzes these operands in a block without a comptime reason
+    /// (`Sema.zirTypeofBuiltin`), so calls there are not executed even where the surrounding code
+    /// is evaluated at comptime (see `comptimeOperand`)
+    in_typeof: bool = false,
     /// Backward-branch quota of comptime evaluations started directly in the member (see
     /// `eval.bodyQuota`), computed on first use
     quota: ?u32 = null,
@@ -610,6 +615,28 @@ const Inferrer = struct {
         return null;
     }
 
+    /// The operand `e` of `catch` / `orelse` (inferred as `tv`) with its comptime value. With a
+    /// comptime-known operand the compiler analyzes only the side that is taken
+    /// (`Sema.zirCondbr`), so the type of the whole expression depends on this value. Inference
+    /// executes calls only in comptime contexts, but the compiler also evaluates the
+    /// initializers of container-level constants and variables, fields and `comptime` blocks at
+    /// comptime: there the interpreter computes the operand. Operands of `@TypeOf` are analyzed
+    /// without a comptime reason, so calls in them stay runtime.
+    fn comptimeOperand(inf: *Inferrer, e: ExprId, tv: TypedValue) Error!TypedValue {
+        if (tv.val) |v| if (v != .unknown) return tv;
+        switch (inf.ip.key(tv.ty)) {
+            .error_union_type, .optional_type => {},
+            else => return tv,
+        }
+        if (inf.in_typeof or inf.dead != 0 or inf.r.ctx.incomplete()) return tv;
+        if (inf.comptime_depth == 0) {
+            const kind = (try inf.r.itemTree(inf.file)).items[inf.item].kind;
+            if (kind == .@"fn" or kind == .@"test") return tv;
+        }
+        const ev = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
+        return if (ev.val != null and ev.ty == tv.ty) ev else tv;
+    }
+
     /// Branch of an `if` / `switch`: a branch that will not execute is recorded as inactive code
     /// (see `Result.inactive`)
     fn inferArm(inf: *Inferrer, e: ExprId, expected: ?Index, dead_branch: bool) Error!TypedValue {
@@ -806,9 +833,14 @@ const Inferrer = struct {
     /// `fn f(comptime T: type) switch (@typeInfo(T)) {...}`).
     fn inferComptime(inf: *Inferrer, e: ExprId, expected: ?Index) Error!TypedValue {
         const outermost = inf.comptime_depth == 0;
+        const in_typeof = inf.in_typeof;
         inf.comptime_depth += 1;
+        inf.in_typeof = false;
         const tv = blk: {
-            defer inf.comptime_depth -= 1;
+            defer {
+                inf.comptime_depth -= 1;
+                inf.in_typeof = in_typeof;
+            }
             break :blk try inf.infer(e, expected);
         };
         if (tv.val != null or inf.dead > 0) return tv;
@@ -1033,12 +1065,13 @@ const Inferrer = struct {
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) try sameLiveValue(ip, values.items, ty) else null };
             },
             .@"catch" => |c| {
-                const lhs = try inf.infer(c.lhs, null);
+                const lhs = try inf.comptimeOperand(c.lhs, try inf.infer(c.lhs, null));
                 const payload, const err = inf.unwrapErrorUnion(lhs.ty);
-                if (c.capture) |cap| inf.bindings[@backingInt(cap)] = .{ .ty = err };
                 // When comptime-known, only one side is evaluated, and a right-hand side that is
                 // taken gets only the result type of the whole expression
                 const ok = inf.condValue(lhs);
+                // The capture of a comptime-known error is that error
+                if (c.capture) |cap| inf.bindings[@backingInt(cap)] = .{ .ty = err, .val = if (ok == false) lhs.val else null };
                 const rhs = try inf.inferBranch(c.rhs, inf.fallbackType(expected, if (ok == false) .unknown else payload, c.rhs), ok == true);
                 if (ok) |o| return if (o) .{ .ty = payload, .val = lhs.val } else rhs;
                 return .{ .ty = try inf.peer(&.{ payload, rhs.ty }) };
@@ -1716,6 +1749,9 @@ const Inferrer = struct {
             return .{ .ty = t, .val = if (v.ty == t) v.val else null };
         }
         if (eq(u8, name, "@TypeOf")) {
+            const in_typeof = inf.in_typeof;
+            inf.in_typeof = true;
+            defer inf.in_typeof = in_typeof;
             var types: std.ArrayList(Index) = .empty;
             for (args) |a| try types.append(inf.scratch, (try inf.infer(a, null)).ty);
             const t = try inf.peer(types.items);
@@ -2780,7 +2816,7 @@ const Inferrer = struct {
         const ip = inf.ip;
         switch (op) {
             .keyword_orelse => {
-                const lhs = try inf.infer(lhs_e, null);
+                const lhs = try inf.comptimeOperand(lhs_e, try inf.infer(lhs_e, null));
                 const child: Index = switch (ip.key(lhs.ty)) {
                     .optional_type => |c| c,
                     else => .unknown,

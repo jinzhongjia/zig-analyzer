@@ -1212,16 +1212,16 @@ const Evaluator = struct {
             .@"switch" => |s| return ev.switchExpr(f, e, s, want),
             .@"catch" => |c| {
                 const lhs = try ev.eval(f, c.lhs, null);
-                const eu = switch (ip.key(lhs.ty)) {
-                    .error_union_type => |eu| eu,
-                    else => return error.Abort,
-                };
+                if (ip.key(lhs.ty) != .error_union_type) return error.Abort;
                 // The payload may be storage inside the interpreter (a pointer to an element of a
                 // local array, etc.); as with `try`, `condition` tells it apart from an error
                 const taken = try ev.condition(lhs);
                 if (taken.yes) return taken.payload;
                 if (c.capture) |cap| f.slots[@backingInt(cap)] = taken.payload;
-                return ev.eval(f, c.rhs, eu.payload);
+                // The handler gets the result type of the whole expression, not the payload type
+                // (AstGen `orelseCatchExpr`); with a comptime-known error only the handler is
+                // analyzed, so the result has the handler's type
+                return ev.eval(f, c.rhs, want);
             },
             .binary => |bin| return ev.binary(f, bin.op, bin.lhs, bin.rhs, want),
             .prefix => |p| return ev.prefix(f, p.op, p.operand, want),
@@ -2143,13 +2143,11 @@ const Evaluator = struct {
             },
             .keyword_orelse => {
                 const lhs = try ev.eval(f, lhs_e, null);
-                const child = switch (ip.key(lhs.ty)) {
-                    .optional_type => |c| c,
-                    else => return error.Abort,
-                };
+                if (ip.key(lhs.ty) != .optional_type) return error.Abort;
                 const c = try ev.condition(lhs);
                 if (c.yes) return c.payload;
-                return ev.eval(f, rhs_e, if (child != .unknown) child else want);
+                // As with `catch`, the handler gets the result type of the whole expression
+                return ev.eval(f, rhs_e, want);
             },
             .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => {
                 // Matching the compiler, the operands have no result type and are coerced to their
