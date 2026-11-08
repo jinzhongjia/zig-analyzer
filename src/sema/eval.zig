@@ -852,6 +852,10 @@ const CellOrigin = enum {
     /// A comptime-known value that is not a place: the compiler's `analyzeRef` makes an
     /// anonymous constant of it, the same constant for equal values of the same type
     temporary,
+    /// A copy of storage outside this evaluation whose place is not known here (a field reached
+    /// through an interned pointer that records no place, a value captured from an enclosing
+    /// function): pointers into it compare as an interned pointer to that data would
+    copy,
 };
 
 /// A container-level declaration under the instance it belongs to (`queries.declInst`)
@@ -2746,6 +2750,9 @@ const Evaluator = struct {
         const ox = ev.cellOrigin(x.cell);
         const oy = ev.cellOrigin(y.cell);
         if (ox == .thread_local or oy == .thread_local) return null;
+        // A copy may be any storage outside this evaluation that holds the same data
+        if (ox == .copy and oy != .storage) return ev.mayAliasPointer(y, a);
+        if (oy == .copy and ox != .storage) return ev.mayAliasPointer(x, b);
         if (ox == .temporary and oy == .temporary) return ev.temporaryEql(x, y);
         // A constant local is an anonymous constant in the compiler too, so storage may be the
         // same constant as a temporary
@@ -2763,7 +2770,7 @@ const Evaluator = struct {
         switch (ev.cellOrigin(r.cell)) {
             .storage => return false,
             .thread_local => return null,
-            .decl, .extern_decl, .temporary => {},
+            .decl, .extern_decl, .temporary, .copy => {},
         }
         return if (try ev.mayAlias(r, q)) null else false;
     }
@@ -2794,14 +2801,15 @@ const Evaluator = struct {
         return samePlace(x, y);
     }
 
-    /// Pointer into temporary `r` and pointer `p` into storage of this evaluation
+    /// Pointer into a declaration, a temporary or a copy `r`, and pointer `p` into storage that
+    /// may hold the same data: unequal when what `p` points to cannot be where `r` points
     fn mayAliasPointer(ev: *Evaluator, r: Ref, p: Val) EvalError!?bool {
         const q = try ev.freeze(p) orelse return null;
         return if (try ev.mayAlias(r, q)) null else false;
     }
 
-    /// Whether interned pointer `q` can point to where `r` points in a declaration or a
-    /// temporary: what `q` points to, and the sentinel its type places after its elements, must
+    /// Whether interned pointer `q` can point to where `r` points in a declaration, a temporary
+    /// or a copy: what `q` points to, and the sentinel its type places after its elements, must
     /// be what that storage holds from there on. A string literal (`*const [n:0]u8`) can thus
     /// never point into an array without that sentinel.
     fn mayAlias(ev: *Evaluator, r: Ref, q: Index) EvalError!bool {
@@ -3024,15 +3032,14 @@ const Evaluator = struct {
 
     /// `&x` when x is not storage: a pointer to a new constant cell holding `v`. A value that is
     /// not a place (`isTemporary`) is a temporary constant; other operands (a field reached
-    /// through a pointer held by a declaration, a value captured from an enclosing function)
-    /// copy storage whose identity is not known here, and the copy counts as storage of this
-    /// evaluation.
+    /// through a pointer that records no place, a value captured from an enclosing function)
+    /// copy storage whose place is not known here (`CellOrigin.copy`).
     fn addressOfValue(ev: *Evaluator, f: *Frame, e: ExprId, v: Val) EvalError!Val {
         const temporary = isTemporary(f.body, e);
         if (temporary or f.body.expr(e) == .name_ref) if (try ev.functionPointer(v)) |p| return p;
         const cell = try ev.a.create(Val);
         cell.* = try ev.copy(v);
-        if (temporary) try ev.cell_origins.put(ev.a, cell, .temporary);
+        try ev.cell_origins.put(ev.a, cell, if (temporary) .temporary else .copy);
         return .{ .ty = try ev.ip.ptrTo(v.ty, .one, true), .v = .{ .ref = .{ .cell = cell, .path = &.{}, .is_const = true, .immutable = true } } };
     }
 
@@ -3414,10 +3421,13 @@ const Evaluator = struct {
             ref.window = .{ .start = std.math.cast(u32, offset + start) orelse return error.Abort, .len = std.math.cast(u32, end - start) orelse return error.Abort };
             return .{ .ty = ptr_ty, .v = .{ .ref = ref } };
         }
-        // Otherwise (interned constants, etc.): the elements are copies and are not interned
+        // Otherwise (interned constants, etc.): the elements are copies and are not interned. A
+        // pointer that records no place points to storage that is not known here.
         const elems = try ev.allocElems(end - start);
         for (elems, start..) |*o, i| o.* = try ev.elemAt(base, i);
-        return ev.pointerToNew(ptr_ty, try ev.makeAgg(array, elems));
+        const p = try ev.pointerToNew(ptr_ty, try ev.makeAgg(array, elems));
+        if (ev.ip.key(base.ty) == .ptr_type) try ev.cell_origins.put(ev.a, p.v.ref.cell, .copy);
+        return p;
     }
 
     /// Storage being sliced: the storage the pointer points to (or the place an interned pointer
