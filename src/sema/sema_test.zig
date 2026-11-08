@@ -2772,6 +2772,160 @@ test "containers in a type function capture the values its body computed" {
     });
 }
 
+test "containers in a function capture a comptime var where the body reaches them" {
+    // Prevents a captured variable from having only its type: the compiler loads its value
+    // when the body reaches each container, so containers before and after a modification differ
+    try expectTypes(
+        \\fn VarCapture(comptime n: comptime_int) type {
+        \\    comptime var x = n;
+        \\    x += 2;
+        \\    return struct { pub const v: comptime_int = x; };
+        \\}
+        \\fn BeforeAfter(comptime n: comptime_int) type {
+        \\    comptime var x = n;
+        \\    const A = struct { pub const v: comptime_int = x; };
+        \\    x += 10;
+        \\    const B = struct { pub const v: comptime_int = x; };
+        \\    x *= 2;
+        \\    return struct {
+        \\        pub const a = A.v;
+        \\        pub const b = B.v;
+        \\        pub const c: comptime_int = x;
+        \\    };
+        \\}
+        \\fn Pick(comptime b: bool) type {
+        \\    comptime var x: u8 = 1;
+        \\    if (b) {
+        \\        x = 2;
+        \\        return struct { pub const v = x; };
+        \\    }
+        \\    x = 3;
+        \\    return struct { pub const v = x; };
+        \\}
+        \\fn Branch(comptime b: bool) type {
+        \\    comptime var x: u8 = 1;
+        \\    if (b) x = 9;
+        \\    return struct { pub const v = x; };
+        \\}
+        \\fn Loop(comptime n: u32) type {
+        \\    comptime var sum: u32 = 0;
+        \\    comptime var i: u32 = 0;
+        \\    inline while (i < n) : (i += 1) sum += i;
+        \\    return struct { pub const v = sum; };
+        \\}
+        \\fn TypeVar(comptime T: type) type {
+        \\    comptime var U: type = T;
+        \\    U = ?U;
+        \\    return struct { pub const V = U; };
+        \\}
+        \\fn Method(comptime n: comptime_int) type {
+        \\    comptime var x = n;
+        \\    x += 5;
+        \\    return struct {
+        \\        pub fn get() comptime_int {
+        \\            return x;
+        \\        }
+        \\    };
+        \\}
+        \\fn Nested(comptime n: comptime_int) type {
+        \\    comptime var x = n;
+        \\    x += 1;
+        \\    return struct {
+        \\        pub fn Inner() type {
+        \\            return struct { pub const w: comptime_int = x; };
+        \\        }
+        \\    };
+        \\}
+        \\fn ThroughLocal(comptime n: comptime_int) type {
+        \\    comptime var x = n;
+        \\    x += 4;
+        \\    return struct {
+        \\        pub fn Inner() type {
+        \\            const z = x;
+        \\            return struct { pub const w: comptime_int = z; };
+        \\        }
+        \\    };
+        \\}
+        \\fn ThroughCall(comptime n: comptime_int) type {
+        \\    comptime var x = n;
+        \\    x += 1;
+        \\    const y = blk: {
+        \\        const S = struct {
+        \\            pub fn get() comptime_int {
+        \\                return x * 2;
+        \\            }
+        \\        };
+        \\        break :blk S.get();
+        \\    };
+        \\    return struct { pub const v = y; };
+        \\}
+        \\fn ComptimeScope(comptime n: comptime_int) type {
+        \\    return comptime blk: {
+        \\        var x = n;
+        \\        x += 1;
+        \\        break :blk struct { pub const v: comptime_int = x; };
+        \\    };
+        \\}
+        \\fn VarId(comptime n: comptime_int) type {
+        \\    comptime var x = n;
+        \\    x = @divTrunc(x, 2);
+        \\    return struct { pub const v = x; };
+        \\}
+        \\fn InLoop(comptime n: comptime_int) type {
+        \\    comptime var x = 0;
+        \\    comptime var T: type = void;
+        \\    inline for (0..n) |_| {
+        \\        x += 1;
+        \\        T = struct { pub const v: comptime_int = x; };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn g() void {
+        \\    const var_capture = VarCapture(1).v;
+        \\    const captured_before = BeforeAfter(1).a;
+        \\    const captured_after = BeforeAfter(1).b;
+        \\    const captured_last = BeforeAfter(1).c;
+        \\    const pick_set = Pick(true).v;
+        \\    const pick_kept = Pick(false).v;
+        \\    const branch_set = Branch(true).v;
+        \\    const branch_kept = Branch(false).v;
+        \\    const loop_sum = Loop(5).v;
+        \\    const type_var = TypeVar(u8).V;
+        \\    const method_read = Method(1).get();
+        \\    const nested_read = Nested(3).Inner().w;
+        \\    const through_local = ThroughLocal(1).Inner().w;
+        \\    const through_call = ThroughCall(1).v;
+        \\    const comptime_scope = ComptimeScope(4).v;
+        \\    const same_capture = VarId(2) == VarId(3);
+        \\    const other_capture = VarId(2) == VarId(4);
+        \\    const in_loop = InLoop(3).v;
+        \\    _ = .{ var_capture, captured_before, captured_after, captured_last, pick_set, pick_kept, branch_set, branch_kept, loop_sum, type_var, method_read, nested_read, through_local, through_call, comptime_scope, same_capture, other_capture, in_loop };
+        \\}
+    , &.{
+        .{ "var_capture", "comptime_int = 3" },
+        .{ "captured_before", "comptime_int = 1" },
+        .{ "captured_after", "comptime_int = 11" },
+        .{ "captured_last", "comptime_int = 22" },
+        .{ "pick_set", "u8 = 2" },
+        .{ "pick_kept", "u8 = 3" },
+        .{ "branch_set", "u8 = 9" },
+        .{ "branch_kept", "u8 = 1" },
+        .{ "loop_sum", "u32 = 10" },
+        .{ "type_var", "type = ?u8" },
+        .{ "method_read", "comptime_int = 6" },
+        .{ "nested_read", "comptime_int = 4" },
+        .{ "through_local", "comptime_int = 5" },
+        .{ "through_call", "comptime_int = 4" },
+        .{ "comptime_scope", "comptime_int = 5" },
+        // The identity of a container is its captured values: both capture x = 1
+        .{ "same_capture", "bool = true" },
+        .{ "other_capture", "bool = false" },
+        // A container in a loop body captures a value per iteration, while the containers of all
+        // iterations share one instance (the compiler gives 3)
+        .{ "in_loop", "comptime_int" },
+    });
+}
+
 test "inferred error sets from function bodies" {
     try expectTypes(
         \\fn wrap(x: anytype) !@TypeOf(x) { return x; }
