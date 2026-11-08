@@ -288,6 +288,22 @@ pub const CallConv = union(enum) {
 /// root value of the file
 pub const ZonLiteral = struct { file: FileId, path: []const u32 };
 
+/// See `Key.ptr_base`. The declaration is `item` of `file` in the instance context it belongs
+/// to (`queries.declInst`); `path` is the field or element index taken at each level of its
+/// value, and `window` the elements of the aggregate at `path` that a pointer to several elements
+/// starts from (a slice or a sliced array), as in the interpreter's storage cells. With
+/// `as_array`, the pointer is a `*T` → `*[1]T` view of the place at `path`.
+pub const PtrBase = struct {
+    file: FileId,
+    item: u32,
+    inst: ?Index,
+    path: []const u32,
+    window: ?Window = null,
+    as_array: bool = false,
+
+    pub const Window = struct { start: u32, len: u32 };
+};
+
 pub const Key = union(enum) {
     unknown,
     simple_type: Simple,
@@ -344,14 +360,22 @@ pub const Key = union(enum) {
     fn_value: struct { ty: Index, file: FileId, decl: AstId, inst: ?Index = null },
 
     /// Value of an array, vector, tuple or struct (in field order). When the type is a slice or a
-    /// pointer to an array, it represents the elements pointed to.
-    aggregate: struct { ty: Index, elems: []const Index },
-    /// Aggregate with u8 elements (a string); the type means the same as in `aggregate`
-    bytes: struct { ty: Index, bytes: []const u8 },
+    /// pointer to an array, it represents the elements pointed to, and `base` is the place they
+    /// are in when it is known (a `ptr_base`).
+    aggregate: struct { ty: Index, elems: []const Index, base: ?Index = null },
+    /// Aggregate with u8 elements (a string); the type and `base` mean the same as in `aggregate`
+    bytes: struct { ty: Index, bytes: []const u8, base: ?Index = null },
     /// Value of a union
     union_value: struct { ty: Index, tag: []const u8, payload: Index },
-    /// Single-item pointer to a comptime value
-    ptr_value: struct { ty: Index, pointee: Index },
+    /// Single-item pointer to a comptime value; `base` is the place of the value when it is known
+    /// (a `ptr_base`)
+    ptr_value: struct { ty: Index, pointee: Index, base: ?Index = null },
+    /// The place a comptime pointer points to when that is the storage of a container-level
+    /// declaration (the compiler's `nav` base address with its `field` / `arr_elem` steps).
+    /// Pointers record it so that they keep pointing there once interned: two pointers to one
+    /// place are equal, and pointers to different declarations are not, whatever the values.
+    /// Neither a type nor a value: only the `base` of pointer values refers to it.
+    ptr_base: PtrBase,
     /// A non-null value of optional type `ty` whose payload is itself represented as `null_value`
     /// (or as another `opt_payload`), such as a `??u8` holding a null `?u8`. Every other non-null
     /// optional is represented by its payload value, and `null_value` is the null of every
@@ -937,8 +961,13 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
             out.comptime_fields = try a.dupe(bool, t.comptime_fields);
             break :blk .{ .reified_type = out };
         },
-        .aggregate => |v| .{ .aggregate = .{ .ty = v.ty, .elems = try a.dupe(Index, v.elems) } },
-        .bytes => |v| .{ .bytes = .{ .ty = v.ty, .bytes = try a.dupe(u8, v.bytes) } },
+        .aggregate => |v| .{ .aggregate = .{ .ty = v.ty, .elems = try a.dupe(Index, v.elems), .base = v.base } },
+        .bytes => |v| .{ .bytes = .{ .ty = v.ty, .bytes = try a.dupe(u8, v.bytes), .base = v.base } },
+        .ptr_base => |v| blk: {
+            var out = v;
+            out.path = try a.dupe(u32, v.path);
+            break :blk .{ .ptr_base = out };
+        },
         .big_int => |v| .{ .big_int = .{ .ty = v.ty, .positive = v.positive, .limbs = try a.dupe(std.math.big.Limb, v.limbs), .decimal = try a.dupe(u8, v.decimal) } },
         .union_value => |v| .{ .union_value = .{ .ty = v.ty, .tag = try a.dupe(u8, v.tag), .payload = v.payload } },
         .opaque_param => |o| .{ .opaque_param = .{ .file = o.file, .owner = o.owner, .binding = o.binding, .name = try a.dupe(u8, o.name) } },
@@ -1271,6 +1300,8 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
         // Matches the compiler, which prints a non-null optional as its payload
         .opt_payload => |v| try ip.print(v.payload, w, container_name),
         .instance, .context => try w.writeAll("instance"),
+        // Only referred to by the `base` of pointer values, which are shown by what they point to
+        .ptr_base => try w.writeAll("_"),
         .opaque_param => |o| try w.writeAll(o.name),
         .runtime => try w.writeAll("_"),
     }

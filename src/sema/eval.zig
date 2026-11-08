@@ -447,7 +447,27 @@ fn containerArgValue(r: *Resolver, ns: Namespace, inst: ?Index) Error!?TypedValu
 pub fn constPointer(r: *Resolver, ptr_ty: Index, pointee: Index) Error!Index {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
     defer ev.deinit();
-    return ev.pointerTo(ptr_ty, pointee);
+    return ev.pointerTo(ptr_ty, pointee, null);
+}
+
+/// `&e` where `e` has the comptime-known value `pointee`, under the given bindings: a pointer of
+/// type `ptr_ty` to that value (see `constPointer`), which records its place when `e` is a
+/// container-level declaration or a field or element inside one (`InternPool.Key.ptr_base`), as
+/// the interpreter's `&` does
+pub fn addressValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, ptr_ty: Index, pointee: Index) Error!Index {
+    const scope = if (r.context == null) try queries.enterContext(r, file, inst) else null;
+    defer if (scope) |s| s.leave();
+    var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
+    defer arena.deinit();
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
+    defer ev.deinit();
+    var frame = try ev.newFrame(file, item, body, inst);
+    for (bindings, frame.slots) |b, *slot| slot.* = Evaluator.thaw(b);
+    const base = ev.addressBase(&frame, e, pointee) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => null,
+        else => |x| return x,
+    };
+    return ev.pointerTo(ptr_ty, pointee, base);
 }
 
 /// Tag type of a union (E for `union(E)`, the generated tag enum for `union(enum)`); null when
@@ -934,6 +954,9 @@ const Evaluator = struct {
     decl_cells: std.AutoHashMapUnmanaged(DeclKey, *Val) = .empty,
     /// Origins of the cells that are not `.storage` (see `CellOrigin`)
     cell_origins: std.AutoHashMapUnmanaged(*const Val, CellOrigin) = .empty,
+    /// The declaration of each cell in `decl_cells`: an interned pointer into one records it
+    /// (`ptrBase`)
+    cell_decls: std.AutoHashMapUnmanaged(*const Val, DeclKey) = .empty,
 
     fn deinit(ev: *Evaluator) void {
         if (!ev.owns_calls) return;
@@ -1013,10 +1036,67 @@ const Evaluator = struct {
                     break :blk try ev.makeAgg(try ev.ip.get(.{ .array_type = .{ .len = elems.len, .child = ev.elemTypeOf(v.ty, 0) } }), elems);
                 } else try ev.load(ref);
                 const pointee = try ev.freeze(target) orelse return null;
-                return try ev.pointerTo(v.ty, pointee);
+                return try ev.pointerTo(v.ty, pointee, try ev.ptrBase(ref));
             },
             .unknown, .undef, .ip, .int, .big => unreachable,
         }
+    }
+
+    /// The `ptr_base` of a pointer to `ref`: null when the cell is not the storage of a
+    /// container-level declaration
+    fn ptrBase(ev: *Evaluator, ref: Ref) Error!?Index {
+        const decl = ev.cell_decls.get(ref.cell) orelse return null;
+        return try ev.ip.get(.{ .ptr_base = .{
+            .file = decl.file,
+            .item = decl.item,
+            .inst = decl.inst,
+            .path = ref.path,
+            .window = if (ref.window) |w| .{ .start = w.start, .len = w.len } else null,
+            .as_array = ref.as_array,
+        } });
+    }
+
+    /// The `ptr_base` of `&e` when `e` is a place inside a container-level declaration and holds
+    /// `pointee` there; null for other operands, and for functions, which are the identity of
+    /// pointers to them (`functionPointer`)
+    fn addressBase(ev: *Evaluator, f: *Frame, e: ExprId, pointee: Index) EvalError!?Index {
+        if (ev.ip.key(pointee) == .fn_value) return null;
+        const ref = try ev.placeFor(f, e, .address);
+        if (try ev.freeze(try ev.load(ref)) != pointee) return null;
+        return ev.ptrBase(ref);
+    }
+
+    /// The place interned pointer `p` points to when it records one (`InternPool.Key.ptr_base`):
+    /// in this evaluation's cell of that declaration (`declPlace`), which cannot be written. Null
+    /// for other values.
+    fn basePlace(ev: *Evaluator, p: Val) EvalError!?Ref {
+        const x = switch (p.v) {
+            .ip => |x| x,
+            else => return null,
+        };
+        const base = switch (ev.ip.key(x)) {
+            .ptr_value => |v| v.base,
+            .aggregate => |v| v.base,
+            .bytes => |v| v.base,
+            else => null,
+        } orelse return null;
+        const b = ev.ip.key(base).ptr_base;
+        const decl = try ev.declPlace(b.file, b.item, b.inst);
+        return .{
+            .cell = decl.cell,
+            .path = b.path,
+            .window = if (b.window) |w| .{ .start = w.start, .len = w.len } else null,
+            .is_const = true,
+            .as_array = b.as_array,
+        };
+    }
+
+    /// The place pointer `p` points to: its reference, or the place an interned pointer records
+    fn pointerPlace(ev: *Evaluator, p: Val) EvalError!?Ref {
+        return switch (p.v) {
+            .ref => |r| r,
+            else => ev.basePlace(p),
+        };
     }
 
     /// Interned value (integers are interned here); null when it is neither an interned value nor
@@ -1074,15 +1154,15 @@ const Evaluator = struct {
     }
 
     /// Pointer value: pointers to arrays and slices are represented by the pointed-to elements,
-    /// others by `ptr_value`
-    fn pointerTo(ev: *Evaluator, ptr_ty: Index, pointee: Index) Error!Index {
+    /// others by `ptr_value`; `base` is the place pointed to when it is known (`ptrBase`)
+    fn pointerTo(ev: *Evaluator, ptr_ty: Index, pointee: Index, base: ?Index) Error!Index {
         const ip = ev.ip;
         if (ev.isArrayPtr(ptr_ty)) switch (ip.key(pointee)) {
-            .aggregate => |agg| return ip.get(.{ .aggregate = .{ .ty = ptr_ty, .elems = agg.elems } }),
-            .bytes => |b| return ip.get(.{ .bytes = .{ .ty = ptr_ty, .bytes = b.bytes } }),
+            .aggregate => |agg| return ip.get(.{ .aggregate = .{ .ty = ptr_ty, .elems = agg.elems, .base = base } }),
+            .bytes => |b| return ip.get(.{ .bytes = .{ .ty = ptr_ty, .bytes = b.bytes, .base = base } }),
             else => {},
         };
-        return ip.get(.{ .ptr_value = .{ .ty = ptr_ty, .pointee = pointee } });
+        return ip.get(.{ .ptr_value = .{ .ty = ptr_ty, .pointee = pointee, .base = base } });
     }
 
     /// Slice, many-item pointer, or single-item pointer to an array / tuple / vector
@@ -2621,12 +2701,15 @@ const Evaluator = struct {
 
     /// Whether two comptime pointers are equal; null when it cannot be determined. As in the
     /// compiler, pointers are equal when they point to the same location of the same storage;
-    /// what the storage of a cell is in the compiler is its `CellOrigin`. Interned constant data
-    /// is distinguished by value (equal values are the same data, matching the compiler's
-    /// deduplication of identical literals) and carries no other identity: compared with a
-    /// pointer into a declaration or a temporary, it is unequal only when its data cannot be
-    /// stored at that location (`mayAlias`).
-    fn pointerEql(ev: *Evaluator, a: Val, b: Val) EvalError!?bool {
+    /// what the storage of a cell is in the compiler is its `CellOrigin`. An interned pointer
+    /// that records the declaration it points into is compared at that place (`basePlace`).
+    /// Other interned constant data is distinguished by value (equal values are the same data,
+    /// matching the compiler's deduplication of identical literals) and carries no other
+    /// identity: compared with a pointer into a declaration or a temporary, it is unequal only
+    /// when its data cannot be stored at that location (`mayAlias`).
+    fn pointerEql(ev: *Evaluator, a_in: Val, b_in: Val) EvalError!?bool {
+        const a = try ev.withPlace(a_in);
+        const b = try ev.withPlace(b_in);
         switch (a.v) {
             .ref => |x| switch (b.v) {
                 .ref => |y| return ev.refEql(x, a, y, b),
@@ -2640,6 +2723,13 @@ const Evaluator = struct {
             },
             else => return null,
         }
+    }
+
+    /// `p` as a reference to the place it records, when it is an interned pointer that records
+    /// one (`basePlace`); `p` otherwise
+    fn withPlace(ev: *Evaluator, p: Val) EvalError!Val {
+        const r = try ev.basePlace(p) orelse return p;
+        return .{ .ty = p.ty, .v = .{ .ref = r } };
     }
 
     fn cellOrigin(ev: *Evaluator, cell: *const Val) CellOrigin {
@@ -2851,10 +2941,8 @@ const Evaluator = struct {
                         if (pt.size == .slice) {
                             const arr = try ev.deref(p);
                             const ty = try ip.ptrTo(arr.ty, .one, pt.is_const);
-                            return switch (p.v) {
-                                .ref => |r| .{ .ty = ty, .v = .{ .ref = r } },
-                                else => ev.pointerToNew(ty, arr),
-                            };
+                            if (try ev.pointerPlace(p)) |r| return .{ .ty = ty, .v = .{ .ref = r } };
+                            return ev.pointerToNew(ty, arr);
                         }
                         // `&p.*` of a single-item pointer is `p` itself (`Sema.zirRefDeref`),
                         // once `p` is known to point to something
@@ -2971,7 +3059,7 @@ const Evaluator = struct {
         const item = try ev.itemIndex(.{ .file = func.file, .item = func.decl }) orelse return error.Abort;
         if ((try ev.r.itemTree(func.file)).items[item].flags.is_extern) return error.Abort;
         const ty = try ev.ip.ptrTo(v.ty, .one, true);
-        return Val.of(ty, try ev.pointerTo(ty, x));
+        return Val.of(ty, try ev.pointerTo(ty, x, null));
     }
 
     /// What a place is resolved for
@@ -3029,7 +3117,8 @@ const Evaluator = struct {
                 const p = try ev.eval(f, x, null);
                 return switch (p.v) {
                     .ref => |r| ev.through(r, p.ty),
-                    else => error.Abort,
+                    // Declarations are not assignment targets
+                    else => if (use == .address) try ev.basePlace(p) orelse error.Abort else error.Abort,
                 };
             },
             .@"comptime" => |x| return ev.placeFor(f, x, use),
@@ -3044,19 +3133,22 @@ const Evaluator = struct {
         };
     }
 
-    /// Place; when its value is a pointer to local storage, the place it points to instead
-    /// (automatic dereferencing)
+    /// Place; when its value is a pointer to storage of this evaluation, or for `&` to a place an
+    /// interned pointer records (`basePlace`), the place it points to instead (automatic
+    /// dereferencing)
     fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId, use: PlaceUse) EvalError!Ref {
         const ref = try ev.placeFor(f, e, use);
         // The value of a range, or of a `*T` → `*[1]T` view, is an array, not a pointer
         if (ref.window != null or ref.as_array) return ref;
         const v = try ev.load(ref);
-        return switch (v.v) {
-            .ref => |r| ev.through(r, v.ty),
-            // A pointer held by a declaration or a temporary points to storage outside it, whose
-            // identity is not known here
-            else => if (use == .address and ev.ip.key(v.ty) == .ptr_type and ev.cellOrigin(ref.cell) != .storage) error.Abort else ref,
-        };
+        switch (v.v) {
+            .ref => |r| return ev.through(r, v.ty),
+            else => {},
+        }
+        if (use == .address) if (try ev.basePlace(v)) |r| return r;
+        // A pointer held by a declaration or a temporary that records no place points to storage
+        // outside it, whose identity is not known here
+        return if (use == .address and ev.ip.key(v.ty) == .ptr_type and ev.cellOrigin(ref.cell) != .storage) error.Abort else ref;
     }
 
     /// The storage of container-level declaration `item` (in instance context `inst`): one cell
@@ -3080,6 +3172,7 @@ const Evaluator = struct {
             gop.value_ptr.* = cell;
             const origin: CellOrigin = if (it.flags.is_threadlocal) .thread_local else if (it.flags.is_extern) .extern_decl else .decl;
             try ev.cell_origins.put(ev.a, cell, origin);
+            try ev.cell_decls.put(ev.a, cell, key);
             break :cell cell;
         };
         return .{ .cell = cell, .path = &.{}, .is_const = true, .immutable = true };
@@ -3320,13 +3413,10 @@ const Evaluator = struct {
         return ev.pointerToNew(ptr_ty, try ev.makeAgg(array, elems));
     }
 
-    /// Storage being sliced: the storage the pointer points to, or the local array variable itself;
-    /// null when there is no storage to reference
+    /// Storage being sliced: the storage the pointer points to (or the place an interned pointer
+    /// records), or the local array variable itself; null when there is no storage to reference
     fn sliceTarget(ev: *Evaluator, f: *Frame, lhs: ExprId, base: Val) EvalError!?Ref {
-        switch (base.v) {
-            .ref => |r| return r,
-            else => {},
-        }
+        if (try ev.pointerPlace(base)) |r| return r;
         if (ev.ip.key(base.ty) != .array_type) return null;
         return ev.place(f, lhs) catch |err| switch (err) {
             error.Abort => null,
@@ -3547,19 +3637,20 @@ const Evaluator = struct {
                 ip.key(p.child).array_type.len == 1 and ip.key(v.ty) == .ptr_type and
                 ip.key(v.ty).ptr_type.size == .one and ip.key(v.ty).ptr_type.child == ip.key(p.child).array_type.child)
             {
+                // An interned pointer that records its place views that place
+                const viewed = try ev.pointerPlace(v);
                 switch (v.v) {
-                    .ref => |r| {
+                    .ref, .ip => if (viewed) |r| {
                         // The pointee is itself an array (`*[n]U` → `*[1][n]U`) taken from a
                         // range or a view, which has no place of its own to view
                         if (r.window != null or r.as_array) return error.Abort;
                         var view = r;
                         view.as_array = true;
                         return .{ .ty = t, .v = .{ .ref = view } };
-                    },
-                    .ip => {
+                    } else {
                         const elem = try ev.freeze(try ev.deref(v)) orelse return error.Abort;
                         const array = try ip.get(.{ .aggregate = .{ .ty = p.child, .elems = &.{elem} } });
-                        return Val.of(t, try ev.pointerTo(t, array));
+                        return Val.of(t, try ev.pointerTo(t, array, null));
                     },
                     else => return error.Abort,
                 }
@@ -3571,7 +3662,7 @@ const Evaluator = struct {
                     for (elems, 0..) |*o, i| o.* = try ev.coerce(try ev.elemAt(v, i), p.child);
                     const array = try ip.get(.{ .array_type = .{ .len = n, .child = p.child, .sentinel = p.sentinel } });
                     const frozen = try ev.freeze(try ev.makeAgg(array, elems)) orelse return error.Abort;
-                    return Val.of(t, try ev.pointerTo(t, frozen));
+                    return Val.of(t, try ev.pointerTo(t, frozen, null));
                 }
             },
             .array_type, .vector_type => if (ev.isAnon(v.ty)) {
@@ -4417,7 +4508,7 @@ const Evaluator = struct {
                         if (pv.pointee == .unknown) return v;
                         from.child = if (valueOfType(ip, pv.pointee, b.child)) b.child else value.typeOfValue(ip, pv.pointee);
                         if (from.child == .unknown) return v;
-                        repr = .{ .ip = try ev.pointerTo(try ip.get(.{ .ptr_type = from }), pv.pointee) };
+                        repr = .{ .ip = try ev.pointerTo(try ip.get(.{ .ptr_type = from }), pv.pointee, pv.base) };
                     }
                 },
                 .aggregate => |agg| from = pointerType(ip, agg.ty) orelse return v,
@@ -4497,14 +4588,11 @@ const Evaluator = struct {
             break :blk (try ev.r.itemTree(ns.file)).items[m].flags.is_comptime;
         } else (try ev.fieldAttrs(parent_ty, index, fields[index])).is_comptime;
         if (is_comptime) return error.Abort;
-        const ref = switch (field_ptr.v) {
-            .ref => |r| r,
-            else => return error.Abort,
-        };
+        const ref = try ev.pointerPlace(field_ptr) orelse return error.Abort;
         // A `*T` → `*[1]T` view points to an array, which does not coerce to a pointer to the
         // field
         if (ref.window != null or ref.as_array or ref.path.len == 0) return error.Abort;
-        const parent: Ref = .{ .cell = ref.cell, .path = ref.path[0 .. ref.path.len - 1], .is_const = parent_ptr.is_const, .immutable = ref.immutable };
+        const parent: Ref = .{ .cell = ref.cell, .path = ref.path[0 .. ref.path.len - 1], .is_const = ref.is_const or parent_ptr.is_const, .immutable = ref.immutable };
         if (value.eqlTypes(ip, (try ev.loadPath(parent)).ty, parent_ty) != true) return error.Abort;
         const at = ref.path[ref.path.len - 1];
         if (at != index) {

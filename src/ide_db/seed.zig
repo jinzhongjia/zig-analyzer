@@ -805,8 +805,11 @@ const Closure = struct {
             .aggregate => |a| (try c.reaches(a.ty)) or try c.anyReaches(a.elems, &.{}),
             .bytes => |b| c.reaches(b.ty),
             .union_value => |u| (try c.reaches(u.ty)) or try c.reaches(u.payload),
+            // The `base` of a pointer is only where it points: the pointer's type and the value
+            // it points to are what lead to types
             .ptr_value => |p| (try c.reaches(p.ty)) or try c.reaches(p.pointee),
             .opt_payload => |o| (try c.reaches(o.ty)) or try c.reaches(o.payload),
+            .ptr_base => |b| c.importers.contains(b.file) or (if (b.inst) |i| try c.reaches(i) else false),
             .instance => |i| blk: {
                 if (try c.anyReaches(i.args, i.arg_types)) break :blk true;
                 break :blk if (i.parent) |p| try c.reaches(p) else false;

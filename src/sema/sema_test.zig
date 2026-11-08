@@ -7570,13 +7570,12 @@ test "comptime evaluation: pointer identity of declarations, functions and tempo
         \\const r_eql_view = eqlView();
         \\const r_eql_view_other = eqlViewOther();
     , &.{
-        // `&` of a declaration points to the declaration, as the pointer stored in `gp` does;
-        // an interned pointer keeps no identity, so equal data gives no value instead of `false`
-        .{ "p_gp_addr", "bool" },
+        // `&` of a declaration points to the declaration, and so does the pointer stored in `gp`
+        .{ "p_gp_addr", "bool = true" },
         .{ "p_addr_addr", "bool = true" },
         .{ "p_eql_addr", "bool = true" },
         .{ "p_eql_other", "bool = false" },
-        .{ "r_gp_addr", "bool" },
+        .{ "r_gp_addr", "bool = true" },
         .{ "r_addr_addr", "bool = true" },
         // Distinct declarations with equal values
         .{ "r_two_decls", "bool = false" },
