@@ -3081,6 +3081,75 @@ test "integer, float and C type layouts follow the target" {
     try expectTargetLayouts(try targetOf("msp430-freestanding-none", null), .{ .{ 4, 2 }, .{ 8, 2 }, .{ 16, 2 }, .{ 10, 2 }, .{ 16, 2 }, .{ 2, 2 }, .{ 8, 2 }, .{ 22, 2 } }, 65535);
 }
 
+test "layouts of integer types wider than 128 bits follow the target" {
+    // These types and the types containing them had no layout. Expected values are the results of
+    // zig 0.17.0 and 0.17.1 (printed with @compileLog in `zig build-obj -target <target>`).
+    const src =
+        \\const S = struct { a: u8, b: u256, c: u8 };
+        \\const P = packed struct { a: u100, b: u100 };
+        \\const E = enum(u256) { a, b };
+        \\fn g() void {
+        \\    const s_u129 = @sizeOf(u129);
+        \\    const a_u129 = @alignOf(u129);
+        \\    const s_u256 = @sizeOf(u256);
+        \\    const a_u256 = @alignOf(u256);
+        \\    const s_i200 = @sizeOf(i200);
+        \\    const s_u1000 = @sizeOf(u1000);
+        \\    const b_u1000 = @bitSizeOf(u1000);
+        \\    const s_u65535 = @sizeOf(u65535);
+        \\    const s_S = @sizeOf(S);
+        \\    const a_S = @alignOf(S);
+        \\    const s_array = @sizeOf([3]u200);
+        \\    const s_optional = @sizeOf(?u256);
+        \\    const s_error_union = @sizeOf(anyerror!u256);
+        \\    const s_P = @sizeOf(P);
+        \\    const a_P = @alignOf(P);
+        \\    const b_P = @bitSizeOf(P);
+        \\    const s_E = @sizeOf(E);
+        \\    _ = .{ s_u129, a_u129, s_u256, a_u256, s_i200, s_u1000, b_u1000, s_u65535, s_S, a_S, s_array, s_optional, s_error_union, s_P, a_P, b_P, s_E };
+        \\}
+    ;
+    for ([_][]const u8{ "x86_64-linux-musl", "x86_64-windows-gnu", "aarch64-macos-none" }) |triple| try expectTypesTargeted(try targetOf(triple, null), src, &.{
+        .{ "s_u129", "comptime_int = 32" },
+        .{ "a_u129", "comptime_int = 16" },
+        .{ "s_u256", "comptime_int = 32" },
+        .{ "a_u256", "comptime_int = 16" },
+        .{ "s_i200", "comptime_int = 32" },
+        .{ "s_u1000", "comptime_int = 128" },
+        .{ "b_u1000", "comptime_int = 1000" },
+        .{ "s_u65535", "comptime_int = 8192" },
+        .{ "s_S", "comptime_int = 48" },
+        .{ "a_S", "comptime_int = 16" },
+        .{ "s_array", "comptime_int = 96" },
+        .{ "s_optional", "comptime_int = 48" },
+        .{ "s_error_union", "comptime_int = 48" },
+        .{ "s_P", "comptime_int = 32" },
+        .{ "a_P", "comptime_int = 16" },
+        .{ "b_P", "comptime_int = 200" },
+        .{ "s_E", "comptime_int = 32" },
+    });
+    // The maximum alignment of integers is 4
+    try expectTypesTargeted(try targetOf("x86-linux-musl", null), src, &.{
+        .{ "s_u129", "comptime_int = 20" },
+        .{ "a_u129", "comptime_int = 4" },
+        .{ "s_u256", "comptime_int = 32" },
+        .{ "a_u256", "comptime_int = 4" },
+        .{ "s_i200", "comptime_int = 28" },
+        .{ "s_u1000", "comptime_int = 128" },
+        .{ "b_u1000", "comptime_int = 1000" },
+        .{ "s_u65535", "comptime_int = 8192" },
+        .{ "s_S", "comptime_int = 36" },
+        .{ "a_S", "comptime_int = 4" },
+        .{ "s_array", "comptime_int = 84" },
+        .{ "s_optional", "comptime_int = 36" },
+        .{ "s_error_union", "comptime_int = 36" },
+        .{ "s_P", "comptime_int = 28" },
+        .{ "a_P", "comptime_int = 4" },
+        .{ "b_P", "comptime_int = 200" },
+        .{ "s_E", "comptime_int = 32" },
+    });
+}
+
 test "type layouts with several targets keep only what the targets agree on" {
     const x86_64 = try targetOf("x86_64-linux-musl", null);
     const x86 = try targetOf("x86-linux-musl", null);
@@ -3114,10 +3183,10 @@ test "integer layouts match std.zig.target for every width" {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
-    for ([_][]const u8{ "x86_64-linux-musl", "x86-linux-musl", "x86-windows-gnu", "arm-linux-musleabihf", "avr-freestanding-none", "msp430-freestanding-none", "xtensa-freestanding-none" }) |triple| {
+    for ([_][]const u8{ "x86_64-linux-musl", "x86_64-windows-gnu", "aarch64-macos-none", "x86-linux-musl", "x86-windows-gnu", "arm-linux-musleabihf", "avr-freestanding-none", "msp430-freestanding-none", "xtensa-freestanding-none" }) |triple| {
         const t = try std.zig.system.resolveTargetQuery(testing.io, try .parse(.{ .arch_os_abi = triple }));
         try w.setTarget(.{ .scalar_abi = .of(&t) });
-        for (1..129) |i| {
+        for (1..std.math.maxInt(u16) + 1) |i| {
             const bits: u16 = @intCast(i);
             const l = value.intLayout(&w.ip, bits).?;
             try testing.expectEqual(std.zig.target.intAlignment(&t, bits), l.alignment);

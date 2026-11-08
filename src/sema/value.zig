@@ -831,12 +831,11 @@ pub fn bitsOf(bytes: u64) ?u64 {
 /// Layout (`std.zig.target.intAlignment` / `intByteSize`) of a fixed-width integer type,
 /// including the backing integer of a packed container and the tag of an enum: the alignment is
 /// the byte size rounded up to a power of 2, but no larger than the target's maximum integer
-/// alignment. Null when the maximum alignment differs between modules and affects the alignment
-/// of this bit width.
+/// alignment; the same rule applies to every bit width. Null when the maximum alignment differs
+/// between modules and affects the alignment of this bit width.
 pub fn intLayout(ip: *InternPool, bits: u16) ?Layout {
     if (bits == 0) return .{ .size = 0, .alignment = 1, .bits = 0 };
-    if (bits > 128) return null;
-    const bytes: u64 = (bits + 7) / 8;
+    const bytes: u64 = (@as(u64, bits) + 7) / 8;
     const natural = std.math.ceilPowerOfTwoAssert(u64, bytes);
     const max_align = ip.scalarAbi().max_int_align;
     const alignment = @min(natural, max_align.min);
