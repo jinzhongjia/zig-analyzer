@@ -1270,7 +1270,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
 
 /// `callconv(...) ` of a function type as the compiler prints it: nothing for `.auto`, the tag
 /// for tags without options, `.c` for the target's C calling convention, and the value otherwise
-fn writeCallConv(ip: *InternPool, cc: CallConv, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
+pub fn writeCallConv(ip: *InternPool, cc: CallConv, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
     switch (cc) {
         .auto => {},
         .other => |v| {

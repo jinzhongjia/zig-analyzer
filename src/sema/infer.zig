@@ -1984,9 +1984,10 @@ const Inferrer = struct {
         for (simple) |s| if (eq(u8, name, s[0])) return .{ .ty = s[1] };
         if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName") or eq(u8, name, "@typeName")) {
             if (args.len == 1) if (try inf.pureValue(name, args)) |tv| return tv;
-            // The argument of `@typeName` is always a type: when the name cannot be evaluated,
-            // there is no runtime slice form
-            if (eq(u8, name, "@typeName")) return .unknown;
+            const sentinel = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } });
+            // The name of a type is always comptime-known (`*const [N:0]u8`), even when it
+            // cannot be evaluated here
+            if (eq(u8, name, "@typeName")) return .{ .ty = try ip.ptrTo(try ip.get(.{ .abstract_array_type = .{ .len = null, .child = .u8_type, .sentinel = sentinel } }), .one, true) };
             // Only a runtime operand gives `[:0]const u8`; a comptime-known one gives the string
             // literal `*const [N:0]u8` (`Sema.zirTagName`, `Sema.zirErrorName`). When inference
             // has no value for a comptime-known operand (a tagged union literal, `@enumFromInt`,
@@ -1996,7 +1997,6 @@ const Inferrer = struct {
                 const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
                 return if (tv.val != null) tv else .unknown;
             }
-            const sentinel = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } });
             return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = .u8_type, .size = .slice, .is_const = true, .sentinel = sentinel } }) };
         }
         // With a result type, the rounding builtins convert to it (see `roundCast`); without one,
