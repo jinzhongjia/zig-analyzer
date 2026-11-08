@@ -132,6 +132,80 @@ pub fn compute(ctx: *Db.Ctx, key: CallKey) Error!TypedValue {
     return ev.toTyped(result) catch |err| giveUp(err);
 }
 
+/// Computation of `LocalEval`: executes function `key.owner` in its instance `key.inst`, with the
+/// argument values the instance records, and stops once the frame of the function defines local
+/// constant `key.target`. Only a constant defined at most once per call (outside the bodies,
+/// conditions and continue expressions of loops) has one value per instance; such a constant
+/// also has that value in every iteration of a loop inferred per iteration, so an iteration
+/// instance stands for the instance of its function. The call sites that produce the instance
+/// are not known, so the backward branch quota is the default one (`@setEvalBranchQuota` in the
+/// function raises it as usual).
+pub fn localValue(ctx: *Db.Ctx, key: queries.LocalKey) Error!TypedValue {
+    const binding = switch (key.target) {
+        .binding => |b| b,
+        .expr => return .unknown,
+    };
+    const ip = ctx.db.env.ip;
+    var run = key.inst orelse return .unknown;
+    var inst = switch (ip.key(run)) {
+        .instance => |i| i,
+        else => return .unknown,
+    };
+    if (inst.file != key.owner.file or inst.decl != key.owner.item) return .unknown;
+    if (inst.iteration) |it| {
+        if (it.abstract) return .unknown;
+        inst.iteration = null;
+        run = try ip.get(.{ .instance = inst });
+    }
+    const body = try ctx.get(hir.ItemBody, key.owner);
+    if (@backingInt(binding) >= body.bindings.len) return .unknown;
+    const b = body.binding(binding);
+    if (b.kind != .local_const or repeats(body, b.range.start)) return .unknown;
+    var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+    defer scratch.deinit();
+    var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+    const scope = try queries.enterContext(&r, key.owner.file, run);
+    defer scope.leave();
+    var stop: Stop = .{ .binding = binding };
+    var ev: Evaluator = .{ .r = &r, .ip = ip, .a = scratch.allocator(), .arena = &scratch, .stop = &stop };
+    defer ev.deinit();
+    const vals = try ev.a.alloc(Val, body.params.len);
+    for (body.params, vals, 0..) |p, *v, i| {
+        const x: Index = if (i < inst.args.len) inst.args[i] else .unknown;
+        // The instance records only the type of the argument of an anytype parameter, which
+        // `runFunction` takes from the instance
+        const param = body.binding(p);
+        const type_only = param.ty == null and !param.is_comptime;
+        v.* = if (x == .unknown or x == .runtime or type_only) .unknown else Val.of(value.typeOfValue(ip, x), x);
+    }
+    _ = ev.runFunction(key.owner, run, vals) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => {},
+        error.Canceled => return error.Canceled,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    return stop.value orelse .unknown;
+}
+
+/// Whether code at offset `pos` of a body can run more than once per execution of the body: in
+/// the body, the condition or the continue expression of a loop
+fn repeats(body: *const Body, pos: u32) bool {
+    const within = struct {
+        fn f(b: *const Body, e: ExprId, at: u32) bool {
+            const rg = b.range(e);
+            return rg.start <= at and at < rg.end;
+        }
+    }.f;
+    for (body.exprs) |x| switch (x) {
+        .loop => |l| {
+            if (within(body, l.body, pos)) return true;
+            if (l.cont) |c| if (within(body, c, pos)) return true;
+            if (l.kind == .@"while") for (l.inputs) |i| if (within(body, i, pos)) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
 /// comptime value of the body of a member (container-level constant, field default value).
 /// `want` is the type annotation.
 pub fn ownerValue(r: *Resolver, owner: hir.OwnerKey, inst: ?Index, want: ?Index) Error!TypedValue {
@@ -670,6 +744,11 @@ const Ref = struct {
     /// place at `path` itself is the only element of the array pointed to, so reads and writes
     /// through the pointer reach that place
     as_array: bool = false,
+    /// The storage cell never changes after it is initialized: the slot of a binding other than a
+    /// `var`, or a new cell reachable only through `*const` pointers. A property of the cell, not
+    /// of the access path: a place reached through a `*const` pointer to a `var` is const but not
+    /// immutable.
+    immutable: bool = false,
 
     const Window = struct { start: u32, len: u32 };
 };
@@ -729,6 +808,16 @@ const Label = struct {
 
 pub const Field = struct { name: []const u8, ty: Index, item: ?u32 = null };
 
+/// Where `localValue` stops the evaluation: once the frame of the function it executes defines
+/// local constant `binding`
+const Stop = struct {
+    binding: Body.BindingId,
+    /// The frame of the function `localValue` executes (the first frame `runFunction` creates)
+    frame: ?*const Frame = null,
+    /// The value of the constant once defined; every later step then aborts
+    value: ?TypedValue = null,
+};
+
 const Evaluator = struct {
     r: *Resolver,
     ip: *InternPool,
@@ -754,6 +843,8 @@ const Evaluator = struct {
     /// Target (index into `Frame.labels`) and value of break / continue; the value of return
     jump_target: usize = 0,
     jump_value: Val = .unknown,
+    /// Stops the evaluation at the definition of a local constant (see `localValue`)
+    stop: ?*Stop = null,
 
     fn deinit(ev: *Evaluator) void {
         if (!ev.owns_calls) return;
@@ -764,6 +855,7 @@ const Evaluator = struct {
 
     fn tick(ev: *Evaluator) EvalError!void {
         const ctx = ev.r.ctx;
+        if (ev.stop) |s| if (s.value != null) return error.Abort;
         ev.steps +%= 1;
         if (ev.steps % 256 == 0) {
             try ctx.checkCanceled();
@@ -917,6 +1009,32 @@ const Evaluator = struct {
         return .{ .ty = v.ty, .v = .{ .agg = out } };
     }
 
+    /// Whether the value is or contains a pointer through which storage inside the interpreter
+    /// can change: a pointer to a cell that is not immutable, or to an immutable cell whose
+    /// content in turn contains such a pointer. The same rule as the compiler's
+    /// `Value.canMutateComptimeVarState`. Past `depth` levels of pointers the answer is yes.
+    fn refersToMutableStorage(v: Val, depth: u32) bool {
+        return switch (v.v) {
+            .ref => |r| !r.immutable or depth == 0 or refersToMutableStorage(pointeeOf(r), depth - 1),
+            .agg => |agg| for (agg.elems) |e| {
+                if (refersToMutableStorage(e, depth)) break true;
+            } else false,
+            .unknown, .undef, .ip, .int, .big => false,
+        };
+    }
+
+    /// The value at the end of the reference's path, without copying (for a range, the whole
+    /// aggregate it is a range of); an interned level contains no pointers into the interpreter,
+    /// so the walk stops there
+    fn pointeeOf(r: Ref) Val {
+        var cur = r.cell.*;
+        for (r.path) |i| switch (cur.v) {
+            .agg => |agg| cur = if (i < agg.elems.len) agg.elems[i] else return .unknown,
+            else => return .unknown,
+        };
+        return cur;
+    }
+
     // ── Aggregates ───────────────────────────────────────────────────
 
     /// Type of element `i` (arrays, slices, pointers to arrays, vectors, tuples, structs)
@@ -985,10 +1103,59 @@ const Evaluator = struct {
         return if (i == a.len) Val.of(a.child, s) else null;
     }
 
+    /// The sentinel after the elements of a sequence of type `t`: an array, the array a
+    /// single-item pointer points to, a slice, or a many-item pointer
+    fn seqSentinel(ev: *Evaluator, t: Index) ?Index {
+        const ip = ev.ip;
+        return switch (ip.key(t)) {
+            .array_type => |a| a.sentinel,
+            .abstract_array_type => |a| a.sentinel,
+            .ptr_type => |p| switch (p.size) {
+                .one => switch (ip.key(p.child)) {
+                    .array_type => |a| a.sentinel,
+                    .abstract_array_type => |a| a.sentinel,
+                    else => null,
+                },
+                .slice, .many, .c => p.sentinel,
+            },
+            else => null,
+        };
+    }
+
+    /// Whether a pointer of type `t` reads the element right after the elements it holds. A slice
+    /// with a sentinel reads it there (`Sema.elemValSlice` accepts index `len`); a many-item or C
+    /// pointer reads whatever its storage holds there (`Sema.elemVal` loads through it, and the
+    /// loaded storage includes the sentinel of an array: `Type.arrayBase` counts it).
+    fn readsPastEnd(ev: *Evaluator, t: Index) bool {
+        return switch (ev.ip.key(t)) {
+            .ptr_type => |p| switch (p.size) {
+                .slice => p.sentinel != null,
+                .many, .c => true,
+                .one => false,
+            },
+            else => false,
+        };
+    }
+
+    /// Element `i` of an interned slice or many-item pointer of type `t` holding `len` elements,
+    /// for `i` past them; `storage` is the type the elements were interned with. Only the element
+    /// right after them is known, as a sentinel: for a slice its own, which the language
+    /// guarantees the storage holds there; for a many-item pointer that of the storage, since the
+    /// pointer type does not bound the read (`[*]const u8` pointing to `"ab"` reads its `0`).
+    fn elemPastEnd(ev: *Evaluator, t: Index, storage: Index, i: usize, len: usize) EvalError!Val {
+        if (i != len or !ev.readsPastEnd(t)) return error.Abort;
+        const p = ev.ip.key(t).ptr_type;
+        const s = (if (p.size == .slice) p.sentinel else ev.seqSentinel(storage)) orelse return error.Abort;
+        return Val.of(p.child, s);
+    }
+
     /// Element `i`; unknown when the value is unknown
     fn elemAt(ev: *Evaluator, v: Val, i: usize) EvalError!Val {
         const ty = ev.elemTypeOf(v.ty, i);
-        if (v.v != .ref) if (ev.sentinelElem(v.ty, i)) |s| return s;
+        // The sentinel of an array is part of its type, and so is that of the array a single-item
+        // pointer points to: index `len` reads it whatever the value (`Sema.elemValArray`, and
+        // the single-item pointer case of `Sema.elemVal`)
+        if (ev.sentinelElem(ev.arrayOf(v.ty), i)) |s| return s;
         switch (v.v) {
             .unknown => return .{ .ty = ty },
             .undef => return .{ .ty = ty, .v = .undef },
@@ -996,10 +1163,11 @@ const Evaluator = struct {
             .agg => |agg| return if (i < agg.elems.len) agg.elems[i] else error.Abort,
             .ref => |ref| {
                 // Range: the index is relative to the start of the range; take the element
-                // directly from the containing aggregate
+                // directly from the containing aggregate, which also holds the element right after
+                // the range (the sentinel position of `buf[0..n :0]`)
                 const base = try ev.loadPath(ref);
                 const index = if (ref.window) |w| blk: {
-                    if (i >= w.len) return error.Abort;
+                    if (i > w.len or (i == w.len and !ev.readsPastEnd(v.ty))) return error.Abort;
                     break :blk w.start + i;
                 } else i;
                 // `*T` → `*[1]T`: the place itself is element 0, read as the pointer's element
@@ -1017,10 +1185,10 @@ const Evaluator = struct {
                 return elem;
             },
             .ip => |x| switch (ev.ip.key(x)) {
-                .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else error.Abort,
+                .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else ev.elemPastEnd(v.ty, agg.ty, i, agg.elems.len),
                 // Aggregates whose elements are all u8 are also represented as bytes (e.g. a
                 // value of `struct { short: ?u8 }`): use the declared type of the element
-                .bytes => |b| return if (i < b.bytes.len) Val.of(if (ty != .unknown) ty else .u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else error.Abort,
+                .bytes => |b| return if (i < b.bytes.len) Val.of(if (ty != .unknown) ty else .u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else ev.elemPastEnd(v.ty, b.ty, i, b.bytes.len),
                 .ptr_value => |p| return ev.elemAt(Val.of(ev.pointeeType(v.ty), p.pointee), i),
                 .union_value => |u| return if (i == 0) Val.of(ty, u.payload) else error.Abort,
                 else => return error.Abort,
@@ -1254,16 +1422,16 @@ const Evaluator = struct {
             .@"switch" => |s| return ev.switchExpr(f, e, s, want),
             .@"catch" => |c| {
                 const lhs = try ev.eval(f, c.lhs, null);
-                const eu = switch (ip.key(lhs.ty)) {
-                    .error_union_type => |eu| eu,
-                    else => return error.Abort,
-                };
+                if (ip.key(lhs.ty) != .error_union_type) return error.Abort;
                 // The payload may be storage inside the interpreter (a pointer to an element of a
                 // local array, etc.); as with `try`, `condition` tells it apart from an error
                 const taken = try ev.condition(lhs);
                 if (taken.yes) return taken.payload;
                 if (c.capture) |cap| f.slots[@backingInt(cap)] = taken.payload;
-                return ev.eval(f, c.rhs, eu.payload);
+                // The handler gets the result type of the whole expression, not the payload type
+                // (AstGen `orelseCatchExpr`); with a comptime-known error only the handler is
+                // analyzed, so the result has the handler's type
+                return ev.eval(f, c.rhs, want);
             },
             .binary => |bin| return ev.binary(f, bin.op, bin.lhs, bin.rhs, want),
             .prefix => |p| return ev.prefix(f, p.op, p.operand, want),
@@ -1672,8 +1840,9 @@ const Evaluator = struct {
     }
 
     /// Calls a function value: through `CallEval` (results are cached) when all arguments can be
-    /// interned; otherwise (an argument contains a pointer to storage inside the interpreter,
-    /// through which the callee may write) executes it in the current interpreter
+    /// interned; otherwise executes it in the current interpreter: when an argument of a runtime
+    /// parameter is an aggregate or a pointer inside the interpreter, or an argument of an anytype
+    /// or comptime parameter refers to storage that can change (the callee may write through it)
     fn callFn(ev: *Evaluator, callee: Val, fty: infer.FnType, args: []const Val) EvalError!Val {
         const ip = ev.ip;
         const fv = switch (ip.key((try ev.ipOf(callee)) orelse return error.Abort)) {
@@ -1683,8 +1852,8 @@ const Evaluator = struct {
         const callee_tv: TypedValue = .{ .ty = callee.ty, .val = try ev.ipOf(callee) };
         const g = try infer.genericCallee(ev.r, ev.a, callee_tv, fty);
         // Arguments are interned and the call goes through a query (results are cached). Mutable
-        // aggregates and pointers passed to non-comptime parameters are not interned: the callee
-        // may write through the pointers, and large intermediate values should not stay in the
+        // aggregates and pointers passed to runtime parameters are not interned: the callee may
+        // write through the pointers, and large intermediate values should not stay in the
         // grow-only InternPool either.
         const tvs = try ev.a.alloc(TypedValue, args.len);
         var local = false;
@@ -1692,16 +1861,28 @@ const Evaluator = struct {
         // through `scalarCall`
         var scalar = false;
         for (args, tvs, 0..) |a, *tv, i| {
-            const comptime_param = if (g) |gg| gg.kind(i) != .runtime else false;
-            if (!comptime_param and (a.v == .agg or a.v == .ref)) {
+            const kind: infer.ParamKind = if (g) |gg| gg.kind(i) else .runtime;
+            if (kind == .runtime and (a.v == .agg or a.v == .ref)) {
                 local = true;
                 tv.* = .{ .ty = a.ty };
                 continue;
             }
-            if (!comptime_param and a.v == .int) {
+            if (kind == .runtime and a.v == .int) {
                 scalar = true;
                 tv.* = .{ .ty = a.ty };
                 continue;
+            }
+            // A pointer to storage that can change, directly or inside an aggregate, passed to an
+            // anytype or comptime parameter: the callee may write through it or return it, so the
+            // call runs on the caller's storage, as in the compiler, which does not memoize a
+            // comptime call when an argument can mutate comptime state. The instance of an anytype
+            // parameter records only the type; a comptime parameter still takes the value.
+            if (refersToMutableStorage(a, max_freeze_depth)) {
+                local = true;
+                if (kind == .anytype_type) {
+                    tv.* = .{ .ty = a.ty };
+                    continue;
+                }
             }
             tv.* = .{ .ty = a.ty, .val = try ev.freeze(a) };
         }
@@ -1813,6 +1994,9 @@ const Evaluator = struct {
         const sig = try ev.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .signature, .inst = inst });
         const inst_args = ip.key(inst).instance.args;
         var frame = try ev.newFrame(owner.file, item, body, inst);
+        if (ev.stop) |s| if (s.frame == null) {
+            s.frame = &frame;
+        };
         for (body.params, 0..) |p, i| {
             const arg: Val = if (i < args.len) args[i] else .unknown;
             // The type of an anytype parameter is the type of the argument (also what the instance
@@ -1904,6 +2088,7 @@ const Evaluator = struct {
                 const ty: ?Index = if (binding.ty) |t| try ev.evalType(f, t) else null;
                 const init: Val = if (binding.init) |x| try ev.eval(f, x, ty) else .{ .ty = ty orelse .unknown, .v = .undef };
                 f.slots[@backingInt(bid)] = try ev.copy(.{ .ty = ty orelse init.ty, .v = init.v });
+                try ev.defined(f, bid);
             },
             .@"defer" => |x| try defers.append(ev.a, .{ .body = x, .on_error = false }),
             .@"errdefer" => |x| try defers.append(ev.a, .{ .body = x, .on_error = true }),
@@ -1915,6 +2100,7 @@ const Evaluator = struct {
                         .binding => |bid| {
                             const ty: ?Index = if (f.body.binding(bid).ty) |te| try ev.evalType(f, te) else null;
                             f.slots[@backingInt(bid)] = try ev.copy(try ev.coerce(elem, ty));
+                            try ev.defined(f, bid);
                         },
                         .expr => |x| {
                             if (f.body.expr(x) == .name_ref and std.mem.eql(u8, f.body.expr(x).name_ref, "_")) continue;
@@ -1924,6 +2110,16 @@ const Evaluator = struct {
                 }
             },
         };
+    }
+
+    /// A statement of frame `f` has defined local `bid`: when it is where the evaluation stops
+    /// (see `Stop`), keeps its value and ends the evaluation
+    fn defined(ev: *Evaluator, f: *const Frame, bid: Body.BindingId) EvalError!void {
+        const s = ev.stop orelse return;
+        if (s.frame != f or s.binding != bid) return;
+        const tv = try ev.toTyped(f.slots[@backingInt(bid)]);
+        s.value = tv;
+        return error.Abort;
     }
 
     const Condition = struct { yes: bool, payload: Val = .unknown };
@@ -2185,13 +2381,11 @@ const Evaluator = struct {
             },
             .keyword_orelse => {
                 const lhs = try ev.eval(f, lhs_e, null);
-                const child = switch (ip.key(lhs.ty)) {
-                    .optional_type => |c| c,
-                    else => return error.Abort,
-                };
+                if (ip.key(lhs.ty) != .optional_type) return error.Abort;
                 const c = try ev.condition(lhs);
                 if (c.yes) return c.payload;
-                return ev.eval(f, rhs_e, if (child != .unknown) child else want);
+                // As with `catch`, the handler gets the result type of the whole expression
+                return ev.eval(f, rhs_e, want);
             },
             .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => {
                 // Matching the compiler, the operands have no result type and are coerced to their
@@ -2235,43 +2429,50 @@ const Evaluator = struct {
                 // `const m: u8 = (0xFF << 4) >> 4` is computed as comptime_int and gives 255 when
                 // coerced to u8
                 const lhs = try ev.eval(f, lhs_e, null);
-                const is_shift = op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right or op == .angle_bracket_angle_bracket_left_pipe;
                 const rhs = try ev.eval(f, rhs_e, null);
-                // Bitwise operations on bool
-                if (lhs.ty == .bool_type and rhs.ty == .bool_type) {
-                    const x = (try ev.condition(lhs)).yes;
-                    const y = (try ev.condition(rhs)).yes;
-                    return boolVal(switch (op) {
-                        .ampersand => x and y,
-                        .pipe => x or y,
-                        .caret => x != y,
-                        else => return error.Abort,
-                    });
-                }
-                if (!is_shift and (ip.isFloat(lhs.ty) or ip.isFloat(rhs.ty))) {
-                    const ty = peerFloatType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
-                    // Comptime operands are coerced (rounded) to the peer type first
-                    const x = ev.floatOf(try ev.coerce(lhs, ty)) orelse return error.Abort;
-                    const y = ev.floatOf(try ev.coerce(rhs, ty)) orelse return error.Abort;
-                    return Val.of(ty, try value.binaryFloat(ip, op, ty, x, y) orelse return error.Abort);
-                }
-                const ty = if (is_shift) lhs.ty else value.peerIntType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
-                if (ev.intOf(lhs)) |a| {
-                    if (ev.intOf(rhs)) |b| {
-                        if (value.binaryInt(ip, op, ty, a, b)) |r| return Val.ofInt(ty, r);
-                    }
-                }
-                // A comptime_int operand may not fit i128 (or the result may not): compute at
-                // arbitrary precision
-                if (ty == .comptime_int_type) {
-                    const a = try ev.bigOf(lhs) orelse return error.Abort;
-                    const b = try ev.bigOf(rhs) orelse return error.Abort;
-                    const r = try bigint.binary(ev.a, op, a, b) orelse return error.Abort;
-                    return Val.ofBig(ty, r);
-                }
-                return error.Abort;
+                return ev.arith(op, lhs, rhs);
             },
         }
+    }
+
+    /// Arithmetic, bitwise and shift operator `op` on evaluated operands: the binary expression
+    /// `a op b`, and the operator of the compound assignment `a op= b`
+    fn arith(ev: *Evaluator, op: SyntaxKind, lhs: Val, rhs: Val) EvalError!Val {
+        const ip = ev.ip;
+        const is_shift = op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right or op == .angle_bracket_angle_bracket_left_pipe;
+        // Bitwise operations on bool
+        if (lhs.ty == .bool_type and rhs.ty == .bool_type) {
+            const x = (try ev.condition(lhs)).yes;
+            const y = (try ev.condition(rhs)).yes;
+            return boolVal(switch (op) {
+                .ampersand => x and y,
+                .pipe => x or y,
+                .caret => x != y,
+                else => return error.Abort,
+            });
+        }
+        if (!is_shift and (ip.isFloat(lhs.ty) or ip.isFloat(rhs.ty))) {
+            const ty = peerFloatType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
+            // Comptime operands are coerced (rounded) to the peer type first
+            const x = ev.floatOf(try ev.coerce(lhs, ty)) orelse return error.Abort;
+            const y = ev.floatOf(try ev.coerce(rhs, ty)) orelse return error.Abort;
+            return Val.of(ty, try value.binaryFloat(ip, op, ty, x, y) orelse return error.Abort);
+        }
+        const ty = if (is_shift) lhs.ty else value.peerIntType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
+        if (ev.intOf(lhs)) |a| {
+            if (ev.intOf(rhs)) |b| {
+                if (value.binaryInt(ip, op, ty, a, b)) |r| return Val.ofInt(ty, r);
+            }
+        }
+        // A comptime_int operand may not fit i128 (or the result may not): compute at
+        // arbitrary precision
+        if (ty == .comptime_int_type) {
+            const a = try ev.bigOf(lhs) orelse return error.Abort;
+            const b = try ev.bigOf(rhs) orelse return error.Abort;
+            const r = try bigint.binary(ev.a, op, a, b) orelse return error.Abort;
+            return Val.ofBig(ty, r);
+        }
+        return error.Abort;
     }
 
     /// Whether two comptime pointers are equal; null when it cannot be determined. Storage cells
@@ -2332,11 +2533,16 @@ const Evaluator = struct {
         return ev.makeAgg(ty, elems);
     }
 
-    /// Pointer to a new storage cell (holding `target`)
+    /// Pointer to a new storage cell (holding `target`); the cell is reachable only through this
+    /// pointer and its copies, so with a `*const` type it never changes
     fn pointerToNew(ev: *Evaluator, ptr_ty: Index, target: Val) Error!Val {
         const cell = try ev.a.create(Val);
         cell.* = target;
-        return .{ .ty = ptr_ty, .v = .{ .ref = .{ .cell = cell, .path = &.{} } } };
+        const immutable = switch (ev.ip.key(ptr_ty)) {
+            .ptr_type => |p| p.is_const,
+            else => false,
+        };
+        return .{ .ty = ptr_ty, .v = .{ .ref = .{ .cell = cell, .path = &.{}, .immutable = immutable } } };
     }
 
     /// Array type: a pointer to an array yields the array it points to; a slice is treated as an
@@ -2436,7 +2642,7 @@ const Evaluator = struct {
             error.Abort => blk: {
                 const cell = try ev.a.create(Val);
                 cell.* = try ev.copy(v);
-                break :blk Ref{ .cell = cell, .path = &.{}, .is_const = true };
+                break :blk Ref{ .cell = cell, .path = &.{}, .is_const = true, .immutable = true };
             },
             else => |x| return x,
         };
@@ -2449,10 +2655,14 @@ const Evaluator = struct {
             .name_ref => |name| {
                 const def = try ev.r.resolveName(f.file, f.item, f.body, f.body.expr_scopes[@backingInt(e)], name) orelse return error.Abort;
                 switch (def) {
-                    .local => |l| if (l.file == f.file and l.item == f.item) return .{
-                        .cell = &f.slots[@backingInt(l.binding)],
-                        .path = &.{},
-                        .is_const = f.body.binding(l.binding).kind != .local_var,
+                    .local => |l| if (l.file == f.file and l.item == f.item) {
+                        const is_var = f.body.binding(l.binding).kind == .local_var;
+                        return .{
+                            .cell = &f.slots[@backingInt(l.binding)],
+                            .path = &.{},
+                            .is_const = !is_var,
+                            .immutable = !is_var,
+                        };
                     },
                     else => {},
                 }
@@ -2512,11 +2722,11 @@ const Evaluator = struct {
             break :blk w.start + i;
         } else i;
         // `*T` → `*[1]T`: element 0 is the place itself
-        if (base.as_array) return if (index == 0) .{ .cell = base.cell, .path = base.path, .is_const = base.is_const } else error.Abort;
+        if (base.as_array) return if (index == 0) .{ .cell = base.cell, .path = base.path, .is_const = base.is_const, .immutable = base.immutable } else error.Abort;
         const path = try ev.a.alloc(u32, base.path.len + 1);
         @memcpy(path[0..base.path.len], base.path);
         path[base.path.len] = index;
-        return .{ .cell = base.cell, .path = path, .is_const = base.is_const };
+        return .{ .cell = base.cell, .path = path, .is_const = base.is_const, .immutable = base.immutable };
     }
 
     fn assign(ev: *Evaluator, f: *Frame, op: SyntaxKind, lhs_e: ExprId, rhs_e: ExprId) EvalError!void {
@@ -2563,7 +2773,9 @@ const Evaluator = struct {
         }
         const rhs_want: ?Index = if (old.ty != .unknown) old.ty else null;
         if (op == .equal) return ev.store(ref, try ev.eval(f, rhs_e, rhs_want));
-        // Compound assignment `a += b`
+        // Compound assignment `a op= b`: as in the compiler (`AstGen.assignOp`), the old value and
+        // the right operand go through the operator of `a op b`, and the result is stored (and
+        // coerced to the type of `a`)
         const bin: SyntaxKind = switch (op) {
             .plus_equal => .plus,
             .minus_equal => .minus,
@@ -2583,27 +2795,20 @@ const Evaluator = struct {
             .angle_bracket_angle_bracket_right_equal => .angle_bracket_angle_bracket_right,
             else => return error.Abort,
         };
-        const rhs = try ev.eval(f, rhs_e, if (bin == .angle_bracket_angle_bracket_left or bin == .angle_bracket_angle_bracket_right) null else rhs_want);
-        if (old.ty == .bool_type) {
-            const x = (try ev.condition(old)).yes;
-            const y = (try ev.condition(rhs)).yes;
-            return ev.store(ref, boolVal(switch (bin) {
-                .ampersand => x and y,
-                .pipe => x or y,
-                .caret => x != y,
-                else => return error.Abort,
-            }));
-        }
-        if (old.ty == .comptime_int_type) {
-            const a = try ev.bigOf(old) orelse return error.Abort;
-            const b = try ev.bigOf(rhs) orelse return error.Abort;
-            const r = try bigint.binary(ev.a, bin, a, b) orelse return error.Abort;
-            return ev.store(ref, Val.ofBig(old.ty, r));
-        }
-        const a = ev.intOf(old) orelse return error.Abort;
-        const b = ev.intOf(rhs) orelse return error.Abort;
-        const r = value.binaryInt(ev.ip, bin, old.ty, a, b) orelse return error.Abort;
-        try ev.store(ref, Val.ofInt(old.ty, r));
+        const rhs = try ev.eval(f, rhs_e, if (bin == .angle_bracket_angle_bracket_left or bin == .angle_bracket_angle_bracket_right) null else ev.compoundRhsType(bin, rhs_want));
+        try ev.store(ref, try ev.arith(bin, old, rhs));
+    }
+
+    /// Result type of the right operand of the compound assignment with operator `bin` to a place
+    /// of type `t` (`Sema.zirInplaceArithResultTy`): the type of the place, except that `+=` on a
+    /// many-item or C pointer adds a `usize`, and `-=` on one subtracts either an integer or a
+    /// pointer, so its right operand has no result type
+    fn compoundRhsType(ev: *Evaluator, bin: SyntaxKind, t: ?Index) ?Index {
+        if (bin == .plus or bin == .minus) if (t) |ty| switch (ev.ip.key(ty)) {
+            .ptr_type => |p| if (p.size == .many or p.size == .c) return if (bin == .plus) .usize_type else null,
+            else => {},
+        };
+        return t;
     }
 
     /// Modifies the `len` of a slice (`list.items.len += 1`): when the slice points to storage
@@ -2635,7 +2840,7 @@ const Evaluator = struct {
         };
         const n = if (r.as_array) 1 else try ev.elemCount(try ev.load(.{ .cell = r.cell, .path = r.path })) orelse return error.Abort;
         if (len < 0 or w.start + len > n) return error.Abort;
-        try ev.store(ref, .{ .ty = s.ty, .v = .{ .ref = .{ .cell = r.cell, .path = r.path, .window = .{ .start = w.start, .len = @intCast(len) }, .as_array = r.as_array } } });
+        try ev.store(ref, .{ .ty = s.ty, .v = .{ .ref = .{ .cell = r.cell, .path = r.path, .window = .{ .start = w.start, .len = @intCast(len) }, .as_array = r.as_array, .immutable = r.immutable } } });
         return true;
     }
 
@@ -2694,19 +2899,7 @@ const Evaluator = struct {
         };
         // Consistent with the inference path: an explicit sentinel takes precedence; slicing to
         // the end keeps the sentinel of the source array
-        const src_sentinel: ?Index = switch (ip.key(base.ty)) {
-            .array_type => |a| a.sentinel,
-            .abstract_array_type => |a| a.sentinel,
-            .ptr_type => |p| switch (p.size) {
-                .one => switch (ip.key(p.child)) {
-                    .array_type => |a| a.sentinel,
-                    .abstract_array_type => |a| a.sentinel,
-                    else => null,
-                },
-                .slice, .many, .c => p.sentinel,
-            },
-            else => null,
-        };
+        const src_sentinel = ev.seqSentinel(base.ty);
         const explicit: ?Index = if (s.sentinel) |se| blk: {
             const v = try ev.eval(f, se, child);
             break :blk try ev.freeze(v) orelse return error.Abort;
@@ -3055,9 +3248,22 @@ const Evaluator = struct {
             const t = try ev.evalType(f, args[0]);
             return ev.eval(f, args[1], t);
         }
+        if (eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast")) {
+            if (args.len != 1) return error.Abort;
+            // Merged with a cast below that takes the result type: that cast converts to the
+            // destination of the whole chain
+            if (infer.qualifierCastTakesResultType(f.body, args[0])) return ev.eval(f, args[0], want);
+            // Otherwise the destination comes from the operand, whose value is unchanged; `eval`
+            // then coerces it to the result type (`*u8` to `error{E}!*u8` or `*const [1]u8`)
+            const v = try ev.eval(f, args[0], null);
+            // An operand of unknown type gives an unknown value, which still takes the result type
+            if (v.ty == .unknown) return Val.unknown;
+            const t = try infer.qualifierCastDest(ip, v.ty, name) orelse return error.Abort;
+            return .{ .ty = t, .v = v.v };
+        }
         const vals = try ev.a.alloc(Val, args.len);
         // Result types of the arguments
-        for (args, vals, 0..) |a, *o, i| o.* = try ev.eval(f, a, try ev.builtinArgType(name, i, vals[0..i]));
+        for (args, vals, 0..) |a, *o, i| o.* = try ev.eval(f, a, try ev.builtinArgType(name, i, vals[0..i], want));
         if (try ev.pureBuiltin(name, vals)) |v| return v;
         if (eq(u8, name, "@TypeOf")) {
             if (vals.len == 0) return error.Abort;
@@ -3195,13 +3401,16 @@ const Evaluator = struct {
                 .attrs_unknown = attrs.unknown,
             }));
         }
-        if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast") or eq(u8, name, "@enumFromInt") or eq(u8, name, "@fromBackingInt") or eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast") or eq(u8, name, "@errorCast") or eq(u8, name, "@errSetCast") or eq(u8, name, "@floatCast") or eq(u8, name, "@floatFromInt") or eq(u8, name, "@intFromFloat")) {
+        if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast") or eq(u8, name, "@enumFromInt") or eq(u8, name, "@fromBackingInt") or eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@errorCast") or eq(u8, name, "@errSetCast") or eq(u8, name, "@floatCast") or eq(u8, name, "@floatFromInt") or eq(u8, name, "@intFromFloat")) {
             if (vals.len != 1) return error.Abort;
             // Pointer casts do not change the value: without a result type (e.g. the nested
             // `@ptrCast(@alignCast(p))`), pass it through unchanged
-            const pointer_cast = eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast") or eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast");
+            const pointer_cast = eq(u8, name, "@ptrCast") or eq(u8, name, "@alignCast");
             if (want == null and pointer_cast) return vals[0];
-            const t = want orelse return error.Abort;
+            // The destination of `@fromBackingInt` is the result type without error union and
+            // optional (the compiler's `resolveDestType` with `.remove_eu_opt`); the result is
+            // coerced to the result type afterwards
+            const t = (if (eq(u8, name, "@fromBackingInt")) destType(ip, want) else want) orelse return error.Abort;
             if (pointer_cast and !try ev.keepsPointee(vals[0], t)) return .{ .ty = t };
             return ev.cast(name, vals[0], t);
         }
@@ -3487,11 +3696,21 @@ const Evaluator = struct {
         return ev.floatOf(v) orelse error.Abort;
     }
 
-    /// Result type of argument `i` of a builtin (`prev` holds the preceding arguments). In
-    /// builtins that construct types, arguments given per field get `*const [n]T`, which forms
-    /// such as `&@splat(.{})` need.
-    fn builtinArgType(ev: *Evaluator, name: []const u8, i: usize, prev: []const Val) EvalError!?Index {
+    /// Result type of argument `i` of a builtin (`prev` holds the preceding arguments, `want` is
+    /// the result type of the call). In builtins that construct types, arguments given per field
+    /// get `*const [n]T`, which forms such as `&@splat(.{})` need.
+    fn builtinArgType(ev: *Evaluator, name: []const u8, i: usize, prev: []const Val, want: ?Index) EvalError!?Index {
         const eq = std.mem.eql;
+        // The operand is coerced to the backing integer of the destination type (the compiler's
+        // `from_backing_int_arg_ty`): the tag type of an enum, the backing integer of a packed
+        // struct or union. `@fromBackingInt(@intCast(i))` needs it.
+        if (eq(u8, name, "@fromBackingInt") and i == 0) {
+            const dest = destType(ev.ip, want) orelse return null;
+            return ev.backingIntType(dest) catch |err| switch (err) {
+                error.Abort => null,
+                else => |x| return x,
+            };
+        }
         const is_struct = eq(u8, name, "@Struct");
         const elem: ?Index = if ((is_struct or eq(u8, name, "@Union")) and (i == 3 or i == 4)) blk: {
             if (i == 3) break :blk .type_type;
@@ -4650,6 +4869,22 @@ fn peerFloatType(ip: *InternPool, a: Index, b: Index) ?Index {
     return null;
 }
 
+/// Destination type of a cast builtin with result type `want`: without error union and optional,
+/// as in the compiler's `resolveDestType` with `.remove_eu_opt`; null without a result type
+fn destType(ip: *InternPool, want: ?Index) ?Index {
+    var t = want orelse return null;
+    if (t == .unknown) return null;
+    switch (ip.key(t)) {
+        .error_union_type => |eu| t = eu.payload,
+        else => {},
+    }
+    switch (ip.key(t)) {
+        .optional_type => |c| t = c,
+        else => {},
+    }
+    return t;
+}
+
 /// Whether a field of a tuple or anonymous struct literal is comptime; gives up when it cannot
 /// be determined
 fn literalFieldAttrs(values: []const Index, i: usize) EvalError!Evaluator.FieldAttrs {
@@ -4757,7 +4992,7 @@ fn packedHostSize(ip: *InternPool, l: value.Layout) ?u64 {
     if (bytes == l.size) return bytes;
     return switch (ip.vectorAbi()) {
         .x86_64, .x86_64_avx, .x86_64_avx512 => l.size,
-        .llvm, .llvm_aarch64 => bytes,
+        .llvm, .llvm_stack_align_8, .llvm_stack_align_16 => bytes,
         // The C and wasm backends share a vector layout but not this rule
         .elem, .unknown => null,
     };

@@ -153,27 +153,11 @@ pub fn pointerBits(text: []const u8) ?u16 {
     return std.Target.ptrBitWidth_arch_abi(arch, abi);
 }
 
-/// Target information in builtin.zig that determines vector layout
-pub const VectorFacts = struct {
-    backend: std.lang.CompilerBackend,
-    arch: std.Target.Cpu.Arch,
-    /// x86 CPU features
-    avx: bool,
-    avx512f: bool,
-    soft_float: bool,
-};
-
-pub fn vectorFacts(text: []const u8) ?VectorFacts {
-    const backend = tagAfter(text, "pub const zig_backend = std.lang.CompilerBackend.") orelse return null;
-    const arch = tagAfter(text, "    .arch = .") orelse return null;
-    const features = featureList(text) orelse return null;
-    return .{
-        .backend = std.meta.stringToEnum(std.lang.CompilerBackend, backend) orelse return null,
-        .arch = std.meta.stringToEnum(std.Target.Cpu.Arch, arch) orelse return null,
-        .avx = hasFeature(features, "avx"),
-        .avx512f = hasFeature(features, "avx512f"),
-        .soft_float = hasFeature(features, "soft_float"),
-    };
+/// The compiler backend in builtin.zig (`zig_backend`), which with the target decides the layout
+/// of vectors
+pub fn backend(text: []const u8) ?std.lang.CompilerBackend {
+    const name = tagAfter(text, "pub const zig_backend = std.lang.CompilerBackend.") orelse return null;
+    return std.meta.stringToEnum(std.lang.CompilerBackend, name);
 }
 
 /// Members of `cpu.features`: between `featureSet(&.{` and `})`, one per line
@@ -181,14 +165,6 @@ fn featureList(text: []const u8) ?[]const u8 {
     const start = (std.mem.indexOf(u8, text, "featureSet(&.{") orelse return null) + "featureSet(&.{".len;
     const end = std.mem.indexOfPos(u8, text, start, "})") orelse return null;
     return text[start..end];
-}
-
-fn hasFeature(features: []const u8, name: []const u8) bool {
-    var it = std.mem.tokenizeAny(u8, features, " \n,");
-    while (it.next()) |tok| {
-        if (std.mem.eql(u8, featureName(tok) orelse continue, name)) return true;
-    }
-    return false;
 }
 
 /// Name of an item in the feature list: `.avx`; a name that is not a valid identifier is written
@@ -285,30 +261,18 @@ test "malformed feature names are skipped" {
         \\    .tag = .linux,
         \\};
     ;
-    const f = vectorFacts(text).?;
-    try std.testing.expect(f.avx and !f.avx512f);
     const t = target(text).?;
-    try std.testing.expect(t.cpu.has(.x86, .avx) and !t.cpu.has(.x86, .avx2) and !t.cpu.has(.x86, .@"64bit"));
+    try std.testing.expect(t.cpu.has(.x86, .avx) and !t.cpu.has(.x86, .avx2) and !t.cpu.has(.x86, .avx512f) and !t.cpu.has(.x86, .@"64bit"));
 }
 
-test vectorFacts {
+test backend {
     const text =
         \\pub const zig_backend = std.lang.CompilerBackend.stage2_x86_64;
-        \\pub const cpu: std.Target.Cpu = .{
-        \\    .arch = .x86_64,
-        \\    .model = &std.Target.x86.cpu.znver4,
-        \\    .features = std.Target.x86.featureSet(&.{
-        \\        .@"64bit",
-        \\        .avx,
-        \\        .avx2,
-        \\        .avx512bw,
-        \\    }),
-        \\};
+        \\pub const output_mode: std.lang.OutputMode = .Obj;
     ;
-    const f = vectorFacts(text).?;
-    try std.testing.expectEqual(std.lang.CompilerBackend.stage2_x86_64, f.backend);
-    try std.testing.expectEqual(std.Target.Cpu.Arch.x86_64, f.arch);
-    try std.testing.expect(f.avx and !f.avx512f and !f.soft_float);
+    try std.testing.expectEqual(std.lang.CompilerBackend.stage2_x86_64, backend(text).?);
+    try std.testing.expectEqual(null, backend("pub const zig_backend = std.lang.CompilerBackend.nonexistent;\n"));
+    try std.testing.expectEqual(null, backend("pub const output_mode: std.lang.OutputMode = .Obj;\n"));
 }
 
 /// The identifier after `prefix` (up to `,` or `;`)

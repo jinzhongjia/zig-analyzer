@@ -4062,6 +4062,32 @@ test "switch prongs on a comptime-known tagged union are inactive unless they ma
     try testing.expectEqualStrings("return 0", text[ranges[0].start..ranges[0].end]);
 }
 
+test "switch prongs on a comptime-known integer are inactive unless a range item contains it" {
+    // A range item has no single value, so no prong was chosen and none was judged inactive
+    const text =
+        \\const n: u8 = 42;
+        \\fn f() u8 {
+        \\    return switch (n) {
+        \\        0...9 => 1,
+        \\        10...99 => 2,
+        \\        else => 3,
+        \\    };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const ranges = try inactive.ranges(&r, file);
+    try testing.expectEqual(2, ranges.len);
+    try testing.expectEqualStrings("1", text[ranges[0].start..ranges[0].end]);
+    try testing.expectEqualStrings("3", text[ranges[1].start..ranges[1].end]);
+}
+
 /// Uses the real standard library of the local zig (skipped when PATH has no zig): `@typeInfo`
 /// needs `std.builtin.Type`
 fn useRealStd(w: *World) !void {
@@ -7205,6 +7231,11 @@ test "builtin hover combines official documentation and inferred values" {
     const cases = [_]struct { text: []const u8, signature: []const u8, value: ?[]const u8 }{
         .{ .text = "const n = @si<|>zeOf(u32);", .signature = "@sizeOf(comptime T: type) comptime_int", .value = "comptime_int = 4" },
         .{ .text = "const n = @a<|>s(u32, 1);", .signature = "@as(comptime T: type, expression) T", .value = "u32 = 1" },
+        // A rounding builtin has its result type; the call itself is the payload of the optionals,
+        // however deeply they are nested
+        .{ .text = "fn f(x: f32) u32 { return @ro<|>und(x); }", .signature = "@round(value: anytype) @TypeOf(value)", .value = "Inferred result:\n\n```zig\nu32\n```" },
+        .{ .text = "fn f() void { const o: ?u8 = @ce<|>il(@as(f64, 2.25)); _ = o; }", .signature = "@ceil(value: anytype) @TypeOf(value)", .value = "Inferred result:\n\n```zig\nu8 = 3\n```" },
+        .{ .text = "fn f() void { const o: ??u8 = @ce<|>il(@as(f32, 1.5)); _ = o; }", .signature = "@ceil(value: anytype) @TypeOf(value)", .value = "Inferred result:\n\n```zig\nu8 = 2\n```" },
         .{ .text = "@si<|>zeOf", .signature = "@sizeOf(comptime T: type) comptime_int", .value = null },
         .{ .text = "const n = @si<|>zeOf(", .signature = "@sizeOf(comptime T: type) comptime_int", .value = null },
     };

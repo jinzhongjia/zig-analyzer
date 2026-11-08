@@ -1096,11 +1096,11 @@ fn builtinTarget(server: *Server, file: Vfs.FileId) Allocator.Error!za.sema.Inte
         else => return server.builtin_targets.get(file) orelse .{ .pointer_bits = null, .scalar_abi = .unknown },
     };
     defer server.gpa.free(text);
-    const facts = za.project.builtin.vectorFacts(text);
+    const backend = za.project.builtin.backend(text);
     const target = za.project.builtin.target(text);
     const result: za.sema.InternPool.Target = .{
         .pointer_bits = za.project.builtin.pointerBits(text),
-        .vector_abi = if (facts) |f| .of(f.backend, f.arch, f.avx, f.avx512f, f.soft_float) else .unknown,
+        .vector_abi = if (backend) |b| if (target) |*t| .of(b, t) else .unknown else .unknown,
         .scalar_abi = if (target) |*t| .of(t) else .unknown,
     };
     try server.builtin_targets.put(server.gpa, file, result);
@@ -3367,7 +3367,7 @@ fn projectsLoading(server: *Server) bool {
 
 /// The zig environment or a project's first load is still pending: name resolution and types may
 /// be incomplete. A restart does not end a first load: it goes on in the new instance.
-fn projectsPending(server: *Server) bool {
+pub fn projectsPending(server: *Server) bool {
     if (!server.startup_ended.load(.acquire) or server.first_load_restarts.load(.acquire) != 0) return true;
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
@@ -4326,7 +4326,7 @@ fn maybeResetSema(server: *Server, start: SemaUsage) void {
 const sema_reset_keys = 200_000;
 
 /// Queries cleared by a whole-generation reclaim
-const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.SignatureInst, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.sema.ZonValue, database.sema.ZonImports, database.sema.ZonResultType, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
+const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.LocalEval, database.sema.SignatureInst, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.sema.ZonValue, database.sema.ZonImports, database.sema.ZonResultType, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
 
 fn semaKeys(server: *Server) usize {
     var n: usize = 0;

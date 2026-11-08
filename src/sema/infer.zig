@@ -331,6 +331,11 @@ const Inferrer = struct {
     /// Greater than 0 inside a comptime context (type expressions, array lengths, comptime
     /// arguments, etc.): function calls there are evaluated by the interpreter
     comptime_depth: u32 = 0,
+    /// Inside the operands of `@TypeOf` and not in a comptime context nested in them: the
+    /// compiler analyzes these operands in a block without a comptime reason
+    /// (`Sema.zirTypeofBuiltin`), so calls there are not executed even where the surrounding code
+    /// is evaluated at comptime (see `comptimeOperand`)
+    in_typeof: bool = false,
     /// Backward-branch quota of comptime evaluations started directly in the member (see
     /// `eval.bodyQuota`), computed on first use
     quota: ?u32 = null,
@@ -565,14 +570,21 @@ const Inferrer = struct {
     }
 
     /// Whether a condition whose value cannot be evaluated is comptime-known (e.g. because it
-    /// depends on an abstract parameter): in a comptime context, with a comptime-only result type,
-    /// in initializers of container-level constants and variables and in fields (evaluated at
-    /// comptime), or when the condition itself is comptime-known
+    /// depends on an abstract parameter): with a comptime-only result type, or when the condition
+    /// is comptime-known (see `comptimeKnown`)
     fn comptimeCond(inf: *Inferrer, cond: ExprId, result: Index) Error!bool {
-        if (inf.comptime_depth > 0 or value.isComptimeOnly(inf.ip, result)) return true;
+        if (value.isComptimeOnly(inf.ip, result)) return true;
+        return inf.comptimeKnown(cond);
+    }
+
+    /// Whether the value of `e` is comptime-known even when inference cannot compute it: in a
+    /// comptime context, in initializers of container-level constants and variables and in fields
+    /// (evaluated at comptime), or when `knownness` finds it comptime-known
+    fn comptimeKnown(inf: *Inferrer, e: ExprId) Error!bool {
+        if (inf.comptime_depth > 0) return true;
         const kind = (try inf.r.itemTree(inf.file)).items[inf.item].kind;
         if (kind != .@"fn" and kind != .@"test") return true;
-        return try inf.knownness(cond, 0) == .comptime_known;
+        return try inf.knownness(e, 0) == .comptime_known;
     }
 
     /// A comptime-known condition: a bool value, or whether an optional is null (the value of a
@@ -608,6 +620,28 @@ const Inferrer = struct {
         if (v == .null_value) return false;
         if (v == .unknown or v == .undefined_value) return null;
         return null;
+    }
+
+    /// The operand `e` of `catch` / `orelse` (inferred as `tv`) with its comptime value. With a
+    /// comptime-known operand the compiler analyzes only the side that is taken
+    /// (`Sema.zirCondbr`), so the type of the whole expression depends on this value. Inference
+    /// executes calls only in comptime contexts, but the compiler also evaluates the
+    /// initializers of container-level constants and variables, fields and `comptime` blocks at
+    /// comptime: there the interpreter computes the operand. Operands of `@TypeOf` are analyzed
+    /// without a comptime reason, so calls in them stay runtime.
+    fn comptimeOperand(inf: *Inferrer, e: ExprId, tv: TypedValue) Error!TypedValue {
+        if (tv.val) |v| if (v != .unknown) return tv;
+        switch (inf.ip.key(tv.ty)) {
+            .error_union_type, .optional_type => {},
+            else => return tv,
+        }
+        if (inf.in_typeof or inf.dead != 0 or inf.r.ctx.incomplete()) return tv;
+        if (inf.comptime_depth == 0) {
+            const kind = (try inf.r.itemTree(inf.file)).items[inf.item].kind;
+            if (kind == .@"fn" or kind == .@"test") return tv;
+        }
+        const ev = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
+        return if (ev.val != null and ev.ty == tv.ty) ev else tv;
     }
 
     /// Branch of an `if` / `switch`: a branch that will not execute is recorded as inactive code
@@ -806,9 +840,14 @@ const Inferrer = struct {
     /// `fn f(comptime T: type) switch (@typeInfo(T)) {...}`).
     fn inferComptime(inf: *Inferrer, e: ExprId, expected: ?Index) Error!TypedValue {
         const outermost = inf.comptime_depth == 0;
+        const in_typeof = inf.in_typeof;
         inf.comptime_depth += 1;
+        inf.in_typeof = false;
         const tv = blk: {
-            defer inf.comptime_depth -= 1;
+            defer {
+                inf.comptime_depth -= 1;
+                inf.in_typeof = in_typeof;
+            }
             break :blk try inf.infer(e, expected);
         };
         if (tv.val != null or inf.dead > 0) return tv;
@@ -976,6 +1015,10 @@ const Inferrer = struct {
                 for (s.prongs) |prong| for (prong.items) |item| {
                     // Items of a switch on a value of unknown type have an unknown result type
                     if (operand.ty == .unknown) try inf.noteUnknownResult(item);
+                    // `a...b`: the compiler coerces both bounds to the item type, like a scalar item
+                    if (switchRange(inf.body, item)) |range| for (range) |bound| {
+                        _ = try inf.infer(bound, item_ty);
+                    };
                     _ = try inf.infer(item, item_ty);
                 };
                 // Labeled switch: the value of `break :label value` is also a result
@@ -1029,12 +1072,13 @@ const Inferrer = struct {
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) try sameLiveValue(ip, values.items, ty) else null };
             },
             .@"catch" => |c| {
-                const lhs = try inf.infer(c.lhs, null);
+                const lhs = try inf.comptimeOperand(c.lhs, try inf.infer(c.lhs, null));
                 const payload, const err = inf.unwrapErrorUnion(lhs.ty);
-                if (c.capture) |cap| inf.bindings[@backingInt(cap)] = .{ .ty = err };
                 // When comptime-known, only one side is evaluated, and a right-hand side that is
                 // taken gets only the result type of the whole expression
                 const ok = inf.condValue(lhs);
+                // The capture of a comptime-known error is that error
+                if (c.capture) |cap| inf.bindings[@backingInt(cap)] = .{ .ty = err, .val = if (ok == false) lhs.val else null };
                 const rhs = try inf.inferBranch(c.rhs, inf.fallbackType(expected, if (ok == false) .unknown else payload, c.rhs), ok == true);
                 if (ok) |o| return if (o) .{ .ty = payload, .val = lhs.val } else rhs;
                 return .{ .ty = try inf.peer(&.{ payload, rhs.ty }) };
@@ -1601,7 +1645,8 @@ const Inferrer = struct {
         return if (value.isConcrete(inf.ip, ty)) ty else null;
     }
 
-    /// The prong that executes when both the switch operand and the prong items are comptime-known
+    /// The prong that executes when both the switch operand and the prong items are comptime-known.
+    /// A range item `a...b` matches an operand between its bounds, both inclusive.
     fn chooseProng(inf: *Inferrer, prongs: []const Body.Prong, operand: TypedValue) Error!?usize {
         const v = operand.val orelse return null;
         var else_prong: ?usize = null;
@@ -1611,8 +1656,12 @@ const Inferrer = struct {
                 continue;
             }
             for (prong.items) |item| {
-                const iv = inf.get(item).val orelse return null;
-                if (try eval.eqlValues(inf.r, iv, v) orelse return null) return i;
+                const hit = if (switchRange(inf.body, item)) |range|
+                    (try inf.compare(.angle_bracket_right_equal, operand, inf.get(range[0])) orelse return null) and
+                        (try inf.compare(.angle_bracket_left_equal, operand, inf.get(range[1])) orelse return null)
+                else
+                    try eval.eqlValues(inf.r, inf.get(item).val orelse return null, v) orelse return null;
+                if (hit) return i;
             }
         }
         return else_prong;
@@ -1707,6 +1756,9 @@ const Inferrer = struct {
             return .{ .ty = t, .val = if (v.ty == t) v.val else null };
         }
         if (eq(u8, name, "@TypeOf")) {
+            const in_typeof = inf.in_typeof;
+            inf.in_typeof = true;
+            defer inf.in_typeof = in_typeof;
             var types: std.ArrayList(Index) = .empty;
             for (args) |a| try types.append(inf.scratch, (try inf.infer(a, null)).ty);
             const t = try inf.peer(types.items);
@@ -1825,8 +1877,11 @@ const Inferrer = struct {
         // Stripping const / volatile: the result depends only on the argument's type
         // (matches the compiler)
         if (eq(u8, name, "@constCast") or eq(u8, name, "@volatileCast")) {
-            const t = if (args.len == 1) inf.get(args[0]).ty else .unknown;
-            return .{ .ty = if (eq(u8, name, "@constCast")) try inf.mutablePtr(t) else t };
+            if (args.len != 1) return .unknown;
+            const t = inf.get(args[0]).ty;
+            // Merged with a cast below that takes the result type, the chain has that cast's type
+            if (qualifierCastTakesResultType(inf.body, args[0])) return .{ .ty = t };
+            return .{ .ty = try qualifierCastDest(ip, t, name) orelse t };
         }
         if (eq(u8, name, "@intFromEnum") or eq(u8, name, "@backingInt")) {
             if (try inf.pureValue(name, args)) |tv| return tv;
@@ -1901,9 +1956,22 @@ const Inferrer = struct {
             // The argument of `@typeName` is always a type: when the name cannot be evaluated,
             // there is no runtime slice form
             if (eq(u8, name, "@typeName")) return .unknown;
+            // Only a runtime operand gives `[:0]const u8`; a comptime-known one gives the string
+            // literal `*const [N:0]u8` (`Sema.zirTagName`, `Sema.zirErrorName`). When inference
+            // has no value for a comptime-known operand (a tagged union literal, `@enumFromInt`,
+            // a call in a container-level initializer), the interpreter evaluates the name; when
+            // it cannot, the length of the result is unknown.
+            if (args.len == 1 and inf.dead == 0 and !inf.r.ctx.incomplete() and try inf.comptimeKnown(args[0])) {
+                const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
+                return if (tv.val != null) tv else .unknown;
+            }
             const sentinel = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } });
             return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = .u8_type, .size = .slice, .is_const = true, .sentinel = sentinel } }) };
         }
+        // With a result type, the rounding builtins convert to it (see `roundCast`); without one,
+        // they have the type of the operand like the other float math builtins below
+        const rounding = [_][]const u8{ "@floor", "@ceil", "@trunc", "@round" };
+        for (rounding) |n| if (eq(u8, name, n)) if (expected) |want| return inf.roundCast(name, args, want);
         // The result has the type of the first argument (for division and remainder, the
         // peer type of both sides)
         const same = [_][]const u8{ "@abs", "@sqrt", "@sin", "@cos", "@tan", "@exp", "@exp2", "@log", "@log2", "@log10", "@floor", "@ceil", "@trunc", "@round", "@byteSwap", "@bitReverse", "@min", "@max", "@mod", "@rem", "@divExact", "@divFloor", "@divTrunc", "@divCeil" };
@@ -2052,21 +2120,6 @@ const Inferrer = struct {
         return t;
     }
 
-    /// Strips const from a pointer (including an optional pointer)
-    fn mutablePtr(inf: *Inferrer, t: Index) Error!Index {
-        const ip = inf.ip;
-        switch (ip.key(t)) {
-            .ptr_type => |p| {
-                var q = p;
-                q.is_const = false;
-                return ip.get(.{ .ptr_type = q });
-            },
-            .optional_type => |c| if (ip.key(c) == .ptr_type) return ip.optionalOf(try inf.mutablePtr(c)),
-            else => {},
-        }
-        return t;
-    }
-
     /// Result type of `@clz` / `@ctz` / `@popCount`: the smallest unsigned integer that holds 0
     /// through the bit width, element-wise for vectors
     fn bitCountType(inf: *Inferrer, t: Index) Error!?Index {
@@ -2080,6 +2133,35 @@ const Inferrer = struct {
         }
         const info = value.intInfo(ip, t) orelse return null;
         return try ip.intType(.unsigned, if (info.bits == 0) 0 else std.math.log2_int(u16, info.bits) + 1);
+    }
+
+    /// `@floor` / `@ceil` / `@trunc` / `@round` with the result type `want` (matches the
+    /// compiler's `zirRoundCast`): the call has the result type without its error unions and
+    /// optionals, however deeply nested (`Type.optEuBaseType`), and an unknown result type gives
+    /// an unknown result. The operand must be a float: a float destination takes it coerced to
+    /// the destination before rounding, an integer destination takes it rounded in its own type
+    /// and converted to the integer.
+    fn roundCast(inf: *Inferrer, name: []const u8, args: []const ExprId, want: Index) Error!TypedValue {
+        const ip = inf.ip;
+        if (want == .unknown) return .unknown;
+        var dest = want;
+        while (true) dest = switch (ip.key(dest)) {
+            .optional_type => |child| child,
+            .error_union_type => |eu| eu.payload,
+            else => break,
+        };
+        const result: TypedValue = .{ .ty = dest };
+        if (args.len != 1 or inf.dead > 0 or inf.r.ctx.incomplete()) return result;
+        const operand = inf.get(args[0]);
+        const v = operand.val orelse return result;
+        if (!ip.isFloat(operand.ty)) return result;
+        if (ip.isFloat(dest)) {
+            const x = try value.coerceValue(ip, v, dest) orelse return result;
+            return try eval.builtinValue(inf.r, name, &.{.{ .ty = dest, .val = x }}) orelse result;
+        }
+        if (!ip.isInt(dest)) return result;
+        const rounded = try eval.builtinValue(inf.r, name, &.{operand}) orelse return result;
+        return .{ .ty = dest, .val = try value.coerceValue(ip, rounded.val.?, dest) };
     }
 
     /// Return type of a function (or function pointer); unknown when it depends on the parameters
@@ -2771,7 +2853,7 @@ const Inferrer = struct {
         const ip = inf.ip;
         switch (op) {
             .keyword_orelse => {
-                const lhs = try inf.infer(lhs_e, null);
+                const lhs = try inf.comptimeOperand(lhs_e, try inf.infer(lhs_e, null));
                 const child: Index = switch (ip.key(lhs.ty)) {
                     .optional_type => |c| c,
                     else => .unknown,
@@ -4065,6 +4147,42 @@ fn isPtrCast(name: []const u8) bool {
     return false;
 }
 
+/// Whether `@constCast` / `@volatileCast` applied to `operand` is merged with a cast below it that
+/// takes the result type (`@constCast(@ptrCast(p))`, `@volatileCast(@constCast(@alignCast(p)))`,
+/// `@constCast(@fieldParentPtr(...))`): the compiler's AstGen then emits one cast whose
+/// destination is the result type (`ptr_cast_full`, `field_parent_ptr`). Below a chain of only
+/// `@constCast` / `@volatileCast`, it emits `ptr_cast_no_dest`, whose destination comes from the
+/// operand (see `qualifierCastDest`). Parentheses, which the compiler looks through, are not in HIR.
+pub fn qualifierCastTakesResultType(body: *const Body, operand: ExprId) bool {
+    var e = operand;
+    while (true) {
+        const c = switch (body.expr(e)) {
+            .builtin_call => |c| c,
+            else => return false,
+        };
+        if (std.mem.eql(u8, c.name, "@fieldParentPtr")) return c.args.len == 2;
+        if (!isPtrCast(c.name) or c.args.len != 1) return false;
+        if (!std.mem.eql(u8, c.name, "@constCast") and !std.mem.eql(u8, c.name, "@volatileCast")) return true;
+        e = c.args[0];
+    }
+}
+
+/// Destination type of `@constCast` / `@volatileCast` on an operand of type `t` that does not take
+/// the result type (the compiler's `zirPtrCastNoDest`): `t` with `const` or `volatile` cleared, an
+/// optional pointer staying optional. Null when `t` is not a pointer or an optional pointer.
+pub fn qualifierCastDest(ip: *InternPool, t: Index, name: []const u8) Allocator.Error!?Index {
+    switch (ip.key(t)) {
+        .ptr_type => |p| {
+            var q = p;
+            if (std.mem.eql(u8, name, "@constCast")) q.is_const = false else q.attrs.is_volatile = false;
+            return try ip.get(.{ .ptr_type = q });
+        },
+        .optional_type => |c| if (ip.key(c) == .ptr_type) return try ip.optionalOf((try qualifierCastDest(ip, c, name)).?),
+        else => {},
+    }
+    return null;
+}
+
 fn isErrorSet(ip: *InternPool, t: Index) bool {
     return switch (ip.key(t)) {
         .error_set_type, .inferred_error_set => true,
@@ -4531,6 +4649,14 @@ fn hasMember(r: *Resolver, t: Index, name: []const u8, decl: bool) Error!?bool {
     return tree.items[m].flags.is_pub;
 }
 
+/// The bounds of a switch prong item of the form `a...b`
+fn switchRange(body: *const Body, item: ExprId) ?[2]ExprId {
+    return switch (body.expr(item)) {
+        .other => |range| if (range.len == 2) range[0..2].* else null,
+        else => null,
+    };
+}
+
 /// Values of an `inline` prong (for operands that are not unions or error sets): the items are
 /// expanded in order, and a range `a...b` one integer at a time. `count` is the number of values
 /// and `value` is the `want`-th one; `count` is null when an item cannot be evaluated or for an
@@ -4547,10 +4673,15 @@ pub fn inlineProngValues(ip: *InternPool, body: *const Body, exprs: []const Type
                 if (range.len != 2) return .{ .count = null, .value = null };
                 const lo = value.intOf(ip, exprs[@backingInt(range[0])].val) orelse return .{ .count = null, .value = null };
                 const hi = value.intOf(ip, exprs[@backingInt(range[1])].val) orelse return .{ .count = null, .value = null };
-                if (hi < lo) continue;
-                const len: u64 = @intCast(hi - lo + 1);
+                // The bounds are coerced to the operand type: values of `u128` above the range of
+                // i128 are stored as the bit pattern, so they are ordered in that type and their
+                // distance is taken modulo 2^128
+                if (value.compareInts(ip, .angle_bracket_left, int_ty, int_ty, hi, lo)) continue;
+                // A range too long for a u32 count gives no count, like the total below
+                const span = std.math.cast(u32, @as(u128, @bitCast(hi -% lo))) orelse return .{ .count = null, .value = null };
+                const len = @as(u64, span) + 1;
                 if (want) |w| if (found == null and w >= n and w < n + len) {
-                    found = try ip.get(.{ .int_value = .{ .ty = int_ty, .value = lo + @as(i128, w - n) } });
+                    found = try ip.get(.{ .int_value = .{ .ty = int_ty, .value = lo +% @as(i128, w - n) } });
                 };
                 n += len;
             },

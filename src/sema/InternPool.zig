@@ -763,14 +763,15 @@ pub const ScalarAbi = struct {
 };
 
 /// Layout rules for vectors (the vector branch of `Type.abiAlignment` / `abiSize`), determined by
-/// the compiler backend, the architecture and the CPU features
+/// the compiler backend, the architecture and its stack alignment, and the CPU features
 pub const VectorAbi = enum(u8) {
     unknown,
     /// The size and alignment are the byte size rounded up to a power of 2 (LLVM and other backends)
     llvm,
-    /// Like `llvm`, but the alignment is no larger than the stack alignment of 16 (aarch64); in Zig
-    /// 0.17.0 the size is then the byte size padded to the alignment
-    llvm_aarch64,
+    /// Like `llvm`, but the alignment is no larger than the stack alignment, 8 (32-bit ARM, s390x)
+    /// or 16 (aarch64); in Zig 0.17.0 the size is then the byte size padded to the alignment
+    llvm_stack_align_8,
+    llvm_stack_align_16,
     /// The self-hosted x86_64 backend: the alignment is at least 16; with AVX / AVX-512,
     /// vectors larger than 16 / 32 bytes are aligned to 32 / 64
     x86_64,
@@ -779,21 +780,36 @@ pub const VectorAbi = enum(u8) {
     /// The alignment of the element (C and wasm backends)
     elem,
 
-    pub fn of(backend: std.lang.CompilerBackend, arch: std.Target.Cpu.Arch, avx: bool, avx512f: bool, soft_float: bool) VectorAbi {
-        // Soft float on x86: float elements use the element layout, and element types are not
-        // distinguished here
-        if (soft_float) return .unknown;
+    /// The rules for target `t` compiled by `backend`
+    pub fn of(backend: std.lang.CompilerBackend, t: *const std.Target) VectorAbi {
+        // Soft float on x86 (`std.zig.target.compilerRtFloatAbi`): float elements use the element
+        // layout, and element types are not distinguished here. The `soft_float` feature of other
+        // architectures and the soft float ABIs of ARM do not change the rules.
+        if (t.cpu.has(.x86, .soft_float)) return .unknown;
+        const arch = t.cpu.arch;
         return switch (backend) {
-            .stage2_x86_64 => if (avx512f) .x86_64_avx512 else if (avx) .x86_64_avx else .x86_64,
+            .stage2_x86_64 => if (t.cpu.has(.x86, .avx512f)) .x86_64_avx512 else if (t.cpu.has(.x86, .avx)) .x86_64_avx else .x86_64,
             .stage2_c, .stage2_wasm => .elem,
-            // Other backends go by the byte size. On ARM and s390x the alignment does not exceed
-            // their respective stack alignments, and f16 is soft float on MIPS and PowerPC, so
-            // only common architectures are handled
-            else => switch (arch) {
+            // Other backends go by the byte size; on 32-bit ARM, aarch64 and s390x the alignment
+            // does not exceed the target's stack alignment. f16 is soft float on MIPS and PowerPC,
+            // so the remaining architectures are limited to common ones.
+            else => if (arch.isArm() or arch.isAarch64() or arch == .s390x) switch (t.stackAlignment()) {
+                8 => .llvm_stack_align_8,
+                16 => .llvm_stack_align_16,
+                else => .unknown,
+            } else switch (arch) {
                 .x86, .x86_64, .riscv32, .riscv64, .wasm32, .wasm64, .loongarch64 => .llvm,
-                .aarch64, .aarch64_be => .llvm_aarch64,
                 else => .unknown,
             },
+        };
+    }
+
+    /// The largest alignment of a vector; null when it is not capped
+    pub fn maxAlignment(abi: VectorAbi) ?u64 {
+        return switch (abi) {
+            .llvm_stack_align_8 => 8,
+            .llvm_stack_align_16 => 16,
+            else => null,
         };
     }
 };
@@ -1392,4 +1408,53 @@ test "reset that runs out of memory leaves the pool intact" {
     try testing.expectEqual(n, ip.count());
     try testing.expectEqual(Index.u8_type, try ip.intType(.unsigned, 8));
     try testing.expectEqual(slice, try ip.ptrTo(.u8_type, .slice, true));
+}
+test "vector rules follow the backend, the architecture's stack alignment and x86 features" {
+    const T = struct {
+        fn target(arch: std.Target.Cpu.Arch, os_tag: std.Target.Os.Tag, abi: std.Target.Abi) std.Target {
+            const os = os_tag.defaultVersionRange(arch, abi);
+            return .{ .cpu = .baseline(arch, os), .os = os, .abi = abi, .ofmt = .default(os_tag, arch) };
+        }
+    };
+    const cases = [_]struct { std.lang.CompilerBackend, std.Target.Cpu.Arch, std.Target.Os.Tag, std.Target.Abi, VectorAbi }{
+        // 32-bit ARM, with hard and soft float ABIs, and s390x: capped at a stack alignment of 8
+        .{ .stage2_llvm, .arm, .linux, .gnueabihf, .llvm_stack_align_8 },
+        .{ .stage2_llvm, .arm, .linux, .gnueabi, .llvm_stack_align_8 },
+        .{ .stage2_llvm, .armeb, .linux, .gnueabihf, .llvm_stack_align_8 },
+        .{ .stage2_llvm, .thumb, .linux, .musleabi, .llvm_stack_align_8 },
+        .{ .stage2_llvm, .thumbeb, .freestanding, .eabihf, .llvm_stack_align_8 },
+        .{ .stage2_llvm, .s390x, .linux, .gnu, .llvm_stack_align_8 },
+        .{ .stage2_llvm, .aarch64, .linux, .gnu, .llvm_stack_align_16 },
+        .{ .stage2_llvm, .aarch64_be, .linux, .gnu, .llvm_stack_align_16 },
+        .{ .stage2_llvm, .aarch64, .macos, .none, .llvm_stack_align_16 },
+        .{ .stage2_llvm, .aarch64, .windows, .msvc, .llvm_stack_align_16 },
+        .{ .stage2_llvm, .x86_64, .linux, .gnu, .llvm },
+        .{ .stage2_llvm, .x86, .windows, .msvc, .llvm },
+        .{ .stage2_llvm, .wasm32, .freestanding, .none, .llvm },
+        .{ .stage2_wasm, .wasm32, .freestanding, .none, .elem },
+        .{ .stage2_c, .arm, .linux, .gnueabihf, .elem },
+        .{ .stage2_x86_64, .x86_64, .linux, .gnu, .x86_64 },
+        .{ .stage2_llvm, .mips, .linux, .gnu, .unknown },
+    };
+    for (cases) |c| {
+        const t = T.target(c[1], c[2], c[3]);
+        testing.expectEqual(c[4], VectorAbi.of(c[0], &t)) catch |err| {
+            std.debug.print("{t} {t}-{t}-{t}\n", .{ c[0], c[1], c[2], c[3] });
+            return err;
+        };
+    }
+    // The `soft_float` feature of ARM keeps the rules; on x86 it makes float elements use the
+    // element layout
+    var arm = T.target(.arm, .linux, .gnueabi);
+    arm.cpu.features.addFeature(@backingInt(std.Target.arm.Feature.soft_float));
+    try testing.expectEqual(VectorAbi.llvm_stack_align_8, VectorAbi.of(.stage2_llvm, &arm));
+    var x86 = T.target(.x86, .linux, .musl);
+    x86.cpu.features.addFeature(@backingInt(std.Target.x86.Feature.soft_float));
+    try testing.expectEqual(VectorAbi.unknown, VectorAbi.of(.stage2_llvm, &x86));
+    var avx = T.target(.x86_64, .linux, .gnu);
+    avx.cpu.features.addFeature(@backingInt(std.Target.x86.Feature.avx));
+    try testing.expectEqual(VectorAbi.x86_64_avx, VectorAbi.of(.stage2_x86_64, &avx));
+    avx.cpu.features.addFeature(@backingInt(std.Target.x86.Feature.avx512f));
+    try testing.expectEqual(VectorAbi.x86_64_avx512, VectorAbi.of(.stage2_x86_64, &avx));
+    try testing.expectEqual(VectorAbi.llvm, VectorAbi.of(.stage2_llvm, &avx));
 }

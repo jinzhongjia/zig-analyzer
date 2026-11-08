@@ -628,6 +628,26 @@ pub const LocalValue = struct {
     }
 };
 
+/// Value of a local constant of a function as the function body computes it: the interpreter
+/// executes the function in its instance `inst` and takes the value of the constant once it is
+/// defined (see `eval.localValue`). A container defined in a function body captures the values
+/// the body has computed for the locals it refers to (the compiler's `getCaptures`), which can
+/// depend on the statements before the definition (a local variable modified in a loop, an array
+/// sorted in place); `LocalValue` infers only the initializer and cannot see those statements.
+pub const LocalEval = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = LocalKey;
+    pub const Value = TypedValue;
+
+    pub fn compute(ctx: *Db.Ctx, key: Key) engine.Error!Value {
+        return eval.localValue(ctx, key);
+    }
+
+    pub fn cycleFallback(_: Key) Value {
+        return .unknown;
+    }
+};
+
 pub const LocalScope = struct {
     file: FileId,
     item: u32,
@@ -644,7 +664,14 @@ pub fn defType(r: *Resolver, def: resolve.Def, current: ?LocalScope, inst: ?Inde
         },
         .local => |l| {
             if (current) |c| if (c.file == l.file and c.item == l.item) return c.bindings[@backingInt(l.binding)];
-            return r.ctx.get(LocalValue, .{ .owner = try r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = try normalizeInst(r, l.file, l.item, inst) });
+            const key: LocalKey = .{ .owner = try r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = try normalizeInst(r, l.file, l.item, inst) };
+            const tv = try r.ctx.get(LocalValue, key);
+            if (tv.val != null or r.ctx.incomplete()) return tv;
+            // A local of another member is read from a container defined in its function body,
+            // which captured the value the body computed for a constant
+            if ((try r.body(l.file, l.item)).binding(l.binding).kind != .local_const) return tv;
+            const run = try r.ctx.get(LocalEval, key);
+            return if (run.val != null and (tv.ty == .unknown or run.ty == tv.ty)) run else tv;
         },
         .file => |f| return importValue(r, f),
     }

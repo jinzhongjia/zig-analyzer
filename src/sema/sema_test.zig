@@ -565,6 +565,58 @@ test "pointer casts keep the value only when the elements are unchanged" {
         .{ "none_back", "?*const u8 = null" },
     });
 }
+test "@constCast and @volatileCast take their destination type from the operand" {
+    // The casts converted to the result type themselves, so a result type such as
+    // `error{Bad}!*u8` or `*const [1]u8` lost the value, and `@volatileCast` kept `volatile`.
+    try expectTypes(
+        \\const three: u8 = 3;
+        \\const four: u8 = 4;
+        \\const vp: *const volatile u8 = &four;
+        \\const ovp: ?*const volatile u8 = &four;
+        \\const ocp: ?*const u8 = &three;
+        \\const erased: *const anyopaque = @ptrCast(&three);
+        \\fn euConstCast(p: *const u8) error{Bad}!*u8 { return @constCast(p); }
+        \\fn euVolatileCast(p: *const volatile u8) error{Bad}!*const u8 { return @volatileCast(p); }
+        \\fn arrConstCast(p: *const u8) *const [1]u8 { return @constCast(p); }
+        \\fn euOptConstCast(p: ?*const u8) error{Bad}!?*u8 { return @constCast(p); }
+        \\fn fullChain(p: *const anyopaque) *u8 { return @constCast(@ptrCast(p)); }
+        \\fn fullChainAlign(p: *align(1) const u8) *u8 { return @volatileCast(@constCast(@alignCast(p))); }
+        \\const eu_constcast = (euConstCast(&three) catch unreachable).*;
+        \\const eu_volatilecast = (euVolatileCast(&four) catch unreachable).*;
+        \\const arr_constcast = arrConstCast(&three)[0];
+        \\const eu_opt_constcast = (euOptConstCast(&three) catch unreachable).?.*;
+        \\const eu_opt_null = euOptConstCast(null) catch unreachable;
+        \\const typeof_constcast = @TypeOf(@constCast(&three));
+        \\const typeof_volatilecast = @TypeOf(@volatileCast(vp));
+        \\const typeof_both = @TypeOf(@constCast(@volatileCast(vp)));
+        \\const typeof_opt_volatilecast = @TypeOf(@volatileCast(ovp));
+        \\const typeof_opt_constcast = @TypeOf(@constCast(ocp));
+        \\const full_chain = fullChain(erased).*;
+        \\const full_chain_align = fullChainAlign(&three).*;
+        \\fn runtime(p: *const volatile u8, op: ?*const volatile u8) void {
+        \\    const r1 = @volatileCast(p);
+        \\    const r2 = @constCast(@volatileCast(op));
+        \\    _ = .{ r1, r2 };
+        \\}
+    , &.{
+        .{ "eu_constcast", "u8 = 3" },
+        .{ "eu_volatilecast", "u8 = 4" },
+        .{ "arr_constcast", "u8 = 3" },
+        .{ "eu_opt_constcast", "u8 = 3" },
+        .{ "eu_opt_null", "?*u8 = null" },
+        .{ "typeof_constcast", "type = *u8" },
+        .{ "typeof_volatilecast", "type = *const u8" },
+        .{ "typeof_both", "type = *u8" },
+        // An optional pointer stays optional
+        .{ "typeof_opt_volatilecast", "type = ?*const u8" },
+        .{ "typeof_opt_constcast", "type = ?*u8" },
+        // Merged with `@ptrCast` / `@alignCast`, the destination is the result type
+        .{ "full_chain", "u8 = 3" },
+        .{ "full_chain_align", "u8 = 3" },
+        .{ "r1", "*const u8" },
+        .{ "r2", "?*u8" },
+    });
+}
 
 test "a function chosen by switching on an enum defined in the signature" {
     // The tag recorded by the instance kept the type of another instance, so no prong was chosen
@@ -632,6 +684,93 @@ test "the sentinel element of an array" {
         .{ "same", "[2:0]u8 = \"ab\"" },
         // Storing a value other than the sentinel is a compile error
         .{ "other", "[2:0]u8" },
+    });
+}
+
+test "the sentinel element read through pointers, slices and many-item pointers" {
+    try expectTypes(
+        \\const many: [*:0]const u8 = "hello";
+        \\const slice: [:0]const u8 = "hello";
+        \\const plain: [*]const u8 = "hello";
+        \\const c_ptr: [*c]const u8 = "hey";
+        \\const unterminated: [*c]const u8 = &[_]u8{ 1, 2, 3 };
+        \\const no_sentinel: []const u8 = "hello";
+        \\const seven: *const [2:7]u8 = &[_:7]u8{ 1, 2 };
+        \\const wide: [:0]const u16 = &[_:0]u16{ 1, 2, 3 };
+        \\const lit = "hello"[5];
+        \\const via_many = many[5];
+        \\const via_slice = slice[5];
+        \\const via_plain = plain[5];
+        \\const via_c = c_ptr[3];
+        \\const via_unterminated = unterminated[3];
+        \\const via_seven = seven[2];
+        \\const via_wide = wide[3];
+        \\const past_lit = "hello"[6];
+        \\const past_many = many[6];
+        \\const past_slice = slice[6];
+        \\const past_len = no_sentinel[5];
+        \\const in_range = blk: {
+        \\    var buf = [_]u8{ 'a', 'b', 0, 'd' };
+        \\    const s: [:0]u8 = buf[0..2 :0];
+        \\    break :blk s[2];
+        \\};
+        \\const range_to_end = blk: {
+        \\    var buf: [3:0]u8 = "abc".*;
+        \\    const s: [:0]u8 = buf[1..];
+        \\    break :blk s[2];
+        \\};
+        \\const range_written = blk: {
+        \\    var buf = [_]u8{ 'a', 'b', 0, 'd' };
+        \\    const s: [:0]u8 = buf[0..2 :0];
+        \\    buf[2] = 'x';
+        \\    break :blk s[2];
+        \\};
+        \\const range_many = blk: {
+        \\    var buf = [_]u8{ 'a', 'b', 0, 'd' };
+        \\    const s: [:0]u8 = buf[0..2 :0];
+        \\    break :blk s.ptr[2];
+        \\};
+        \\const range_past = blk: {
+        \\    var buf = [_]u8{ 'a', 'b', 0, 'd' };
+        \\    const s: [:0]u8 = buf[0..2 :0];
+        \\    break :blk s[3];
+        \\};
+        \\const range_no_sentinel = blk: {
+        \\    var buf = [_]u8{ 1, 2, 3, 4 };
+        \\    const s: []u8 = buf[0..2];
+        \\    break :blk s[2];
+        \\};
+        \\fn scan(p: [*:0]const u8) usize {
+        \\    var i: usize = 0;
+        \\    while (p[i] != 0) i += 1;
+        \\    return i;
+        \\}
+        \\const scanned = scan("abcd");
+    , &.{
+        .{ "lit", "u8 = 0" },
+        .{ "via_many", "u8 = 0" },
+        .{ "via_slice", "u8 = 0" },
+        // A many-item pointer reads the storage it points to, whose sentinel the pointer type
+        // need not have
+        .{ "via_plain", "u8 = 0" },
+        .{ "via_c", "u8 = 0" },
+        .{ "via_unterminated", "u8" },
+        .{ "via_seven", "u8 = 7" },
+        .{ "via_wide", "u16 = 0" },
+        // Indices past the sentinel, and index `len` of a slice without one, are compile errors
+        .{ "past_lit", "u8" },
+        .{ "past_many", "u8" },
+        .{ "past_slice", "u8" },
+        .{ "past_len", "u8" },
+        // A range of local storage reads the element after it from the containing array: what
+        // that array holds there, which need not be the sentinel once overwritten
+        .{ "in_range", "u8 = 0" },
+        .{ "range_to_end", "u8 = 0" },
+        .{ "range_written", "u8 = 120" },
+        .{ "range_many", "u8 = 0" },
+        .{ "range_past", "u8" },
+        .{ "range_no_sentinel", "u8" },
+        .{ "scanned", "usize = 4" },
     });
 }
 
@@ -1045,6 +1184,50 @@ test "comptime name builtins produce string literal types" {
         .{ "v_tagname_rt", "[:0]const u8" },
     });
 }
+test "@tagName and @errorName of comptime-known operands without an inferred value are string literals" {
+    // Prevents typing them as the runtime `[:0]const u8`, which dropped the interpreter's value.
+    // Expected values: zig 0.17.0 and 0.17.1 give the same result for each name.
+    try expectTypes(
+        \\const U = union(enum) { a: u8, b: struct { x: u32 = 1 } };
+        \\const E = enum { x, y };
+        \\fn fail() anyerror {
+        \\    return error.Oops;
+        \\}
+        \\pub const union_name = @tagName(U{ .a = 1 });
+        \\pub const default_name = @tagName(U{ .b = .{} });
+        \\pub const coerced_name = @tagName(@as(U, .{ .a = 3 }));
+        \\pub const from_int_name = @tagName(@as(E, @enumFromInt(1)));
+        \\pub const block_name = blk: {
+        \\    const u: U = .{ .a = 2 };
+        \\    break :blk @tagName(u);
+        \\};
+        \\pub const error_name = @errorName(fail());
+        \\fn probe(u: U) void {
+        \\    const in_comptime = comptime @tagName(U{ .b = .{} });
+        \\    const in_comptime_block = comptime blk: {
+        \\        const name = @tagName(U{ .a = 1 });
+        \\        break :blk name;
+        \\    };
+        \\    const runtime_union = @tagName(u);
+        \\    _ = .{ in_comptime, in_comptime_block, runtime_union };
+        \\}
+        \\comptime {
+        \\    _ = &probe;
+        \\}
+    , &.{
+        .{ "union_name", "*const [1:0]u8 = \"a\"" },
+        .{ "default_name", "*const [1:0]u8 = \"b\"" },
+        .{ "coerced_name", "*const [1:0]u8 = \"a\"" },
+        .{ "from_int_name", "*const [1:0]u8 = \"y\"" },
+        .{ "block_name", "*const [1:0]u8 = \"a\"" },
+        .{ "error_name", "*const [4:0]u8 = \"Oops\"" },
+        .{ "in_comptime", "*const [1:0]u8 = \"b\"" },
+        .{ "name", "*const [1:0]u8 = \"a\"" },
+        .{ "in_comptime_block", "*const [1:0]u8 = \"a\"" },
+        // A runtime operand still gives a slice
+        .{ "runtime_union", "[:0]const u8" },
+    });
+}
 
 test "@typeName gives the compiler's fully qualified name" {
     // Prevents giving the hover display name (`"E"` instead of `"main.E"`)
@@ -1342,6 +1525,210 @@ test "comptime float values" {
     });
 }
 
+test "comptime compound assignment evaluates like the binary operator" {
+    // Prevents giving up on compound assignment to anything but bool and integers: `a op= b` is
+    // `a = a op b` with `b` coerced to the type of `a`, so floats are computed and rounded as by
+    // the binary operator; expected values are the results of zig 0.17.0 and 0.17.1
+    try expectTypes(
+        \\fn floatAcc() f64 {
+        \\    var x: f64 = 1.0;
+        \\    x += 0.5;
+        \\    x *= 4;
+        \\    x -= 1;
+        \\    x /= 2;
+        \\    return x;
+        \\}
+        \\fn floatLoop() f32 {
+        \\    var s: f32 = 0;
+        \\    for (0..4) |i| s += @floatFromInt(i);
+        \\    return s;
+        \\}
+        \\fn ctFloatAcc() comptime_float {
+        \\    var x: comptime_float = 1.0;
+        \\    x += 0.25;
+        \\    return x;
+        \\}
+        \\fn opsF16() f16 {
+        \\    var x: f16 = 1.5;
+        \\    x += 0.25;
+        \\    x -= 0.5;
+        \\    x *= 3;
+        \\    x /= 2;
+        \\    return x;
+        \\}
+        \\fn opsF80() f80 {
+        \\    var x: f80 = 1;
+        \\    x /= 3;
+        \\    x *= 3;
+        \\    return x;
+        \\}
+        \\fn opsF128() f128 {
+        \\    var x: f128 = 1;
+        \\    x /= 3;
+        \\    x += 1;
+        \\    return x;
+        \\}
+        \\fn roundF32() f32 {
+        \\    var x: f32 = 0.1;
+        \\    x += 0.2;
+        \\    return x;
+        \\}
+        \\fn roundF16() f16 {
+        \\    var x: f16 = 0;
+        \\    for (0..10) |_| x += 0.1;
+        \\    return x;
+        \\}
+        \\fn ctPrec() comptime_float {
+        \\    var x: comptime_float = 0.1;
+        \\    x += 0.2;
+        \\    return x;
+        \\}
+        \\fn intToFloat() f32 {
+        \\    const i: usize = 3;
+        \\    var x: f32 = 0.5;
+        \\    x += i;
+        \\    return x;
+        \\}
+        \\fn places() f64 {
+        \\    var x: f64 = 1;
+        \\    const p = &x;
+        \\    p.* += 0.5;
+        \\    var o: ?f64 = 2;
+        \\    o.? *= 1.5;
+        \\    var s: struct { v: f64 } = .{ .v = 1 };
+        \\    s.v -= 0.25;
+        \\    var a = [_]f64{ 1, 2, 3 };
+        \\    a[1] /= 4;
+        \\    for (&a) |*e| e.* *= 2;
+        \\    return x + o.? + s.v + a[0] + a[1] + a[2];
+        \\}
+        \\fn others() i32 {
+        \\    var b = true;
+        \\    b &= false;
+        \\    b |= true;
+        \\    b ^= true;
+        \\    var w: u16 = 1;
+        \\    const y: u8 = 200;
+        \\    w += y;
+        \\    var x: i32 = -5;
+        \\    x += 3;
+        \\    x *= -4;
+        \\    x -= 100;
+        \\    return x + w + @intFromBool(b);
+        \\}
+        \\const float_acc = floatAcc();
+        \\const float_loop = floatLoop();
+        \\const ct_float_acc = ctFloatAcc();
+        \\const ops_f16 = opsF16();
+        \\const ops_f80 = opsF80();
+        \\const ops_f128 = opsF128();
+        \\const round_f32 = roundF32();
+        \\const round_f16 = roundF16();
+        \\const ct_prec = ctPrec();
+        \\const int_to_float = intToFloat();
+        \\const in_places = places();
+        \\const other_types = others();
+    , &.{
+        .{ "float_acc", "f64 = 2.5" },
+        .{ "float_loop", "f32 = 6" },
+        .{ "ct_float_acc", "comptime_float = 1.25" },
+        .{ "ops_f16", "f16 = 1.875" },
+        .{ "ops_f80", "f80 = 1" },
+        .{ "ops_f128", "f128 = 1.3333333333333333333333333333333333" },
+        .{ "round_f32", "f32 = 0.3" },
+        // Each `+=` rounds to f16
+        .{ "round_f16", "f16 = 1" },
+        .{ "ct_prec", "comptime_float = 0.30000000000000000000000000000000004" },
+        .{ "int_to_float", "f32 = 3.5" },
+        .{ "in_places", "f64 = 14.25" },
+        .{ "other_types", "i32 = 109" },
+    });
+}
+
+test "comptime compound assignment gives no value where the compiler reports an error" {
+    try expectTypes(
+        \\fn ctDivZero() comptime_float {
+        \\    var x: comptime_float = 1;
+        \\    x /= 0;
+        \\    return x;
+        \\}
+        \\fn fraction() comptime_int {
+        \\    var x: comptime_int = 7;
+        \\    x += 0.5;
+        \\    return x;
+        \\}
+        \\fn overflow() u8 {
+        \\    var x: u8 = 255;
+        \\    x += 1;
+        \\    return x;
+        \\}
+        \\fn boolAdd() bool {
+        \\    var x = true;
+        \\    x += true;
+        \\    return x;
+        \\}
+        \\const ct_div_zero = ctDivZero();
+        \\const fractional = fraction();
+        \\const overflowed = overflow();
+        \\const bool_add = boolAdd();
+    , &.{
+        .{ "ct_div_zero", "comptime_float" },
+        .{ "fractional", "comptime_int" },
+        .{ "overflowed", "u8" },
+        .{ "bool_add", "bool" },
+    });
+}
+
+test "comptime float remainder" {
+    // `%` on floats is `@rem` when no operand is negative, or when the remainder is zero; with a
+    // negative operand and a nonzero remainder the compiler reports an error; expected values
+    // are the results of zig 0.17.0 and 0.17.1
+    try expectTypes(
+        \\fn modAssign() f64 {
+        \\    var x: f64 = 7.5;
+        \\    x %= 2;
+        \\    return x;
+        \\}
+        \\fn modFrac() f32 {
+        \\    var x: f32 = 5.75;
+        \\    x %= 1.5;
+        \\    return x;
+        \\}
+        \\fn modCt() comptime_float {
+        \\    var x: comptime_float = 7.5;
+        \\    x %= 2;
+        \\    return x;
+        \\}
+        \\fn modNegZero() f64 {
+        \\    var x: f64 = -4.0;
+        \\    x %= 2;
+        \\    return x;
+        \\}
+        \\fn modNegRhs() f64 {
+        \\    var x: f64 = 5.5;
+        \\    x %= -2;
+        \\    return x;
+        \\}
+        \\const mod_f64 = @as(f64, 7.5) % 2;
+        \\const mod_ct = 7.5 % 2.0;
+        \\const mod_neg = @as(f64, -5.5) % 2;
+        \\const mod_assign = modAssign();
+        \\const mod_frac = modFrac();
+        \\const mod_ct_assign = modCt();
+        \\const mod_neg_zero = modNegZero();
+        \\const mod_neg_rhs = modNegRhs();
+    , &.{
+        .{ "mod_f64", "f64 = 1.5" },
+        .{ "mod_ct", "comptime_float = 1.5" },
+        .{ "mod_neg", "f64" },
+        .{ "mod_assign", "f64 = 1.5" },
+        .{ "mod_frac", "f32 = 1.25" },
+        .{ "mod_ct_assign", "comptime_float = 1.5" },
+        .{ "mod_neg_zero", "f64 = -0" },
+        .{ "mod_neg_rhs", "f64" },
+    });
+}
+
 test "instances of the same container compare by their captured values" {
     // Matches the compiler: the identity of a container = definition position + captured values
     try expectTypes(
@@ -1363,6 +1750,124 @@ test "instances of the same container compare by their captured values" {
         .{ "cap", "u8 = 2" },
         .{ "id", "u8 = 2" },
         .{ "same", "u8 = 1" },
+    });
+}
+
+test "containers in a type function capture the values its body computed" {
+    // Prevents members from seeing only a re-inference of a captured constant's initializer,
+    // which has no value for local arrays and for values derived from local variables
+    try expectTypes(
+        \\fn LocalArray(comptime n: comptime_int) type {
+        \\    const arr = [_]comptime_int{ n, 2 };
+        \\    const min = arr[0];
+        \\    return struct { pub const v: comptime_int = min; };
+        \\}
+        \\fn ArrayDirect(comptime n: comptime_int) type {
+        \\    const arr = [_]comptime_int{ n, 2 };
+        \\    return struct { pub const v: comptime_int = arr[0]; };
+        \\}
+        \\fn VarOnly(comptime n: comptime_int) type {
+        \\    var x = n;
+        \\    _ = &x;
+        \\    const y = x;
+        \\    return struct { pub const v: comptime_int = y; };
+        \\}
+        \\fn VarModified(comptime n: comptime_int) type {
+        \\    var x = n;
+        \\    x += 1;
+        \\    const y = x;
+        \\    return struct { pub const v: comptime_int = y; };
+        \\}
+        \\fn Branch(comptime b: bool) type {
+        \\    var x: u32 = 1;
+        \\    if (b) x = 10;
+        \\    const y = x;
+        \\    return struct { pub const v = y; };
+        \\}
+        \\fn Loop(comptime n: u32) type {
+        \\    var sum: u32 = 0;
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1) sum += i;
+        \\    const total = sum;
+        \\    return struct { pub const v = total; };
+        \\}
+        \\fn Destructure(comptime n: comptime_int) type {
+        \\    var x = n;
+        \\    x += 1;
+        \\    const a, const b = .{ x, x * 2 };
+        \\    return struct { pub const v: comptime_int = a + b; };
+        \\}
+        \\fn Nested(comptime n: comptime_int) type {
+        \\    var x = n;
+        \\    x *= 3;
+        \\    const y = x;
+        \\    return struct {
+        \\        pub fn Inner() type {
+        \\            return struct { pub const w: comptime_int = y; };
+        \\        }
+        \\    };
+        \\}
+        \\fn ReadBeforeReturn(comptime n: comptime_int) type {
+        \\    var x = n;
+        \\    x += 1;
+        \\    const y = x;
+        \\    const S = struct { pub const v: comptime_int = y; };
+        \\    if (S.v != n + 1) @compileError("unreachable");
+        \\    return S;
+        \\}
+        \\fn OutsideLoop(comptime n: comptime_int) type {
+        \\    var x = n;
+        \\    x += 1;
+        \\    const y = x;
+        \\    var T: type = void;
+        \\    inline for (0..2) |_| T = struct { pub const v: comptime_int = y; };
+        \\    return T;
+        \\}
+        \\fn PerIteration(comptime n: comptime_int) type {
+        \\    var T: type = void;
+        \\    for (0..n) |i| {
+        \\        const k = i * 2;
+        \\        T = struct { pub const v = k; };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn AnyCapture(x: anytype) type {
+        \\    const y = x;
+        \\    return struct { pub const v = y; };
+        \\}
+        \\fn g() void {
+        \\    const local_array = LocalArray(7).v;
+        \\    const array_direct = ArrayDirect(9).v;
+        \\    const var_only = VarOnly(4).v;
+        \\    const var_modified = VarModified(4).v;
+        \\    const branch_true = Branch(true).v;
+        \\    const branch_false = Branch(false).v;
+        \\    const loop = Loop(5).v;
+        \\    const destructure = Destructure(1).v;
+        \\    const nested = Nested(2).Inner().w;
+        \\    const read_before_return = ReadBeforeReturn(6).v;
+        \\    const outside_loop = OutsideLoop(1).v;
+        \\    const per_iteration = PerIteration(3).v;
+        \\    const any_capture = AnyCapture(@as(u8, 3)).v;
+        \\    _ = .{ local_array, array_direct, var_only, var_modified, branch_true, branch_false, loop, destructure, nested, read_before_return, outside_loop, per_iteration, any_capture };
+        \\}
+    , &.{
+        .{ "local_array", "comptime_int = 7" },
+        .{ "array_direct", "comptime_int = 9" },
+        .{ "var_only", "comptime_int = 4" },
+        .{ "var_modified", "comptime_int = 5" },
+        .{ "branch_true", "u32 = 10" },
+        .{ "branch_false", "u32 = 1" },
+        .{ "loop", "u32 = 10" },
+        .{ "destructure", "comptime_int = 6" },
+        .{ "nested", "comptime_int = 6" },
+        .{ "read_before_return", "comptime_int = 7" },
+        .{ "outside_loop", "comptime_int = 2" },
+        // A constant in a loop body has a value per iteration, while the containers of all
+        // iterations share one instance (the compiler gives 4)
+        .{ "per_iteration", "usize" },
+        // The instance records only the type of an anytype argument (the compiler gives 3)
+        .{ "any_capture", "u8" },
     });
 }
 
@@ -1764,6 +2269,51 @@ test "float math builtins use the precision of the operand type" {
     });
 }
 
+test "rounding builtins have their result type" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 (`Sema.zirRoundCast`): with a
+    // result type, the call has that type without error unions and optionals. An integer result
+    // type takes the rounded operand converted to it; a float result type takes the operand
+    // coerced to it before rounding (0.4999999 as an f16 is 0.5, which rounds to 1).
+    try expectTypes(
+        \\fn ret(r: f32) u32 {
+        \\    return @floor(r);
+        \\}
+        \\fn f(x: f32, y: f32, z: f32, v: @Vector(2, f32), comptime T: type) void {
+        \\    const i: u32 = @round(x);
+        \\    const k: u8 = @round(@as(f32, 2.5));
+        \\    const w: f64 = @floor(@as(f32, 1.5));
+        \\    const half: f16 = @round(0.4999999);
+        \\    const t: i8 = @trunc(-1.5);
+        \\    const c: comptime_int = @ceil(2.25);
+        \\    const o: ?u8 = @ceil(@as(f64, 2.25));
+        \\    const e: anyerror!u8 = @floor(@as(f64, 7.75));
+        \\    const a = @as(u16, @round(@as(f32, 9.5)));
+        \\    const vi: @Vector(2, i32) = @trunc(v);
+        \\    const g: T = @round(y);
+        \\    const n = @round(z);
+        \\    _ = .{ i, k, w, half, t, c, o, e, a, vi, g, n };
+        \\}
+    , &.{
+        .{ "@floor(r)", "u32" },
+        .{ "@round(x)", "u32" },
+        .{ "@round(@as(f32, 2.5))", "u8 = 3" },
+        .{ "k", "u8 = 3" },
+        .{ "@floor(@as(f32, 1.5))", "f64 = 1" },
+        .{ "@round(0.4999999)", "f16 = 1" },
+        .{ "half", "f16 = 1" },
+        .{ "@trunc(-1.5)", "i8 = -1" },
+        .{ "@ceil(2.25)", "comptime_int = 3" },
+        // The call gives the payload, which is then coerced to the optional or error union
+        .{ "@ceil(@as(f64, 2.25))", "?u8 = 3" },
+        .{ "@floor(@as(f64, 7.75))", "anyerror!u8 = 7" },
+        .{ "@round(@as(f32, 9.5))", "u16 = 10" },
+        .{ "@trunc(v)", "@Vector(2, i32)" },
+        .{ "@round(y)", "T" },
+        // Without a result type, the result has the type of the operand
+        .{ "@round(z)", "f32" },
+    });
+}
+
 test "@abs maps signed integer types to their unsigned counterparts" {
     // Expected values are the results of zig 0.17.0 (`@compileLog(@TypeOf(@abs(v)), ...)` prints
     // `@Vector(4, u32)`, `usize`, `c_uint`, `c_ulong`, `c_ushort`, `c_ulonglong`, `u32`,
@@ -1828,6 +2378,83 @@ test "orelse and catch on comptime-known operands take only the evaluated side" 
         .{ "rt", "u8" },
         .{ "rte", "u8" },
         .{ "ann", "u32 = 2" },
+    });
+}
+
+test "catch and orelse on operands evaluated at comptime take the type of the side that is taken" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 (`@TypeOf` and `{any}` of each
+    // declaration, printed by a `zig test` runner). The handler gets the result type of the whole
+    // expression, not the payload type; operands of `@TypeOf` are runtime, so their peer type
+    // stays. Typing the result as the peer of the payload and the handler gave `u32 = "s"`.
+    try expectTypes(
+        \\const Err = error{ Foo, Bar };
+        \\fn mayFail(x: u32) Err!u32 {
+        \\    if (x == 0) return error.Foo;
+        \\    return x;
+        \\}
+        \\fn fails() error{Oops}!u32 {
+        \\    return error.Oops;
+        \\}
+        \\fn ok() error{Oops}!u32 {
+        \\    return 5;
+        \\}
+        \\fn maybe(x: u32) ?u32 {
+        \\    return if (x == 0) null else x;
+        \\}
+        \\fn catchInCall() bool {
+        \\    const x = fails() catch 9;
+        \\    return @TypeOf(x) == comptime_int;
+        \\}
+        \\fn orelseInCall() bool {
+        \\    const x = maybe(0) orelse "s";
+        \\    return @TypeOf(x) == *const [1:0]u8;
+        \\}
+        \\pub const catch_int = fails() catch 9;
+        \\pub const catch_typed = fails() catch @as(u64, 9);
+        \\pub const catch_str = fails() catch "s";
+        \\pub const catch_capture = fails() catch |e| @errorName(e);
+        \\pub const catch_capture_arg = mayFail(0) catch |e| @errorName(e);
+        \\pub const catch_block = fails() catch blk: {
+        \\    break :blk "blk";
+        \\};
+        \\pub const catch_ok_str = ok() catch "s";
+        \\pub const catch_ok_typed = ok() catch @as(u64, 9);
+        \\pub const catch_annotated: u64 = fails() catch 9;
+        \\pub const orelse_null_str = @as(?u32, null) orelse "s";
+        \\pub const orelse_call_str = maybe(0) orelse "s";
+        \\pub const orelse_call_typed = maybe(0) orelse @as(u64, 1);
+        \\pub const orelse_call_int = maybe(0) orelse 1;
+        \\pub const orelse_call_some = maybe(3) orelse "s";
+        \\pub const catch_then_orelse = (fails() catch @as(?u8, null)) orelse "n";
+        \\pub const local_type = blk: {
+        \\    const x = fails() catch 9;
+        \\    break :blk @TypeOf(x);
+        \\};
+        \\pub const typeof_catch = @TypeOf(fails() catch 0);
+        \\pub const typeof_orelse = @TypeOf(maybe(0) orelse 1);
+        \\pub const catch_in_call = catchInCall();
+        \\pub const orelse_in_call = orelseInCall();
+    , &.{
+        .{ "catch_int", "comptime_int = 9" },
+        .{ "catch_typed", "u64 = 9" },
+        .{ "catch_str", "*const [1:0]u8 = \"s\"" },
+        .{ "catch_capture", "*const [4:0]u8 = \"Oops\"" },
+        .{ "catch_capture_arg", "*const [3:0]u8 = \"Foo\"" },
+        .{ "catch_block", "*const [3:0]u8 = \"blk\"" },
+        .{ "catch_ok_str", "u32 = 5" },
+        .{ "catch_ok_typed", "u32 = 5" },
+        .{ "catch_annotated", "u64 = 9" },
+        .{ "orelse_null_str", "*const [1:0]u8 = \"s\"" },
+        .{ "orelse_call_str", "*const [1:0]u8 = \"s\"" },
+        .{ "orelse_call_typed", "u64 = 1" },
+        .{ "orelse_call_int", "comptime_int = 1" },
+        .{ "orelse_call_some", "u32 = 3" },
+        .{ "catch_then_orelse", "*const [1:0]u8 = \"n\"" },
+        .{ "local_type", "type = comptime_int" },
+        .{ "typeof_catch", "type = u32" },
+        .{ "typeof_orelse", "type = u32" },
+        .{ "catch_in_call", "bool = true" },
+        .{ "orelse_in_call", "bool = true" },
     });
 }
 
@@ -2041,7 +2668,7 @@ test "vector layouts follow the backend and CPU features" {
         .{ "v100bool", "comptime_int = 16" },
         .{ "v3ptr", "comptime_int = 32" },
     });
-    try expectTypesTargeted(.{ .vector_abi = .llvm_aarch64 }, src, &.{
+    try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_16 }, src, &.{
         .{ "v16f32", "comptime_int = 16" },
         .{ "v8u32", "comptime_int = 16" },
         .{ "v3ptr", "comptime_int = 32" },
@@ -2065,7 +2692,7 @@ test "LLVM vector sizes are powers of two even where the alignment is capped" {
         \\const s5u64 = @sizeOf(@Vector(5, u64));
         \\const s0 = @sizeOf(@Vector(0, u8));
     ;
-    try expectTypesTargeted(.{ .vector_abi = .llvm_aarch64 }, src, &.{
+    try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_16 }, src, &.{
         .{ "s3", "comptime_int = 4" },
         .{ "s17", "comptime_int = 32" },
         .{ "s33", "comptime_int = 64" },
@@ -2095,7 +2722,7 @@ test "vector sizes follow the user's zig where the alignment is capped" {
         \\const s0 = @sizeOf(@Vector(0, u8));
         \\const s_struct = @sizeOf(S);
     ;
-    try expectTypesTargeted(.{ .vector_abi = .llvm_aarch64, .dialect = .zig_0_17_0 }, src, &.{
+    try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_16, .dialect = .zig_0_17_0 }, src, &.{
         .{ "s3", "comptime_int = 4" },
         .{ "s17", "comptime_int = 32" },
         .{ "s32", "comptime_int = 32" },
@@ -2106,7 +2733,7 @@ test "vector sizes follow the user's zig where the alignment is capped" {
         .{ "s0", "comptime_int = 0" },
         .{ "s_struct", "comptime_int = 64" },
     });
-    try expectTypesTargeted(.{ .vector_abi = .llvm_aarch64, .dialect = .zig_0_17_1 }, src, &.{
+    try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_16, .dialect = .zig_0_17_1 }, src, &.{
         .{ "s3", "comptime_int = 4" },
         .{ "s17", "comptime_int = 32" },
         .{ "s32", "comptime_int = 32" },
@@ -2127,6 +2754,67 @@ test "vector sizes follow the user's zig where the alignment is capped" {
             .{ "s_struct", "comptime_int = 128" },
         });
     }
+}
+
+test "vector alignment is capped at the stack alignment of 8 on 32-bit ARM and s390x" {
+    // Expected values are the results of `zig build-obj` of each version for arm-linux-gnueabihf
+    // and s390x-linux-gnu, which agree; the layout of these vectors was unknown
+    const src =
+        \\const S = struct { v: @Vector(5, u64), x: u8 };
+        \\const U = union(enum) { v: @Vector(3, u64), x: u8 };
+        \\const s4f32 = @sizeOf(@Vector(4, f32));
+        \\const a4f32 = @alignOf(@Vector(4, f32));
+        \\const a8f32 = @alignOf(@Vector(8, f32));
+        \\const s3u8 = @sizeOf(@Vector(3, u8));
+        \\const a3u8 = @alignOf(@Vector(3, u8));
+        \\const s9u8 = @sizeOf(@Vector(9, u8));
+        \\const s17u8 = @sizeOf(@Vector(17, u8));
+        \\const s5u64 = @sizeOf(@Vector(5, u64));
+        \\const a5u64 = @alignOf(@Vector(5, u64));
+        \\const s16u64 = @sizeOf(@Vector(16, u64));
+        \\const s0 = @sizeOf(@Vector(0, u8));
+        \\const a0 = @alignOf(@Vector(0, u8));
+        \\const s_struct = @sizeOf(S);
+        \\const a_struct = @alignOf(S);
+        \\const s_union = @sizeOf(U);
+        \\const s_array = @sizeOf([2]@Vector(10, u32));
+        \\const s_opt = @sizeOf(?@Vector(4, f32));
+        \\const bits = @bitSizeOf(@Vector(3, u5));
+    ;
+    const Dialect = @import("../syntax/Parse.zig").Dialect;
+    // The same in both versions: sizes that are powers of 2 or multiples of the alignment
+    for ([_]Dialect{ .zig_0_17_0, .zig_0_17_1 }) |dialect| {
+        try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_8, .dialect = dialect }, src, &.{
+            .{ "s4f32", "comptime_int = 16" },
+            .{ "a4f32", "comptime_int = 8" },
+            .{ "a8f32", "comptime_int = 8" },
+            .{ "s3u8", "comptime_int = 4" },
+            .{ "a3u8", "comptime_int = 4" },
+            .{ "s9u8", "comptime_int = 16" },
+            .{ "a5u64", "comptime_int = 8" },
+            .{ "s16u64", "comptime_int = 128" },
+            .{ "s0", "comptime_int = 0" },
+            .{ "a0", "comptime_int = 1" },
+            .{ "a_struct", "comptime_int = 8" },
+            .{ "s_opt", "comptime_int = 24" },
+            .{ "bits", "comptime_int = 15" },
+        });
+    }
+    // Zig 0.17.0 pads the byte size to the alignment, 0.17.1 rounds it up to a power of 2
+    try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_8, .dialect = .zig_0_17_0 }, src, &.{
+        .{ "s17u8", "comptime_int = 24" },
+        .{ "s5u64", "comptime_int = 40" },
+        .{ "s_struct", "comptime_int = 48" },
+        .{ "s_union", "comptime_int = 32" },
+        .{ "s_array", "comptime_int = 80" },
+    });
+    try expectTypesTargeted(.{ .vector_abi = .llvm_stack_align_8, .dialect = .zig_0_17_1 }, src, &.{
+        .{ "s17u8", "comptime_int = 32" },
+        .{ "s5u64", "comptime_int = 64" },
+        .{ "s_struct", "comptime_int = 72" },
+        .{ "s_union", "comptime_int = 40" },
+        .{ "s_array", "comptime_int = 128" },
+    });
 }
 
 test "pointer layouts follow the target and the user's zig" {
@@ -3421,6 +4109,49 @@ test "@typeInfo and @Fn keep the calling convention and genericity of functions"
         .{ "r_eq", "u1 = 1" },
     });
 }
+test "@tagName of the C calling convention follows the target" {
+    // Expected values: `@compileLog` of each name with `zig build-obj -target <arch>-<os>-<abi>`;
+    // zig 0.17.0 and 0.17.1 agree except for m68k-netbsd, where the 0.17.1 standard library
+    // selects `m68k_sysv` and the 0.17.0 one `m68k_gnu`
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    const netbsd_m68k: []const u8 = if (std.mem.eql(u8, env.version, "0.17.0")) "m68k_gnu" else "m68k_sysv";
+    const src =
+        \\const std = @import("std");
+        \\const builtin = @import("builtin");
+        \\pub const cc = @tagName(builtin.target.cCallingConvention().?);
+        \\pub const cc_tag = @tagName(std.meta.activeTag(builtin.target.cCallingConvention().?));
+    ;
+    const targets = [_]struct { []const u8, []const u8, []const u8, []const u8, []const u8 }{
+        .{ "x86_64", "windows", "gnu", "coff", "x86_64_win" },
+        .{ "x86_64", "linux", "gnu", "elf", "x86_64_sysv" },
+        .{ "x86", "windows", "gnu", "coff", "x86_mingw" },
+        .{ "aarch64", "macos", "none", "macho", "aarch64_aapcs_darwin" },
+        .{ "aarch64", "windows", "msvc", "coff", "aarch64_aapcs_win" },
+        .{ "arm", "linux", "gnueabihf", "elf", "arm_aapcs_vfp" },
+        .{ "wasm32", "wasi", "musl", "wasm", "wasm_mvp" },
+        .{ "m68k", "linux", "gnu", "elf", "m68k_gnu" },
+        .{ "m68k", "netbsd", "none", "elf", netbsd_m68k },
+    };
+    for (targets) |t| {
+        var builtin_buf: [512]u8 = undefined;
+        const builtin_text = try std.fmt.bufPrint(&builtin_buf,
+            \\const std = @import("std");
+            \\pub const target: std.Target = .{{
+            \\    .cpu = .{{ .arch = .{s}, .model = undefined, .features = undefined }},
+            \\    .os = .{{ .tag = .{s}, .version_range = undefined }},
+            \\    .abi = .{s},
+            \\    .ofmt = .{s},
+            \\}};
+        , .{ t[0], t[1], t[2], t[3] });
+        var expected_buf: [64]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buf, "*const [{d}:0]u8 = \"{s}\"", .{ t[4].len, t[4] });
+        expectStdTypesBuiltin(builtin_text, src, &.{ .{ "cc", expected }, .{ "cc_tag", expected } }) catch |err| {
+            std.debug.print("target {s}-{s}-{s}\n", .{ t[0], t[1], t[2] });
+            return err;
+        };
+    }
+}
 
 test "@typeInfo, @Pointer and std results keep pointer attributes" {
     // Prevents default attributes in `@typeInfo` and std results losing their alignment
@@ -3914,6 +4645,34 @@ test "std.meta type functions" {
         .{ "sliced", "type = [:0]const u8" },
     });
 }
+test "@tagName of values only the interpreter computes in container-level constants" {
+    // Prevents typing the names of a call result and of reified enum values as the runtime
+    // `[:0]const u8`. Expected values: zig 0.17.0 and 0.17.1 give the same result for each name.
+    try expectStdTypesBuiltin(target_builtin,
+        \\const std = @import("std");
+        \\const U = union(enum) { a: u8, b: u16 };
+        \\pub const active = @tagName(std.meta.activeTag(U{ .b = 2 }));
+        \\pub const reified = blk: {
+        \\    const E = @Enum(u16, .exhaustive, &.{ "x", "y" }, &.{ 0, 1 });
+        \\    break :blk @tagName(@as(E, @enumFromInt(1)));
+        \\};
+        \\pub const generated = blk: {
+        \\    @setEvalBranchQuota(1_000_000);
+        \\    var names: [3][]const u8 = undefined;
+        \\    var values: [3]u16 = undefined;
+        \\    for (0..3) |i| {
+        \\        names[i] = std.fmt.comptimePrint("f{d}", .{i});
+        \\        values[i] = @intCast(i);
+        \\    }
+        \\    const E = @Enum(u16, .exhaustive, &names, &values);
+        \\    break :blk @tagName(@as(E, @enumFromInt(2)));
+        \\};
+    , &.{
+        .{ "active", "*const [1:0]u8 = \"b\"" },
+        .{ "reified", "*const [1:0]u8 = \"y\"" },
+        .{ "generated", "*const [2:0]u8 = \"f2\"" },
+    });
+}
 
 test "@Int in function bodies takes any known signedness and u16 bit counts" {
     try expectStdTypes(
@@ -3971,6 +4730,40 @@ test "type reflection and reification" {
         // Matches the compiler: comptime-known fields in a literal are comptime fields
         .{ "tuple", "struct { comptime u8 = 1, comptime bool = true } = .{ 1, true }" },
         .{ "first", "u8 = 1" },
+    });
+}
+
+test "containers in a type function capture locals derived from @typeInfo arrays" {
+    // The shapes of std.enums.EnumIndexer without its sort: a local copy of the field values
+    // and constants indexed out of it
+    try expectStdTypes(
+        \\const Color = enum { red, green, blue };
+        \\fn ConstCapture(comptime E: type) type {
+        \\    const fields_len = @typeInfo(E).@"enum".field_names.len;
+        \\    const field_values = @typeInfo(E).@"enum".field_values[0..fields_len].*;
+        \\    const min = field_values[0];
+        \\    return struct {
+        \\        pub const count: comptime_int = min + fields_len;
+        \\        pub fn indexOf(e: E) usize {
+        \\            return @as(usize, @intCast(@backingInt(e) - min));
+        \\        }
+        \\    };
+        \\}
+        \\fn SliceIndex(comptime E: type) type {
+        \\    const fv = @typeInfo(E).@"enum".field_values;
+        \\    const second = fv[1];
+        \\    return struct { pub const v: comptime_int = second; };
+        \\}
+        \\fn g() void {
+        \\    const indexer_count = ConstCapture(Color).count;
+        \\    const index = comptime ConstCapture(Color).indexOf(.blue);
+        \\    const slice_index = SliceIndex(Color).v;
+        \\    _ = .{ indexer_count, index, slice_index };
+        \\}
+    , &.{
+        .{ "indexer_count", "comptime_int = 3" },
+        .{ "index", "usize = 2" },
+        .{ "slice_index", "comptime_int = 1" },
     });
 }
 
@@ -4286,6 +5079,46 @@ test "std generic containers" {
     });
 }
 
+test "std.enums.values, std.enums.fromInt, std.meta.stringToEnum and StaticStringMap.initEnum at comptime" {
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const Color = enum { red, green, blue };
+        \\const Small = enum(u4) { a = 3, b = 5 };
+        \\const Open = enum(u8) { x = 1, y = 2, _ };
+        \\const from_fields = std.enums.valuesFromFields(Color, &.{ 0, 2 }).len;
+        \\const values_len = std.enums.values(Color).len;
+        \\const values_2 = std.enums.values(Color)[2];
+        \\const backing_cmp = blk: {
+        \\    for (std.enums.values(Color)) |v| {
+        \\        if (@backingInt(v) == 2) break :blk v;
+        \\    }
+        \\    break :blk Color.red;
+        \\};
+        \\const from_int = std.enums.fromInt(Color, 1);
+        \\const from_int_none = std.enums.fromInt(Color, 7);
+        \\const from_int_explicit = std.enums.fromInt(Small, 5);
+        \\const from_int_open = std.enums.fromInt(Open, @as(u32, 2));
+        \\const string_red = std.meta.stringToEnum(Color, "red");
+        \\const string_green = std.meta.stringToEnum(Color, "green");
+        \\const string_none = std.meta.stringToEnum(Color, "pink");
+        \\const map_get = std.StaticStringMap(Color).initEnum().get("green");
+    , &.{
+        .{ "from_fields", "usize = 2" },
+        .{ "values_len", "usize = 3" },
+        .{ "values_2", "Color = .blue" },
+        .{ "backing_cmp", "Color = .blue" },
+        .{ "from_int", "?Color = .green" },
+        .{ "from_int_none", "?Color = null" },
+        .{ "from_int_explicit", "?Small = .b" },
+        // A non-exhaustive enum: `return @fromBackingInt(@intCast(tag))` with the result type `?E`
+        .{ "from_int_open", "?Open = .y" },
+        .{ "string_red", "?Color = .red" },
+        .{ "string_green", "?Color = .green" },
+        .{ "string_none", "?Color = null" },
+        .{ "map_get", "?Color = .green" },
+    });
+}
+
 test "local types used by containers in the body: no cycle through the whole function" {
     // A method of a container in the body uses a local type of the outer function, and the outer
     // function body references that method; the body has an `enum(u32)`.
@@ -4499,6 +5332,34 @@ test "std.mem pointer reinterpretation" {
     });
 }
 
+test "std.mem functions that scan a many-item pointer up to its sentinel at comptime" {
+    try expectStdTypesBuiltin(target_builtin,
+        \\const std = @import("std");
+        \\const spanned = std.mem.span(@as([*:0]const u8, "abc")).len;
+        \\const measured = std.mem.len(@as([*:0]const u8, "abcd"));
+        \\const measured_c = std.mem.len(@as([*c]const u8, "hey"));
+        \\const sliced = std.mem.sliceTo(@as([*:0]const u8, "abc"), 0).len;
+        \\const printed = std.mem.span(@as([*:0]const u8, std.fmt.comptimePrint("{d}", .{1234}))).len;
+        \\const wide = std.mem.span(@as([*:0]const u16, &[_:0]u16{ 1, 2, 3 })).len;
+        \\const local = blk: {
+        \\    var buf = [_]u8{ 'a', 'b', 0, 'd' };
+        \\    const s: [:0]u8 = buf[0..2 :0];
+        \\    break :blk std.mem.len(s.ptr);
+        \\};
+        \\const ordered = std.mem.orderZ(u8, "ab", "abc");
+    , &.{
+        .{ "spanned", "usize = 3" },
+        .{ "measured", "usize = 4" },
+        .{ "measured_c", "usize = 3" },
+        .{ "sliced", "usize = 3" },
+        .{ "printed", "usize = 4" },
+        .{ "wide", "usize = 3" },
+        .{ "local", "usize = 2" },
+        // Compares the sentinel of the shorter string with a byte of the longer one
+        .{ "ordered", "Order = .lt" },
+    });
+}
+
 test "switch on a type: unevaluable prong items do not hide a matching prong" {
     try expectTypes(
         \\const Vec = @import("missing.zig").Vec;
@@ -4520,6 +5381,52 @@ test "switch on a type: unevaluable prong items do not hide a matching prong" {
         .{ "hit", "u32 = 0" },
         // None matches and some prong items cannot be evaluated: must not fall back to else
         .{ "miss", "unknown" },
+    });
+}
+
+test "a switch on a comptime-known integer takes the prong whose range contains it" {
+    // A range item has no single value: no prong was chosen, and the switch took the peer type of
+    // all prongs (`[:0]const u8`) without a value.
+    try expectTypes(
+        \\const inside = switch (@as(u8, 42)) {
+        \\    0...9 => "a",
+        \\    10...99 => "bb",
+        \\    else => "ccc",
+        \\};
+        \\const at_low = switch (@as(u8, 10)) { 0...9 => "a", 10...99 => "bb", else => "ccc" };
+        \\const at_high = switch (@as(u8, 99)) { 0...9 => "a", 10...99 => "bb", else => "ccc" };
+        \\const past = switch (@as(u8, 200)) { 0...9 => "a", 10...99 => "bb", else => "ccc" };
+        \\const mixed_range = switch (@as(u8, 50)) { 1, 40...60, 99 => "mixed", else => "e" };
+        \\const mixed_scalar = switch (@as(u8, 99)) { 1, 40...60, 99 => "mixed", else => "e" };
+        \\const scalar_after = switch (@as(u8, 42)) { 0...9 => "a", 42 => "bb", else => "ccc" };
+        \\const char = switch (@as(u8, 'x')) { 'a'...'z' => "lower", 'A'...'Z' => "upper!", else => "?" };
+        \\const negative = switch (@as(i8, -5)) { -128...-1 => "neg", 0...127 => "nonneg" };
+        \\const untyped = switch (42) { 0...9 => "a", 10...99 => "bb", else => "ccc" };
+        \\const big = switch (1 << 100) { 0...(1 << 99) => "a", (1 << 99) + 1...(1 << 101) => "bb", else => "ccc" };
+        \\const high: u128 = 0xF000_0000_0000_0000_0000_0000_0000_0000;
+        \\const half = 0x8000_0000_0000_0000_0000_0000_0000_0000;
+        \\const max = 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
+        \\const wide = switch (high) { 0...9 => "a", half...max => "bb", else => "ccc" };
+        \\const lo: u8 = 30;
+        \\const hi = 50;
+        \\const named = switch (@as(u8, 42)) { lo...hi => "bb", else => "ccc" };
+    , &.{
+        .{ "inside", "*const [2:0]u8 = \"bb\"" },
+        // Both bounds are inclusive
+        .{ "at_low", "*const [2:0]u8 = \"bb\"" },
+        .{ "at_high", "*const [2:0]u8 = \"bb\"" },
+        .{ "past", "*const [3:0]u8 = \"ccc\"" },
+        .{ "mixed_range", "*const [5:0]u8 = \"mixed\"" },
+        .{ "mixed_scalar", "*const [5:0]u8 = \"mixed\"" },
+        .{ "scalar_after", "*const [2:0]u8 = \"bb\"" },
+        .{ "char", "*const [5:0]u8 = \"lower\"" },
+        .{ "negative", "*const [3:0]u8 = \"neg\"" },
+        .{ "untyped", "*const [2:0]u8 = \"bb\"" },
+        .{ "big", "*const [2:0]u8 = \"bb\"" },
+        // The `comptime_int` bounds are coerced to `u128`, so those above the range of i128 are
+        // compared as u128
+        .{ "wide", "*const [2:0]u8 = \"bb\"" },
+        .{ "named", "*const [2:0]u8 = \"bb\"" },
     });
 }
 
@@ -4697,6 +5604,263 @@ test "comptime evaluation: slices, pointers and error unions in interpreter stor
         // Pointer capture of an optional, and `*const T` to `*const [1]T`
         .{ "r_short", "usize = 104" },
         .{ "r_bump", "usize = 3" },
+    });
+}
+
+test "comptime evaluation: anytype and comptime parameters write through pointers into the caller's storage" {
+    // Prevents running the callee on interned copies of such arguments, which lost its writes;
+    // expected values are the results of zig 0.17.0 and 0.17.1
+    try expectTypes(
+        \\const Ctx = struct {
+        \\    items: []u32,
+        \\    fn swap(ctx: Ctx, a: usize, b: usize) void {
+        \\        const t = ctx.items[a];
+        \\        ctx.items[a] = ctx.items[b];
+        \\        ctx.items[b] = t;
+        \\    }
+        \\};
+        \\fn viaAny(ctx: anytype) void {
+        \\    ctx.swap(0, 1);
+        \\}
+        \\fn anySlice(s: anytype) void {
+        \\    s[0] = 9;
+        \\}
+        \\fn anyPtr(p: anytype) void {
+        \\    p.* = 9;
+        \\}
+        \\fn anyArrPtr(p: anytype) void {
+        \\    p[1] = 9;
+        \\}
+        \\fn anyTuple(t: anytype) void {
+        \\    t[0].* = 9;
+        \\}
+        \\fn anyStruct(c: anytype) void {
+        \\    c.p.* = 9;
+        \\}
+        \\fn anyNested(t: anytype) void {
+        \\    t[0][0].* = 9;
+        \\}
+        \\fn idAny(p: anytype) @TypeOf(p) {
+        \\    return p;
+        \\}
+        \\fn readAny(s: anytype) u32 {
+        \\    return s[0] + s[1];
+        \\}
+        \\fn setCt(s: []comptime_int) void {
+        \\    s[0] = 9;
+        \\}
+        \\fn setType(p: *type) void {
+        \\    p.* = u8;
+        \\}
+        \\fn setCtPtr(comptime p: *u32) void {
+        \\    p.* = 9;
+        \\}
+        \\fn setCtAny(comptime p: anytype) void {
+        \\    p.* = 9;
+        \\}
+        \\fn lenCt(comptime s: []const u8) usize {
+        \\    return s.len;
+        \\}
+        \\fn setPtrPtr(pp: anytype) void {
+        \\    pp.*.* = 9;
+        \\}
+        \\const Field = struct { x: u32 };
+        \\const w_swap = blk: {
+        \\    var a = [_]u32{ 1, 2 };
+        \\    viaAny(Ctx{ .items = &a });
+        \\    break :blk a[0];
+        \\};
+        \\const w_slice = blk: {
+        \\    var a = [_]u32{ 1, 2 };
+        \\    anySlice(@as([]u32, &a));
+        \\    break :blk a[0];
+        \\};
+        \\const w_ptr = blk: {
+        \\    var x: u32 = 1;
+        \\    anyPtr(&x);
+        \\    break :blk x;
+        \\};
+        \\const w_arr_ptr = blk: {
+        \\    var a = [_]u32{ 1, 2 };
+        \\    anyArrPtr(&a);
+        \\    break :blk a[1];
+        \\};
+        \\const w_tuple = blk: {
+        \\    var x: u32 = 1;
+        \\    anyTuple(.{&x});
+        \\    break :blk x;
+        \\};
+        \\const w_struct = blk: {
+        \\    var x: u32 = 1;
+        \\    anyStruct(.{ .p = &x });
+        \\    break :blk x;
+        \\};
+        \\const w_nested = blk: {
+        \\    var x: u32 = 1;
+        \\    anyNested(.{.{&x}});
+        \\    break :blk x;
+        \\};
+        \\const w_builtin_call = blk: {
+        \\    var x: u32 = 1;
+        \\    @call(.auto, anyPtr, .{&x});
+        \\    break :blk x;
+        \\};
+        \\const w_alias = blk: {
+        \\    var a = [_]u32{ 1, 2 };
+        \\    const q = idAny(&a);
+        \\    a[0] = 7;
+        \\    break :blk q[0];
+        \\};
+        \\const w_read = blk: {
+        \\    var a = [_]u32{ 4, 5 };
+        \\    break :blk readAny(&a);
+        \\};
+        \\const w_twice = blk: {
+        \\    var a = [_]u32{ 1, 2 };
+        \\    anySlice(@as([]u32, &a));
+        \\    a[0] += 1;
+        \\    anyArrPtr(&a);
+        \\    break :blk a[0] * 100 + a[1];
+        \\};
+        \\const w_ct_slice = blk: {
+        \\    var a = [_]comptime_int{ 1, 2 };
+        \\    setCt(&a);
+        \\    break :blk a[0];
+        \\};
+        \\const w_ct_type = blk: {
+        \\    var T: type = u32;
+        \\    setType(&T);
+        \\    break :blk T;
+        \\};
+        \\const w_ct_ptr = blk: {
+        \\    var x: u32 = 1;
+        \\    setCtPtr(&x);
+        \\    break :blk x;
+        \\};
+        \\const w_ct_any = blk: {
+        \\    var x: u32 = 1;
+        \\    setCtAny(&x);
+        \\    break :blk x;
+        \\};
+        \\const w_const_local = blk: {
+        \\    const arr = "abc".*;
+        \\    break :blk lenCt(&arr);
+        \\};
+        \\const w_ptr_ptr = blk: {
+        \\    var x: u32 = 1;
+        \\    const p = &x;
+        \\    setPtrPtr(&p);
+        \\    break :blk x;
+        \\};
+        \\const w_alias_const = blk: {
+        \\    var a = [_]u32{ 1, 2 };
+        \\    const q = idAny(@as(*const [2]u32, &a));
+        \\    a[0] = 7;
+        \\    break :blk q[0];
+        \\};
+        \\const w_alias_field = blk: {
+        \\    var s: Field = .{ .x = 1 };
+        \\    const p: *const Field = &s;
+        \\    const q = idAny(&p.x);
+        \\    s.x = 7;
+        \\    break :blk q.*;
+        \\};
+    , &.{
+        // anytype parameters: a struct holding a slice, a slice, single-item and array
+        // pointers, and pointers inside tuples and anonymous structs
+        .{ "w_swap", "u32 = 2" },
+        .{ "w_slice", "u32 = 9" },
+        .{ "w_ptr", "u32 = 9" },
+        .{ "w_arr_ptr", "u32 = 9" },
+        .{ "w_tuple", "u32 = 9" },
+        .{ "w_struct", "u32 = 9" },
+        .{ "w_nested", "u32 = 9" },
+        .{ "w_builtin_call", "u32 = 9" },
+        // A returned pointer still points into the caller's storage
+        .{ "w_alias", "u32 = 7" },
+        .{ "w_read", "u32 = 9" },
+        .{ "w_twice", "u32 = 1009" },
+        // Parameters that are comptime because of their comptime-only type, and explicit
+        // comptime parameters
+        .{ "w_ct_slice", "comptime_int = 9" },
+        .{ "w_ct_type", "type = u8" },
+        .{ "w_ct_ptr", "u32 = 9" },
+        .{ "w_ct_any", "u32 = 9" },
+        // A pointer to a constant local is passed as an interned value; a constant holding a
+        // pointer to a variable, and `*const` pointers to a variable, still reach the variable
+        .{ "w_const_local", "usize = 3" },
+        .{ "w_ptr_ptr", "u32 = 9" },
+        .{ "w_alias_const", "u32 = 7" },
+        .{ "w_alias_field", "u32 = 7" },
+    });
+}
+
+test "comptime evaluation: std.sort and std.mem.sortUnstable sort in place" {
+    // Prevents leaving the array unsorted when the sort passes its context through anytype;
+    // expected values are the results of zig 0.17.0 and 0.17.1
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\fn lessThan(_: void, x: u32, y: u32) bool {
+        \\    return x < y;
+        \\}
+        \\fn lessThanCt(_: void, x: comptime_int, y: comptime_int) bool {
+        \\    return x < y;
+        \\}
+        \\fn gen(comptime n: usize) [n]u32 {
+        \\    var a: [n]u32 = undefined;
+        \\    var x: u32 = 12345;
+        \\    for (&a) |*e| {
+        \\        x = x *% 1103515245 +% 12345;
+        \\        e.* = x >> 16;
+        \\    }
+        \\    return a;
+        \\}
+        \\const s_insertion = blk: {
+        \\    var a = [_]u32{ 5, 3, 9, 1, 7, 2, 8 };
+        \\    std.sort.insertion(u32, &a, {}, lessThan);
+        \\    break :blk a[0] * 100 + a[3] * 10 + a[6];
+        \\};
+        \\const s_pdq = blk: {
+        \\    var a = [_]u32{ 5, 3, 9, 1, 7, 2, 8 };
+        \\    std.sort.pdq(u32, &a, {}, lessThan);
+        \\    break :blk a[0] * 100 + a[3] * 10 + a[6];
+        \\};
+        \\const s_heap = blk: {
+        \\    var a = [_]u32{ 5, 3, 9, 1, 7, 2, 8 };
+        \\    std.sort.heap(u32, &a, {}, lessThan);
+        \\    break :blk a[0] * 100 + a[3] * 10 + a[6];
+        \\};
+        \\const s_unstable = blk: {
+        \\    var a = [_]u32{ 5, 3, 9, 1, 7, 2, 8 };
+        \\    std.mem.sortUnstable(u32, &a, {}, lessThan);
+        \\    break :blk a[0] * 100 + a[3] * 10 + a[6];
+        \\};
+        \\const s_unstable_ct = blk: {
+        \\    var a = [_]comptime_int{ 3, 1, 2 };
+        \\    std.mem.sortUnstable(comptime_int, &a, {}, lessThanCt);
+        \\    break :blk a[0] * 100 + a[1] * 10 + a[2];
+        \\};
+        \\const s_pdq_sorted = blk: {
+        \\    @setEvalBranchQuota(100_000);
+        \\    var a = gen(100);
+        \\    std.sort.pdq(u32, &a, {}, lessThan);
+        \\    break :blk std.sort.isSorted(u32, &a, {}, lessThan);
+        \\};
+        \\const s_pdq_median = blk: {
+        \\    @setEvalBranchQuota(100_000);
+        \\    var a = gen(100);
+        \\    std.sort.pdq(u32, &a, {}, lessThan);
+        \\    break :blk a[50];
+        \\};
+    , &.{
+        .{ "s_insertion", "u32 = 159" },
+        .{ "s_pdq", "u32 = 159" },
+        .{ "s_heap", "u32 = 159" },
+        .{ "s_unstable", "u32 = 159" },
+        .{ "s_unstable_ct", "comptime_int = 123" },
+        // 100 elements take the partitioning path of pdqsort rather than insertion sort
+        .{ "s_pdq_sorted", "bool = true" },
+        .{ "s_pdq_median", "u32 = 32588" },
     });
 }
 
@@ -5199,6 +6363,60 @@ test "comptime evaluation of integer builtins, @memset, @memmove and @call" {
         .{ "filled", "u8 = 7" },
         .{ "moved", "u8 = 3" },
         .{ "called", "u8 = 3" },
+    });
+}
+
+test "comptime @fromBackingInt coerces its operand to the backing integer of the destination type" {
+    try expectTypes(
+        \\const Color = enum { red, green, blue };
+        \\const E8 = enum(u8) { a = 10, b, c = 20 };
+        \\const Es = enum(i8) { neg = -3, zero = 0, pos = 5 };
+        \\const cast: Color = @fromBackingInt(@intCast(@as(comptime_int, 2)));
+        \\const cast_u: Color = @fromBackingInt(@intCast(@as(u32, 1)));
+        \\const truncated: Color = @fromBackingInt(@truncate(@as(u32, 0x102)));
+        \\const bit_cast: Es = @fromBackingInt(@bitCast(@as(u8, 0xfd)));
+        \\const explicit: E8 = @fromBackingInt(@intCast(@as(usize, 11)));
+        \\const signed: Es = @fromBackingInt(@intCast(@as(i64, 5)));
+        \\const as_dest = @as(Color, @fromBackingInt(@intCast(@as(u64, 2))));
+        \\fn optional(x: u32) ?Color {
+        \\    return @fromBackingInt(@intCast(x));
+        \\}
+        \\const from_opt = optional(2);
+        \\fn errorUnion(x: u32) error{Bad}!Color {
+        \\    if (x > 2) return error.Bad;
+        \\    return @fromBackingInt(@intCast(x));
+        \\}
+        \\const from_eu = errorUnion(1) catch unreachable;
+        \\const stored = blk: {
+        \\    var result: [2]Color = undefined;
+        \\    result[0] = @fromBackingInt(1);
+        \\    result[1] = @fromBackingInt(@intCast(2));
+        \\    const final = result;
+        \\    break :blk final;
+        \\};
+        \\const stored_by_ptr = blk: {
+        \\    var result: [3]Color = undefined;
+        \\    for (&result, [_]comptime_int{ 0, 1, 2 }) |*r, v| {
+        \\        r.* = @fromBackingInt(@intCast(v));
+        \\    }
+        \\    const final = result;
+        \\    break :blk final;
+        \\};
+    , &.{
+        // The operand's result type is the tag type: `u2` for `Color`, the explicit one otherwise
+        .{ "cast", "Color = .blue" },
+        .{ "cast_u", "Color = .green" },
+        .{ "truncated", "Color = .blue" },
+        .{ "bit_cast", "Es = .neg" },
+        .{ "explicit", "E8 = .b" },
+        .{ "signed", "Es = .pos" },
+        .{ "as_dest", "Color = .blue" },
+        // The destination type drops the optional and the error union of the result type
+        .{ "from_opt", "?Color = .blue" },
+        .{ "from_eu", "Color = .green" },
+        // Stores through element places and pointer captures (the shape of std.enums.valuesFromFields)
+        .{ "stored", "[2]Color = .{ .green, .blue }" },
+        .{ "stored_by_ptr", "[3]Color = .{ .red, .green, .blue }" },
     });
 }
 
