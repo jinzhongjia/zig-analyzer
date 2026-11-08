@@ -571,6 +571,76 @@ test "comptime anytype arguments of different types are different instances" {
     });
 }
 
+test "anytype arguments of comptime-only types are recorded by value" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1: an anytype parameter is comptime
+    // when the argument type is comptime-only, so the instance records the argument value, which
+    // the signature reads. Recording such arguments by type only gave `[_]u8` for
+    // `@TypeOf(arrOf(3))` and made `Any(5) == Any(6)` true.
+    try expectTypes(
+        \\fn arrOf(x: anytype) [x]u8 { return undefined; }
+        \\fn Wrap(comptime T: type) type { return struct { t: T }; }
+        \\fn wrapOf(x: anytype) Wrap(x) { return undefined; }
+        \\const E = enum { a, b, c };
+        \\fn tagArr(x: anytype) [@intFromEnum(@as(E, x))]u8 { return undefined; }
+        \\fn nullArr(x: anytype) [if (x == null) 1 else 2]u8 { return undefined; }
+        \\fn three() usize { return 3; }
+        \\fn four() usize { return 4; }
+        \\fn callArr(f: anytype) [f()]u8 { return undefined; }
+        \\fn mix(a: anytype, n: anytype) [n]@TypeOf(a) { return undefined; }
+        \\fn dep(n: anytype, y: [n]u8) [n]u8 { return y; }
+        \\const V = struct {
+        \\    pub fn get(_: V, n: anytype) [n]u8 { return undefined; }
+        \\};
+        \\const v: V = .{};
+        \\inline fn inlineArr(x: anytype) [x]u8 { return undefined; }
+        \\fn outer() usize { return @sizeOf(@TypeOf(arrOf(3))); }
+        \\fn Any(x: anytype) type { return struct { pub const val = x; }; }
+        \\fn optArr(x: anytype) [if (x.? == u8) 1 else 2]u8 { return undefined; }
+        \\const int_arg = @TypeOf(arrOf(3));
+        \\const distinct = @TypeOf(arrOf(3)) == @TypeOf(arrOf(4));
+        \\const type_arg = @TypeOf(wrapOf(u8));
+        \\const literal_arg = @TypeOf(tagArr(.c));
+        \\const null_arg = @TypeOf(nullArr(null));
+        \\const fn_three = @TypeOf(callArr(three));
+        \\const fn_four = @TypeOf(callArr(four));
+        \\const mixed = @TypeOf(mix(@as(u16, 1), 2));
+        \\const dependent = @TypeOf(dep(2, .{ 1, 2 }));
+        \\const method = @TypeOf(v.get(3));
+        \\const inline_arg = @TypeOf(inlineArr(3));
+        \\const nested = outer();
+        \\const name_int = @typeName(Any(3));
+        \\const name_type = @typeName(Any(u8));
+        \\const name_literal = @typeName(Any(.c));
+        \\const int_eq = Any(5) == Any(6);
+        \\const type_eq = Any(u8) == Any(u16);
+        \\const captured = Any(5).val;
+        \\const opt_arg = @TypeOf(optArr(@as(?type, u16)));
+    , &.{
+        .{ "int_arg", "type = [3]u8" },
+        .{ "distinct", "bool = false" },
+        .{ "type_arg", "type = Wrap(u8)" },
+        .{ "literal_arg", "type = [2]u8" },
+        .{ "null_arg", "type = [1]u8" },
+        .{ "fn_three", "type = [3]u8" },
+        .{ "fn_four", "type = [4]u8" },
+        // A comptime-known argument of a runtime type stays recorded by type
+        .{ "mixed", "type = [2]u16" },
+        .{ "dependent", "type = [2]u8" },
+        .{ "method", "type = [3]u8" },
+        .{ "inline_arg", "type = [3]u8" },
+        .{ "nested", "usize = 3" },
+        .{ "name_int", "*const [11:0]u8 = \"main.Any(3)\"" },
+        .{ "name_type", "*const [12:0]u8 = \"main.Any(u8)\"" },
+        .{ "name_literal", "*const [12:0]u8 = \"main.Any(.c)\"" },
+        .{ "int_eq", "bool = false" },
+        .{ "type_eq", "bool = false" },
+        .{ "captured", "comptime_int = 5" },
+        // A non-null optional value is represented by its payload: the instance records the
+        // argument type with it, so `x.?` is the payload
+        .{ "opt_arg", "type = [2]u8" },
+    });
+}
+
 test "functions with an inferred error set are evaluated in constants" {
     // The inferred error set of the running function must be the one in the function's type,
     // otherwise the computed value of the initializer is discarded.
