@@ -1,6 +1,7 @@
 //! comptime interpreter: interprets on HIR the function calls evaluated at comptime (type
 //! constructors, calls in a comptime context) and the initializer expressions of container-level
-//! constants; values are types and values in the InternPool.
+//! declarations (the value of a constant, the type of a variable); values are types and values in
+//! the InternPool.
 //!
 //! Values inside the interpreter are mutable: locals, elements of arrays and structs, and writes
 //! through pointers (a pointer is represented as a storage cell + an element path). Values are
