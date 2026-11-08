@@ -3145,6 +3145,39 @@ test "comptime @ptrCast of a *T coerced to *[1]T reinterprets the place" {
         .{ "view_cast_back", "u32 = 67305985" },
     });
 }
+test "comptime @bitCast and @ptrCast reinterpret into the destination type of their result type" {
+    // `@bitCast` strips the error union and the optional of its result type, `@ptrCast` only
+    // the error union (the compiler's `resolveDestType`); the result is then wrapped
+    try expectTypesTargeted(try targetOf("x86_64-linux-musl", null),
+        \\const P = packed struct(u16) { lo: u8, hi: u8 };
+        \\const bit_opt = blk: {
+        \\    const x: ?u16 = @bitCast(P{ .lo = 1, .hi = 2 });
+        \\    break :blk x.?;
+        \\};
+        \\const bit_eu = blk: {
+        \\    const x: anyerror!P = @bitCast(@as(u16, 0x0403));
+        \\    const v = x catch unreachable;
+        \\    break :blk v.hi;
+        \\};
+        \\const ptr_eu = blk: {
+        \\    var v: u32 = 0x04030201;
+        \\    const r: anyerror!*[4]u8 = @ptrCast(&v);
+        \\    const b = r catch unreachable;
+        \\    break :blk b[1];
+        \\};
+        \\const ptr_opt = blk: {
+        \\    var v: u32 = 0x04030201;
+        \\    const r: ?*[4]u8 = @ptrCast(&v);
+        \\    break :blk r.?[2];
+        \\};
+    , &.{
+        .{ "bit_opt", "u16 = 513" },
+        .{ "bit_eu", "u8 = 4" },
+        .{ "ptr_eu", "u8 = 2" },
+        // An optional pointer is not reinterpreted: no value (the compiler gives 3)
+        .{ "ptr_opt", "u8" },
+    });
+}
 
 test "escaped identifiers name the same declaration as plain ones" {
     try expectTypes(
