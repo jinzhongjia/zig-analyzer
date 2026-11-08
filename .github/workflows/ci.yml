@@ -49,7 +49,7 @@ jobs:
           cache-key: build
       - name: Build the executable
         run: zig build -Doptimize=ReleaseSafe
-      - name: Compile check (including benchmark tools)
+      - name: Compile check (including the tools)
         run: zig build check -Doptimize=ReleaseSafe
 
   corpus:

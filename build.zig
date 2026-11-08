@@ -161,7 +161,6 @@ pub fn build(b: *std.Build) void {
     bench_run.addArtifactArg(exe);
     bench_run.addPassthruArgs();
     b.step("bench", "Measure LSP latencies against a project (see tools/lsp_bench.zig)").dependOn(&bench_run.step);
-    check.dependOn(&bench.step);
 
     // Test runner: the runner bundled with Zig, with stack trace recording enabled for the testing
     // allocator (so that leaks can be located under ReleaseSafe too), unwound with frame pointers
@@ -177,6 +176,10 @@ pub fn build(b: *std.Build) void {
     const patch_run = b.addRunArtifact(patch_runner);
     patch_run.addFileArg(std.Build.LazyPath.zig_lib.path(b, "compiler/test_runner.zig"));
     const test_runner = patch_run.addOutputFileArg("test_runner.zig");
+
+    // check also compiles every tool: CI runs only some of them, and a tool that nothing compiles
+    // stops compiling unnoticed when the analyzer's interfaces change
+    for ([_]*std.Build.Step.Compile{ check_imports, gen_lsp, gen_builtins, gen_manifest, corpus, sema_corpus, bench, patch_runner }) |tool| check.dependOn(&tool.step);
 
     // Tests that depend on a real zig (build system protocol, single-file compilation, end-to-end)
     // run only in test-all and test-stress: under `zig build test` zig is not found (see
