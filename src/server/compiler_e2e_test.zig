@@ -434,8 +434,9 @@ fn slowZig(h: *Harness, project: *fixture.Project) !std.json.Value {
     return jsonValue(h, try std.fmt.allocPrint(h.arena.allocator(), "{{\"zig\": {{\"path\": \"{s}/zigw\"}}}}", .{project.root}));
 }
 
-/// `build()` blocks reading the FIFO `gate` until the test writes to it, so the project stays loading
-/// for as long as the test needs. `@import("foo")` only resolves once the build graph is known.
+/// `build()` blocks reading the FIFO `gate` until the test writes to it (see `openGate`), so the
+/// project stays loading for as long as the test needs. `@import("foo")` only resolves once the
+/// build graph is known.
 const gated_build =
     \\const std = @import("std");
     \\pub fn build(b: *std.Build) void {
@@ -473,9 +474,84 @@ fn createGatedProject() !fixture.Project {
     return project;
 }
 
-/// Lets `build()` continue; blocks until it has opened the FIFO
+/// How long `build()` of a gated project may take to reach the gate while the project is loading:
+/// far more than a first load takes on a slow machine, compiling the build runner included. A load
+/// that ends without reaching the gate fails the wait at once instead (see `expectLoading`).
+const gate_timeout_s = 300;
+
+/// The first load of a gated project cannot end before `build()` has passed the gate. When the
+/// server is not loading the project any more (or never started it), the build ended before the
+/// gate (zig cannot write its global cache, cannot compile build.zig, ...) and will never reach it:
+/// fails, printing what the server reported.
+fn expectLoading(h: *Harness) !void {
+    if (h.server.projectsPending()) return;
+    std.debug.print("the server is not loading the project, but build() has not reached the gate\n", .{});
+    // Lets the server publish what it has to say about the load
+    waitIdle(h) catch |err| std.debug.print("zig-analyzer/waitIdle failed: {t}\n", .{err});
+    var reported = false;
+    for (try shownMessages(h)) |m| {
+        std.debug.print("shown: {s}\n", .{m});
+        reported = true;
+    }
+    if ((try h.diagnostics()).get("build.zig")) |lines| for (lines) |l| {
+        std.debug.print("build.zig: {s}\n", .{l});
+        reported = true;
+    };
+    if (!reported) std.debug.print("the server reported no cause\n", .{});
+    return error.ProjectLoadEnded;
+}
+
+/// Called while `build()` of a gated project has not reached `what` yet: fails when it never will
+/// (see `expectLoading`) or once `gate_timeout_s` have passed since `started`; otherwise sleeps
+/// briefly
+fn awaitGate(h: *Harness, started: std.Io.Clock.Timestamp, what: []const u8) !void {
+    try expectLoading(h);
+    if (started.untilNow(testing.io).raw.toSeconds() >= gate_timeout_s) {
+        std.debug.print("build() has not reached {s} within {d} s while the project is loading\n", .{ what, gate_timeout_s });
+        for (try shownMessages(h)) |m| std.debug.print("shown: {s}\n", .{m});
+        return error.Timeout;
+    }
+    try testing.io.sleep(.fromMilliseconds(10), .awake);
+}
+
+/// Lets `build()` continue once it has opened the FIFO `gate`. A blocking open for writing would
+/// wait for a reader, forever when `build()` never gets there; with O_NONBLOCK, the open fails with
+/// ENXIO while there is no reader, and a reader blocked in its own open counts as one.
 fn openGate(h: *Harness, project: *fixture.Project) !void {
-    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(h.arena.allocator(), "gate"), .data = "x" });
+    const posix = std.posix;
+    const path = try project.path(h.arena.allocator(), "gate");
+    // Close-on-exec: a copy of the write end in a process the server starts meanwhile would keep
+    // `build()` from reading the end of the file
+    const flags: posix.O = .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true };
+    const started = std.Io.Clock.Timestamp.now(testing.io, .awake);
+    const fd = while (true) {
+        break posix.openat(posix.AT.FDCWD, path, flags, 0) catch |err| switch (err) {
+            error.NoDevice => {
+                try awaitGate(h, started, "the gate");
+                continue;
+            },
+            else => |e| return e,
+        };
+    };
+    const gate: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+    defer gate.close(testing.io);
+    try gate.writeStreamingAll(testing.io, "x");
+}
+
+/// Waits until `build()` of a gated project has created the file `name` in the project
+fn awaitFile(h: *Harness, project: *fixture.Project, name: []const u8) !void {
+    const path = try project.path(h.arena.allocator(), name);
+    const started = std.Io.Clock.Timestamp.now(testing.io, .awake);
+    while (true) {
+        std.Io.Dir.cwd().access(testing.io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                try awaitGate(h, started, name);
+                continue;
+            },
+            else => |e| return e,
+        };
+        return;
+    }
 }
 
 fn sendHover(h: *Harness, uri: []const u8, line: u32, character: u32) !i64 {
@@ -489,6 +565,7 @@ fn hoverValue(resp: std.json.Value) []const u8 {
 
 /// The text of a hover answered during the load. The writes of startup may cancel a read in
 /// progress, as they may for a client, which asks again; the gate keeps the load from ending.
+/// A text without the loading note from a load that has ended fails as `expectLoading` does.
 fn hoverDuringLoad(h: *Harness, uri: []const u8, line: u32, character: u32) ![]const u8 {
     while (true) {
         const resp = try h.response(try sendHover(h, uri, line, character));
@@ -496,7 +573,9 @@ fn hoverDuringLoad(h: *Harness, uri: []const u8, line: u32, character: u32) ![]c
             try testing.expectEqual(-32801, e.object.get("code").?.integer);
             continue;
         }
-        return hoverValue(resp);
+        const text = hoverValue(resp);
+        if (std.mem.indexOf(u8, text, loading_note) == null) try expectLoading(h);
+        return text;
     }
 }
 
@@ -509,9 +588,11 @@ fn answered(h: *Harness, id: i64) bool {
 }
 
 /// A syntax request gets its response during the load (the writes of startup may cancel it, which
-/// is a response too), and the request `id` has not got one by then
+/// is a response too), and the request `id` has not got one by then. An answer from a load that
+/// has ended fails as `expectLoading` does.
 fn expectHeld(h: *Harness, uri: []const u8, id: i64) !void {
     _ = try h.request("textDocument/documentSymbol", .{ .textDocument = .{ .uri = uri } });
+    if (answered(h, id)) try expectLoading(h);
     try testing.expect(!answered(h, id));
 }
 
@@ -559,16 +640,15 @@ test "wait_for_project: a restart during the first load does not end the wait" {
     try h.start();
     defer h.finish();
     const a = h.arena.allocator();
-    // `build()` also says when it has reached the gate, through a second FIFO: rewriting build.zig
-    // earlier would only change what the first instance compiles
+    // `build()` also says when it has reached the gate, by creating the file `reached`: rewriting
+    // build.zig earlier would only change what the first instance compiles
     const gate_line = "    _ = std.Io.Dir.cwd().readFileAlloc(b.graph.io, \"gate\", b.allocator, .limited(16)) catch unreachable;\n";
     const reached_line = "    std.Io.Dir.cwd().writeFile(b.graph.io, .{ .sub_path = \"reached\", .data = \"x\" }) catch unreachable;\n";
-    try createFifo(&project, "reached");
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "build.zig", .data = try std.mem.replaceOwned(u8, a, gated_build, gate_line, reached_line ++ gate_line) });
     try initializeWith(&h, project.root, false, try jsonValue(&h, wait_options));
     const uri = try open(&h, try project.path(a, "main.zig"), gated_main);
     const held = try sendHover(&h, uri, 2, 12);
-    _ = try std.Io.Dir.cwd().readFileAlloc(testing.io, try project.path(a, "reached"), a, .limited(16));
+    try awaitFile(&h, &project, "reached");
     try expectHeld(&h, uri, held);
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "build.zig", .data = try std.mem.replaceOwned(u8, a, gated_build, gate_line, "") });
     const text = hoverValue(try h.response(held));
