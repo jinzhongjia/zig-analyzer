@@ -1929,6 +1929,14 @@ test "@typeName gives the compiler's fully qualified name" {
         \\    inline for (0..n) |i| T = struct { const v = i; };
         \\    return T;
         \\}
+        \\const DeclLoop = blk: {
+        \\    var T: type = void;
+        \\    for (0..2) |i| {
+        \\        const L = struct { pub const U = struct { pub const v = i; }; };
+        \\        T = L;
+        \\    }
+        \\    break :blk T;
+        \\};
         \\const n_E = @typeName(E);
         \\const n_inner = @typeName(S.Inner);
         \\const n_box = @typeName(Box(u8));
@@ -1954,6 +1962,8 @@ test "@typeName gives the compiler's fully qualified name" {
         \\const n_plain = @typeName(Out(u8).Plain);
         \\const n_loop = @typeName(LoopNamed(2));
         \\const n_loop_anon = @typeName(LoopAnon(2));
+        \\const n_decl_loop = @typeName(DeclLoop);
+        \\const n_decl_loop_inner = @typeName(DeclLoop.U);
         \\const is_list = std.mem.startsWith(u8, @typeName(std.ArrayList(u8)), "array_list.");
         \\const branch = if (is_list) @as(u8, 1) else @as(u16, 2);
         \\const eqname = @intFromBool(std.mem.eql(u8, @typeName(E), "main.E"));
@@ -1997,6 +2007,10 @@ test "@typeName gives the compiler's fully qualified name" {
         .{ "n_shared", "*const [_:0]u8" },
         .{ "n_plain", "*const [_:0]u8" },
         .{ "n_loop_anon", "*const [_:0]u8" },
+        // A local constant in the initializer block of a declaration is named after a global
+        // counter, also in a loop
+        .{ "n_decl_loop", "*const [_:0]u8" },
+        .{ "n_decl_loop_inner", "*const [_:0]u8" },
         // A local constant in a loop is named after it in every iteration
         .{ "n_loop", "*const [16:0]u8 = \"main.LoopNamed.L\"" },
         .{ "is_list", "bool = true" },
@@ -3231,6 +3245,236 @@ test "captured comptime vars of different types are different captures" {
         .{ "same_v", "u8 = 3" },
         .{ "different_types", "bool = false" },
         .{ "ty_v", "u16 = 3" },
+    });
+}
+
+test "containers in a loop of a container-level initializer capture the values of each iteration" {
+    // Prevents the containers of all iterations from sharing the instance of the declaration,
+    // which left the loop captures they read without a value and made the types of different
+    // iterations compare equal
+    try expectTypes(
+        \\const decl_loop = blk: {
+        \\    var T: type = void;
+        \\    for (0..3) |i| {
+        \\        T = struct { pub const v = i; };
+        \\    }
+        \\    break :blk T.v;
+        \\};
+        \\const no_capture = blk: {
+        \\    var T: type = void;
+        \\    for (0..3) |_| {
+        \\        T = struct { pub const v = 5; };
+        \\    }
+        \\    break :blk T.v;
+        \\};
+        \\const capture_no_loop = blk: {
+        \\    const k = 7;
+        \\    const S = struct { pub const v = k; };
+        \\    break :blk S.v;
+        \\};
+        \\const Ts = blk: {
+        \\    var ts: [3]type = undefined;
+        \\    for (0..3) |i| ts[i] = struct { pub const v = i; };
+        \\    break :blk ts;
+        \\};
+        \\const first = Ts[0].v;
+        \\const last = Ts[2].v;
+        \\const distinct = Ts[0] == Ts[1];
+        \\const same = Ts[1] == Ts[1];
+        \\const same_captures = blk: {
+        \\    var ts: [2]type = undefined;
+        \\    for (0..2) |i| {
+        \\        const k = 5;
+        \\        ts[i] = struct { pub const v = k; };
+        \\    }
+        \\    break :blk ts[0] == ts[1];
+        \\};
+        \\const other_decl = blk: {
+        \\    var a: type = void;
+        \\    for (0..1) |i| a = struct { pub const v = i; };
+        \\    break :blk a;
+        \\} == blk: {
+        \\    var b: type = void;
+        \\    for (0..1) |i| b = struct { pub const v = i; };
+        \\    break :blk b;
+        \\};
+        \\const loop_const = blk: {
+        \\    var T: type = void;
+        \\    for (0..3) |i| {
+        \\        const c = i * 2;
+        \\        T = struct { pub const v = c; };
+        \\    }
+        \\    break :blk T.v;
+        \\};
+        \\const loop_var = blk: {
+        \\    var x = 0;
+        \\    var T: type = void;
+        \\    for (0..3) |_| {
+        \\        x += 1;
+        \\        T = struct { pub const v: comptime_int = x; };
+        \\    }
+        \\    break :blk T.v;
+        \\};
+        \\const while_var = blk: {
+        \\    var x = 0;
+        \\    var i = 0;
+        \\    var T: type = void;
+        \\    while (i < 3) : (i += 1) {
+        \\        x += 2;
+        \\        T = struct { pub const v: comptime_int = x; };
+        \\    }
+        \\    break :blk T.v;
+        \\};
+        \\const nested_loops = blk: {
+        \\    var T: type = void;
+        \\    for (0..2) |i| {
+        \\        for (0..3) |j| {
+        \\            T = struct { pub const v = i * 10 + j; };
+        \\        }
+        \\    }
+        \\    break :blk T.v;
+        \\};
+        \\const inner = blk: {
+        \\    var T: type = void;
+        \\    for (0..3) |i| {
+        \\        T = struct {
+        \\            pub const U = struct { pub const v = i + 100; };
+        \\        };
+        \\    }
+        \\    break :blk T.U.v;
+        \\};
+        \\const this_same = blk: {
+        \\    var T: type = void;
+        \\    for (0..3) |i| {
+        \\        T = struct {
+        \\            pub const Self = @This();
+        \\            pub const v = i;
+        \\        };
+        \\    }
+        \\    break :blk T == T.Self and T.Self.v == 2;
+        \\};
+        \\const field_type = blk: {
+        \\    var T: type = void;
+        \\    for (0..3) |i| {
+        \\        T = struct { x: [i]u8 };
+        \\    }
+        \\    break :blk @FieldType(T, "x");
+        \\};
+        \\const member_fn = blk: {
+        \\    var T: type = void;
+        \\    for (0..3) |i| {
+        \\        T = struct {
+        \\            pub fn get() usize {
+        \\                return i;
+        \\            }
+        \\        };
+        \\    }
+        \\    break :blk T.get();
+        \\};
+        \\const tail_head = blk: {
+        \\    const ts = [_]type{ u8, u16, u32 };
+        \\    var T: type = struct {};
+        \\    for (ts) |t| {
+        \\        const Prev = T;
+        \\        T = struct {
+        \\            pub const Head = t;
+        \\            pub const Tail = Prev;
+        \\        };
+        \\    }
+        \\    break :blk T.Tail.Tail.Head;
+        \\};
+        \\const count = blk: {
+        \\    var total: usize = 0;
+        \\    for (0..4) |i| {
+        \\        const S = struct { pub const v = i * i; };
+        \\        total += S.v;
+        \\    }
+        \\    break :blk total;
+        \\};
+        \\const first_big = blk: {
+        \\    const xs = [_]u8{ 1, 5, 7 };
+        \\    for (xs) |x| {
+        \\        if (x > 2) break :blk struct { pub const v = x; }.v;
+        \\    }
+        \\    break :blk 0;
+        \\};
+        \\const anon_type = blk: {
+        \\    var T: type = void;
+        \\    for (0..2) |i| T = struct { x: [i]u8 };
+        \\    break :blk T;
+        \\};
+        \\const reified = blk: {
+        \\    var T: type = void;
+        \\    for (0..2) |i| {
+        \\        T = struct {
+        \\            pub const E = @Enum(u8, .exhaustive, &.{"a"}, &.{@as(u8, i)});
+        \\        };
+        \\    }
+        \\    break :blk T.E;
+        \\};
+        \\const reified_value = @intFromEnum(reified.a);
+        \\fn Gen(comptime n: usize) type {
+        \\    return struct {
+        \\        pub const x = blk: {
+        \\            var T: type = void;
+        \\            for (0..n) |i| {
+        \\                T = struct { pub const v = i; };
+        \\            }
+        \\            break :blk T.v;
+        \\        };
+        \\    };
+        \\}
+        \\const generic = Gen(4).x;
+        \\const Outer = struct {
+        \\    pub const x = blk: {
+        \\        var T: type = void;
+        \\        for (0..3) |i| {
+        \\            T = struct { pub const v = i * 3; };
+        \\        }
+        \\        break :blk T.v;
+        \\    };
+        \\};
+        \\const nested_decl = Outer.x;
+        \\const WithDefault = struct {
+        \\    x: usize = blk: {
+        \\        var T: type = void;
+        \\        for (0..3) |i| {
+        \\            T = struct { pub const v = i; };
+        \\        }
+        \\        break :blk T.v;
+        \\    },
+        \\};
+        \\const field_default = (WithDefault{}).x;
+    , &.{
+        .{ "decl_loop", "usize = 2" },
+        .{ "no_capture", "comptime_int = 5" },
+        .{ "capture_no_loop", "comptime_int = 7" },
+        .{ "first", "usize = 0" },
+        .{ "last", "usize = 2" },
+        .{ "distinct", "bool = false" },
+        .{ "same", "bool = true" },
+        // Iterations that capture equal values define the same type
+        .{ "same_captures", "bool = true" },
+        // Containers of different declarations differ even when they capture equal values
+        .{ "other_decl", "bool = false" },
+        .{ "loop_const", "usize = 4" },
+        .{ "loop_var", "comptime_int = 3" },
+        .{ "while_var", "comptime_int = 6" },
+        .{ "nested_loops", "usize = 12" },
+        .{ "inner", "usize = 102" },
+        .{ "this_same", "bool = true" },
+        .{ "field_type", "type = [2]u8" },
+        .{ "member_fn", "usize = 2" },
+        .{ "tail_head", "type = u8" },
+        .{ "count", "usize = 14" },
+        .{ "first_big", "u8 = 5" },
+        .{ "anon_type", "type = struct { x: [1]u8 }" },
+        // Named as outside a loop, not after the declaration's instance
+        .{ "reified", "type = E" },
+        .{ "reified_value", "u8 = 1" },
+        .{ "generic", "usize = 3" },
+        .{ "nested_decl", "usize = 6" },
+        .{ "field_default", "usize = 2" },
     });
 }
 
