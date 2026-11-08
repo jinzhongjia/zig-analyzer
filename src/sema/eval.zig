@@ -3386,6 +3386,7 @@ const Evaluator = struct {
         // The compiler merges the casts above `@fieldParentPtr` into it: the chain is one
         // `@fieldParentPtr` whose destination comes from the result type of the outermost cast
         if (mergedFieldParentPtr(f.body, e)) |inner| return ev.eval(f, inner, want);
+        if (eq(u8, name, "@Fn")) return ev.reifyFn(f, args);
         const vals = try ev.a.alloc(Val, args.len);
         // Result types of the arguments
         for (args, vals, 0..) |a, *o, i| o.* = try ev.eval(f, a, try ev.builtinArgType(name, i, vals[0..i], want));
@@ -3482,18 +3483,6 @@ const Evaluator = struct {
                 },
             };
             return Val.ofType(try ip.get(.{ .ptr_type = .{ .child = child, .size = size, .is_const = is_const, .sentinel = if (sentinel == .null_value) null else sentinel, .attrs = attrs } }));
-        }
-        if (eq(u8, name, "@Fn")) {
-            if (vals.len != 4) return error.Abort;
-            const varargs = try ev.boolField(vals[3], "varargs");
-            const cc: InternPool.CallConv = blk: {
-                const v = ev.fieldAccess(vals[3], "callconv") catch |err| switch (err) {
-                    error.Abort => break :blk .unknown,
-                    else => |x| return x,
-                };
-                break :blk try callConv(ev.r, try ev.freeze(v));
-            };
-            return Val.ofType(try ip.get(.{ .fn_type = .{ .params = try ev.typesOf(vals[0]), .ret = try asType(vals[2]), .varargs = varargs, .cc = cc } }));
         }
         if (eq(u8, name, "@Enum")) {
             if (vals.len != 4) return error.Abort;
@@ -3830,6 +3819,50 @@ const Evaluator = struct {
 
     fn floatArg(ev: *Evaluator, v: Val) EvalError!f128 {
         return ev.floatOf(v) orelse error.Abort;
+    }
+
+    /// `@Fn(param_types, param_attrs, ReturnType, attrs)`. As in the compiler, the arguments
+    /// have the result types `[]const type`, `*const [param_types.len]ParamAttributes`, `type`
+    /// and `Attributes` (of `std.builtin.Type.Fn`).
+    fn reifyFn(ev: *Evaluator, f: *Frame, args: []const ExprId) EvalError!Val {
+        const ip = ev.ip;
+        if (args.len != 4) return error.Abort;
+        const fn_ty = try ev.stdType(&.{ "builtin", "Type", "Fn" });
+        const params = try ev.typesOf(try ev.eval(f, args[0], try ip.ptrTo(.type_type, .slice, true)));
+        const pa_ty = try ev.member(fn_ty, "ParamAttributes");
+        const pa = try ev.eval(f, args[1], try ip.ptrTo(try ip.get(.{ .array_type = .{ .len = params.len, .child = pa_ty } }), .one, true));
+        if (try ev.elemCount(pa) != params.len) return error.Abort;
+        var noalias_bits: u32 = 0;
+        for (0..params.len) |i| if (try ev.boolField(try ev.elemAt(pa, i), "noalias")) {
+            noalias_bits |= InternPool.FnType.bitOf(i) orelse return error.Abort;
+        };
+        const ret = try ev.evalType(f, args[2]);
+        var cc: InternPool.CallConv = .auto;
+        var varargs = false;
+        switch (f.body.expr(args[3])) {
+            // A struct literal: absent fields keep their defaults. As in `callconv(...)`, `.c`
+            // and the tags without options are known from the syntax.
+            .init => |x| if (x.ty == null) {
+                for (x.fields) |fl| {
+                    const field = fl.name orelse return error.Abort;
+                    if (std.mem.eql(u8, field, "callconv")) {
+                        cc = try writtenCallConv(ev.r, f.body, fl.value, try ev.callConvValue(f, fl.value));
+                    } else if (std.mem.eql(u8, field, "varargs")) {
+                        varargs = switch (try ev.freeze(try ev.eval(f, fl.value, .bool_type)) orelse return error.Abort) {
+                            .true_value => true,
+                            .false_value => false,
+                            else => return error.Abort,
+                        };
+                    } else return error.Abort;
+                }
+                return Val.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret, .varargs = varargs, .cc = cc, .noalias_bits = noalias_bits } }));
+            },
+            else => {},
+        }
+        const attrs = try ev.eval(f, args[3], try ev.member(fn_ty, "Attributes"));
+        cc = try callConv(ev.r, try ev.freeze(try ev.fieldAccess(attrs, "callconv")));
+        varargs = try ev.boolField(attrs, "varargs");
+        return Val.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret, .varargs = varargs, .cc = cc, .noalias_bits = noalias_bits } }));
     }
 
     /// Result type of argument `i` of a builtin (`prev` holds the preceding arguments, `want` is
