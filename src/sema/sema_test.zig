@@ -7617,11 +7617,11 @@ test "comptime evaluation: pointer identity of declarations, functions and tempo
         // `&p.*` is `p`
         .{ "r_deref", "bool = true" },
         // A `*T` → `*[1]T` view of a declaration points to the declaration, its only element
-        // being the place: an interned pointer is compared with that one element (equal data
-        // gives no value, as for `gp`; a literal's sentinel has no room after it)
+        // being the place, and so does the view stored in `gview`; a literal's sentinel has no
+        // room after the place
         .{ "r_view_same", "bool = true" },
         .{ "r_view_elem", "bool = true" },
-        .{ "r_view_interned", "bool" },
+        .{ "r_view_interned", "bool = true" },
         .{ "r_view_lit", "bool = false" },
         .{ "r_eql_view", "bool = true" },
         .{ "r_eql_view_other", "bool = false" },
@@ -7976,6 +7976,180 @@ test "comptime evaluation: @fieldParentPtr in extern and packed containers" {
         // Every field of an extern or packed union starts at the union's address
         .{ "extern_union_other", "u8 = 4" },
         .{ "packed_union_other", "u8 = 4" },
+    });
+}
+
+test "comptime evaluation: pointers stored in declarations keep the place they point to" {
+    try expectTypes(
+        \\const S = struct { a: u8, b: u8 };
+        \\const s_val: S = .{ .a = 1, .b = 2 };
+        \\const s_two: S = .{ .a = 1, .b = 2 };
+        \\const fp = &s_val.b;
+        \\const fp2 = &s_val.b;
+        \\const sp: *const S = &s_val;
+        \\const sp2: *const S = &s_val;
+        \\const sq: *const S = &s_two;
+        \\const arr = [_]u8{ 1, 2, 3, 4 };
+        \\const arr2 = [_]u8{ 1, 2, 3, 4 };
+        \\const gp: [*]const u8 = &arr;
+        \\const gs: []const u8 = &arr;
+        \\const gs_part: []const u8 = arr[1..3];
+        \\const ptrs = [_]*const u8{ &s_val.a, &s_val.b };
+        \\const Holder = struct { p: *const u8 };
+        \\const holder: Holder = .{ .p = &s_val.b };
+        \\fn G(comptime n: u8) type {
+        \\    return struct {
+        \\        const tab = [_]u8{ n, n };
+        \\        const tp: *const [2]u8 = &tab;
+        \\        fn self() bool {
+        \\            return tp == &tab;
+        \\        }
+        \\    };
+        \\}
+        \\fn parentOf(p: *const u8) *const S {
+        \\    return @fieldParentPtr("b", p);
+        \\}
+        \\fn isSVal(p: *const S) bool {
+        \\    return p == &s_val;
+        \\}
+        \\fn eql(a: []const u8, b: []const u8) bool {
+        \\    if (a.len != b.len) return false;
+        \\    if (a.len == 0 or a.ptr == b.ptr) return true;
+        \\    for (a, b) |x, y| if (x != y) return false;
+        \\    return true;
+        \\}
+        \\fn cmpField() bool {
+        \\    return fp == &s_val.b;
+        \\}
+        \\fn otherDecl() bool {
+        \\    return sp == &s_two;
+        \\}
+        \\fn twoStoredOther() bool {
+        \\    return sp == sq;
+        \\}
+        \\fn parentLocal() u8 {
+        \\    const p: *const S = @fieldParentPtr("b", fp);
+        \\    return p.a;
+        \\}
+        \\fn parentHeld() bool {
+        \\    const p: *const S = @fieldParentPtr("b", holder.p);
+        \\    return p == sp;
+        \\}
+        \\fn manyPtr() bool {
+        \\    return gp == @as([*]const u8, &arr);
+        \\}
+        \\fn sliceWhole() bool {
+        \\    return gs.ptr == @as([*]const u8, &arr);
+        \\}
+        \\fn sliceOther() bool {
+        \\    return gs.ptr == @as([*]const u8, &arr2);
+        \\}
+        \\fn slicePart() bool {
+        \\    return gs_part.ptr == gp[1..3].ptr;
+        \\}
+        \\fn slicePartElem() bool {
+        \\    return &gs_part[0] == &arr[1];
+        \\}
+        \\fn slicePartOther() bool {
+        \\    return &gs_part[0] == &arr[0];
+        \\}
+        \\fn localSlice() bool {
+        \\    const s: []const u8 = arr[1..3];
+        \\    return &s[0] == &arr[1];
+        \\}
+        \\fn derefAddr() bool {
+        \\    return &sp.* == sp;
+        \\}
+        \\fn localCopy() bool {
+        \\    const p = sp;
+        \\    return p == &s_val;
+        \\}
+        \\fn genericNamed() bool {
+        \\    const T = G(1);
+        \\    return T.tp == &T.tab;
+        \\}
+        \\fn genericCall() bool {
+        \\    return &G(1).tab == &G(1).tab;
+        \\}
+        \\const c_parent = parentOf(fp).a;
+        \\const c_parent_cmp = parentOf(fp) == &s_val;
+        \\const c_cmp_field = fp == &s_val.b;
+        \\const c_cmp_struct = sp == &s_val;
+        \\const c_field_via_ptr = &sp.b == &s_val.b;
+        \\const c_other_field = fp == &s_val.a;
+        \\const c_other_decl = sp == &s_two;
+        \\const c_two_stored = sp == sp2;
+        \\const c_two_stored_other = sp == sq;
+        \\const c_two_field_ptrs = fp == fp2;
+        \\const c_elem_via_ptr = &gp[2] == &arr[2];
+        \\const c_ptr_in_array = ptrs[1] == &s_val.b;
+        \\const c_ptr_in_array_other = ptrs[0] == &s_val.b;
+        \\const c_held = holder.p == &s_val.b;
+        \\const c_held_other = holder.p == &s_two.b;
+        \\const c_generic_self = G(1).self();
+        \\const r_cmp_field = cmpField();
+        \\const r_other_decl = otherDecl();
+        \\const r_two_stored_other = twoStoredOther();
+        \\const r_parent_local = parentLocal();
+        \\const r_parent_held = parentHeld();
+        \\const r_many_ptr = manyPtr();
+        \\const r_slice_whole = sliceWhole();
+        \\const r_slice_other = sliceOther();
+        \\const r_slice_part = slicePart();
+        \\const r_slice_part_elem = slicePartElem();
+        \\const r_slice_part_other = slicePartOther();
+        \\const r_local_slice = localSlice();
+        \\const r_deref = derefAddr();
+        \\const r_local_copy = localCopy();
+        \\const r_passed = isSVal(sp);
+        \\const r_passed_other = isSVal(sq);
+        \\const r_eql_whole = eql(gs, &arr);
+        \\const r_eql_other = eql(gs, &arr2);
+        \\const r_generic_named = genericNamed();
+        \\const r_generic_call = genericCall();
+    , &.{
+        // `@fieldParentPtr` goes back from a field pointer held by a declaration
+        .{ "c_parent", "u8 = 1" },
+        .{ "c_parent_cmp", "bool = true" },
+        .{ "r_parent_local", "u8 = 1" },
+        .{ "r_parent_held", "bool = true" },
+        // A stored pointer is another address of the place it was taken from
+        .{ "c_cmp_field", "bool = true" },
+        .{ "c_cmp_struct", "bool = true" },
+        .{ "c_field_via_ptr", "bool = true" },
+        .{ "c_two_stored", "bool = true" },
+        .{ "c_two_field_ptrs", "bool = true" },
+        .{ "c_elem_via_ptr", "bool = true" },
+        .{ "c_ptr_in_array", "bool = true" },
+        .{ "c_held", "bool = true" },
+        .{ "c_generic_self", "bool = true" },
+        .{ "r_cmp_field", "bool = true" },
+        .{ "r_many_ptr", "bool = true" },
+        .{ "r_slice_whole", "bool = true" },
+        .{ "r_deref", "bool = true" },
+        .{ "r_local_copy", "bool = true" },
+        .{ "r_passed", "bool = true" },
+        .{ "r_generic_named", "bool = true" },
+        // Other fields and other declarations, whatever their values
+        .{ "c_other_field", "bool = false" },
+        .{ "c_other_decl", "bool = false" },
+        .{ "c_two_stored_other", "bool = false" },
+        .{ "c_ptr_in_array_other", "bool = false" },
+        .{ "c_held_other", "bool = false" },
+        .{ "r_other_decl", "bool = false" },
+        .{ "r_two_stored_other", "bool = false" },
+        .{ "r_slice_other", "bool = false" },
+        .{ "r_passed_other", "bool = false" },
+        // Slicing a declaration's array points into the declaration
+        .{ "r_slice_part", "bool = true" },
+        .{ "r_slice_part_elem", "bool = true" },
+        .{ "r_slice_part_other", "bool = false" },
+        .{ "r_local_slice", "bool = true" },
+        .{ "r_eql_whole", "bool = true" },
+        .{ "r_eql_other", "bool = true" },
+        // `&` of a member of a type returned by a call does not evaluate the call again for the
+        // place, so its place is not known: no value instead of `false`
+        .{ "r_generic_call", "bool" },
     });
 }
 
