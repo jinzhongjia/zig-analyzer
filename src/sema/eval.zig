@@ -132,6 +132,80 @@ pub fn compute(ctx: *Db.Ctx, key: CallKey) Error!TypedValue {
     return ev.toTyped(result) catch |err| giveUp(err);
 }
 
+/// Computation of `LocalEval`: executes function `key.owner` in its instance `key.inst`, with the
+/// argument values the instance records, and stops once the frame of the function defines local
+/// constant `key.target`. Only a constant defined at most once per call (outside the bodies,
+/// conditions and continue expressions of loops) has one value per instance; such a constant
+/// also has that value in every iteration of a loop inferred per iteration, so an iteration
+/// instance stands for the instance of its function. The call sites that produce the instance
+/// are not known, so the backward branch quota is the default one (`@setEvalBranchQuota` in the
+/// function raises it as usual).
+pub fn localValue(ctx: *Db.Ctx, key: queries.LocalKey) Error!TypedValue {
+    const binding = switch (key.target) {
+        .binding => |b| b,
+        .expr => return .unknown,
+    };
+    const ip = ctx.db.env.ip;
+    var run = key.inst orelse return .unknown;
+    var inst = switch (ip.key(run)) {
+        .instance => |i| i,
+        else => return .unknown,
+    };
+    if (inst.file != key.owner.file or inst.decl != key.owner.item) return .unknown;
+    if (inst.iteration) |it| {
+        if (it.abstract) return .unknown;
+        inst.iteration = null;
+        run = try ip.get(.{ .instance = inst });
+    }
+    const body = try ctx.get(hir.ItemBody, key.owner);
+    if (@backingInt(binding) >= body.bindings.len) return .unknown;
+    const b = body.binding(binding);
+    if (b.kind != .local_const or repeats(body, b.range.start)) return .unknown;
+    var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+    defer scratch.deinit();
+    var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+    const scope = try queries.enterContext(&r, key.owner.file, run);
+    defer scope.leave();
+    var stop: Stop = .{ .binding = binding };
+    var ev: Evaluator = .{ .r = &r, .ip = ip, .a = scratch.allocator(), .arena = &scratch, .stop = &stop };
+    defer ev.deinit();
+    const vals = try ev.a.alloc(Val, body.params.len);
+    for (body.params, vals, 0..) |p, *v, i| {
+        const x: Index = if (i < inst.args.len) inst.args[i] else .unknown;
+        // The instance records only the type of the argument of an anytype parameter, which
+        // `runFunction` takes from the instance
+        const param = body.binding(p);
+        const type_only = param.ty == null and !param.is_comptime;
+        v.* = if (x == .unknown or x == .runtime or type_only) .unknown else Val.of(value.typeOfValue(ip, x), x);
+    }
+    _ = ev.runFunction(key.owner, run, vals) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => {},
+        error.Canceled => return error.Canceled,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    return stop.value orelse .unknown;
+}
+
+/// Whether code at offset `pos` of a body can run more than once per execution of the body: in
+/// the body, the condition or the continue expression of a loop
+fn repeats(body: *const Body, pos: u32) bool {
+    const within = struct {
+        fn f(b: *const Body, e: ExprId, at: u32) bool {
+            const rg = b.range(e);
+            return rg.start <= at and at < rg.end;
+        }
+    }.f;
+    for (body.exprs) |x| switch (x) {
+        .loop => |l| {
+            if (within(body, l.body, pos)) return true;
+            if (l.cont) |c| if (within(body, c, pos)) return true;
+            if (l.kind == .@"while") for (l.inputs) |i| if (within(body, i, pos)) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
 /// comptime value of the body of a member (container-level constant, field default value).
 /// `want` is the type annotation.
 pub fn ownerValue(r: *Resolver, owner: hir.OwnerKey, inst: ?Index, want: ?Index) Error!TypedValue {
@@ -725,6 +799,16 @@ const Label = struct {
 
 pub const Field = struct { name: []const u8, ty: Index, item: ?u32 = null };
 
+/// Where `localValue` stops the evaluation: once the frame of the function it executes defines
+/// local constant `binding`
+const Stop = struct {
+    binding: Body.BindingId,
+    /// The frame of the function `localValue` executes (the first frame `runFunction` creates)
+    frame: ?*const Frame = null,
+    /// The value of the constant once defined; every later step then aborts
+    value: ?TypedValue = null,
+};
+
 const Evaluator = struct {
     r: *Resolver,
     ip: *InternPool,
@@ -750,6 +834,8 @@ const Evaluator = struct {
     /// Target (index into `Frame.labels`) and value of break / continue; the value of return
     jump_target: usize = 0,
     jump_value: Val = .unknown,
+    /// Stops the evaluation at the definition of a local constant (see `localValue`)
+    stop: ?*Stop = null,
 
     fn deinit(ev: *Evaluator) void {
         if (!ev.owns_calls) return;
@@ -760,6 +846,7 @@ const Evaluator = struct {
 
     fn tick(ev: *Evaluator) EvalError!void {
         const ctx = ev.r.ctx;
+        if (ev.stop) |s| if (s.value != null) return error.Abort;
         ev.steps +%= 1;
         if (ev.steps % 256 == 0) {
             try ctx.checkCanceled();
@@ -1771,6 +1858,9 @@ const Evaluator = struct {
         const sig = try ev.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .signature, .inst = inst });
         const inst_args = ip.key(inst).instance.args;
         var frame = try ev.newFrame(owner.file, item, body, inst);
+        if (ev.stop) |s| if (s.frame == null) {
+            s.frame = &frame;
+        };
         for (body.params, 0..) |p, i| {
             const arg: Val = if (i < args.len) args[i] else .unknown;
             // The type of an anytype parameter is the type of the argument (also what the instance
@@ -1862,6 +1952,7 @@ const Evaluator = struct {
                 const ty: ?Index = if (binding.ty) |t| try ev.evalType(f, t) else null;
                 const init: Val = if (binding.init) |x| try ev.eval(f, x, ty) else .{ .ty = ty orelse .unknown, .v = .undef };
                 f.slots[@backingInt(bid)] = try ev.copy(.{ .ty = ty orelse init.ty, .v = init.v });
+                try ev.defined(f, bid);
             },
             .@"defer" => |x| try defers.append(ev.a, .{ .body = x, .on_error = false }),
             .@"errdefer" => |x| try defers.append(ev.a, .{ .body = x, .on_error = true }),
@@ -1873,6 +1964,7 @@ const Evaluator = struct {
                         .binding => |bid| {
                             const ty: ?Index = if (f.body.binding(bid).ty) |te| try ev.evalType(f, te) else null;
                             f.slots[@backingInt(bid)] = try ev.copy(try ev.coerce(elem, ty));
+                            try ev.defined(f, bid);
                         },
                         .expr => |x| {
                             if (f.body.expr(x) == .name_ref and std.mem.eql(u8, f.body.expr(x).name_ref, "_")) continue;
@@ -1882,6 +1974,16 @@ const Evaluator = struct {
                 }
             },
         };
+    }
+
+    /// A statement of frame `f` has defined local `bid`: when it is where the evaluation stops
+    /// (see `Stop`), keeps its value and ends the evaluation
+    fn defined(ev: *Evaluator, f: *const Frame, bid: Body.BindingId) EvalError!void {
+        const s = ev.stop orelse return;
+        if (s.frame != f or s.binding != bid) return;
+        const tv = try ev.toTyped(f.slots[@backingInt(bid)]);
+        s.value = tv;
+        return error.Abort;
     }
 
     const Condition = struct { yes: bool, payload: Val = .unknown };
