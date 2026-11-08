@@ -59,16 +59,33 @@ pub fn scan(io: Io, arena: Allocator, vfs: *Vfs, rules: origin.Rules) Allocator.
 pub fn contains(vfs: *Vfs, rules: origin.Rules, path: []const u8) bool {
     if (!isSource(std.fs.path.basename(path))) return false;
     if (origin.classify(vfs, rules, path, false) != .user) return false;
-    roots: for (rules.roots) |root| {
-        if (!vfs.isUnder(path, root)) continue;
-        var dir = std.fs.path.dirname(path);
-        while (dir) |d| : (dir = std.fs.path.dirname(d)) {
-            if (d.len <= root.len) break;
-            if (skipped(std.fs.path.basename(d)) or isLibraryDir(vfs, rules, d)) continue :roots;
-        }
-        return true;
+    const dir = std.fs.path.dirname(path) orelse return false;
+    for (rules.roots) |root| {
+        if (vfs.isUnder(path, root) and enters(vfs, rules, root, dir)) return true;
     }
     return false;
+}
+
+/// Whether a directory created or removed at `dir` may change what `scan` finds: `scan` enters it,
+/// or it is a root or contains one. A directory that `scan` does not enter (such as those a build
+/// creates in `.zig-cache` and `zig-out`) holds none of the files it finds.
+pub fn affectsScan(vfs: *Vfs, rules: origin.Rules, dir: []const u8) bool {
+    for (rules.roots) |root| {
+        if (vfs.isUnder(root, dir)) return true;
+        if (vfs.isUnder(dir, root) and enters(vfs, rules, root, dir)) return true;
+    }
+    return false;
+}
+
+/// Whether walking `root` enters `dir`, a directory under it: no directory below `root` on the way
+/// to `dir`, `dir` included, is skipped or a library directory
+fn enters(vfs: *Vfs, rules: origin.Rules, root: []const u8, dir: []const u8) bool {
+    var d: ?[]const u8 = dir;
+    while (d) |p| : (d = std.fs.path.dirname(p)) {
+        if (p.len <= root.len) return true;
+        if (skipped(std.fs.path.basename(p)) or isLibraryDir(vfs, rules, p)) return false;
+    }
+    return true;
 }
 
 /// `dir` is or lies in a local cache, a fetched package, or the global cache
@@ -158,4 +175,36 @@ test scan {
         try testing.expect(!contains(&vfs, rules, try std.fs.path.join(a, &.{ ws, sub })));
     }
     try testing.expect(!contains(&vfs, rules, try std.fs.path.join(a, &.{ base, "outside.zig" })));
+    // A directory created or removed changes what `scan` finds when `scan` enters it, or when it is
+    // a root or contains one
+    for ([_][]const u8{
+        "src",
+        "src" ++ sep ++ "new",
+        "examples",
+        "nested",
+        "vendor",
+        ".hidden",
+        ".hidden" ++ sep ++ "proj",
+        ".hidden" ++ sep ++ "proj" ++ sep ++ "sub",
+    }) |sub| {
+        try testing.expect(affectsScan(&vfs, rules, try std.fs.path.join(a, &.{ ws, sub })));
+    }
+    try testing.expect(affectsScan(&vfs, rules, ws));
+    try testing.expect(affectsScan(&vfs, rules, base));
+    // What a build leaves behind, version control, packages and caches: `scan` enters none of them
+    for ([_][]const u8{
+        ".zig-cache",
+        ".zig-cache" ++ sep ++ "o" ++ sep ++ "0123",
+        ".git" ++ sep ++ "objects",
+        "zig-out",
+        "zig-out" ++ sep ++ "bin",
+        "zig-pkg" ++ sep ++ "dep-hash",
+        "cache",
+        "cache" ++ sep ++ "c",
+        "vendor" ++ sep ++ "pkg",
+        ".hidden" ++ sep ++ "other",
+    }) |sub| {
+        try testing.expect(!affectsScan(&vfs, rules, try std.fs.path.join(a, &.{ ws, sub })));
+    }
+    try testing.expect(!affectsScan(&vfs, rules, try std.fs.path.join(a, &.{ base, "outside" })));
 }
