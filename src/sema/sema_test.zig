@@ -6045,6 +6045,36 @@ test "constants whose inferred type has unknown parts take the type and value of
     });
 }
 
+test "variables whose inferred type has unknown parts take the type of the interpreter" {
+    // Only a variable whose inferred type was entirely unknown ran the interpreter, so one with an
+    // array whose length a loop computes kept the length unknown.
+    try expectTypes(
+        \\var array = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk @as([n]u8, @splat(0)); };
+        \\var optional_null = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk @as(?[n]u8, null); };
+        \\var tuple = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk .{ @as([n]u8, @splat(1)), @as(u8, 2) }; };
+        \\var annotated: [3]u8 = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk @as([n]u8, @splat(7)); };
+        \\const S = struct {
+        \\    var in_struct = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk @as([n]u16, @splat(0)); };
+        \\};
+        \\const read = array;
+        \\fn g() void {
+        \\    const len = array.len;
+        \\    const elem = S.in_struct[0];
+        \\    _ = .{ len, elem };
+        \\}
+    , &.{
+        .{ "array", "[3]u8" },
+        .{ "optional_null", "?[3]u8" },
+        .{ "tuple", "struct { comptime [3]u8 = \"\\x01\\x01\\x01\", comptime u8 = 2 }" },
+        .{ "annotated", "[3]u8" },
+        .{ "in_struct", "[3]u16" },
+        // The value of a variable is never comptime-known, but the length of its array type is
+        .{ "read", "[3]u8" },
+        .{ "len", "usize = 3" },
+        .{ "elem", "u16" },
+    });
+}
+
 test "anytype arguments do not expand large arrays" {
     // Previously: anytype arguments were evaluated as a comptime context,
     // and slicing a huge array expanded its elements one by one in the interpreter

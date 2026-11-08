@@ -186,18 +186,18 @@ pub const DeclType = struct {
                 };
                 const is_const = tree.items[item].kind == .@"const";
                 // The initializer of every container-level declaration is evaluated at comptime,
-                // that of a variable too (its initial value must be comptime-known): when
-                // inference cannot compute the value of a constant, or the type of a variable
-                // without a type annotation, the interpreter executes the initializer expression.
-                // It does too when inference gives a constant without an annotation a type with
-                // unknown parts (an array whose length a loop computes: inference does not execute
-                // non-inline loops). Without an annotation, the result is taken only when it fills
-                // in the unknown parts of the inferred type and value and agrees with every part
-                // inference knows. A variable takes only the type of the result, since its value
-                // can change at runtime. For a variable with an annotation, or one whose type
-                // inference knows, the result could not change the type.
+                // that of a variable too (its initial value must be comptime-known). The
+                // interpreter executes the initializer expression when inference cannot compute
+                // the value of a constant, or gives a declaration without a type annotation a type
+                // with unknown parts (an unknown type, or an array whose length a loop computes:
+                // inference does not execute non-inline loops). Without an annotation, the result
+                // is taken only when it fills in the unknown parts of the inferred type and value
+                // and agrees with every part inference knows. A variable takes only the type of
+                // the result, since its value can change at runtime. For a variable with an
+                // annotation, or one whose type inference knows completely, the result could not
+                // change the type.
                 const partial = annotation == null and !@import("value.zig").isPrecise(ip, value.ty);
-                const run = if (is_const) value.val == null or partial else annotation == null and value.ty == .unknown;
+                const run = partial or (is_const and value.val == null);
                 if (run and b.value != null and !ctx.incomplete()) {
                     const ev = try eval.ownerValue(&r, key, dk.inst, annotation);
                     if (ev.val != null and (annotation != null or completesInferred(ip, value, ev))) value = ev;
