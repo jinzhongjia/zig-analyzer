@@ -855,7 +855,8 @@ const CellOrigin = enum {
     /// A `threadlocal` variable: its address is known only at runtime
     thread_local,
     /// A comptime-known value that is not a place: the compiler's `analyzeRef` makes an
-    /// anonymous constant of it, the same constant for equal values of the same type
+    /// anonymous constant of it, the same constant for equal values of the same type. A `++`
+    /// result that is a pointer points to such a constant too (`Sema.zirArrayCat`).
     temporary,
     /// A copy of storage outside this evaluation whose place is not known here (a field reached
     /// through an interned pointer that records no place, a value captured from an enclosing
@@ -2961,8 +2962,28 @@ const Evaluator = struct {
             for (elems, types) |e, *t| t.* = e.ty;
             ty = try ip.get(.{ .tuple_type = .{ .types = types, .values = try ev.comptimeFieldValues(elems) } });
         }
-        // Intermediate results stay inside the interpreter and are not interned
-        if (ip.key(ty) == .ptr_type) return ev.pointerToNew(ty, try ev.makeAgg(ip.key(ty).ptr_type.child, elems));
+        // A pointer points to an anonymous constant holding the result (`uavRef` in
+        // `Sema.zirArrayCat`). When both operands are interned, the result is interned as a string
+        // literal is, so it is the same interned value as an equal literal and compares with
+        // interned pointers as literals do. Otherwise it stays inside the interpreter in a
+        // temporary cell: freezing the operands could copy what their pointers point to.
+        if (ip.key(ty) == .ptr_type) {
+            const array = ip.key(ty).ptr_type.child;
+            interned: {
+                if (lhs.v != .ip or rhs.v != .ip) break :interned;
+                const frozen = try ev.a.alloc(Index, total);
+                for (elems, frozen) |e, *o| o.* = try ev.freeze(e) orelse break :interned;
+                // An empty string is `bytes` like the literal `""`
+                const data = if (total == 0 and ip.key(array).array_type.child == .u8_type)
+                    try ip.get(.{ .bytes = .{ .ty = array, .bytes = "" } })
+                else
+                    try ev.aggregate(array, frozen);
+                return Val.of(ty, try ev.pointerTo(ty, data, null));
+            }
+            const p = try ev.pointerToNew(ty, try ev.makeAgg(array, elems));
+            try ev.cell_origins.put(ev.a, p.v.ref.cell, .temporary);
+            return p;
+        }
         return ev.makeAgg(ty, elems);
     }
 
