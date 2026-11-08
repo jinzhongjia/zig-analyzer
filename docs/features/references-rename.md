@@ -14,7 +14,7 @@ A member access through a namespace chosen by build configuration, or in a regio
 
 The scope of references, rename, reference-editing fixes, and workspace symbol: project files in the module graph (excluding std), user source files under the root directories, and open documents. Root directories are walked in the background, skipping hidden directories, `zig-pkg`, `zig-out`, and project caches, so files in no build graph are searched too.
 
-Until a walk finishes and during a project's first load, references, rename, and those fixes fail with that reason rather than returning partial results. Local names and non-`pub` declarations other than fields are exempt, since only their file can refer to them.
+References, rename, and those fixes that meet a walk scheduled or in progress wait until the walks scheduled up to then have finished and then answer, so a change on disk just before the request does not make them fail. Walks scheduled during the wait are for changes noticed after the request and are not waited for, so the wait ends even while source files keep being created. Before the first walk is scheduled and during a project's first load, they fail with that reason rather than returning partial results. Local names and non-`pub` declarations other than fields are exempt, since only their file can refer to them.
 
 ## Rename
 

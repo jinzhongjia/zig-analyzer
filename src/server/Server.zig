@@ -65,6 +65,10 @@ pending: std.ArrayList(*Pending) = .empty,
 /// Test hook: holds the read and semantic requests of one method at a point of their execution
 /// (see `TestGate`); always null outside tests
 test_gate: ?*TestGate = null,
+/// Test hook: while set, each scan schedules another before it is recorded as finished, as when
+/// source files keep being created during every walk, so that a scan is always pending; always
+/// false outside tests
+test_rescan: std.atomic.Value(bool) = .init(false),
 
 /// Background tasks: reading projects' build system protocol, publishing diagnostics. Several
 /// threads submit tasks to it, and `Io.Group` does not allow submitting during an await, so it
@@ -210,11 +214,16 @@ index_cond: Io.Condition = .init,
 /// Generation of the workspace file scan (see `scheduleScan`): incremented whenever the source
 /// files under the root directories may have changed
 scan_generation: std.atomic.Value(u64) = .init(0),
-/// Generation of the last finished scan (`never_scanned` before the first one): the search scope is
-/// complete only when it equals `scan_generation` (see `scopeIncomplete`)
-scan_done: std.atomic.Value(u64) = .init(never_scanned),
+/// Generation of the last finished scan (0 before the first one); it only grows, since scans run
+/// one at a time. The search scope is complete when it equals `scan_generation` (see
+/// `scopeIncomplete`).
+scan_done: std.atomic.Value(u64) = .init(0),
 /// Whether a scan task is running (only one runs at a time)
 scanning: std.atomic.Value(bool) = .init(false),
+/// `scan_wait_cond` is signaled when a scan finishes, when requests are canceled, and on shutdown
+/// (see `waitScans`)
+scan_wait_mutex: Io.Mutex = .init,
+scan_wait_cond: Io.Condition = .init,
 config_mutex: Io.Mutex = .init,
 config: Config = .{},
 // ── Pulled configuration (accessed only on the main loop) ──
@@ -391,6 +400,8 @@ const Pending = struct {
     since: Db.Mark,
     /// The document a request held by `waitForProjects` refers to, as it was when received
     document: ?HeldDocument = null,
+    /// The scan generation a semantic request has waited for (see `waitScans`); 0 until it waits
+    scans_awaited: u64 = 0,
     /// Type information when the task started (see `maybeResetSema`)
     sema_start: SemaUsage = .{},
 };
@@ -425,6 +436,9 @@ pub const HandlerError = error{
     InvalidParams,
     /// The new name is not a valid identifier
     InvalidIdentifier,
+    /// A scan of the root directories is scheduled or running, so the search scope may lack files:
+    /// the request waits for the scans scheduled so far and runs again (see `scopeIncomplete`)
+    ScanPending,
 };
 
 /// Initializes in place: the query engine holds a pointer to `server.env`, so the Server must not
@@ -867,11 +881,23 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
                 if (server.waitSymbolIndex(pending) or waited_for_projects) pending.since = server.db.mark(pending.since.inputs);
             }
             server.testGate(method, .before_read, pending);
-            while (!attempt(server, pending, params, waited_for_projects)) {}
+            while (true) switch (attempt(server, pending, params, waited_for_projects)) {
+                .answered => return,
+                .again => {},
+                // Outside the read transaction: the scan's write waits for read transactions
+                .after_scans => server.waitScans(pending),
+            };
         }
 
-        /// Returns whether the request was answered (see `answerFailure`)
-        fn attempt(server: *Server, pending: *Pending, params: Params, waited_for_projects: bool) bool {
+        const Next = enum {
+            answered,
+            /// Run again at once (see `answerFailure`)
+            again,
+            /// Run again after the scans scheduled so far (see `HandlerError.ScanPending`)
+            after_scans,
+        };
+
+        fn attempt(server: *Server, pending: *Pending, params: Params, waited_for_projects: bool) Next {
             var attempt_arena: std.heap.ArenaAllocator = .init(server.gpa);
             defer attempt_arena.deinit();
             const a = attempt_arena.allocator();
@@ -895,14 +921,23 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             const t0 = Io.Clock.awake.now(server.io);
             defer server.reportIfSlow(&ctx, method, t0, &trace);
             var r: Resolver = .{ .ctx = &ctx, .arena = a };
-            const result = func(server, &r, a, params) catch |err| return server.answerFailure(&ctx, pending, err);
+            handler_scans_awaited = pending.scans_awaited;
+            defer handler_scans_awaited = 0;
+            const result = func(server, &r, a, params) catch |err| return failed(server, &ctx, pending, err);
             // As in ReadTask: a handler that swallowed `Canceled` has an incomplete result
-            ctx.checkCanceled() catch |err| return server.answerFailure(&ctx, pending, err);
+            ctx.checkCanceled() catch |err| return failed(server, &ctx, pending, err);
             if (comptime isOutcome(@TypeOf(result))) switch (result) {
                 .ok => |v| server.sendResponse(pending.id, v),
                 .failed => |message| server.sendError(pending.id, jsonrpc.error_codes.request_failed, message),
             } else server.sendResponse(pending.id, result);
-            return true;
+            return .answered;
+        }
+
+        fn failed(server: *Server, ctx: *const Db.Ctx, pending: *const Pending, err: anyerror) Next {
+            // Waits once: after the wait, the scans it waited for are enough (see `scopeIncomplete`),
+            // so the scope is still incomplete only when the wait was cut short
+            if (err == error.ScanPending and pending.scans_awaited == 0 and !pending.cancel.load(.acquire) and !server.isShuttingDown()) return .after_scans;
+            return if (server.answerFailure(ctx, pending, err)) .answered else .again;
         }
     };
 }
@@ -1319,13 +1354,37 @@ fn scanTask(server: *Server) Io.Cancelable!void {
         server.scanOnce() catch |err| switch (err) {
             error.OutOfMemory => log.err("out of memory while scanning the workspace for source files", .{}),
         };
+        if (server.test_rescan.load(.acquire)) server.scheduleScan();
         server.scan_done.store(generation, .release);
+        server.wakeScanWaiters();
         if (server.scan_generation.load(.acquire) != generation) continue;
         server.scanning.store(false, .release);
         // Scheduled again after the flag was released, and no other task took over: continue
         if (server.scan_generation.load(.monotonic) == generation) return;
         if (server.scanning.swap(true, .acq_rel)) return;
     }
+}
+
+/// Waits until the scans scheduled so far have finished, or until `pending` is canceled or the
+/// server shuts down, and records them in `pending.scans_awaited`: from then on the request takes
+/// the search scope as of these scans (see `scopeIncomplete`). Scans scheduled during the wait are
+/// for changes noticed after the request started waiting, and are not waited for: while source
+/// files keep being created, a scan is always pending, and waiting for no scan to be pending would
+/// not end. The wait is the rest of the walk in progress and at most one more.
+fn waitScans(server: *Server, pending: *Pending) void {
+    const target = server.scan_generation.load(.acquire);
+    pending.scans_awaited = target;
+    server.scan_wait_mutex.lockUncancelable(server.io);
+    defer server.scan_wait_mutex.unlock(server.io);
+    while (server.scan_done.load(.acquire) < target and !pending.cancel.load(.acquire) and !server.isShuttingDown()) {
+        server.scan_wait_cond.wait(server.io, &server.scan_wait_mutex) catch break;
+    }
+}
+
+fn wakeScanWaiters(server: *Server) void {
+    server.scan_wait_mutex.lockUncancelable(server.io);
+    defer server.scan_wait_mutex.unlock(server.io);
+    server.scan_wait_cond.broadcast(server.io);
 }
 
 /// One scan: updates `WorkspaceFiles` when the files found differ, and then indexes them for
@@ -1636,8 +1695,8 @@ fn removePending(server: *Server, pending: *Pending) void {
     }
 }
 
-/// Cancels the request `id`; one waiting for the workspace symbol index or for projects stops
-/// waiting
+/// Cancels the request `id`; one waiting for the workspace symbol index, for projects or for scans
+/// stops waiting
 fn cancelPending(server: *Server, id: jsonrpc.Id) void {
     server.pending_mutex.lockUncancelable(server.io);
     defer server.pending_mutex.unlock(server.io);
@@ -1646,6 +1705,7 @@ fn cancelPending(server: *Server, id: jsonrpc.Id) void {
     }
     server.wakeSymbolWaiters();
     server.wakeProjectWaiters();
+    server.wakeScanWaiters();
 }
 
 fn cancelAllPending(server: *Server) void {
@@ -1654,6 +1714,7 @@ fn cancelAllPending(server: *Server) void {
     for (server.pending.items) |p| p.cancel.store(true, .release);
     server.wakeSymbolWaiters();
     server.wakeProjectWaiters();
+    server.wakeScanWaiters();
 }
 
 const semantic_refresh_id = "zig-analyzer/semanticTokensRefresh";
@@ -3994,6 +4055,7 @@ fn stopWorkspaces(server: *Server) void {
         }
     }
     server.wakeProjectWaiters();
+    server.wakeScanWaiters();
     if (server.watcher) |w| w.stop();
     server.single_compiles.stop(server.io);
 }
@@ -5979,18 +6041,25 @@ fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.Inla
     return out;
 }
 
-/// `scan_done` before the first scan of the root directories has finished
-const never_scanned = std.math.maxInt(u64);
+/// `Pending.scans_awaited` of the semantic request whose handler runs on this thread (see
+/// `SemanticTask`): the handlers that call `scopeIncomplete` get no `Pending`
+threadlocal var handler_scans_awaited: u64 = 0;
 
-/// Why the search scope may lack files that refer to a declaration right now, or null: the root
-/// directories have not been scanned since source files may have changed (see `scheduleScan`), or
-/// a project is still in its first load (until then, which files belong to it and what its imports
-/// by name resolve to are not known). Find references, rename and the fixes that edit references
-/// fail with this reason instead of returning partial results.
-fn scopeIncomplete(server: *Server) ?[]const u8 {
-    if (server.scan_done.load(.acquire) != server.scan_generation.load(.acquire))
+/// Why the search scope may lack files that refer to a declaration right now, or null: the first
+/// scan of the root directories has not been scheduled yet (startup has not ended), or a project is
+/// still in its first load (until then, which files belong to it and what its imports by name
+/// resolve to are not known). Find references, rename and the fixes that edit references fail with
+/// this reason instead of returning partial results. While a scan is scheduled or running (source
+/// files may have changed since the last one, see `scheduleScan`), returns `error.ScanPending`
+/// instead: the request waits for the scans scheduled so far, which takes a moment, and runs again
+/// (see `waitScans`). Once it has waited, the scans it waited for are enough.
+fn scopeIncomplete(server: *Server) error{ScanPending}!?[]const u8 {
+    const scheduled = server.scan_generation.load(.acquire);
+    if (scheduled == 0)
         return "the workspace folders are still being searched for source files, so not all files that may refer to it are known yet";
     if (server.projectsLoading()) return "the project is still loading, so not all files that may refer to it are known yet";
+    const needed = if (handler_scans_awaited != 0) handler_scans_awaited else scheduled;
+    if (server.scan_done.load(.acquire) < needed) return error.ScanPending;
     return null;
 }
 
@@ -6946,6 +7015,12 @@ fn sendHandlerError(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_
             server.sendError(id, jsonrpc.error_codes.content_modified, "content modified"),
         error.InvalidParams => server.sendError(id, jsonrpc.error_codes.invalid_params, "invalid params"),
         error.InvalidIdentifier => server.sendError(id, jsonrpc.error_codes.request_failed, "new name is not a valid identifier"),
+        // Answered only when the wait for scans was cut short, by a cancellation or the shutdown
+        // (see `SemanticTask`)
+        error.ScanPending => if (canceled_by_client)
+            server.sendError(id, jsonrpc.error_codes.request_cancelled, "request cancelled")
+        else
+            server.sendError(id, jsonrpc.error_codes.request_failed, "the server is shutting down"),
         else => server.sendError(id, jsonrpc.error_codes.internal_error, @errorName(err)),
     }
 }
