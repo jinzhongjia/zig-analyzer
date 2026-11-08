@@ -3303,6 +3303,9 @@ const Evaluator = struct {
             const t = try infer.qualifierCastDest(ip, v.ty, name) orelse return error.Abort;
             return .{ .ty = t, .v = v.v };
         }
+        // The compiler merges the casts above `@fieldParentPtr` into it: the chain is one
+        // `@fieldParentPtr` whose destination comes from the result type of the outermost cast
+        if (mergedFieldParentPtr(f.body, e)) |inner| return ev.eval(f, inner, want);
         const vals = try ev.a.alloc(Val, args.len);
         // Result types of the arguments
         for (args, vals, 0..) |a, *o, i| o.* = try ev.eval(f, a, try ev.builtinArgType(name, i, vals[0..i], want));
@@ -3333,6 +3336,10 @@ const Evaluator = struct {
         if (eq(u8, name, "@field")) {
             if (vals.len != 2) return error.Abort;
             return ev.fieldAccess(vals[0], try ev.stringOf(vals[1]));
+        }
+        if (eq(u8, name, "@fieldParentPtr")) {
+            if (vals.len != 2) return error.Abort;
+            return ev.fieldParentPtr(try ev.stringOf(vals[0]), vals[1], want orelse return error.Abort);
         }
         if (eq(u8, name, "@hasDecl") or eq(u8, name, "@hasField")) {
             if (vals.len != 2) return error.Abort;
@@ -3824,6 +3831,48 @@ const Evaluator = struct {
             .array_type => |arr| .{ .elem = arr.child, .len = arr.len, .single = false },
             else => .{ .elem = p.child, .len = null, .single = true },
         };
+    }
+
+    /// `@fieldParentPtr(name, field_ptr)` with result type `result_ty` (the compiler's
+    /// `zirFieldParentPtr`). The destination type is the result type without its error union: a
+    /// pointer or an optional pointer to a struct or union. The result points to the value that
+    /// contains the field `field_ptr` points to, which must be field `name` of a value of the
+    /// parent type, or in an extern or packed union (whose fields all start at the union's
+    /// address) another field of the same type. Gives up otherwise: with an auto layout the
+    /// compiler rejects it, and with the other layouts the result reinterprets memory, which the
+    /// interpreter does not model. A comptime field is rejected as in the compiler. Qualifiers
+    /// and alignment are not checked against the field pointer.
+    fn fieldParentPtr(ev: *Evaluator, name: []const u8, field_ptr: Val, result_ty: Index) EvalError!Val {
+        const ip = ev.ip;
+        const dest = switch (ip.key(result_ty)) {
+            .error_union_type => |eu| eu.payload,
+            else => result_ty,
+        };
+        const parent_ptr = pointerType(ip, dest) orelse return error.Abort;
+        if (parent_ptr.size != .one) return error.Abort;
+        const parent_ty = parent_ptr.child;
+        const fields = try ev.fieldsOf(parent_ty) orelse return error.Abort;
+        const index = for (fields, 0..) |field, i| {
+            if (std.mem.eql(u8, field.name, name)) break i;
+        } else return error.Abort;
+        const is_comptime = if (fields[index].item) |m| blk: {
+            const ns = try queries.namespaceOfType(ev.r, parent_ty) orelse return error.Abort;
+            break :blk (try ev.r.itemTree(ns.file)).items[m].flags.is_comptime;
+        } else (try ev.fieldAttrs(parent_ty, index, fields[index])).is_comptime;
+        if (is_comptime) return error.Abort;
+        const ref = switch (field_ptr.v) {
+            .ref => |r| r,
+            else => return error.Abort,
+        };
+        if (ref.window != null or ref.path.len == 0) return error.Abort;
+        const parent: Ref = .{ .cell = ref.cell, .path = ref.path[0 .. ref.path.len - 1], .is_const = parent_ptr.is_const, .immutable = ref.immutable };
+        if (value.eqlTypes(ip, (try ev.loadPath(parent)).ty, parent_ty) != true) return error.Abort;
+        const at = ref.path[ref.path.len - 1];
+        if (at != index) {
+            if (!ev.isUnion(parent_ty) or try ev.layoutOf(parent_ty) == .auto) return error.Abort;
+            if (at >= fields.len or value.eqlTypes(ip, fields[at].ty, fields[index].ty) != true) return error.Abort;
+        }
+        return .{ .ty = dest, .v = .{ .ref = parent } };
     }
 
     fn cast(ev: *Evaluator, name: []const u8, v: Val, t: Index) EvalError!Val {
@@ -4878,6 +4927,28 @@ const Evaluator = struct {
         return ev.ip.intType(.unsigned, std.math.cast(u16, bits) orelse return error.Abort);
     }
 };
+
+/// The `@fieldParentPtr` call that the casts at `e` are merged into (the compiler's AstGen
+/// `ptrCast`): `@alignCast`, `@addrSpaceCast`, `@constCast` and `@volatileCast` around
+/// `@fieldParentPtr`. With `@ptrCast` in the chain nothing is merged, and `@fieldParentPtr` has
+/// no result type.
+fn mergedFieldParentPtr(body: *const Body, e: ExprId) ?ExprId {
+    const merged = [_][]const u8{ "@alignCast", "@addrSpaceCast", "@constCast", "@volatileCast" };
+    var cur = e;
+    var depth: usize = 0;
+    while (true) : (depth += 1) {
+        const bc = switch (body.expr(cur)) {
+            .builtin_call => |c| c,
+            else => return null,
+        };
+        if (std.mem.eql(u8, bc.name, "@fieldParentPtr")) return if (depth > 0 and bc.args.len == 2) cur else null;
+        for (merged) |name| {
+            if (std.mem.eql(u8, bc.name, name)) break;
+        } else return null;
+        if (bc.args.len != 1) return null;
+        cur = bc.args[0];
+    }
+}
 
 fn compareBig(op: SyntaxKind, x: bigint.Big, y: bigint.Big) bool {
     const ord = bigint.order(x, y);
