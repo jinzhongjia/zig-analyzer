@@ -533,7 +533,9 @@ fn abortToNull(err: EvalError) Error!?TypedValue {
 /// Whether two values are equal: beyond `value.eqlValues`, two containers at the same location
 /// in different instances are compared by the values they capture (in Zig the identity of a
 /// container = definition location + captured values: a container that captures no arguments
-/// is the same type across instances)
+/// is the same type across instances). Captured values are compared as the compiler interns
+/// them: values of different types are different captures even when `==` holds for them
+/// (`@as(u8, 3)` and `@as(u16, 3)`).
 pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
     const ip = r.ctx.db.env.ip;
     if (value.eqlValues(ip, a, b)) |eq| return eq;
@@ -552,13 +554,14 @@ pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
     var unknown = false;
     for (try captures(r, ns)) |cap| {
         const def: resolve.Def = .{ .local = .{ .file = ns.file, .item = cap.item, .binding = cap.binding } };
-        const va = (try queries.defType(r, def, null, ia)).val orelse return null;
-        const vb = (try queries.defType(r, def, null, ib)).val orelse return null;
-        const eq = value.eqlValues(ip, va, vb) orelse {
-            unknown = true;
-            continue;
-        };
-        if (!eq) return false;
+        const ta = try queries.defType(r, def, null, ia);
+        const tb = try queries.defType(r, def, null, ib);
+        const va = ta.val orelse return null;
+        const vb = tb.val orelse return null;
+        const same_value = value.eqlValues(ip, va, vb);
+        const same_type = value.eqlTypes(ip, ta.ty, tb.ty);
+        if (same_value == false or same_type == false) return false;
+        if (same_value == null or same_type == null) unknown = true;
     }
     return if (unknown) null else true;
 }
