@@ -449,6 +449,117 @@ test "a build step that rewrites a source file with the same content does not re
     try h.notify("exit", {});
 }
 
+// Prevents one more build after the server read a file in the middle of a build step rewriting it:
+// the truncated contents became the basis of the rebuild, and the write's own notification
+// differed from it
+test "a change read while a build step is rewriting the file does not build once more" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const gen = b.addExecutable(.{ .name = "gen", .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("tools/gen.zig"),
+        \\        .target = b.graph.host,
+        \\    }) });
+        \\    const run = b.addRunArtifact(gen);
+        \\    run.addDirectoryArg(b.path("src"));
+        \\    const exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{
+        \\        .root_source_file = b.path("src/main.zig"),
+        \\        .target = b.standardTargetOptions(.{}),
+        \\        .optimize = b.standardOptimizeOption(.{}),
+        \\    }) });
+        \\    exe.step.dependOn(&run.step);
+        \\    b.installArtifact(exe);
+        \\    const check = b.step("check", "Check that everything compiles");
+        \\    check.dependOn(&exe.step);
+        \\}
+        \\
+        },
+        // Rewrites src/gen.zig verbatim; while `.hold` exists in the project root, the file stays
+        // truncated
+        .{ .path = "tools/gen.zig", .text =
+        \\const std = @import("std");
+        \\pub fn main(init: std.process.Init) !void {
+        \\    var args = try init.minimal.args.iterateAllocator(init.gpa);
+        \\    defer args.deinit();
+        \\    _ = args.next();
+        \\    const src = args.next().?;
+        \\    const path = try std.fs.path.join(init.gpa, &.{ src, "gen.zig" });
+        \\    defer init.gpa.free(path);
+        \\    const hold = try std.fs.path.join(init.gpa, &.{ src, "..", ".hold" });
+        \\    defer init.gpa.free(hold);
+        \\    var file = try std.Io.Dir.cwd().createFile(init.io, path, .{});
+        \\    defer file.close(init.io);
+        \\    while (true) {
+        \\        std.Io.Dir.cwd().access(init.io, hold, .{}) catch break;
+        \\        try init.io.sleep(.fromMilliseconds(5), .awake);
+        \\    }
+        \\    try file.writeStreamingAll(init.io, "pub const value = 1;\n");
+        \\}
+        \\
+        },
+        .{ .path = "src/main.zig", .text = "const gen = @import(\"gen.zig\");\npub fn main() void {\n    _ = gen.value;\n}\n" },
+        .{ .path = "src/gen.zig", .text = "pub const value = 1;\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    // The server watches: the client cannot register file watching dynamically
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    try open(&h, main_uri, "const gen = @import(\"gen.zig\");\npub fn main() void {\n    _ = gen.value;\n}\n");
+    try waitIdleWithin(&h, 120);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const gen_path = try project.path(a, "src/gen.zig");
+    const hold_path = try project.path(a, ".hold");
+    const watcher = h.server.watcher.?;
+    const builds = compiles(&h);
+
+    // A rewrite with the same content is noticed only once the build below has started
+    var first: watch.Watcher.TestPause = .{};
+    watcher.test_pause.store(&first, .release);
+    watcher.requestResync();
+    first.entered.waitUncancelable(testing.io);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = gen_path, .data = "pub const value = 1;\n" });
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = hold_path, .data = "" });
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+    // The generate step has truncated src/gen.zig and waits
+    const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(60));
+    while ((try std.Io.Dir.cwd().statFile(testing.io, gen_path, .{})).size != 0) {
+        if (std.Io.Clock.awake.now(testing.io).durationTo(deadline).nanoseconds <= 0) return error.NotTruncated;
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    // The server reads the truncated file
+    const batches = watchBatches(&h);
+    watcher.test_pause.store(null, .release);
+    first.release.set(testing.io);
+    try waitBatchAfter(&h, batches);
+
+    // The generate step finishes its write, and the build completes before the server notices it
+    var second: watch.Watcher.TestPause = .{};
+    watcher.test_pause.store(&second, .release);
+    watcher.requestResync();
+    second.entered.waitUncancelable(testing.io);
+    try std.Io.Dir.cwd().deleteFile(testing.io, hold_path);
+    try waitIdleWithin(&h, 60);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const later = watchBatches(&h);
+    watcher.test_pause.store(null, .release);
+    second.release.set(testing.io);
+    try waitBatchAfter(&h, later);
+    try waitIdleWithin(&h, 60);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(1, compiles(&h) - builds);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "workspace folders: added folders start a project, removed ones clear its diagnostics" {
     var first = try fixture.Project.create(&.{.{ .path = "a.zig", .text = "pub const a = 1;\n" }});
     defer first.deinit();
