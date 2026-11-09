@@ -1585,6 +1585,58 @@ test "after the maker exits, the build that repeats the completed one is told ap
     try h.notify("exit", {});
 }
 
+// Prevents logging an error for a build request written to a maker that has exited before the
+// server read the end of its stream (the request is built by the restarted project)
+test "a save sent to a maker that has exited, before the end of its stream is read, is built by the restarted project" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&fixture.basic);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    // The client watches: no late notification of the fixture's writes builds again
+    _ = try h.request("initialize", .{
+        .rootUri = root_uri,
+        .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } },
+        .initializationOptions = .{ .files = .{ .watcher = "client" } },
+    });
+    try h.notify("initialized", Empty{});
+    const main_path = try project.path(a, "src/main.zig");
+    const main_uri = try za.base.uri.fromPath(a, main_path);
+    try open(&h, main_uri, fixture.basic[1].text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
+    const builds = compiles(&h);
+
+    var pause: Workspace.ExitPause = .{};
+    h.server.maker_exit_pause.store(&pause, .release);
+    // A failing test does not leave the reading task held
+    defer pause.release.set(testing.io);
+    const first = visibleInstance(&h);
+    try std.posix.kill(makerPid(&h), .KILL);
+    // The maker has exited; the reading task has read the end of its stream and not handled it
+    pause.entered.waitUncancelable(testing.io);
+    const text = "const lib = @import(\"lib\");\npub fn main() void {\n    const x: u8 = 300;\n    _ = x;\n    lib.hello();\n}\n";
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = main_path, .data = text });
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 2 }, .contentChanges = &.{.{ .text = text }} });
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+    // Answered after the save was handled: its build request was written to the exited maker
+    _ = try h.request("zig-analyzer/status", {});
+    try testing.expectEqual(first, visibleInstance(&h));
+    pause.release.set(testing.io);
+    try waitReplaced(&h, first);
+    // The restarted project built the saved file, counted once
+    try testing.expectEqual(builds + 1, compiles(&h));
+    try testing.expect(try lastHas(&h, main_uri, "cannot represent integer value '300'"));
+    try testing.expect(!try lastHas(&h, main_uri, "expected type 'u32'"));
+    try testing.expectEqual(0, (try h.notifications("window/showMessage")).len);
+    try expectLiveWorkspaces(&h, 1);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "a maker that keeps exiting before a build completes is restarted three times in a row, then not until build.zig is saved" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var project = try fixture.Project.create(&gate_project);

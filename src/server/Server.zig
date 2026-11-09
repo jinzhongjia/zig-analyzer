@@ -72,6 +72,9 @@ test_rescan: std.atomic.Value(bool) = .init(false),
 /// Test hook: holds a computed diagnostics result before it is sent (see `PublishGate`); always
 /// null outside tests
 publish_gate: ?*PublishGate = null,
+/// Test hook: holds the reading task of a project once when the maker's stream has ended, before
+/// the exit is handled (see `Workspace.ExitPause`); always null outside tests
+maker_exit_pause: std.atomic.Value(?*Workspace.ExitPause) = .init(null),
 
 /// Background tasks: reading projects' build system protocol, publishing diagnostics. Several
 /// threads submit tasks to it, and `Io.Group` does not allow submitting during an await, so it

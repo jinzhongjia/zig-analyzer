@@ -566,6 +566,21 @@ pub fn configureInputDirs(ws: *Workspace, arena: Allocator, out: *std.ArrayList(
 
 // ── Background task ──────────────────────────────────────────────────
 
+/// Test hook (`Server.maker_exit_pause`): holds the reading task of a project once, when the
+/// maker's stream has ended and before the exit is handled
+pub const ExitPause = struct {
+    /// Set when the reading task has stopped
+    entered: Io.Event = .unset,
+    release: Io.Event = .unset,
+};
+
+fn testExitPause(ws: *Workspace) void {
+    if (!@import("builtin").is_test) return;
+    const pause = ws.server.maker_exit_pause.swap(null, .acq_rel) orelse return;
+    pause.entered.set(ws.server.io);
+    pause.release.waitUncancelable(ws.server.io);
+}
+
 fn run(ws: *Workspace) Io.Cancelable!void {
     var started = true;
     // maker exits when build.zig fails to compile, which is expected (it is restarted when
@@ -578,6 +593,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     ws.computeBuildScripts() catch log.err("{s}: out of memory while finding build scripts", .{ws.root});
     while (true) {
         var event = client.next() catch |err| {
+            if (err != error.Canceled) ws.testExitPause();
             if (err == error.Canceled or ws.server.isShuttingDown()) {
                 // Server shutting down: the reading task was canceled, not a maker problem
             } else if (config_failed) {
