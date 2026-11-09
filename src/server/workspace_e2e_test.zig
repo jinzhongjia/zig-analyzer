@@ -979,11 +979,13 @@ test "shutdown during a build ends zig build and its child processes without wai
     try h.notify("exit", {});
 }
 
-/// Process id of the project's current maker
+/// Process id of the maker of the project's newest instance: an instance started by a restart
+/// takes the place of the old one in the project list only once it has built
 fn makerPid(h: *Harness) std.posix.pid_t {
     h.server.workspaces_mutex.lockUncancelable(testing.io);
     defer h.server.workspaces_mutex.unlock(testing.io);
-    const ws = h.server.workspaces.items[0];
+    const visible = h.server.workspaces.items[0];
+    const ws = visible.successor orelse visible;
     ws.mutex.lockUncancelable(testing.io);
     defer ws.mutex.unlock(testing.io);
     return ws.client.?.child.id.?;
@@ -1055,6 +1057,170 @@ test "restarting a project keeps the previous compiler diagnostics until the new
     }
 
     // All replaced instances have been freed
+    try expectLiveWorkspaces(&h, 1);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+/// Sample project whose check step runs a gate: it creates the file `started` in the project root,
+/// then waits while the file `hold` exists there. A test keeps a build in progress with `hold` and
+/// tells with `waitGate` when a build has reached the gate (POSIX `sh`).
+const gate_project = [_]fixture.File{
+    .{ .path = "build.zig", .text =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const exe = b.addExecutable(.{ .name = "t", .root_module = b.createModule(.{
+    \\        .root_source_file = b.path("main.zig"),
+    \\        .target = b.graph.host,
+    \\    }) });
+    \\    const gate = b.addSystemCommand(&.{ "sh", "-c", "touch started; while [ -e hold ]; do sleep 0.05; done" });
+    \\    gate.setCwd(b.path("."));
+    \\    gate.has_side_effects = true;
+    \\    const check = b.step("check", "Check");
+    \\    check.dependOn(&exe.step);
+    \\    check.dependOn(&gate.step);
+    \\}
+    \\
+    },
+    .{ .path = "main.zig", .text = "pub fn main() void {\n    const x: u32 = \"not a number\";\n    _ = x;\n}\n" },
+};
+
+/// Deletes the file `started` of `gate_project` if a build has created it
+fn clearGate(project: *fixture.Project) !void {
+    project.tmp.dir.deleteFile(testing.io, "started") catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+}
+
+/// Waits until a build of `gate_project` has reached the gate, and deletes `started` so that the
+/// next build can be told apart. Fails as soon as a warning is shown to the user.
+fn waitGate(h: *Harness, project: *fixture.Project) !void {
+    for (0..600) |_| {
+        // Reads the messages that arrived meanwhile
+        _ = try h.request("zig-analyzer/status", {});
+        try testing.expectEqual(0, (try h.notifications("window/showMessage")).len);
+        project.tmp.dir.deleteFile(testing.io, "started") catch |err| switch (err) {
+            error.FileNotFound => {
+                try testing.io.sleep(.fromMilliseconds(100), .awake);
+                continue;
+            },
+            else => |e| return e,
+        };
+        return;
+    }
+    return error.Timeout;
+}
+
+test "a maker that exits during a build or between builds is restarted, and the new instance builds the saved files" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&gate_project);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_path = try project.path(a, "main.zig");
+    const main_uri = try za.base.uri.fromPath(a, main_path);
+    try open(&h, main_uri, gate_project[1].text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
+
+    // Save a second error, and the maker exits while building it: the build the save requested is
+    // done by the new instance, and until then the file keeps its compiler diagnostics
+    const saved = gate_project[1].text ++ "comptime {\n    const y: bool = 1;\n    _ = y;\n}\n";
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "hold", .data = "" });
+    try clearGate(&project);
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = main_uri, .version = 2 }, .contentChanges = &.{.{ .text = saved }} });
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = main_path, .data = saved });
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+    try waitGate(&h, &project);
+    var from = (try h.notifications("textDocument/publishDiagnostics")).len;
+    try std.posix.kill(makerPid(&h), .KILL);
+    try project.tmp.dir.deleteFile(testing.io, "hold");
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try expectEveryPublishContains(&h, from, main_uri, "expected type 'u32'");
+    try testing.expectEqual(2, (try lastDiagnostics(&h, main_uri)).?.len);
+    try testing.expect(try lastHas(&h, main_uri, "expected type 'bool'"));
+
+    // The maker exits between two builds: restarted the same way, with the same result
+    try clearGate(&project);
+    from = (try h.notifications("textDocument/publishDiagnostics")).len;
+    try std.posix.kill(makerPid(&h), .KILL);
+    try waitGate(&h, &project);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try expectEveryPublishContains(&h, from, main_uri, "expected type 'bool'");
+    try testing.expectEqual(2, (try lastDiagnostics(&h, main_uri)).?.len);
+    try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
+
+    // Neither exit is reported to the user
+    try testing.expectEqual(0, (try h.notifications("window/showMessage")).len);
+    try expectLiveWorkspaces(&h, 1);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "a maker that keeps exiting before a build completes is restarted three times in a row, then not until build.zig is saved" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&gate_project);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    _ = try h.request("initialize", .{ .rootUri = root_uri, .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try open(&h, main_uri, gate_project[1].text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
+
+    // An exit during a build, then the new instance's first build completes: the count of restarts
+    // without a completed build starts over from that instance
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "hold", .data = "" });
+    try clearGate(&project);
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+    try waitGate(&h, &project);
+    try std.posix.kill(makerPid(&h), .KILL);
+    try waitGate(&h, &project);
+    try project.tmp.dir.deleteFile(testing.io, "hold");
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
+
+    // Exits before any build completes: the first three are restarted without telling the user
+    // (`waitGate` fails on a warning)
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "hold", .data = "" });
+    try clearGate(&project);
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+    try waitGate(&h, &project);
+    for (0..3) |_| {
+        try std.posix.kill(makerPid(&h), .KILL);
+        try waitGate(&h, &project);
+    }
+
+    // The fourth is not: the user is warned, and the compiler diagnostics, no longer updated, are
+    // cleared; the build graph is kept
+    const ws = visibleInstance(&h);
+    try std.posix.kill(makerPid(&h), .KILL);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const warnings = try h.notifications("window/showMessage");
+    try testing.expectEqual(1, warnings.len);
+    try testing.expect(std.mem.indexOf(u8, warnings[0].object.get("params").?.object.get("message").?.string, "keeps exiting unexpectedly") != null);
+    try testing.expect(!try lastHas(&h, main_uri, "expected type 'u32'"));
+    try testing.expect(visibleInstance(&h) == ws);
+    try testing.expect(ws.successor == null);
+    try testing.expect(ws.inModuleGraph());
+
+    // Saving build.zig starts over
+    try project.tmp.dir.deleteFile(testing.io, "hold");
+    const build_uri = try za.base.uri.fromPath(a, try project.path(a, "build.zig"));
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = build_uri } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
     try expectLiveWorkspaces(&h, 1);
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
