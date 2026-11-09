@@ -709,6 +709,10 @@ pub fn errorBits(ip: *const InternPool) ?u16 {
     return ip.currentTarget().error_bits;
 }
 
+pub fn endian(ip: *const InternPool) ?std.builtin.Endian {
+    return ip.currentTarget().endian;
+}
+
 pub fn dialect(ip: *const InternPool) Dialect {
     return ip.currentTarget().dialect;
 }
@@ -746,6 +750,10 @@ pub const Target = struct {
     /// Bit width of error codes, set by the compilation's error limit (`errorBitsOf`); null when
     /// the compilations the parameters are common to disagree
     error_bits: ?u16 = errorBitsOf(null),
+    /// Byte order of the target, which decides how memory reinterpreted through a pointer of
+    /// another type is read; null when unknown or the targets the parameters are common to
+    /// disagree
+    endian: ?std.builtin.Endian = builtin.cpu.arch.endian(),
     /// The user's zig version decides the layouts of vectors whose alignment is capped and of
     /// pointers on targets with a smaller maximum integer alignment
     dialect: Dialect = .latest,

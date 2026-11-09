@@ -817,7 +817,11 @@ const Agg = struct { elems: []Val };
 
 const Ref = struct {
     cell: *Val,
-    /// Element indices taken level by level from the value of the storage cell
+    /// Element indices taken level by level from the value of the storage cell. A pointer cast
+    /// to another pointee type (`@ptrCast`) adds a reinterpreting step of three entries:
+    /// `reinterpret`, the type of the viewed value, and its byte offset in the value the steps
+    /// before it reach. The memory is reinterpreted on each access (`castMemory`, `spliceInto`);
+    /// the indices after the step are taken from the viewed value.
     path: []const u32,
     /// Slice: points to the range `[start, start + len)` of the aggregate at `path` (shares
     /// storage with the original array); with `as_array`, of the one-element array view
@@ -836,6 +840,22 @@ const Ref = struct {
     immutable: bool = false,
 
     const Window = struct { start: u32, len: u32 };
+
+    /// First entry of a reinterpreting step in `path` (no aggregate has this many elements)
+    const reinterpret = std.math.maxInt(u32);
+
+    /// Start of the last reinterpreting step in `path`
+    fn lastReinterpret(path: []const u32) ?usize {
+        var last: ?usize = null;
+        var i: usize = 0;
+        while (i < path.len) {
+            if (path[i] == reinterpret) {
+                last = i;
+                i += 3;
+            } else i += 1;
+        }
+        return last;
+    }
 };
 
 /// What the storage of a cell is in the compiler, which decides what pointers into it are equal
@@ -1377,6 +1397,8 @@ const Evaluator = struct {
             .int, .big => return error.Abort,
             .agg => |agg| return if (i < agg.elems.len) agg.elems[i] else error.Abort,
             .ref => |ref| {
+                // Through a reinterpreting step, only the memory of the element is read
+                if (Ref.lastReinterpret(ref.path) != null) return ev.loadPath(try ev.extend(ref, std.math.cast(u32, i) orelse return error.Abort));
                 // Range: the index is relative to the start of the range; take the element
                 // directly from the containing aggregate, which also holds the element right after
                 // the range (the sentinel position of `buf[0..n :0]`)
@@ -1455,10 +1477,28 @@ const Evaluator = struct {
     }
 
     /// Value obtained by taking elements level by level along `path`; for a range, the aggregate
-    /// containing it (without taking out the range)
+    /// containing it (without taking out the range). Element steps right after a reinterpreting
+    /// step that only move the byte offset (`offsetStep`) are folded into it, so only the memory
+    /// of the element is reinterpreted, as with the compiler's pointers.
     fn loadPath(ev: *Evaluator, ref: Ref) EvalError!Val {
         var cur = ref.cell.*;
-        for (ref.path) |i| cur = try ev.elemAt(cur, i);
+        var i: usize = 0;
+        while (i < ref.path.len) {
+            if (ref.path[i] != Ref.reinterpret) {
+                cur = try ev.elemAt(cur, ref.path[i]);
+                i += 1;
+                continue;
+            }
+            var ty: Index = @fromBackingInt(ref.path[i + 1]);
+            var offset: u64 = ref.path[i + 2];
+            i += 3;
+            while (i < ref.path.len and ref.path[i] != Ref.reinterpret) : (i += 1) {
+                const step = try ev.offsetStep(ty, ref.path[i]) orelse break;
+                ty = step.ty;
+                offset += step.offset;
+            }
+            cur = try ev.castMemory(cur, ty, offset);
+        }
         return cur;
     }
 
@@ -1485,6 +1525,7 @@ const Evaluator = struct {
         }
         // `*T` → `*[1]T`: the place itself is the only element
         if (ref.as_array) return ev.store(try ev.extend(ref, 0), try ev.elemAt(v, 0));
+        if (Ref.lastReinterpret(ref.path)) |k| return ev.storeReinterpreted(ref, k, v);
         var cell = ref.cell;
         for (ref.path, 0..) |i, depth| {
             // The sentinel of an array (`buf[buf.len] = 0` in std.fmt.comptimePrint) is part of
@@ -3052,10 +3093,19 @@ const Evaluator = struct {
     }
 
     /// Two pointers into the same storage cell: the same location when they take the same path
-    /// and start at the same element; paths that part at some level reach different elements
+    /// and start at the same element; paths that part at an element index reach different
+    /// elements. A reinterpreting step views the memory at a byte offset, so where paths part
+    /// at one, the locations may still coincide.
     fn samePlace(x: Ref, y: Ref) ?bool {
-        const n = @min(x.path.len, y.path.len);
-        if (!std.mem.eql(u32, x.path[0..n], y.path[0..n])) return false;
+        var i: usize = 0;
+        while (i < x.path.len and i < y.path.len) {
+            const step = x.path[i] == Ref.reinterpret or y.path[i] == Ref.reinterpret;
+            const len: usize = if (step) 3 else 1;
+            const a = x.path[i..@min(i + len, x.path.len)];
+            const b = y.path[i..@min(i + len, y.path.len)];
+            if (!std.mem.eql(u32, a, b)) return if (step) null else false;
+            i += len;
+        }
         if (x.path.len != y.path.len) return null;
         const xs = if (x.window) |w| w.start else 0;
         const ys = if (y.window) |w| w.start else 0;
@@ -3586,14 +3636,18 @@ const Evaluator = struct {
     /// interned pointer records (`basePlace`), the place it points to instead (automatic
     /// dereferencing)
     fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId, use: PlaceUse) EvalError!Ref {
-        // A pointer computed by pointer arithmetic (`(p + 1)[0] = x`) is not a place: the
-        // compiler takes the element pointer of the value
-        if (f.body.expr(e) == .binary) {
-            const p = try ev.eval(f, e, null);
-            return switch (p.v) {
-                .ref => |r| ev.through(r, p.ty),
-                else => error.Abort,
-            };
+        // A pointer computed by pointer arithmetic (`(p + 1)[0] = x`) or returned by a call
+        // (`std.mem.asBytes(&x)[i] = b`) is not a place: the compiler takes the element pointer
+        // of the value, so the place is the one it points to
+        switch (f.body.expr(e)) {
+            .binary, .call, .builtin_call => {
+                const p = try ev.eval(f, e, null);
+                return switch (p.v) {
+                    .ref => |r| ev.through(r, p.ty),
+                    else => error.Abort,
+                };
+            },
+            else => {},
         }
         const ref = try ev.placeFor(f, e, use);
         // The value of a range, or of a `*T` → `*[1]T` view, is an array, not a pointer
@@ -4462,7 +4516,7 @@ const Evaluator = struct {
             else
                 want orelse return error.Abort;
             const src = if (pointer_cast) try ev.unerase(vals[0], t) else vals[0];
-            if (pointer_cast and !try ev.keepsPointee(src, t)) return .{ .ty = t };
+            if (pointer_cast and !try ev.keepsPointee(src, t)) return if (eq(u8, name, "@ptrCast")) ev.reinterpretPointer(src, t) else .{ .ty = t };
             return ev.cast(name, src, t);
         }
         if (eq(u8, name, "@intFromBool")) {
@@ -4578,6 +4632,10 @@ const Evaluator = struct {
         }
         if (eq(u8, name, "@intFromEnum") or eq(u8, name, "@backingInt")) {
             if (vals.len != 1) return error.Abort;
+            // A packed container: its bits as its backing integer
+            if (eq(u8, name, "@backingInt") and try ev.containerLayout(vals[0].ty) == .@"packed") {
+                return try ev.bitCast(vals[0], try ev.backingIntType(vals[0].ty) orelse return error.Abort);
+            }
             return try ev.enumInt(vals[0]);
         }
         if (eq(u8, name, "@offsetOf") or eq(u8, name, "@bitOffsetOf")) {
@@ -5115,6 +5173,9 @@ const Evaluator = struct {
         // A `*T` → `*[1]T` view points to an array, which does not coerce to a pointer to the
         // field
         if (ref.window != null or ref.as_array or ref.path.len == 0) return error.Abort;
+        // A pointer cast to another pointee type points to reinterpreted bytes of the value its
+        // reinterpreting step views, not to a field of an aggregate
+        if (Ref.lastReinterpret(ref.path)) |k| if (k + 3 == ref.path.len) return error.Abort;
         const parent: Ref = .{ .cell = ref.cell, .path = ref.path[0 .. ref.path.len - 1], .is_const = ref.is_const or parent_ptr.is_const, .immutable = ref.immutable };
         if (value.eqlTypes(ip, (try ev.loadPath(parent)).ty, parent_ty) != true) return error.Abort;
         const at = ref.path[ref.path.len - 1];
@@ -5128,15 +5189,11 @@ const Evaluator = struct {
     fn cast(ev: *Evaluator, name: []const u8, v: Val, t: Index) EvalError!Val {
         const ip = ev.ip;
         const eq = std.mem.eql;
-        if (eq(u8, name, "@bitCast")) if (try ev.floatBitCast(v, t)) |r| return r;
-        if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast")) {
+        if (eq(u8, name, "@bitCast")) return ev.bitCast(v, t);
+        if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate")) {
             if (ev.intOf(v)) |x| {
                 if (eq(u8, name, "@intCast")) return try ev.convertInt(v.ty, t, x) orelse error.Abort;
                 const info = value.intInfo(ip, t) orelse return error.Abort;
-                if (eq(u8, name, "@bitCast")) {
-                    const src = value.intInfo(ip, v.ty) orelse return error.Abort;
-                    if (src.bits != info.bits) return error.Abort;
-                }
                 if (info.bits > 128) return ev.intFromBig(t, try bigint.wrap(ev.a, try value.bigOfInt(ip, ev.a, v.ty, x), info));
                 const r = value.binaryInt(ip, .plus_percent, t, x, 0) orelse return error.Abort;
                 return ev.int(t, r);
@@ -5149,13 +5206,14 @@ const Evaluator = struct {
                     if (!bigint.fits(b, info)) return error.Abort;
                     return ev.intFromBig(t, b);
                 }
-                if (eq(u8, name, "@bitCast")) {
-                    const src = value.intInfo(ip, v.ty) orelse return error.Abort;
-                    if (src.bits != info.bits) return error.Abort;
-                }
                 return ev.intFromBig(t, try bigint.wrap(ev.a, b, info));
             }
             return .{ .ty = t };
+        }
+        // A packed container from the bits of its backing integer
+        if (eq(u8, name, "@fromBackingInt") and try ev.containerLayout(t) == .@"packed") {
+            const int_ty = try ev.backingIntType(t) orelse return error.Abort;
+            return ev.bitCast(try ev.coerce(v, int_ty), t);
         }
         if (eq(u8, name, "@enumFromInt") or eq(u8, name, "@fromBackingInt")) {
             const x = ev.intOf(v) orelse return .{ .ty = t };
@@ -5193,38 +5251,6 @@ const Evaluator = struct {
         return .{ .ty = t, .v = v.v };
     }
 
-    /// `@bitCast` between a float and an integer of the same bit width (as std.fmt.float does to
-    /// read the parts of a float); null when neither side is a float
-    fn floatBitCast(ev: *Evaluator, v: Val, t: Index) EvalError!?Val {
-        const ip = ev.ip;
-        if (ip.isFloat(v.ty) and ip.isInt(t)) {
-            const x = ev.floatOf(v) orelse return .{ .ty = t };
-            const bits = value.floatToBits(ip, v.ty, x) orelse return .{ .ty = t };
-            const info = value.intInfo(ip, t) orelse return error.Abort;
-            if (info.bits != value.floatBits(ip, v.ty)) return error.Abort;
-            const n: i128 = if (info.signed) switch (info.bits) {
-                16 => @as(i16, @bitCast(@as(u16, @truncate(bits)))),
-                32 => @as(i32, @bitCast(@as(u32, @truncate(bits)))),
-                64 => @as(i64, @bitCast(@as(u64, @truncate(bits)))),
-                80 => @as(i80, @bitCast(@as(u80, @truncate(bits)))),
-                128 => @bitCast(bits),
-                else => return error.Abort,
-            } else if (info.bits == 128) @bitCast(bits) else std.math.cast(i128, bits) orelse return .{ .ty = t };
-            return try ev.int(t, n);
-        }
-        if (ip.isInt(v.ty) and ip.isFloat(t)) {
-            const x = ev.intOf(v) orelse return .{ .ty = t };
-            const info = value.intInfo(ip, v.ty) orelse return error.Abort;
-            const width = value.floatBits(ip, t) orelse return .{ .ty = t };
-            if (info.bits != width) return error.Abort;
-            const mask: u128 = if (width == 128) std.math.maxInt(u128) else (@as(u128, 1) << @intCast(width)) - 1;
-            const bits = @as(u128, @bitCast(x)) & mask;
-            const f = value.floatFromBits(ip, t, bits) orelse return .{ .ty = t };
-            return Val.of(t, try value.floatValue(ip, t, f) orelse return error.Abort);
-        }
-        return null;
-    }
-
     fn enumInt(ev: *Evaluator, v: Val) EvalError!Val {
         const ip = ev.ip;
         const x = try ev.freeze(v) orelse return error.Abort;
@@ -5240,6 +5266,768 @@ const Evaluator = struct {
         const int_ty = try ev.enumTagType(enum_ty) orelse .comptime_int_type;
         for (names, values) |n, val| if (std.mem.eql(u8, n, tag_name)) return ev.int(int_ty, val);
         return error.Abort;
+    }
+
+    // ── Reinterpretation ─────────────────────────────────────────────
+
+    /// `@bitCast` (the compiler's `bitCastVal`): the operand is written to packed memory in the
+    /// logical bit order (array and vector elements and the fields of packed containers from the
+    /// least significant bit, `undefined` parts as zero bits) and the result is read back from
+    /// it, so the result does not depend on the target's byte order
+    fn bitCast(ev: *Evaluator, v: Val, t: Index) EvalError!Val {
+        const ip = ev.ip;
+        const unknown: Val = .{ .ty = t };
+        if (!value.isConcrete(ip, v.ty) or !value.isConcrete(ip, t)) return unknown;
+        // The compiler reports an error for a type without a bit representation and for
+        // different bit widths
+        const from = try ev.bitCastable(v.ty) orelse return unknown;
+        const to = try ev.bitCastable(t) orelse return unknown;
+        if (!from or !to) return error.Abort;
+        const bits = try ev.bitCastBits(v.ty) orelse return unknown;
+        const want_bits = try ev.bitCastBits(t) orelse return unknown;
+        if (bits != want_bits) return error.Abort;
+        switch (v.v) {
+            .unknown => return unknown,
+            .undef => return .{ .ty = t, .v = .undef },
+            else => {},
+        }
+        const buf = try ev.allocBytes(bits / 8 + @intFromBool(bits % 8 != 0));
+        if (!try ev.writeBits(v, buf, 0)) return unknown;
+        return try ev.readBits(t, buf, 0) orelse unknown;
+    }
+
+    /// Whether `@bitCast` accepts values of type `t` (the compiler's `hasBitRepresentation`,
+    /// without pointers, which `@bitCast` rejects): integers, floats, bool, void, enums with an
+    /// explicit tag type, packed containers, and arrays and vectors of them; null when it cannot
+    /// be determined
+    fn bitCastable(ev: *Evaluator, t: Index) EvalError!?bool {
+        const ip = ev.ip;
+        switch (ip.key(t)) {
+            .int_type => return true,
+            .simple_type => |s| return s == .void or s == .bool or (ip.isInt(t) and s != .comptime_int) or (ip.isFloat(t) and s != .comptime_float),
+            .array_type => |a| return ev.bitCastable(a.child),
+            .vector_type => |vt| return ev.bitCastable(vt.child),
+            .container_type, .reified_type, .union_tag_type => {
+                if (value.isEnumType(ip, t)) return try ev.hasBitRepr(t);
+                return try ev.containerLayout(t) == .@"packed";
+            },
+            else => return false,
+        }
+    }
+
+    /// Bit width of a type that `@bitCast` accepts (the compiler's `Type.bitSize`): array and
+    /// vector elements, and the sentinel after them, follow each other without padding, so the
+    /// width does not depend on the target's vector layout
+    fn bitCastBits(ev: *Evaluator, t: Index) EvalError!?u64 {
+        const n: u64, const elem: Index = switch (ev.ip.key(t)) {
+            .array_type => |a| .{ a.len + @intFromBool(a.sentinel != null), a.child },
+            .vector_type => |vt| .{ vt.len, vt.child },
+            else => return (try ev.typeLayout(t, 0) orelse return null).bits,
+        };
+        return std.math.mul(u64, n, try ev.bitCastBits(elem) orelse return null) catch null;
+    }
+
+    /// Writes `v` into the packed memory `buf` at bit `off`; bit `i` of the memory is bit `i % 8`
+    /// of byte `i / 8`. Returns false when a part of the value is unknown.
+    fn writeBits(ev: *Evaluator, v: Val, buf: []u8, off: u64) EvalError!bool {
+        const ip = ev.ip;
+        const t = v.ty;
+        switch (v.v) {
+            .unknown => return false,
+            // The memory starts zeroed: `undefined` is written as zero bits
+            .undef => return true,
+            else => {},
+        }
+        try ev.tick();
+        switch (ip.key(t)) {
+            .array_type, .vector_type => {
+                const n = try ev.typeElemCount(t) orelse return false;
+                const elem_bits = try ev.bitCastBits(ev.elemTypeOf(t, 0)) orelse return false;
+                // The sentinel follows the elements
+                const total = n + @intFromBool(ev.sentinelElem(t, n) != null);
+                for (0..total) |i| if (!try ev.writeBits(try ev.elemAt(v, i), buf, off + i * elem_bits)) return false;
+                return true;
+            },
+            else => {},
+        }
+        if (t == .void_type) return true;
+        if (t == .bool_type) {
+            writePacked(buf, off, 1, @intFromBool((try ev.freeze(v) orelse return false) == .true_value));
+            return true;
+        }
+        if (ip.isFloat(t)) {
+            const width = value.floatBits(ip, t) orelse return false;
+            writePacked(buf, off, width, value.floatToBits(ip, t, ev.floatOf(v) orelse return false) orelse return false);
+            return true;
+        }
+        if (ip.isInt(t)) {
+            const info = value.intInfo(ip, t) orelse return false;
+            if (info.bits > 128) return bigint.writePacked(try ev.bigOf(v) orelse return false, info, buf, off);
+            writePacked(buf, off, info.bits, @bitCast(ev.intOf(v) orelse return false));
+            return true;
+        }
+        if (value.isEnumType(ip, t)) return ev.writeBits(try ev.enumInt(v), buf, off);
+        if (ev.isUnion(t)) {
+            // A packed union: the bits of the active field
+            const u = switch (ip.key(try ev.freeze(v) orelse return false)) {
+                .union_value => |u| u,
+                else => return false,
+            };
+            return ev.writeBits(Val.of(try ev.unionFieldType(t, u.tag), u.payload), buf, off);
+        }
+        // A packed struct: the fields from the least significant bit
+        const fields = try ev.layoutFields(t, 0) orelse return false;
+        const sl = try ev.structLayoutOf(t, fields) orelse return false;
+        for (sl.bit_offsets, 0..) |bit_offset, i| if (!try ev.writeBits(try ev.elemAt(v, i), buf, off + (bit_offset orelse return false))) return false;
+        return true;
+    }
+
+    /// Reads a value of type `t` from the packed memory `buf` at bit `off` (see `writeBits`);
+    /// null when the value cannot be represented here: an enum value without a tag, or a packed
+    /// union, whose bits do not determine an active field
+    fn readBits(ev: *Evaluator, t: Index, buf: []const u8, off: u64) EvalError!?Val {
+        const ip = ev.ip;
+        try ev.tick();
+        switch (ip.key(t)) {
+            .array_type, .vector_type => {
+                const n = try ev.typeElemCount(t) orelse return null;
+                const elem_ty = ev.elemTypeOf(t, 0);
+                const elem_bits = try ev.bitCastBits(elem_ty) orelse return null;
+                const elems = try ev.allocElems(n);
+                for (elems, 0..) |*o, i| o.* = try ev.readBits(elem_ty, buf, off + i * elem_bits) orelse return null;
+                return try ev.makeAgg(t, elems);
+            },
+            else => {},
+        }
+        if (t == .void_type) return Val.void_val;
+        if (t == .bool_type) return boolVal(readPacked(buf, off, 1) != 0);
+        if (ip.isFloat(t)) {
+            const width = value.floatBits(ip, t) orelse return null;
+            const f = value.floatFromBits(ip, t, readPacked(buf, off, width)) orelse return null;
+            return Val.of(t, try value.floatValue(ip, t, f) orelse return null);
+        }
+        if (ip.isInt(t)) {
+            const info = value.intInfo(ip, t) orelse return null;
+            if (info.bits > 128) return ev.intFromBig(t, try bigint.readPacked(ev.a, info, buf, off));
+            return Val.ofInt(t, intFromBits(info, readPacked(buf, off, info.bits)));
+        }
+        if (value.isEnumType(ip, t)) {
+            const info = value.intInfo(ip, try ev.enumTagType(t) orelse return null) orelse return null;
+            if (info.bits > 128) return null;
+            return ev.enumWithValue(t, intFromBits(info, readPacked(buf, off, info.bits)));
+        }
+        if (ev.isUnion(t)) return null;
+        const fields = try ev.layoutFields(t, 0) orelse return null;
+        const sl = try ev.structLayoutOf(t, fields) orelse return null;
+        const elems = try ev.allocElems(fields.len);
+        for (elems, fields, sl.bit_offsets) |*o, fl, bit_offset| o.* = try ev.readBits(fl.ty, buf, off + (bit_offset orelse return null)) orelse return null;
+        return try ev.makeAgg(t, elems);
+    }
+
+    /// The tag of enum `t` with the integer value `x`; null when no tag has it
+    fn enumWithValue(ev: *Evaluator, t: Index, x: i128) EvalError!?Val {
+        const names = try ev.enumNames(t) orelse return null;
+        const values = try ev.enumValues(t);
+        for (names, values) |n, val| if (val == x) return Val.of(t, try ev.ip.get(.{ .enum_tag = .{ .ty = t, .name = n } }));
+        return null;
+    }
+
+    /// Zeroed memory of `len` bytes; checks this evaluation's memory limit first (see
+    /// `allocElems`)
+    fn allocBytes(ev: *Evaluator, len: u64) EvalError![]u8 {
+        const used = if (ev.arena) |arena| arena.queryCapacity() else 0;
+        if (len > max_eval_bytes - @min(used, max_eval_bytes)) return error.Abort;
+        const buf = try ev.a.alloc(u8, @intCast(len));
+        @memset(buf, 0);
+        return buf;
+    }
+
+    /// Layout of a struct or union declaration; null for other types
+    fn containerLayout(ev: *Evaluator, t: Index) EvalError!?InternPool.Reified.Layout {
+        switch (ev.ip.key(t)) {
+            .container_type, .reified_type => {},
+            else => return null,
+        }
+        if (value.isEnumType(ev.ip, t)) return null;
+        return (try ev.containerSyntax(t)).layout;
+    }
+
+    fn isExternStruct(ev: *Evaluator, t: Index) EvalError!bool {
+        return try ev.containerLayout(t) == .@"extern" and !ev.isUnion(t);
+    }
+
+    /// Whether values of type `t` have a well-defined memory layout, so that memory holding them
+    /// can be reinterpreted (the compiler's `Type.hasWellDefinedLayout`); null when it cannot be
+    /// determined
+    fn wellDefinedLayout(ev: *Evaluator, t: Index) EvalError!?bool {
+        const ip = ev.ip;
+        if (!value.isConcrete(ip, t)) return null;
+        switch (ip.key(t)) {
+            .int_type => return true,
+            .simple_type => |s| return s == .void or s == .bool or (ip.isInt(t) and s != .comptime_int) or (ip.isFloat(t) and s != .comptime_float),
+            .array_type => |a| return ev.wellDefinedLayout(a.child),
+            .ptr_type => |p| return p.size != .slice,
+            // Optional pointers that are represented by the pointer
+            .optional_type => |c| return switch (ip.key(c)) {
+                .ptr_type => |p| p.size != .slice,
+                else => false,
+            },
+            .container_type, .reified_type, .union_tag_type => {
+                if (value.isEnumType(ip, t)) return try ev.hasBitRepr(t);
+                return (try ev.containerLayout(t) orelse return false) != .auto;
+            },
+            else => return false,
+        }
+    }
+
+    /// Bytes `[start, start + data.len)` of the memory of a value, and the state of each byte
+    const Memory = struct {
+        start: u64,
+        data: []u8,
+        state: []State,
+
+        const State = enum(u8) { unknown, undef, defined };
+
+        fn end(m: *const Memory) u64 {
+            return m.start + m.data.len;
+        }
+
+        /// Sets the state of the bytes `[at, at + len)` that are in the range
+        fn fill(m: *Memory, at: u64, len: u64, state: State) void {
+            const lo = @max(at, m.start);
+            const hi = @min(at + len, m.end());
+            if (lo >= hi) return;
+            @memset(m.state[@intCast(lo - m.start)..@intCast(hi - m.start)], state);
+            // The compiler fills undefined memory with 0xAA
+            @memset(m.data[@intCast(lo - m.start)..@intCast(hi - m.start)], if (state == .undef) 0xAA else 0);
+        }
+
+        /// Writes the `len` bytes of the integer `x` in byte order `endian` at byte `at`; bytes
+        /// beyond the 16 of `x` are zero
+        fn writeInt(m: *Memory, at: u64, len: u64, x: u128, endian: std.builtin.Endian) void {
+            var p = @max(at, m.start);
+            const hi = @min(at + len, m.end());
+            while (p < hi) : (p += 1) {
+                const k = p - at;
+                const significance = switch (endian) {
+                    .little => k,
+                    .big => len - 1 - k,
+                };
+                const i: usize = @intCast(p - m.start);
+                m.data[i] = if (significance < 16) @truncate(x >> @intCast(significance * 8)) else 0;
+                m.state[i] = .defined;
+            }
+        }
+
+        /// The `len` bytes at byte `at` as an integer in byte order `endian`; asserts that they
+        /// are in the range
+        fn readInt(m: *const Memory, at: u64, len: u64, endian: std.builtin.Endian) u128 {
+            var x: u128 = 0;
+            for (0..@intCast(len)) |k| {
+                const significance = switch (endian) {
+                    .little => k,
+                    .big => len - 1 - k,
+                };
+                if (significance >= 16) continue;
+                x |= @as(u128, m.data[@intCast(at + k - m.start)]) << @intCast(significance * 8);
+            }
+            return x;
+        }
+
+        /// State of the bytes `[at, at + len)`: unknown when any is, undefined when all are
+        fn rangeState(m: *const Memory, at: u64, len: u64) State {
+            var all_undef = true;
+            for (m.state[@intCast(at - m.start)..@intCast(at + len - m.start)]) |s| switch (s) {
+                .unknown => return .unknown,
+                .defined => all_undef = false,
+                .undef => {},
+            };
+            return if (all_undef) .undef else .defined;
+        }
+
+        /// Copies the bytes of `src` that are in the range
+        fn overlay(m: *Memory, src: *const Memory) void {
+            var p = @max(m.start, src.start);
+            const hi = @min(m.end(), src.end());
+            while (p < hi) : (p += 1) {
+                m.data[@intCast(p - m.start)] = src.data[@intCast(p - src.start)];
+                m.state[@intCast(p - m.start)] = src.state[@intCast(p - src.start)];
+            }
+        }
+    };
+
+    /// Memory for the bytes `[start, start + len)`, all unknown
+    fn newMemory(ev: *Evaluator, start: u64, len: u64) EvalError!Memory {
+        const data = try ev.allocBytes(len);
+        const state = try ev.allocBytes(len);
+        return .{ .start = start, .data = data, .state = @ptrCast(state) };
+    }
+
+    /// Writes the memory of `v`, which is at byte `at`, into the part of `m` it overlaps (the
+    /// compiler's `writeToMemory`; padding and undefined values are undefined bytes). The bytes
+    /// of values that are not serialized here (pointers, optionals, unions) are unknown.
+    fn writeMemory(ev: *Evaluator, v: Val, m: *Memory, at: u64, endian: std.builtin.Endian) EvalError!void {
+        const ip = ev.ip;
+        const t = v.ty;
+        const l = try ev.typeLayout(t, 0) orelse return;
+        if (l.size == 0 or at >= m.end() or at + l.size <= m.start) return;
+        try ev.tick();
+        switch (v.v) {
+            .unknown => return m.fill(at, l.size, .unknown),
+            .undef => return m.fill(at, l.size, .undef),
+            else => {},
+        }
+        switch (ip.key(t)) {
+            .array_type => |a| {
+                const elem_size = (try ev.typeLayout(a.child, 0) orelse return m.fill(at, l.size, .unknown)).size;
+                if (elem_size == 0) return;
+                // Only the elements that overlap the range
+                const n = a.len + @intFromBool(a.sentinel != null);
+                var i: u64 = if (m.start > at) (m.start - at) / elem_size else 0;
+                while (i < n and at + i * elem_size < m.end()) : (i += 1) try ev.writeMemory(try ev.elemAt(v, @intCast(i)), m, at + i * elem_size, endian);
+                return;
+            },
+            else => {},
+        }
+        if (try ev.isExternStruct(t)) {
+            m.fill(at, l.size, .undef);
+            const fields = try ev.layoutFields(t, 0) orelse return m.fill(at, l.size, .unknown);
+            const sl = try ev.structLayoutOf(t, fields) orelse return m.fill(at, l.size, .unknown);
+            for (sl.bit_offsets, 0..) |bit_offset, i| if (bit_offset) |b| try ev.writeMemory(try ev.elemAt(v, i), m, at + b / 8, endian);
+            return;
+        }
+        const x = try ev.memoryInt(v) orelse return m.fill(at, l.size, .unknown);
+        // A float takes the bytes of its bit width, followed by zero padding
+        const len = if (ip.isFloat(t)) (value.floatBits(ip, t) orelse return m.fill(at, l.size, .unknown)) / 8 else l.size;
+        m.writeInt(at, len, x, endian);
+        m.writeInt(at + len, l.size - len, 0, endian);
+    }
+
+    /// The integer whose bytes are the memory of `v`, a value without fields in memory: an
+    /// integer, enum or packed container in two's complement, a float's bit pattern; null when
+    /// it is unknown or not serialized here
+    fn memoryInt(ev: *Evaluator, v: Val) EvalError!?u128 {
+        const ip = ev.ip;
+        const t = v.ty;
+        if (t == .bool_type) return @intFromBool((try ev.freeze(v) orelse return null) == .true_value);
+        if (ip.isFloat(t)) return value.floatToBits(ip, t, ev.floatOf(v) orelse return null);
+        if (ip.isInt(t)) {
+            const info = value.intInfo(ip, t) orelse return null;
+            if (info.bits > 128) return null;
+            return @bitCast(ev.intOf(v) orelse return null);
+        }
+        if (value.isEnumType(ip, t)) return ev.memoryInt(try ev.enumInt(v));
+        if (try ev.containerLayout(t) != .@"packed") return null;
+        // A packed container: its backing integer
+        const bits = (try ev.typeLayout(t, 0) orelse return null).bits orelse return null;
+        if (bits > 128) return null;
+        var buf: [16]u8 = @splat(0);
+        if (!try ev.writeBits(v, &buf, 0)) return null;
+        const raw = std.mem.readInt(u128, &buf, .little);
+        const backing = (try ev.containerSyntax(t)).arg orelse return raw;
+        const info = value.intInfo(ip, backing) orelse return null;
+        return @bitCast(intFromBits(info, raw));
+    }
+
+    /// The value of type `t` at byte `at` of `m` (the compiler's `readFromMemory`): unknown when
+    /// a byte it reads is unknown, undefined when all its bytes are; values that are not
+    /// deserialized here (pointers, optionals, unions) are unknown. Asserts that the bytes of the
+    /// value are in `m`.
+    fn readMemory(ev: *Evaluator, t: Index, m: *const Memory, at: u64, endian: std.builtin.Endian) EvalError!Val {
+        const ip = ev.ip;
+        const unknown: Val = .{ .ty = t };
+        const l = try ev.typeLayout(t, 0) orelse return unknown;
+        try ev.tick();
+        switch (ip.key(t)) {
+            .array_type => |a| {
+                const elem_size = (try ev.typeLayout(a.child, 0) orelse return unknown).size;
+                const elems = try ev.allocElems(std.math.cast(usize, a.len) orelse return error.Abort);
+                for (elems, 0..) |*o, i| o.* = try ev.readMemory(a.child, m, at + i * elem_size, endian);
+                return ev.makeAgg(t, elems);
+            },
+            else => {},
+        }
+        if (try ev.isExternStruct(t)) {
+            const fields = try ev.layoutFields(t, 0) orelse return unknown;
+            const sl = try ev.structLayoutOf(t, fields) orelse return unknown;
+            const elems = try ev.allocElems(fields.len);
+            for (elems, fields, sl.bit_offsets) |*o, fl, bit_offset| o.* = try ev.readMemory(fl.ty, m, at + (bit_offset orelse return unknown) / 8, endian);
+            return ev.makeAgg(t, elems);
+        }
+        if (l.size != 0) switch (m.rangeState(at, l.size)) {
+            .unknown => return unknown,
+            .undef => return .{ .ty = t, .v = .undef },
+            .defined => {},
+        };
+        if (t == .void_type) return Val.void_val;
+        if (t == .bool_type) return boolVal(m.readInt(at, l.size, endian) != 0);
+        if (ip.isFloat(t)) {
+            const width = value.floatBits(ip, t) orelse return unknown;
+            const f = value.floatFromBits(ip, t, m.readInt(at, width / 8, endian)) orelse return unknown;
+            return Val.of(t, try value.floatValue(ip, t, f) orelse return unknown);
+        }
+        if (ip.isInt(t)) {
+            const info = value.intInfo(ip, t) orelse return unknown;
+            if (info.bits > 128) return unknown;
+            return Val.ofInt(t, intFromBits(info, m.readInt(at, l.size, endian)));
+        }
+        if (value.isEnumType(ip, t)) {
+            const tag = try ev.readMemory(try ev.enumTagType(t) orelse return unknown, m, at, endian);
+            return try ev.enumWithValue(t, ev.intOf(tag) orelse return unknown) orelse unknown;
+        }
+        // A packed struct from the bits of its backing integer
+        if (try ev.containerLayout(t) != .@"packed" or ev.isUnion(t)) return unknown;
+        if ((l.bits orelse return unknown) > 128) return unknown;
+        var buf: [16]u8 = undefined;
+        std.mem.writeInt(u128, &buf, m.readInt(at, l.size, endian), .little);
+        return try ev.readBits(t, &buf, 0) orelse unknown;
+    }
+
+    /// The value of type `ty` in the memory of `base` at byte `offset` (the compiler's
+    /// `loadComptimePtr` through a pointer of another pointee type): nested arrays of the same
+    /// base element type are rearranged; otherwise both types need a well-defined layout, and
+    /// the memory is reinterpreted in the target's byte order
+    fn castMemory(ev: *Evaluator, base: Val, ty: Index, offset: u64) EvalError!Val {
+        const unknown: Val = .{ .ty = ty };
+        if (offset == 0 and ty == base.ty) return base;
+        if (!value.isConcrete(ev.ip, base.ty)) return unknown;
+        if (try ev.restructure(base, ty, offset)) |r| return r;
+        if (!(try ev.wellDefinedLayout(ty) orelse return unknown) or !(try ev.wellDefinedLayout(base.ty) orelse return unknown)) return error.Abort;
+        const size = (try ev.typeLayout(ty, 0) orelse return unknown).size;
+        const base_size = (try ev.typeLayout(base.ty, 0) orelse return unknown).size;
+        if (offset > base_size or size > base_size - offset) return error.Abort;
+        const endian = ev.ip.endian() orelse return unknown;
+        var m = try ev.newMemory(offset, size);
+        try ev.writeMemory(base, &m, 0, endian);
+        return ev.readMemory(ty, &m, offset, endian);
+    }
+
+    /// Base element type of nested arrays and their number (the compiler's `arrayBase`); null
+    /// when an array has a sentinel, which the compiler counts as an element there, so that the
+    /// memory is reinterpreted instead
+    const ArrayBase = struct { elem: Index, count: u64 };
+
+    fn arrayBase(ev: *Evaluator, t: Index) ?ArrayBase {
+        var cur = t;
+        var count: u64 = 1;
+        while (true) switch (ev.ip.key(cur)) {
+            .array_type => |a| {
+                if (a.sentinel != null) return null;
+                count = std.math.mul(u64, count, a.len) catch return null;
+                cur = a.child;
+            },
+            else => return .{ .elem = cur, .count = count },
+        };
+    }
+
+    /// Index of the base element at byte `offset`; null when no base element starts there
+    fn flatIndex(ev: *Evaluator, elem: Index, offset: u64) EvalError!?u64 {
+        if (offset == 0) return 0;
+        const size = (try ev.typeLayout(elem, 0) orelse return null).size;
+        if (size == 0 or offset % size != 0) return null;
+        return offset / size;
+    }
+
+    /// `castMemory` between nested arrays of the same base element type, which the compiler
+    /// rearranges element by element (also for types without a well-defined layout); null when
+    /// it does not apply
+    fn restructure(ev: *Evaluator, base: Val, ty: Index, offset: u64) EvalError!?Val {
+        const want = ev.arrayBase(ty) orelse return null;
+        const have = ev.arrayBase(base.ty) orelse return null;
+        if (want.elem != have.elem) return null;
+        const skip = try ev.flatIndex(want.elem, offset) orelse return null;
+        if (skip > have.count or want.count > have.count - skip) return error.Abort;
+        var next = skip;
+        return try ev.unflatten(base, ty, &next);
+    }
+
+    /// A value of type `ty` (nested arrays) from the base elements of `base` starting at `next`
+    fn unflatten(ev: *Evaluator, base: Val, ty: Index, next: *u64) EvalError!Val {
+        switch (ev.ip.key(ty)) {
+            .array_type => |a| {
+                const elems = try ev.allocElems(std.math.cast(usize, a.len) orelse return error.Abort);
+                for (elems) |*o| o.* = try ev.unflatten(base, a.child, next);
+                return ev.makeAgg(ty, elems);
+            },
+            else => {
+                try ev.tick();
+                defer next.* += 1;
+                return ev.flatElem(base, next.*);
+            },
+        }
+    }
+
+    /// Base element `k` of nested arrays
+    fn flatElem(ev: *Evaluator, v: Val, k: u64) EvalError!Val {
+        switch (ev.ip.key(v.ty)) {
+            .array_type => |a| {
+                const inner = (ev.arrayBase(a.child) orelse return error.Abort).count;
+                return ev.flatElem(try ev.elemAt(v, std.math.cast(usize, k / inner) orelse return error.Abort), k % inner);
+            },
+            else => return v,
+        }
+    }
+
+    /// Storage of base element `k` of the nested arrays in `cell`
+    fn flatPlace(ev: *Evaluator, cell: *Val, k: u64) EvalError!*Val {
+        switch (ev.ip.key(cell.ty)) {
+            .array_type => |a| {
+                const inner = (ev.arrayBase(a.child) orelse return error.Abort).count;
+                const agg = try ev.mutableAgg(cell);
+                if (k / inner >= agg.elems.len) return error.Abort;
+                return ev.flatPlace(&agg.elems[@intCast(k / inner)], k % inner);
+            },
+            else => return cell,
+        }
+    }
+
+    const OffsetStep = struct { ty: Index, offset: u64 };
+
+    /// Element `i` of a value of type `t` as a byte offset into its memory: elements of arrays
+    /// and fields of extern structs, to which the compiler's pointers are byte offsets; null for
+    /// other elements
+    fn offsetStep(ev: *Evaluator, t: Index, i: u32) EvalError!?OffsetStep {
+        switch (ev.ip.key(t)) {
+            .array_type => |a| {
+                if (i >= a.len) return null;
+                const l = try ev.typeLayout(a.child, 0) orelse return null;
+                return .{ .ty = a.child, .offset = std.math.mul(u64, i, l.size) catch return null };
+            },
+            else => {},
+        }
+        if (!try ev.isExternStruct(t)) return null;
+        const fields = try ev.layoutFields(t, 0) orelse return null;
+        if (i >= fields.len) return null;
+        const sl = try ev.structLayoutOf(t, fields) orelse return null;
+        return .{ .ty = fields[i].ty, .offset = (sl.bit_offsets[i] orelse return null) / 8 };
+    }
+
+    /// Store through the reinterpreting step at `ref.path[k]` (the compiler's `storeComptimePtr`
+    /// through a pointer of another pointee type): the stored value is written over the memory
+    /// of the value before the step
+    fn storeReinterpreted(ev: *Evaluator, ref: Ref, k: usize, v: Val) EvalError!void {
+        const outer: Ref = .{ .cell = ref.cell, .path = ref.path[0..k] };
+        var ty: Index = @fromBackingInt(ref.path[k + 1]);
+        var offset: u64 = ref.path[k + 2];
+        var rest = ref.path[k + 3 ..];
+        // Steps that only move the offset: only the memory of the element is written
+        while (rest.len != 0) {
+            const step = try ev.offsetStep(ty, rest[0]) orelse break;
+            ty = step.ty;
+            offset += step.offset;
+            rest = rest[1..];
+        }
+        var new = try ev.copy(if (rest.len == 0) try ev.coerce(v, ty) else try ev.castMemory(try ev.loadPath(outer), ty, offset));
+        if (rest.len != 0) try ev.store(.{ .cell = &new, .path = rest }, v);
+        if (try ev.placeOf(outer)) |cell| return ev.spliceInto(cell, new, offset);
+        var whole = try ev.copy(try ev.loadPath(outer));
+        try ev.spliceInto(&whole, new, offset);
+        try ev.store(outer, whole);
+    }
+
+    /// Storage of the value at `ref`, with the aggregates on the way expanded; null when the path
+    /// has a reinterpreting step
+    fn placeOf(ev: *Evaluator, ref: Ref) EvalError!?*Val {
+        if (Ref.lastReinterpret(ref.path) != null) return null;
+        var cell = ref.cell;
+        for (ref.path) |i| {
+            const agg = try ev.mutableAgg(cell);
+            if (i >= agg.elems.len) return error.Abort;
+            cell = &agg.elems[i];
+        }
+        return cell;
+    }
+
+    /// Writes the memory of `val` over the value in `cell` at byte `offset`. Nested arrays of the
+    /// same base element type are rearranged; otherwise both types need a well-defined layout,
+    /// and the elements and fields the bytes do not reach keep their values.
+    fn spliceInto(ev: *Evaluator, cell: *Val, val: Val, offset: u64) EvalError!void {
+        const t = cell.ty;
+        if (offset == 0 and val.ty == t) {
+            cell.* = val;
+            return;
+        }
+        if (!value.isConcrete(ev.ip, t)) return error.Abort;
+        if (try ev.restructureInto(cell, val, offset)) return;
+        if (!(try ev.wellDefinedLayout(val.ty) orelse return forget(cell)) or !(try ev.wellDefinedLayout(t) orelse return forget(cell))) return error.Abort;
+        const size = (try ev.typeLayout(val.ty, 0) orelse return forget(cell)).size;
+        const base_size = (try ev.typeLayout(t, 0) orelse return forget(cell)).size;
+        if (offset > base_size or size > base_size - offset) return error.Abort;
+        const endian = ev.ip.endian() orelse return forget(cell);
+        var m = try ev.newMemory(offset, size);
+        try ev.writeMemory(val, &m, offset, endian);
+        try ev.patchMemory(cell, &m, 0, endian);
+    }
+
+    /// The value in `cell` becomes unknown
+    fn forget(cell: *Val) void {
+        cell.* = .{ .ty = cell.ty };
+    }
+
+    /// `spliceInto` between nested arrays of the same base element type (see `restructure`);
+    /// false when it does not apply
+    fn restructureInto(ev: *Evaluator, cell: *Val, val: Val, offset: u64) EvalError!bool {
+        const want = ev.arrayBase(val.ty) orelse return false;
+        const have = ev.arrayBase(cell.ty) orelse return false;
+        if (want.elem != have.elem) return false;
+        const skip = try ev.flatIndex(want.elem, offset) orelse return false;
+        if (skip > have.count or want.count > have.count - skip) return error.Abort;
+        for (0..@intCast(want.count)) |j| {
+            try ev.tick();
+            (try ev.flatPlace(cell, skip + j)).* = try ev.copy(try ev.flatElem(val, j));
+        }
+        return true;
+    }
+
+    /// Writes the bytes of `m` over the value in `cell`, which is at byte `at`: the elements and
+    /// fields of arrays and extern structs are written separately (bytes of padding and
+    /// sentinels are not stored), and other values are read back from their patched bytes
+    fn patchMemory(ev: *Evaluator, cell: *Val, m: *const Memory, at: u64, endian: std.builtin.Endian) EvalError!void {
+        const t = cell.ty;
+        const l = try ev.typeLayout(t, 0) orelse return forget(cell);
+        if (l.size == 0 or at >= m.end() or at + l.size <= m.start) return;
+        try ev.tick();
+        switch (ev.ip.key(t)) {
+            .array_type => |a| {
+                const elem_size = (try ev.typeLayout(a.child, 0) orelse return forget(cell)).size;
+                if (elem_size == 0) return;
+                const agg = try ev.mutableAgg(cell);
+                var i: u64 = if (m.start > at) (m.start - at) / elem_size else 0;
+                while (i < agg.elems.len and at + i * elem_size < m.end()) : (i += 1) try ev.patchMemory(&agg.elems[@intCast(i)], m, at + i * elem_size, endian);
+                return;
+            },
+            else => {},
+        }
+        if (try ev.isExternStruct(t)) {
+            const fields = try ev.layoutFields(t, 0) orelse return forget(cell);
+            const sl = try ev.structLayoutOf(t, fields) orelse return forget(cell);
+            const agg = try ev.mutableAgg(cell);
+            if (agg.elems.len != sl.bit_offsets.len) return error.Abort;
+            for (agg.elems, sl.bit_offsets) |*e, bit_offset| if (bit_offset) |b| try ev.patchMemory(e, m, at + b / 8, endian);
+            return;
+        }
+        // A value written over only in part: its own bytes with the written ones over them
+        if (at < m.start or at + l.size > m.end()) {
+            var own = try ev.newMemory(at, l.size);
+            try ev.writeMemory(cell.*, &own, at, endian);
+            own.overlay(m);
+            cell.* = try ev.readMemory(t, &own, at, endian);
+            return;
+        }
+        cell.* = try ev.readMemory(t, m, at, endian);
+    }
+
+    /// `@ptrCast` to a pointer of another pointee type: a pointer into storage inside the
+    /// interpreter, or to the place an interned pointer records (`pointerPlace`), gets a
+    /// reinterpreting step (see `Ref.path`). The step starts at the outermost
+    /// value the pointer is a byte offset into, as with the compiler's pointers (elements of
+    /// arrays and fields of extern structs are reached by offset). Unknown for other pointers, for
+    /// slices and C pointers as the result, and for opaque pointees.
+    fn reinterpretPointer(ev: *Evaluator, p: Val, to: Index) EvalError!Val {
+        const ip = ev.ip;
+        const unknown: Val = .{ .ty = to };
+        const src = switch (ip.key(p.ty)) {
+            .ptr_type => |x| x,
+            else => return unknown,
+        };
+        const dest = switch (ip.key(to)) {
+            .ptr_type => |x| x,
+            else => return unknown,
+        };
+        if (src.size == .c or dest.size == .c or dest.size == .slice) return unknown;
+        if (ev.isOpaque(src.child) or ev.isOpaque(dest.child)) return unknown;
+        var ref: Ref = if (try ev.pointerPlace(p)) |r| r else switch (p.v) {
+            // Constant data whose place is not known here cannot be written through any
+            // pointer: a copy of it is referenced, which compares as the interned pointer would
+            // (`CellOrigin.copy`)
+            .ip => |x| blk: {
+                if (!src.is_const or src.size == .many) return unknown;
+                switch (ip.key(x)) {
+                    .ptr_value, .aggregate, .bytes => {},
+                    else => return unknown,
+                }
+                const cell = try ev.a.create(Val);
+                cell.* = try ev.deref(p);
+                try ev.cell_origins.put(ev.a, cell, .copy);
+                break :blk .{ .cell = cell, .path = &.{}, .is_const = true, .immutable = true };
+            },
+            else => return unknown,
+        };
+        // Types of the values the path reaches (`tys[s]` after `s` steps), and where each step
+        // starts
+        var tys: std.ArrayList(Index) = .empty;
+        var starts: std.ArrayList(usize) = .empty;
+        try tys.append(ev.a, ref.cell.ty);
+        var i: usize = 0;
+        while (i < ref.path.len) {
+            try starts.append(ev.a, i);
+            const t = tys.items[tys.items.len - 1];
+            if (ref.path[i] == Ref.reinterpret) {
+                try tys.append(ev.a, @fromBackingInt(ref.path[i + 1]));
+                i += 3;
+            } else {
+                try tys.append(ev.a, ev.elemTypeOf(t, ref.path[i]));
+                i += 1;
+            }
+        }
+        var steps = starts.items.len;
+        const pointee = tys.items[steps];
+        // A `*T` → `*[1]T` view points into an array holding only the place, in the place's
+        // memory; the cast pointer reaches that memory through the reinterpreting step
+        const in_view = ref.as_array;
+        ref.as_array = false;
+        // The pointee differs from the place, e.g. the payload of an optional, which is
+        // represented by the optional
+        if (in_view and pointee != (if (src.size == .one) ev.elemTypeOf(src.child, 0) else src.child)) return unknown;
+        // A range or many-item pointer: the byte offset of its first element in the array
+        var offset: u64 = 0;
+        if (ref.window != null or src.size != .one) {
+            const elem = if (in_view) pointee else switch (ip.key(pointee)) {
+                .array_type => |a| a.child,
+                else => return unknown,
+            };
+            const start = if (ref.window) |w| w.start else 0;
+            offset = std.math.mul(u64, start, (try ev.typeLayout(elem, 0) orelse return unknown).size) catch return unknown;
+        } else if (!in_view and pointee != src.child) {
+            // E.g. the payload of an optional, which is represented by the optional
+            return unknown;
+        }
+        while (steps > 0) : (steps -= 1) {
+            const s = starts.items[steps - 1];
+            if (ref.path[s] == Ref.reinterpret) {
+                offset += ref.path[s + 2];
+            } else {
+                const step = try ev.offsetStep(tys.items[steps - 1], ref.path[s]) orelse break;
+                offset += step.offset;
+            }
+        }
+        const kept = ref.path[0..if (steps == starts.items.len) ref.path.len else starts.items[steps]];
+        const view: Index, const window: ?Ref.Window = switch (dest.size) {
+            .one => .{ dest.child, null },
+            // A many-item pointer reaches the end of the value it points into
+            .many => blk: {
+                const elem_size = (try ev.typeLayout(dest.child, 0) orelse return unknown).size;
+                const base_size = (try ev.typeLayout(tys.items[steps], 0) orelse return unknown).size;
+                if (elem_size == 0 or offset > base_size) return unknown;
+                const n = std.math.cast(u32, (base_size - offset) / elem_size) orelse return unknown;
+                break :blk .{ try ip.get(.{ .array_type = .{ .len = n, .child = dest.child, .sentinel = null } }), .{ .start = 0, .len = n } };
+            },
+            .slice, .c => unreachable,
+        };
+        const path = try ev.a.alloc(u32, kept.len + 3);
+        @memcpy(path[0..kept.len], kept);
+        path[kept.len..][0..3].* = .{ Ref.reinterpret, @backingInt(view), std.math.cast(u32, offset) orelse return unknown };
+        ref.path = path;
+        ref.window = window;
+        ref.is_const = ref.is_const or dest.is_const;
+        return .{ .ty = to, .v = .{ .ref = ref } };
+    }
+
+    fn isOpaque(ev: *Evaluator, t: Index) bool {
+        return t == .anyopaque_type or switch (ev.ip.key(t)) {
+            .container_type => |c| c.kind == .@"opaque",
+            else => false,
+        };
     }
 
     fn int(ev: *Evaluator, ty: Index, x: anytype) Error!Val {
@@ -6526,4 +7314,26 @@ fn vectorShape(ip: *InternPool, t: Index) ?struct { len: u64, child: Index } {
         .array_type => |a| .{ .len = a.len, .child = a.child },
         else => null,
     };
+}
+
+/// Writes the low `bits` bits of `x` into the packed memory `buf` at bit `off` (see
+/// `Evaluator.writeBits`)
+fn writePacked(buf: []u8, off: u64, bits: u16, x: u128) void {
+    if (bits == 0) return;
+    std.mem.writeVarPackedInt(buf, @intCast(off), bits, x, .little);
+}
+
+/// The `bits` bits of the packed memory `buf` at bit `off`
+fn readPacked(buf: []const u8, off: u64, bits: u16) u128 {
+    if (bits == 0) return 0;
+    return std.mem.readVarPackedInt(u128, buf, @intCast(off), bits, .little, .unsigned);
+}
+
+/// The integer of type `info` whose two's complement bits are the low `info.bits` bits of `raw`
+/// (a u128 is held as its bit pattern in i128)
+fn intFromBits(info: value.IntInfo, raw: u128) i128 {
+    if (info.bits == 0) return 0;
+    const shift: u7 = @intCast(128 - @as(u32, info.bits));
+    const x = raw << shift;
+    return if (info.signed) @as(i128, @bitCast(x)) >> shift else @bitCast(x >> shift);
 }

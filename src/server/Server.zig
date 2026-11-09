@@ -1129,6 +1129,7 @@ fn targetAbi(server: *Server, graph: *const ModuleGraph) Allocator.Error!za.sema
         }
         if (result.pointer_bits != t.pointer_bits) result.pointer_bits = null;
         if (result.vector_abi != t.vector_abi) result.vector_abi = .unknown;
+        if (result.endian != t.endian) result.endian = null;
         result.scalar_abi = result.scalar_abi.merge(t.scalar_abi);
     }
     if (seen.count() == 0) result = if (graph.default_builtin) |f| try server.builtinTarget(f) else .{};
@@ -1150,7 +1151,7 @@ fn targetAbi(server: *Server, graph: *const ModuleGraph) Allocator.Error!za.sema
 fn builtinTarget(server: *Server, file: Vfs.FileId) Allocator.Error!za.sema.InternPool.Target {
     const text = Io.Dir.cwd().readFileAlloc(server.io, server.vfs.path(file), server.gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return server.builtin_targets.get(file) orelse .{ .pointer_bits = null, .scalar_abi = .unknown },
+        else => return server.builtin_targets.get(file) orelse .{ .pointer_bits = null, .scalar_abi = .unknown, .endian = null },
     };
     defer server.gpa.free(text);
     const result = targetOfBuiltin(text);
@@ -1167,6 +1168,7 @@ pub fn targetOfBuiltin(text: []const u8) za.sema.InternPool.Target {
         .pointer_bits = za.project.builtin.pointerBits(text),
         .vector_abi = if (backend) |b| if (target) |*t| .of(b, t) else .unknown else .unknown,
         .scalar_abi = if (target) |*t| .of(t) else .unknown,
+        .endian = if (target) |*t| t.cpu.arch.endian() else null,
     };
 }
 
