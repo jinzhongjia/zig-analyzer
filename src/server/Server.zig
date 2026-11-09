@@ -840,6 +840,8 @@ fn BackgroundTask(comptime func: anytype) type {
 /// (`Db.WriteOrder.unordered`) runs again on the new state: the text the request refers to has not
 /// changed, so the client has nothing to act on. When a write ordered after the request caused the
 /// interruption, the next read transaction would be stale, and `ContentModified` is answered there.
+/// The caller begins the next read only once that write has taken the lock (see
+/// `Db.waitPendingWrites`): beginning it at once could keep the write waiting.
 fn answerFailure(server: *Server, ctx: *const Db.Ctx, pending: *const Pending, err: anyerror) bool {
     const by_client = pending.cancel.load(.acquire);
     if (err == error.Canceled and !by_client and !ctx.stale and !server.isShuttingDown()) return false;
@@ -854,7 +856,7 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
             defer server.finishRequest(arena, pending);
             pending.sema_start = server.semaUsage();
             server.testGate(method, .before_read, pending);
-            while (!attempt(server, pending, params)) {}
+            while (!attempt(server, pending, params)) server.db.waitPendingWrites();
         }
 
         /// Returns whether the request was answered (see `answerFailure`)
@@ -903,7 +905,7 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             server.testGate(method, .before_read, pending);
             while (true) switch (attempt(server, pending, params, waited_for_projects)) {
                 .answered => return,
-                .again => {},
+                .again => server.db.waitPendingWrites(),
                 // Outside the read transaction: the scan's write waits for read transactions
                 .after_scans => server.waitScans(pending),
             };
@@ -911,7 +913,7 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
 
         const Next = enum {
             answered,
-            /// Run again at once (see `answerFailure`)
+            /// Run again once the pending writes have taken the lock (see `answerFailure`)
             again,
             /// Run again after the scans scheduled so far (see `HandlerError.ScanPending`)
             after_scans,
