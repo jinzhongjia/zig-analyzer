@@ -23,8 +23,8 @@
 //! server scan the root directories for source files again (see `Server.scheduleScan`).
 //! A file becomes of interest when it is interned, and the server may read it before this task
 //! watches it: once it is watched, its known text is compared with the disk, so a change in
-//! between is not lost. A file still being read then is compared once the read is done: what
-//! the read gets is not known before.
+//! between is not lost. A file still being read then, or when a change to it is notified, is
+//! compared once the read is done: what the read gets is not known before.
 //!
 //! Polling (periodically checking size and modification time) is only the last resort: when
 //! native notifications are unavailable (other platforms, initialization failure), or some
@@ -645,16 +645,22 @@ pub const Watcher = struct {
             const kind: types.FileChangeType = if (!exists) .Deleted else if (hint == .created) .Created else .Changed;
             try (if (hint == .verify) &verified else &events).append(a, .{ .uri = try uri.fromPath(a, path), .type = kind });
         }
-        if (verified.items.len != 0) for (server.applyWatchedChanges(a, verified.items, .verified)) |path| {
+        if (verified.items.len != 0) try w.reverifyLater(server.applyWatchedChanges(a, verified.items, .verified));
+        if (events.items.len == 0) return;
+        log.debug("{d} file(s) changed on disk", .{events.items.len});
+        try w.reverifyLater(server.applyWatchedChanges(a, events.items, .notified));
+    }
+
+    /// Files that were being read from disk when their changes were handled: compared with the
+    /// disk again after `reverify_ms`
+    fn reverifyLater(w: *Watcher, paths: []const []const u8) Allocator.Error!void {
+        for (paths) |path| {
             const owned = try w.gpa.dupe(u8, path);
             w.reverify.append(w.gpa, owned) catch |err| {
                 w.gpa.free(owned);
                 return err;
             };
-        };
-        if (events.items.len == 0) return;
-        log.debug("{d} file(s) changed on disk", .{events.items.len});
-        _ = server.applyWatchedChanges(a, events.items, .notified);
+        }
     }
 };
 
