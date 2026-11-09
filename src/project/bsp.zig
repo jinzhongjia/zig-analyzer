@@ -10,7 +10,8 @@
 const std = @import("std");
 const Watchdog = @import("../util/watchdog.zig").Watchdog;
 const child_process = @import("../util/child_process.zig");
-const native_os = @import("builtin").os.tag;
+const builtin = @import("builtin");
+const native_os = builtin.os.tag;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const ErrorBundle = std.zig.ErrorBundle;
@@ -663,11 +664,22 @@ pub const SingleFileCompiles = struct {
     stopped: bool = false,
     /// `Running` entries, which live on the stacks of the compiling tasks
     running: std.DoublyLinkedList = .{},
+    /// Test hook (null outside tests): a compile stops after zig has started and before the
+    /// compile is requested, until the pause is released, so that a test can end the processes
+    /// at that point
+    test_pause: ?*TestPause = null,
 
     const Running = struct {
         node: std.DoublyLinkedList.Node = .{},
         child: *std.process.Child,
         group: *Group,
+    };
+
+    /// See `test_pause`
+    const TestPause = struct {
+        /// Set when the compile has stopped
+        entered: Io.Event = .unset,
+        release: Io.Event = .unset,
     };
 
     /// Ends the compiles in progress together with the processes they started (their tasks then
@@ -689,12 +701,23 @@ pub const SingleFileCompiles = struct {
         defer s.mutex.unlock(io);
         return s.stopped;
     }
+
+    fn testPause(s: *SingleFileCompiles, io: Io) void {
+        if (!builtin.is_test) return;
+        const pause = s.test_pause orelse return;
+        pause.entered.set(io);
+        pause.release.waitUncancelable(io);
+    }
 };
 
 /// Single-file mode (no build.zig): runs `zig build-obj -fno-emit-bin --listen=- <file>` with the
 /// zig of `env` and requests one compilation. The compiler and the processes it starts form a
 /// group (see `Group`) that ends with the server however it exits, and that `compiles.stop` ends
 /// at once; the compile then returns `error.Stopped`.
+/// When zig ends before reporting the result for any other reason (it crashed or was killed), the
+/// compile returns `error.WriteFailed` if zig had ended before the request was written to it and
+/// `error.EndOfStream` otherwise; in either case the group is ended and its processes are reaped
+/// before it returns.
 pub fn compileSingleFile(gpa: Allocator, io: Io, env: *const ZigEnv, file_path: []const u8, compiles: *SingleFileCompiles) !SingleFileResult {
     const dir = std.fs.path.dirname(file_path) orelse ".";
     if (compiles.isStopped(io)) return error.Stopped;
@@ -733,6 +756,7 @@ pub fn compileSingleFile(gpa: Allocator, io: Io, env: *const ZigEnv, file_path: 
     var watchdog: Watchdog = .{};
     watchdog.start(io, child.id.?, .{ .duration = .{ .raw = Io.Duration.fromSeconds(120), .clock = .awake } });
     defer watchdog.stop();
+    compiles.testPause(io);
 
     return exchangeSingleFile(gpa, io, &child, file_path) catch |err| {
         // Ended by `stop`: the read or write failed because the compiler is gone
@@ -998,17 +1022,17 @@ test "single-file mode: compile one file, get its errors and the files it read" 
     }
 }
 
-/// A zig whose `zig build-obj` starts a process of its own and then hangs, both keeping the
-/// stdout pipe open; `tmp` holds the script and the file to compile
+/// A zig whose `zig build-obj` runs the shell commands `prelude`, then starts a process of its own
+/// and hangs, both keeping the stdout pipe open; `tmp` holds the script and the file to compile
 const HangingZig = struct {
     tmp: testing.TmpDir,
     env: ZigEnv,
     file: []u8,
 
-    fn create() !HangingZig {
+    fn create(comptime prelude: []const u8) !HangingZig {
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        try tmp.dir.writeFile(testing.io, .{ .sub_path = "zig", .data = "#!/bin/sh\nsleep 600 &\nexec sleep 600\n", .flags = .{ .permissions = .executable_file } });
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "zig", .data = "#!/bin/sh\n" ++ prelude ++ "sleep 600 &\nexec sleep 600\n", .flags = .{ .permissions = .executable_file } });
         try tmp.dir.writeFile(testing.io, .{ .sub_path = "one.zig", .data = "" });
         const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
         defer testing.allocator.free(root);
@@ -1046,12 +1070,49 @@ const HangingZig = struct {
         }
         return error.CompileDidNotStart;
     }
+
+    /// What the operating system does when the server process exits, however it exits: it closes
+    /// the write end of the watchdog's input. Returns the process group of the compile in progress
+    fn serverGone(compiles: *SingleFileCompiles) !std.posix.pid_t {
+        const r = try running(compiles);
+        compiles.mutex.lockUncancelable(testing.io);
+        defer compiles.mutex.unlock(testing.io);
+        const watchdog = &r.group.watchdog.?;
+        watchdog.stdin.?.close(testing.io);
+        watchdog.stdin = null;
+        return r.group.pgid;
+    }
+
+    /// Waits until the script has created `name` in its directory
+    fn waitFor(z: *HangingZig, name: []const u8) !void {
+        for (0..1000) |_| {
+            if (z.tmp.dir.access(testing.io, name, .{})) |_| return else |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            }
+            try testing.io.sleep(.fromMilliseconds(10), .awake);
+        }
+        return error.FileNotCreated;
+    }
 };
+
+/// Within a few seconds, no process has the read end of `pipe` open: the processes that had it
+/// have ended, and a write to the pipe fails
+fn expectNoReader(pipe: Io.File) !void {
+    for (0..100) |_| {
+        var fds = [_]std.posix.pollfd{.{ .fd = pipe.handle, .events = std.posix.POLL.OUT, .revents = 0 }};
+        _ = try std.posix.poll(&fds, 0);
+        // Linux reports POLLERR, macOS POLLHUP
+        if (fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) != 0) return;
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    return error.PipeStillRead;
+}
 
 test "single-file mode: stopping ends a compile in progress and the processes it started" {
     // Shutdown waited for the compiler to finish, and a compile requested meanwhile started after it
     if (native_os == .windows) return error.SkipZigTest;
-    var zig: HangingZig = try .create();
+    var zig: HangingZig = try .create("");
     defer zig.deinit();
     var compiles: SingleFileCompiles = .{};
     var task = try testing.io.concurrent(HangingZig.compile, .{ &zig, &compiles });
@@ -1066,22 +1127,51 @@ test "single-file mode: stopping ends a compile in progress and the processes it
 test "single-file mode: the compiler and the processes it started end when the server goes away" {
     // A server that was killed or crashed left the compiler running
     if (native_os == .windows) return error.SkipZigTest;
-    var zig: HangingZig = try .create();
+    var zig: HangingZig = try .create("");
     defer zig.deinit();
     var compiles: SingleFileCompiles = .{};
     var task = try testing.io.concurrent(HangingZig.compile, .{ &zig, &compiles });
     defer task.cancel(testing.io) catch {};
-    const pgid = blk: {
-        const r = try HangingZig.running(&compiles);
-        compiles.mutex.lockUncancelable(testing.io);
-        defer compiles.mutex.unlock(testing.io);
-        // When the server process exits (no matter how), the operating system closes the write
-        // end of the watchdog's input
-        const watchdog = &r.group.watchdog.?;
-        watchdog.stdin.?.close(testing.io);
-        watchdog.stdin = null;
-        break :blk r.group.pgid;
+    const pgid = try HangingZig.serverGone(&compiles);
+    // The processes may end before the compile request is written to zig or after it. Either
+    // error means that zig is gone, and the compile ends the group in the same way; the next two
+    // tests take each of the two paths
+    task.await(testing.io) catch |err| switch (err) {
+        error.WriteFailed, error.EndOfStream => {},
+        else => return err,
     };
+    try @import("fixture.zig").expectGroupGone(pgid);
+}
+
+test "single-file mode: the compiler and the processes it started end when the server goes away before the compile is requested" {
+    if (native_os == .windows) return error.SkipZigTest;
+    var zig: HangingZig = try .create("");
+    defer zig.deinit();
+    var pause: SingleFileCompiles.TestPause = .{};
+    var compiles: SingleFileCompiles = .{ .test_pause = &pause };
+    var task = try testing.io.concurrent(HangingZig.compile, .{ &zig, &compiles });
+    defer task.cancel(testing.io) catch {};
+    defer pause.release.set(testing.io);
+    try pause.entered.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+    const pgid = try HangingZig.serverGone(&compiles);
+    // zig has ended once nothing reads its input (the compile is paused, so its pipe can be
+    // inspected here)
+    try expectNoReader((try HangingZig.running(&compiles)).child.stdin.?);
+    pause.release.set(testing.io);
+    try testing.expectError(error.WriteFailed, task.await(testing.io));
+    try @import("fixture.zig").expectGroupGone(pgid);
+}
+
+test "single-file mode: the compiler and the processes it started end when the server goes away while the result is awaited" {
+    if (native_os == .windows) return error.SkipZigTest;
+    // zig reads the compile request, then says so by creating `requested`
+    var zig: HangingZig = try .create(std.fmt.comptimePrint("head -c {d} >/dev/null\n: >requested\n", .{@sizeOf(ClientMessage.Header)}));
+    defer zig.deinit();
+    var compiles: SingleFileCompiles = .{};
+    var task = try testing.io.concurrent(HangingZig.compile, .{ &zig, &compiles });
+    defer task.cancel(testing.io) catch {};
+    try zig.waitFor("requested");
+    const pgid = try HangingZig.serverGone(&compiles);
     try testing.expectError(error.EndOfStream, task.await(testing.io));
     try @import("fixture.zig").expectGroupGone(pgid);
 }

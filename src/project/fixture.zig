@@ -165,8 +165,7 @@ fn groupHasLiveProcess(pgid: std.posix.pid_t) !bool {
     while (try it.next(testing.io)) |entry| {
         _ = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
         const path = try std.fmt.bufPrint(&path_buf, "{s}/stat", .{entry.name});
-        // The process may have been reaped since the directory was listed
-        const stat = proc.readFile(testing.io, path, &stat_buf) catch continue;
+        const stat = try readStat(proc, path, &stat_buf) orelse continue;
         // `pid (comm) state ppid pgrp ...`, where comm may contain spaces and parentheses
         const comm_end = std.mem.lastIndexOfScalar(u8, stat, ')') orelse continue;
         var fields = std.mem.tokenizeScalar(u8, stat[comm_end + 1 ..], ' ');
@@ -176,6 +175,29 @@ fn groupHasLiveProcess(pgid: std.posix.pid_t) !bool {
         if (pgrp == pgid and !std.mem.eql(u8, state, "Z") and !std.mem.eql(u8, state, "X")) return true;
     }
     return false;
+}
+
+/// Linux: the contents of `/proc/<pid>/stat` (`path` relative to `/proc`), or null when the process
+/// has been reaped since `/proc` was listed: opening the file then fails with ENOENT, and reading a
+/// file opened before with ESRCH
+fn readStat(proc: std.Io.Dir, path: []const u8, buf: []u8) !?[]u8 {
+    const file = proc.openFile(testing.io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close(testing.io);
+    // Read directly: `std.Io` reports ESRCH from a read as an unexpected error, with a stack trace
+    // in Debug builds
+    const linux = std.os.linux;
+    while (true) {
+        const rc = linux.read(file.handle, buf.ptr, buf.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return buf[0..rc],
+            .INTR => continue,
+            .SRCH => return null,
+            else => |e| return std.posix.unexpectedErrno(e),
+        }
+    }
 }
 
 test "expectGroupGone: a group whose only members are zombies is gone" {
