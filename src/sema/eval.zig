@@ -2966,12 +2966,17 @@ const Evaluator = struct {
     /// Comparison `lhs op rhs` of evaluated operands. Matching the compiler, the operands are
     /// coerced to their peer type: an enum literal to the other side's enum (by tag name, never
     /// as a decl literal; a name that is not a tag is a compile error), a comptime number to the
-    /// other side's float type (rounding it). A tagged union compared with a tag keeps the literal
-    /// as it is. Vectors are compared element by element.
+    /// other side's float type (rounding it), a function body to a pointer to the function
+    /// (`functionOperand`). A tagged union compared with a tag keeps the literal as it is. Vectors
+    /// are compared element by element.
     fn compare(ev: *Evaluator, op: SyntaxKind, lhs_in: Val, rhs_in: Val) EvalError!Val {
         const ip = ev.ip;
         var lhs = lhs_in;
         var rhs = rhs_in;
+        if (op == .equal_equal or op == .bang_equal) {
+            if (try ev.functionOperand(lhs, rhs.ty)) |p| lhs = p;
+            if (try ev.functionOperand(rhs, lhs.ty)) |p| rhs = p;
+        }
         if (ev.peerOperand(lhs.ty, rhs.ty)) lhs = try ev.coerce(lhs, rhs.ty);
         if (ev.peerOperand(rhs.ty, lhs.ty)) rhs = try ev.coerce(rhs, lhs.ty);
         // Optionals of different depths are compared at the deeper one, their peer type:
@@ -3826,6 +3831,18 @@ const Evaluator = struct {
         if ((try ev.r.itemTree(func.file)).items[item].flags.is_extern) return error.Abort;
         const ty = try ev.ip.ptrTo(v.ty, .one, true);
         return Val.of(ty, try ev.pointerTo(ty, x, null));
+    }
+
+    /// Comparison operand `v` when the other operand has type `other`: a function body compared
+    /// with a pointer to a function has the pointer's peer type, and the compiler coerces the
+    /// body to a pointer to the function's declaration (`analyzeNavRef`), the pointer `&` of the
+    /// function gives (`functionPointer`). Null when `v` is not a function body, or `other` is not
+    /// the type of that pointer: the identity of pointers of other types to a function is not
+    /// tracked.
+    fn functionOperand(ev: *Evaluator, v: Val, other: Index) EvalError!?Val {
+        if (ev.ip.key(v.ty) != .fn_type) return null;
+        if (other != try ev.ip.ptrTo(v.ty, .one, true)) return null;
+        return ev.functionPointer(v);
     }
 
     /// What a place is resolved for
