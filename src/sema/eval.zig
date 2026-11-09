@@ -3898,15 +3898,20 @@ const Evaluator = struct {
     /// interned pointer records (`basePlace`), the place it points to instead (automatic
     /// dereferencing)
     fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId, use: PlaceUse) EvalError!Ref {
-        // A pointer computed by pointer arithmetic (`(p + 1)[0] = x`) or returned by a call
-        // (`std.mem.asBytes(&x)[i] = b`) is not a place: the compiler takes the element pointer
-        // of the value, so the place is the one it points to
+        // A pointer computed by pointer arithmetic (`(p + 1)[0] = x`), returned by a call
+        // (`std.mem.asBytes(&x)[i] = b`) or, for `&`, made by slicing (`&a[1..][0]`) is not a
+        // place: the compiler takes the element pointer of the value, so the place is the one it
+        // points to. For `&`, that includes the place an interned pointer records (`basePlace`),
+        // as for a pointer held by a declaration: `&retArr()[1]` points into the anonymous
+        // constant the returned pointer points to. A slice of data whose place is not known
+        // holds a copy of it, which writes must not reach.
         switch (f.body.expr(e)) {
-            .binary, .call, .builtin_call => {
+            .binary, .call, .builtin_call, .slice => {
+                if (use == .write and f.body.expr(e) == .slice) return error.Abort;
                 const p = try ev.eval(f, e, null);
                 return switch (p.v) {
                     .ref => |r| ev.through(r, p.ty),
-                    else => error.Abort,
+                    else => if (use == .address and ev.ip.key(p.ty) == .ptr_type) try ev.basePlace(p) orelse error.Abort else error.Abort,
                 };
             },
             else => {},

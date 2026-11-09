@@ -10472,8 +10472,8 @@ test "comptime evaluation: pointers to anonymous constants keep their identity a
         .{ "p_ret_elem_twice", "bool = true" },
         .{ "p_ret_elem_deref", "u8 = 2" },
         .{ "p_ret_arr", "bool = true" },
-        // The element of a call result is not a place here
-        .{ "p_ret_arr_elem", "bool" },
+        // `&` of an element of a call result points into the constant the result points to
+        .{ "p_ret_arr_elem", "bool = true" },
         // A string literal records no place: compared with it, and as a comptime argument, a
         // pointer to an equal anonymous constant counts by its data
         .{ "p_ret_str_lit", "bool = true" },
