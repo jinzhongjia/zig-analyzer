@@ -457,7 +457,64 @@ fn publishCount(h: *Harness, uri: []const u8) !usize {
     return n;
 }
 
+/// The visible instance of the only project, with a reference held (dropped with `release`): its
+/// address is not reused by a later instance while it is compared with
+fn holdVisibleInstance(h: *Harness) *Workspace {
+    h.server.workspaces_mutex.lockUncancelable(testing.io);
+    defer h.server.workspaces_mutex.unlock(testing.io);
+    const ws = h.server.workspaces.items[0];
+    ws.acquire();
+    return ws;
+}
+
+/// Whether the only project was restarted because its maker crashed since `since` was its visible
+/// instance. The Zig 0.17 maker can panic right after a build, also after `waitIdle` has returned
+/// (see docs/zig-maker-build-request-race.md): the new instance then loads, configures and builds
+/// the project once more, so the write transactions, builds and publishes counted since then are
+/// not only the server's response to what the test did. The new instance is registered before it
+/// does any of that (see `Server.restartWorkspace`): checked after counting, this sees every
+/// restart the counts include. A restart for any other reason returns false, and the counts then
+/// show it.
+fn restartedAfterCrash(h: *Harness, since: *const Workspace) bool {
+    h.server.workspaces_mutex.lockUncancelable(testing.io);
+    defer h.server.workspaces_mutex.unlock(testing.io);
+    const visible = h.server.workspaces.items[0];
+    const current = visible.successor orelse visible;
+    return current != since and current.crash_restarts != 0;
+}
+
+/// What `rewriteWithSameContent` compares after each rewrite
+const Counts = struct {
+    builds: u64,
+    writes: i64,
+    /// Publishes for lib.zig
+    published: usize,
+
+    fn of(h: *Harness, lib_uri: []const u8) !Counts {
+        return .{ .builds = compiles(h), .writes = try writeCount(h), .published = try publishCount(h, lib_uri) };
+    }
+};
+
+/// Attempts of the test below. A maker crash cuts short more of them with few cores and a busy CPU;
+/// only an attempt it cuts short runs again.
+const crash_attempts = 10;
+
 test "rewriting files on disk without changing their content is not a change" {
+    for (0..crash_attempts) |_| {
+        rewriteWithSameContent() catch |err| switch (err) {
+            // What the counts show is not only the server's response to the rewrites: run again
+            // with a new project
+            error.MakerCrashed => continue,
+            else => |e| return e,
+        };
+        return;
+    }
+    return error.MakerCrashedInEveryAttempt;
+}
+
+/// One attempt of the test above; error.MakerCrashed when the project was restarted after its maker
+/// crashed before the counts were compared (see `restartedAfterCrash`)
+fn rewriteWithSameContent() !void {
     var project = try fixture.Project.create(&fixture.basic);
     defer project.deinit();
     var h: Harness = undefined;
@@ -469,13 +526,13 @@ test "rewriting files on disk without changing their content is not a change" {
     try h.notify("initialized", Empty{});
     try open(&h, try za.base.uri.fromPath(a, try project.path(a, "src/main.zig")), fixture.basic[1].text);
     _ = try h.request("zig-analyzer/waitIdle", {});
+    const instance = holdVisibleInstance(&h);
+    defer instance.release();
     const lib_path = try project.path(a, "src/lib.zig");
     const lib_uri = try za.base.uri.fromPath(a, lib_path);
-    const builds = compiles(&h);
-    const writes = try writeCount(&h);
-    const published = try publishCount(&h, lib_uri);
-    try testing.expect(builds > 0);
-    try testing.expect(published > 0);
+    const before = try Counts.of(&h, lib_uri);
+    try testing.expect(before.builds > 0);
+    try testing.expect(before.published > 0);
 
     // Rewrite with the same content (generated code written by a build step): the known text is
     // unchanged, so nothing is written. The server does not know whether the last build read this
@@ -483,28 +540,30 @@ test "rewriting files on disk without changing their content is not a change" {
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = fixture.basic[2].text });
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = lib_uri, .type = 2 }} });
     _ = try h.request("zig-analyzer/waitIdle", {});
-    try testing.expectEqual(builds + 1, compiles(&h));
-    try testing.expectEqual(writes, try writeCount(&h));
+    const first = try Counts.of(&h, lib_uri);
+    if (restartedAfterCrash(&h, instance)) return error.MakerCrashed;
+    try testing.expectEqual(before.builds + 1, first.builds);
+    try testing.expectEqual(before.writes, first.writes);
 
     // Rewrite with the same content again, plus an atomic save that deletes the file and then
     // creates it again: no write, no rebuild, no republish
-    const rebuilt = compiles(&h);
-    const republished = try publishCount(&h, lib_uri);
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = fixture.basic[2].text });
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = lib_uri, .type = 2 }} });
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{ .{ .uri = lib_uri, .type = 3 }, .{ .uri = lib_uri, .type = 1 } } });
     _ = try h.request("zig-analyzer/waitIdle", {});
-    try testing.expectEqual(rebuilt, compiles(&h));
-    try testing.expectEqual(writes, try writeCount(&h));
-    try testing.expectEqual(republished, try publishCount(&h, lib_uri));
+    const second = try Counts.of(&h, lib_uri);
+    if (restartedAfterCrash(&h, instance)) return error.MakerCrashed;
+    try testing.expectEqual(first.builds, second.builds);
+    try testing.expectEqual(before.writes, second.writes);
+    try testing.expectEqual(first.published, second.published);
 
     // The content really changes: written and rebuilt, and the compiler diagnostics of lib.zig are
     // cleared along with it
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = "pub fn hello() void {}\n" });
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = lib_uri, .type = 2 }} });
     _ = try h.request("zig-analyzer/waitIdle", {});
-    try testing.expect(compiles(&h) > rebuilt);
-    try testing.expect(try writeCount(&h) > writes);
+    try testing.expect(compiles(&h) > second.builds);
+    try testing.expect(try writeCount(&h) > before.writes);
     try testing.expectEqual(@as(usize, 0), (try lastDiagnostics(&h, lib_uri)).?.len);
 
     _ = try h.request("shutdown", {});
