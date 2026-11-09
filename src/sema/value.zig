@@ -590,6 +590,29 @@ fn floatKind(ip: *InternPool, ty: Index) ?InternPool.Simple {
     };
 }
 
+/// `t` with error unions and optionals removed, however deeply nested (the compiler's
+/// `Type.optEuBaseType`)
+pub fn optEuBaseType(ip: *InternPool, t: Index) Index {
+    var cur = t;
+    while (true) cur = switch (ip.key(cur)) {
+        .optional_type => |child| child,
+        .error_union_type => |eu| eu.payload,
+        else => return cur,
+    };
+}
+
+/// Result type of the operand of a float math builtin (`@sqrt`, `@floor`, ...) whose call has the
+/// result type `t` (matches the compiler's `zirFloatOpResultType` / `zirRoundOpType`): `t` without
+/// error unions and optionals when that is a float or a vector of floats, otherwise null
+pub fn floatOperandType(ip: *InternPool, t: Index) ?Index {
+    const base = optEuBaseType(ip, t);
+    const scalar = switch (ip.key(base)) {
+        .vector_type => |v| v.child,
+        else => base,
+    };
+    return if (ip.isFloat(scalar)) base else null;
+}
+
 /// Unary float builtins
 pub const FloatFn = enum { sqrt, sin, cos, tan, exp, exp2, log, log2, log10, abs, floor, ceil, trunc, round };
 
