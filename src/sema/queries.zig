@@ -713,12 +713,14 @@ pub const LocalValue = struct {
     }
 };
 
-/// Value of a local constant of a function as the function body computes it: the interpreter
-/// executes the function in its instance `inst` and takes the value of the constant once it is
-/// defined (see `eval.localValue`). A container defined in a function body captures the values
-/// the body has computed for the locals it refers to (the compiler's `getCaptures`), which can
-/// depend on the statements before the definition (a local variable modified in a loop, an array
-/// sorted in place); `LocalValue` infers only the initializer and cannot see those statements.
+/// Value of a local constant of a member as its body computes it: the interpreter executes the
+/// function in its instance `inst`, or the comptime initializer of another member (a
+/// container-level declaration, a field's default value, a comptime block) in instance context
+/// `inst`, and takes the value of the constant once it is defined (see `eval.localValue`). A
+/// container defined in the body captures the values the body has computed for the locals it
+/// refers to (the compiler's `getCaptures`), which can depend on the statements before the
+/// definition (a local variable modified in a loop, an array sorted in place); `LocalValue`
+/// infers only the initializer and cannot see those statements.
 pub const LocalEval = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = LocalKey;
@@ -733,7 +735,7 @@ pub const LocalEval = struct {
     }
 };
 
-/// A local variable of a function as a container defined in the function body captures it
+/// A local variable of a member as a container defined in the member's body captures it
 pub const CaptureKey = struct {
     owner: hir.OwnerKey,
     binding: Body.BindingId,
@@ -742,12 +744,12 @@ pub const CaptureKey = struct {
     inst: ?Index = null,
 };
 
-/// Value of a local variable of a function as a container defined in its body captures it: the
+/// Value of a local variable of a member as a container defined in its body captures it: the
 /// value the variable has when the body reaches the container, which the compiler's
 /// `getCaptures` loads there (`comptime var`, or a `var` in a comptime scope). Containers
 /// defined before and after a modification capture different values, so the value belongs to
-/// the container rather than to the variable. The interpreter executes the function in its
-/// instance `inst` up to the container (see `eval.capturedValue`).
+/// the container rather than to the variable. The interpreter executes the member in instance
+/// `inst` up to the container (see `eval.capturedValue`).
 pub const CapturedVar = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = CaptureKey;
