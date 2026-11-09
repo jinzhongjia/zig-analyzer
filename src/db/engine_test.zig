@@ -584,8 +584,29 @@ test "memoized: what a derived query last computed, without computing it" {
     try setText(&d, 3, "x");
     var ctx = d.beginRead(testing.allocator);
     defer ctx.end();
-    try testing.expect(ctx.memoized(Cached, 1) == .unknown);
+    try testing.expect(ctx.memoized(Cached, 1) == .evicted);
     try testing.expectEqualStrings("abc", ctx.memoized(Cached, 3).value);
+}
+
+test "memoized: a value another read transaction is computing" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 7, .low);
+    gate = .{};
+    var reader: ReadThread(Gated) = .{ .d = &d, .key = 1 };
+    try reader.start();
+    while (gate.entered.load(.acquire) == 0) std.Thread.yield() catch {};
+    const computing = blk: {
+        var ctx = d.beginRead(testing.allocator);
+        defer ctx.end();
+        break :blk ctx.memoized(Gated, 1) == .computing;
+    };
+    gate.release.store(true, .release);
+    try testing.expectEqual(21, try reader.join());
+    try testing.expect(computing);
+    var ctx = d.beginRead(testing.allocator);
+    defer ctx.end();
+    try testing.expectEqual(21, ctx.memoized(Gated, 1).value);
 }
 
 test "inputChangedAt: moves only when that input gets a different value" {

@@ -386,8 +386,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 /// Never computed (or its memo was discarded together with everything computed
                 /// from it)
                 none,
-                /// Being computed by a read transaction, or computed with its value evicted
-                unknown,
+                /// Being computed by a read transaction
+                computing,
+                /// Computed, with its value evicted
+                evicted,
                 value: Q.Value,
             };
         }
@@ -1083,9 +1085,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 defer table.mutex.unlock(db.io);
                 const index = table.keys.getIndex(key) orelse return .none;
                 const slot = table.slots.items[index];
-                if (slot.owner != null) return .unknown;
+                if (slot.owner != null) return .computing;
                 const memo = slot.memo orelse return .none;
-                return if (memo.evicted) .unknown else .{ .value = memo.value };
+                return if (memo.evicted) .evicted else .{ .value = memo.value };
             }
 
             /// The revision in which input `Q` of `key` last got a different value (0: never set).

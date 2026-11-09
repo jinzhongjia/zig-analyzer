@@ -2548,7 +2548,7 @@ fn sameText(ctx: *Db.Ctx, file: Vfs.FileId, text: ?[]const u8) bool {
     if (ctx.isSet(FileText, file)) return text == null;
     return switch (ctx.memoized(syntax_q.SourceText, file)) {
         .none => true,
-        .unknown => false,
+        .computing, .evicted => false,
         .value => |read| if (read.owned) std.mem.eql(u8, read.text, text orelse return false) else text == null,
     };
 }
