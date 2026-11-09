@@ -90,9 +90,9 @@ pub const Expr = union(enum) {
     /// `arg` is the integer type of `enum(u8)`, the tag type of `union(E)`, or the backing integer
     /// of `packed struct(u32)`
     container: struct { arg: ?ExprId },
-    /// Function type `fn (A, B) R`. `is_generic`: has comptime or `anytype` parameters. The
-    /// `callconv(...)` expression is part of the type; its other clauses are in `clauses`.
-    fn_type: struct { params: []const ExprId, ret: ?ExprId, varargs: bool = false, is_generic: bool = false, @"callconv": ?ExprId = null },
+    /// Function type `fn (A, B) R`. The `callconv(...)` expression is part of the type; its
+    /// other clauses are in `clauses`.
+    fn_type: struct { params: []const FnTypeParam, ret: ?ExprId, varargs: bool = false, @"callconv": ?ExprId = null },
     @"return": ?ExprId,
     @"break": struct { label: ?[]const u8, value: ?ExprId },
     /// `continue :l value` of a labeled switch carries a value
@@ -205,8 +205,18 @@ pub const Binding = struct {
     is_ptr: bool = false,
     /// `comptime` parameter, or `comptime var` local variable
     is_comptime: bool = false,
+    /// `noalias` parameter
+    is_noalias: bool = false,
 
     pub const Kind = enum { param, local_const, local_var, capture };
+};
+
+/// A parameter of a function type expression (its name, if any, binds nothing)
+pub const FnTypeParam = struct {
+    /// null for `anytype`
+    ty: ?ExprId,
+    is_comptime: bool = false,
+    is_noalias: bool = false,
 };
 
 pub const Scope = struct {

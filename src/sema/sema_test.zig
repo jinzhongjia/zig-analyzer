@@ -982,8 +982,8 @@ test "@This() in a generic body is the abstract instance, like the written call"
         .{ "r", "Pair(B, A)" },
         // As in the compiler
         .{ "same", "bool = true" },
-        // The name depends on the instance
-        .{ "tn", "unknown" },
+        // The name depends on the instance, but is always a comptime-known string
+        .{ "tn", "*const [_:0]u8" },
     });
 }
 
@@ -1460,14 +1460,134 @@ test "@typeName gives the compiler's fully qualified name" {
         .{ "n_null", "*const [13:0]u8 = \"@TypeOf(null)\"" },
         .{ "n_tuple", "*const [30:0]u8 = \"struct { u8, ?*const [2:0]u8 }\"" },
         .{ "n_err", "*const [17:0]u8 = \"error{A,B}!main.S\"" },
-        // Named after a global counter, or after whichever instance creates the shared type first
-        .{ "n_anon", "unknown" },
-        .{ "n_shared", "unknown" },
-        .{ "n_plain", "unknown" },
+        // Named after a global counter, or after whichever instance creates the shared type
+        // first: still a comptime-known string
+        .{ "n_anon", "*const [_:0]u8" },
+        .{ "n_shared", "*const [_:0]u8" },
+        .{ "n_plain", "*const [_:0]u8" },
         .{ "is_list", "bool = true" },
         .{ "branch", "u8 = 1" },
         .{ "eqname", "u1 = 1" },
         .{ "n_local", "*const [8:0]u8 = \"main.f.L\"" },
+    };
+    for (cases) |c| {
+        testing.expectEqualStrings(c[1], try typeAt(&w, main.file, src, c[0], 0)) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "@typeName names function types and inferred error sets as the compiler does" {
+    // Prevents an unknown name, and an unknown type, for every function type.
+    // Expected values: zig 0.17.0 and 0.17.1 (identical) `@typeName` of each type.
+    var env = @import("../project/ZigEnv.zig").query(testing.allocator, testing.io, null) catch return error.SkipZigTest;
+    defer env.deinit(testing.allocator);
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const std_root_path = try std.fs.path.join(testing.allocator, &.{ env.std_dir, "std.zig" });
+    defer testing.allocator.free(std_root_path);
+    const std_root = try w.vfs.intern(std_root_path);
+    const src =
+        \\const std = @import("std");
+        \\fn g1(a: u32) u32 { return a; }
+        \\fn g5(a: anytype, b: anytype) @TypeOf(a, b) { return a + b; }
+        \\fn gct(comptime T: type, x: T) T { return x; }
+        \\fn gctv(comptime n: u8, x: u32) u32 { return x + n; }
+        \\fn gna(noalias p: *u8, q: *const u8) void { p.* = q.*; }
+        \\fn ginl() callconv(.@"inline") u8 { return 1; }
+        \\noinline fn gnoinl() void {}
+        \\fn gerr() !u8 { return 1; }
+        \\fn gies(comptime T: type) !T { return 1; }
+        \\fn rt_dep(x: u8, y: @TypeOf(x)) u8 { return x + y; }
+        \\fn ctx_struct(comptime T: type, x: struct { a: T }) void { _ = x; }
+        \\fn plain_struct(comptime T: type, x: struct { a: u8 }) T { _ = x; return 0; }
+        \\fn comptime_any(comptime x: anytype) void { _ = x; }
+        \\fn tfn(T: type) void { _ = T; }
+        \\fn Box(comptime T: type) type {
+        \\    return struct {
+        \\        v: T,
+        \\        pub fn get(self: @This()) !T { return self.v; }
+        \\    };
+        \\}
+        \\const n_eql = @typeName(@TypeOf(std.mem.eql));
+        \\const n_alloc = @typeName(@TypeOf(std.mem.Allocator.alloc));
+        \\const n_print = @typeName(@TypeOf(std.debug.print));
+        \\const n_simple = @typeName(fn (u8) bool);
+        \\const n_ptr = @typeName(?*const fn () void);
+        \\const n_nested = @typeName(fn (*const fn () void) *const fn () void);
+        \\const n_g1 = @typeName(@TypeOf(g1));
+        \\const n_g5 = @typeName(@TypeOf(g5));
+        \\const n_gct = @typeName(@TypeOf(gct));
+        \\const n_gctv = @typeName(@TypeOf(gctv));
+        \\const n_gna = @typeName(@TypeOf(gna));
+        \\const n_ginl = @typeName(@TypeOf(ginl));
+        \\const n_gnoinl = @typeName(@TypeOf(gnoinl));
+        \\const n_naked = @typeName(fn () callconv(.naked) void);
+        \\const n_varargs = @typeName(fn (c_int, ...) callconv(.c) c_int);
+        \\const n_fn_comptime = @typeName(fn (comptime u8) void);
+        \\const n_fn_anytype = @typeName(fn (anytype) void);
+        \\const n_fn_noalias = @typeName(fn (noalias *u8) void);
+        \\const n_rt_dep = @typeName(@TypeOf(rt_dep));
+        \\const n_ctx_struct = @typeName(@TypeOf(ctx_struct));
+        \\const n_comptime_any = @typeName(@TypeOf(comptime_any));
+        \\const n_tfn = @typeName(@TypeOf(tfn));
+        \\const n_reified = @typeName(@Fn(&.{c_int}, &@splat(.{}), c_int, .{ .@"callconv" = .c, .varargs = true }));
+        \\const n_gerr = @typeName(@TypeOf(gerr));
+        \\const n_gies = @typeName(@TypeOf(gies));
+        \\const n_box_get = @typeName(@TypeOf(Box(u8).get));
+        \\const n_call_box = @typeName(@TypeOf(Box(u8).get(undefined)));
+        \\const n_ies = @typeName(@typeInfo(@typeInfo(@TypeOf(gerr)).@"fn".return_type.?).error_union.error_set);
+        \\const n_len = @typeName(fn (u8) bool).len;
+        \\const n_plain_struct = @typeName(@TypeOf(plain_struct));
+        \\const n_call_gies = @typeName(@TypeOf(gies(u8)));
+        \\fn generic(comptime T: type) void {
+        \\    const n_generic = @typeName(T);
+        \\    _ = n_generic;
+        \\}
+    ;
+    const main = try w.add("/p/src/main.zig", src);
+    try w.setGraph(std_root, &.{.{ .root = main.file, .imports = &.{} }}, &.{
+        .{ .file = main.file, .module = 0, .compile = 0 },
+    });
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "n_eql", "*const [41:0]u8 = \"fn (comptime type, anytype, anytype) bool\"" },
+        .{ "n_alloc", "*const [48:0]u8 = \"fn (mem.Allocator, comptime type, usize) anytype\"" },
+        .{ "n_print", "*const [38:0]u8 = \"fn (comptime []const u8, anytype) void\"" },
+        .{ "n_simple", "*const [12:0]u8 = \"fn (u8) bool\"" },
+        .{ "n_ptr", "*const [18:0]u8 = \"?*const fn () void\"" },
+        .{ "n_nested", "*const [40:0]u8 = \"fn (*const fn () void) *const fn () void\"" },
+        .{ "n_g1", "*const [12:0]u8 = \"fn (u32) u32\"" },
+        .{ "n_g5", "*const [29:0]u8 = \"fn (anytype, anytype) anytype\"" },
+        .{ "n_gct", "*const [35:0]u8 = \"fn (comptime type, anytype) anytype\"" },
+        .{ "n_gctv", "*const [25:0]u8 = \"fn (comptime u8, u32) u32\"" },
+        .{ "n_gna", "*const [32:0]u8 = \"fn (noalias *u8, *const u8) void\"" },
+        .{ "n_ginl", "*const [29:0]u8 = \"fn () callconv(.@\\\"inline\\\") u8\"" },
+        .{ "n_gnoinl", "*const [19:0]u8 = \"noinline fn () void\"" },
+        .{ "n_naked", "*const [27:0]u8 = \"fn () callconv(.naked) void\"" },
+        .{ "n_varargs", "*const [34:0]u8 = \"fn (c_int, ...) callconv(.c) c_int\"" },
+        .{ "n_fn_comptime", "*const [21:0]u8 = \"fn (comptime u8) void\"" },
+        .{ "n_fn_anytype", "*const [17:0]u8 = \"fn (anytype) void\"" },
+        .{ "n_fn_noalias", "*const [21:0]u8 = \"fn (noalias *u8) void\"" },
+        // A parameter type that refers to a parameter is generic
+        .{ "n_rt_dep", "*const [19:0]u8 = \"fn (u8, anytype) u8\"" },
+        .{ "n_ctx_struct", "*const [32:0]u8 = \"fn (comptime type, anytype) void\"" },
+        .{ "n_comptime_any", "*const [26:0]u8 = \"fn (comptime anytype) void\"" },
+        .{ "n_tfn", "*const [14:0]u8 = \"fn (type) void\"" },
+        .{ "n_reified", "*const [34:0]u8 = \"fn (c_int, ...) callconv(.c) c_int\"" },
+        // Inferred error sets are named after their function
+        .{ "n_gerr", "*const [91:0]u8 = \"fn () @typeInfo(@typeInfo(@TypeOf(main.gerr)).@\\\"fn\\\".return_type.?).error_union.error_set!u8\"" },
+        .{ "n_gies", "*const [109:0]u8 = \"fn (comptime type) @typeInfo(@typeInfo(@TypeOf(main.gies)).@\\\"fn\\\".return_type.?).error_union.error_set!anytype\"" },
+        .{ "n_box_get", "*const [110:0]u8 = \"fn (main.Box(u8)) @typeInfo(@typeInfo(@TypeOf(main.Box(u8).get)).@\\\"fn\\\".return_type.?).error_union.error_set!u8\"" },
+        .{ "n_call_box", "*const [92:0]u8 = \"@typeInfo(@typeInfo(@TypeOf(main.Box(u8).get)).@\\\"fn\\\".return_type.?).error_union.error_set!u8\"" },
+        .{ "n_ies", "*const [82:0]u8 = \"@typeInfo(@typeInfo(@TypeOf(main.gerr)).@\\\"fn\\\".return_type.?).error_union.error_set\"" },
+        .{ "n_len", "usize = 12" },
+        // Named after a global counter (`main.plain_struct__struct_1006`, `main.gies__func_999`):
+        // still a comptime-known string
+        .{ "n_plain_struct", "*const [_:0]u8" },
+        .{ "n_call_gies", "*const [_:0]u8" },
+        .{ "n_generic", "*const [_:0]u8" },
     };
     for (cases) |c| {
         testing.expectEqualStrings(c[1], try typeAt(&w, main.file, src, c[0], 0)) catch |err| {
@@ -4454,6 +4574,82 @@ test "@tagName of the C calling convention follows the target" {
             return err;
         };
     }
+}
+
+test "@Fn coerces its arguments and gives the written function types" {
+    // Prevents `@Fn(&.{}, &.{}, void, .{})` from being `fn () callconv(unknown) void` and
+    // `&@splat(.{})` from having no result type.
+    // Expected values: zig 0.17.0 and 0.17.1 (identical) `@compileLog` of each name.
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const PA = std.builtin.Type.Fn.ParamAttributes;
+        \\fn gna(noalias p: *u8, q: *const u8) void { p.* = q.*; }
+        \\noinline fn gnoinl() void {}
+        \\fn gct(comptime T: type, x: T) T { return x; }
+        \\fn gerr() !u8 { return 1; }
+        \\fn rt_dep(x: u8, y: @TypeOf(x)) u8 { return x + y; }
+        \\fn tfn(T: type) void { _ = T; }
+        \\const R = @Fn(&.{ u8, u16 }, &@splat(.{}), bool, .{});
+        \\const R_cc = @Fn(&.{u8}, &@splat(.{}), void, .{ .@"callconv" = .c });
+        \\const R_ret = @typeInfo(@Fn(&.{u8}, &@splat(.{}), bool, .{})).@"fn".return_type;
+        \\const R_explicit = @Fn(&.{u8}, &[_]PA{.{}}, bool, .{});
+        \\const R_typed = @Fn(&.{u8}, &@as([1]PA, @splat(.{})), bool, .{});
+        \\const R_zero = @Fn(&.{}, &.{}, void, .{});
+        \\const R_auto = @Fn(&.{}, &.{}, void, .{ .@"callconv" = .auto });
+        \\const R_noalias = @Fn(&.{ *u8, *u8 }, &.{ .{ .@"noalias" = true }, .{} }, void, .{});
+        \\const R_varargs = @Fn(&.{c_int}, &@splat(.{}), c_int, .{ .@"callconv" = .c, .varargs = true });
+        \\const eq_zero = @Fn(&.{}, &.{}, void, .{}) == fn () void;
+        \\const eq_splat = @Fn(&.{ u8, u16 }, &@splat(.{}), bool, .{}) == fn (u8, u16) bool;
+        \\const eq_cc = @Fn(&.{u8}, &@splat(.{}), void, .{ .@"callconv" = .c }) == fn (u8) callconv(.c) void;
+        \\const eq_noalias = @Fn(&.{ *u8, *const u8 }, &.{ .{ .@"noalias" = true }, .{} }, void, .{}) == @TypeOf(gna);
+        \\const ne_noalias = @Fn(&.{ *u8, *const u8 }, &@splat(.{}), void, .{}) == @TypeOf(gna);
+        \\const ne_comptime = (fn (comptime u8) void) == fn (u8) void;
+        \\const ne_noinline = @TypeOf(gnoinl) == fn () void;
+        \\const ne_anytype = (fn (anytype) void) == fn (comptime anytype) void;
+        \\const eq_generic = @TypeOf(gct) == @TypeOf(gct);
+        \\const isgen_tfn = @typeInfo(@TypeOf(tfn)).@"fn".is_generic;
+        \\const isgen_ct = @typeInfo(fn (comptime u8) void).@"fn".is_generic;
+        \\const isgen_rt_dep = @typeInfo(@TypeOf(rt_dep)).@"fn".is_generic;
+        \\const rt_dep_param = @typeInfo(@TypeOf(rt_dep)).@"fn".param_types[1] == null;
+        \\const gct_ret = @typeInfo(@TypeOf(gct)).@"fn".return_type == null;
+        \\const any_param = @typeInfo(fn (anytype) void).@"fn".param_types[0] == null;
+        \\const noalias_info = @typeInfo(@TypeOf(gna)).@"fn".param_attrs[0].@"noalias";
+        \\const T_gna = @TypeOf(gna);
+        \\const T_gnoinl = @TypeOf(gnoinl);
+        \\const T_gct = @TypeOf(gct);
+        \\const T_gerr = @TypeOf(gerr);
+    , &.{
+        .{ "R", "type = fn (u8, u16) bool" },
+        .{ "R_cc", "type = fn (u8) callconv(.c) void" },
+        .{ "R_ret", "?type = bool" },
+        .{ "R_explicit", "type = fn (u8) bool" },
+        .{ "R_typed", "type = fn (u8) bool" },
+        .{ "R_zero", "type = fn () void" },
+        .{ "R_auto", "type = fn () void" },
+        .{ "R_noalias", "type = fn (noalias *u8, *u8) void" },
+        .{ "R_varargs", "type = fn (c_int, ...) callconv(.c) c_int" },
+        .{ "eq_zero", "bool = true" },
+        .{ "eq_splat", "bool = true" },
+        .{ "eq_cc", "bool = true" },
+        .{ "eq_noalias", "bool = true" },
+        .{ "ne_noalias", "bool = false" },
+        .{ "ne_comptime", "bool = false" },
+        .{ "ne_noinline", "bool = false" },
+        .{ "ne_anytype", "bool = false" },
+        .{ "eq_generic", "bool = true" },
+        // A comptime-only parameter type makes the function generic
+        .{ "isgen_tfn", "bool = true" },
+        .{ "isgen_ct", "bool = true" },
+        .{ "isgen_rt_dep", "bool = true" },
+        .{ "rt_dep_param", "bool = true" },
+        .{ "gct_ret", "bool = true" },
+        .{ "any_param", "bool = true" },
+        .{ "noalias_info", "bool = true" },
+        .{ "T_gna", "type = fn (noalias *u8, *const u8) void" },
+        .{ "T_gnoinl", "type = noinline fn () void" },
+        .{ "T_gct", "type = fn (comptime type, anytype) anytype" },
+        .{ "T_gerr", "type = fn () error{}!u8" },
+    });
 }
 
 test "@typeInfo, @Pointer and std results keep pointer attributes" {

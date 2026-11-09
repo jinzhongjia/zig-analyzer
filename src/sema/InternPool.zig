@@ -214,8 +214,44 @@ pub const FnType = struct {
     ret: Index,
     varargs: bool = false,
     cc: CallConv = .auto,
-    /// Has comptime or `anytype` parameters
-    is_generic: bool = false,
+    /// Bit `i`: parameter `i` is `comptime`. As in the compiler, the parameter attributes are
+    /// the bits of a u32, which only the first 32 parameters have
+    comptime_bits: u32 = 0,
+    /// Bit `i`: parameter `i` is `noalias`
+    noalias_bits: u32 = 0,
+    /// Bit `i`: the type of parameter `i` is generic (`anytype` in the compiler's type): the
+    /// parameter is `anytype`, or its type expression refers to a parameter. `params[i]` then
+    /// holds the type that inference gives the parameter, which is not part of the identity of
+    /// the function type.
+    generic_bits: u32 = 0,
+    /// The return type expression refers to a parameter: the compiler's return type is
+    /// `anytype`, or `E!anytype` where `E` is the inferred error set of `!T`, which `ret` then
+    /// holds as its error set. The rest of `ret` is not part of the identity of the function
+    /// type, as for `generic_bits`.
+    generic_ret: bool = false,
+    is_noinline: bool = false,
+
+    /// Whether bit `i` of `bits` (`comptime_bits`, `noalias_bits`, or `generic_bits`) is set
+    pub fn paramBit(bits: u32, i: usize) bool {
+        return i < 32 and (bits >> @intCast(i)) & 1 != 0;
+    }
+    /// The bit of parameter `i` in `comptime_bits`, `noalias_bits`, or `generic_bits`; null past
+    /// the first 32 parameters
+    pub fn bitOf(i: usize) ?u32 {
+        return if (i < 32) @as(u32, 1) << @intCast(i) else null;
+    }
+    /// Has comptime or generic parameters: each call instantiates the function
+    pub fn hasGenericParams(f: FnType) bool {
+        return f.comptime_bits != 0 or f.generic_bits != 0;
+    }
+    /// The inferred error set of a generic return type (`E!anytype`)
+    pub fn genericRetErrorSet(f: FnType, ip: *InternPool) ?Index {
+        if (!f.generic_ret) return null;
+        return switch (ip.key(f.ret)) {
+            .error_union_type => |eu| if (ip.key(eu.err) == .inferred_error_set) eu.err else null,
+            else => null,
+        };
+    }
 };
 
 /// Calling convention of a function type: a value of `std.builtin.CallingConvention`. The tags
@@ -1083,16 +1119,25 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("}");
         },
         .fn_type => |f| {
+            if (f.is_noinline) try w.writeAll("noinline ");
             try w.writeAll("fn (");
             for (f.params, 0..) |p, i| {
                 if (i != 0) try w.writeAll(", ");
                 if (try truncateList(container_name, w, f.params.len)) break;
-                try ip.print(p, w, container_name);
+                if (FnType.paramBit(f.comptime_bits, i)) try w.writeAll("comptime ");
+                if (FnType.paramBit(f.noalias_bits, i)) try w.writeAll("noalias ");
+                if (FnType.paramBit(f.generic_bits, i)) try w.writeAll("anytype") else try ip.print(p, w, container_name);
             }
             if (f.varargs) try w.writeAll(if (f.params.len != 0) ", ..." else "...");
             try w.writeAll(") ");
             try ip.writeCallConv(f.cc, w, container_name);
-            try ip.print(f.ret, w, container_name);
+            if (f.generic_ret) {
+                if (f.genericRetErrorSet(ip)) |es| {
+                    try ip.print(es, w, container_name);
+                    try w.writeAll("!");
+                }
+                try w.writeAll("anytype");
+            } else try ip.print(f.ret, w, container_name);
         },
         .container_type => |c| try container_name.write(c, w),
         // Matches the compiler: `struct { comptime u8 = 1, u32 }`, and the empty tuple is
@@ -1225,7 +1270,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
 
 /// `callconv(...) ` of a function type as the compiler prints it: nothing for `.auto`, the tag
 /// for tags without options, `.c` for the target's C calling convention, and the value otherwise
-fn writeCallConv(ip: *InternPool, cc: CallConv, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
+pub fn writeCallConv(ip: *InternPool, cc: CallConv, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
     switch (cc) {
         .auto => {},
         .other => |v| {

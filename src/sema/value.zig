@@ -985,9 +985,11 @@ pub fn isPrecise(ip: *InternPool, v: Index) bool {
         .array_type => |a| isPrecise(ip, a.child) and (a.sentinel == null or isPrecise(ip, a.sentinel.?)),
         .optional_type => |c| isPrecise(ip, c),
         .error_union_type => |e| isPrecise(ip, e.err) and isPrecise(ip, e.payload),
+        // Generic parameter and return types are not part of the identity of a function type
         .fn_type => |f| blk: {
             if (!f.cc.isKnown()) break :blk false;
-            for (f.params) |p| if (!isPrecise(ip, p)) break :blk false;
+            for (f.params, 0..) |p, i| if (!InternPool.FnType.paramBit(f.generic_bits, i) and !isPrecise(ip, p)) break :blk false;
+            if (f.generic_ret) break :blk if (f.genericRetErrorSet(ip)) |es| isPrecise(ip, es) else true;
             break :blk isPrecise(ip, f.ret);
         },
         .container_type => |c| c.inst == null or isPrecise(ip, c.inst.?),
@@ -1040,7 +1042,8 @@ fn concrete(ip: *InternPool, t: Index, unknown_len: bool) bool {
         .error_union_type => |e| concrete(ip, e.err, unknown_len) and concrete(ip, e.payload, unknown_len),
         .fn_type => |f| blk: {
             if (!f.cc.isKnown()) break :blk false;
-            for (f.params) |p| if (!concrete(ip, p, unknown_len)) break :blk false;
+            for (f.params, 0..) |p, i| if (!InternPool.FnType.paramBit(f.generic_bits, i) and !concrete(ip, p, unknown_len)) break :blk false;
+            if (f.generic_ret) break :blk if (f.genericRetErrorSet(ip)) |es| concrete(ip, es, unknown_len) else true;
             break :blk concrete(ip, f.ret, unknown_len);
         },
         .container_type => |c| c.inst == null or concrete(ip, c.inst.?, unknown_len),
@@ -1103,17 +1106,23 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
         .error_union_type => |e| all(&.{ eqlTypes(ip, e.err, kb.error_union_type.err), eqlTypes(ip, e.payload, kb.error_union_type.payload) }),
         .fn_type => |f| blk: {
             const g = kb.fn_type;
-            if (f.params.len != g.params.len or f.varargs != g.varargs or f.is_generic != g.is_generic) break :blk false;
+            if (f.params.len != g.params.len or f.varargs != g.varargs or f.is_noinline != g.is_noinline) break :blk false;
+            if (f.comptime_bits != g.comptime_bits or f.noalias_bits != g.noalias_bits or f.generic_bits != g.generic_bits or f.generic_ret != g.generic_ret) break :blk false;
             if (f.cc.isKnown() and g.cc.isKnown() and !std.meta.eql(f.cc, g.cc)) break :blk false;
             var unknown = !f.cc.isKnown() or !g.cc.isKnown();
-            for (f.params, g.params) |x, y| {
+            // Generic parameter and return types are `anytype` in both
+            for (f.params, g.params, 0..) |x, y, i| {
+                if (InternPool.FnType.paramBit(f.generic_bits, i)) continue;
                 const r = eqlTypes(ip, x, y) orelse {
                     unknown = true;
                     continue;
                 };
                 if (!r) break :blk false;
             }
-            const r = eqlTypes(ip, f.ret, g.ret) orelse break :blk null;
+            const r = if (f.generic_ret) generic: {
+                const x = f.genericRetErrorSet(ip) orelse break :generic g.genericRetErrorSet(ip) == null;
+                break :generic eqlTypes(ip, x, g.genericRetErrorSet(ip) orelse break :blk false) orelse break :blk null;
+            } else eqlTypes(ip, f.ret, g.ret) orelse break :blk null;
             break :blk if (!r) false else if (unknown) null else true;
         },
         // Containers defined at different locations always differ; whether containers defined at

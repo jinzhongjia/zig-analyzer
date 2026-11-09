@@ -81,17 +81,19 @@ pub const Item = struct {
     /// outline, symbol search, naming checks, or name resolution
     pub const Kind = enum { @"fn", @"const", @"var", field, @"test", @"comptime", zon };
 
-    pub const Flags = packed struct(u8) {
+    pub const Flags = packed struct(u16) {
         is_pub: bool = false,
         is_extern: bool = false,
         is_export: bool = false,
         is_inline: bool = false,
+        is_noinline: bool = false,
         is_comptime: bool = false,
         is_threadlocal: bool = false,
         /// The function's return type is `!T` (inferred error set)
         inferred_error_set: bool = false,
         /// The function's parameter list has a non-binding parameter (`...`), only allowed last
         varargs: bool = false,
+        padding: u7 = 0,
     };
 };
 
@@ -130,7 +132,7 @@ pub fn eql(a: *const ItemTree, b: *const ItemTree) bool {
     }
     for (a.items, b.items) |x, y| {
         if (x.ast_id != y.ast_id or x.kind != y.kind or x.container != y.container) return false;
-        if (@as(u8, @bitCast(x.flags)) != @as(u8, @bitCast(y.flags)) or x.sig_hash != y.sig_hash) return false;
+        if (@as(u16, @bitCast(x.flags)) != @as(u16, @bitCast(y.flags)) or x.sig_hash != y.sig_hash) return false;
         if (!optStrEql(x.name, y.name) or !optStrEql(x.doc, y.doc)) return false;
     }
     return true;
@@ -366,6 +368,7 @@ fn memberFlags(member: SyntaxNode) Item.Flags {
             .keyword_extern => flags.is_extern = true,
             .keyword_export => flags.is_export = true,
             .keyword_inline => flags.is_inline = true,
+            .keyword_noinline => flags.is_noinline = true,
             .keyword_comptime => flags.is_comptime = true,
             .keyword_threadlocal => flags.is_threadlocal = true,
             .keyword_const, .keyword_var, .identifier, .keyword_fn => break,

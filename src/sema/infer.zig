@@ -1187,10 +1187,11 @@ const Inferrer = struct {
             },
             .fn_type => |f| {
                 const params = try inf.scratch.alloc(Index, f.params.len);
-                for (f.params, params) |p, *out| out.* = (try inf.infer(p, null)).asType() orelse .unknown;
+                for (f.params, params) |p, *out| out.* = if (p.ty) |t| (try inf.infer(t, null)).asType() orelse .unknown else .unknown;
                 const ret = if (f.ret) |r| (try inf.infer(r, null)).asType() orelse .unknown else .unknown;
                 const cc: InternPool.CallConv = if (f.@"callconv") |x| try eval.writtenCallConv(inf.r, inf.body, x, (try inf.inferComptime(x, try inf.clauseType(.@"callconv"))).val) else .auto;
-                return TypedValue.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret, .varargs = f.varargs, .is_generic = f.is_generic, .cc = cc } }));
+                const bits = eval.fnTypeBits(f.params);
+                return TypedValue.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret, .varargs = f.varargs, .cc = cc, .comptime_bits = bits.comptime_bits, .noalias_bits = bits.noalias_bits, .generic_bits = bits.generic_bits } }));
             },
             .@"return" => |v| {
                 const ret: TypedValue = if (v) |x| try inf.infer(x, inf.ret_type) else .{ .ty = .void_type };
@@ -1983,9 +1984,10 @@ const Inferrer = struct {
         for (simple) |s| if (eq(u8, name, s[0])) return .{ .ty = s[1] };
         if (eq(u8, name, "@tagName") or eq(u8, name, "@errorName") or eq(u8, name, "@typeName")) {
             if (args.len == 1) if (try inf.pureValue(name, args)) |tv| return tv;
-            // The argument of `@typeName` is always a type: when the name cannot be evaluated,
-            // there is no runtime slice form
-            if (eq(u8, name, "@typeName")) return .unknown;
+            const sentinel = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } });
+            // The name of a type is always comptime-known (`*const [N:0]u8`), even when it
+            // cannot be evaluated here
+            if (eq(u8, name, "@typeName")) return .{ .ty = try ip.ptrTo(try ip.get(.{ .abstract_array_type = .{ .len = null, .child = .u8_type, .sentinel = sentinel } }), .one, true) };
             // Only a runtime operand gives `[:0]const u8`; a comptime-known one gives the string
             // literal `*const [N:0]u8` (`Sema.zirTagName`, `Sema.zirErrorName`). When inference
             // has no value for a comptime-known operand (a tagged union literal, `@enumFromInt`,
@@ -1995,7 +1997,6 @@ const Inferrer = struct {
                 const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
                 return if (tv.val != null) tv else .unknown;
             }
-            const sentinel = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } });
             return .{ .ty = try ip.get(.{ .ptr_type = .{ .child = .u8_type, .size = .slice, .is_const = true, .sentinel = sentinel } }) };
         }
         // With a result type, the rounding builtins convert to it (see `roundCast`); without one,

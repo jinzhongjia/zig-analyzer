@@ -330,6 +330,10 @@ pub const Param = struct {
         return n.syntax.childToken(.keyword_comptime) != null;
     }
 
+    pub fn isNoalias(n: Param) bool {
+        return n.syntax.childToken(.keyword_noalias) != null;
+    }
+
     /// The C-variadic `...`, which takes every remaining argument
     pub fn isVarargs(n: Param) bool {
         return n.syntax.childToken(.ellipsis3) != null;

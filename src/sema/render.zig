@@ -345,7 +345,9 @@ pub fn writeFull(r: *Resolver, t: Index, w: *Io.Writer) Io.Writer.Error!void {
 /// are directly the value of a declaration, of a local constant, or of a `return`), containers in
 /// a generic instance that do not capture every argument their name shows (the instances share
 /// one type, named after the instance that creates it first), types constructed by builtins,
-/// function types (the calling convention is not tracked), inferred error sets and unknown parts.
+/// the inferred error sets of generic function instances (named after a global counter too),
+/// function types with more than 32 parameters (whose attributes past the 32nd are not tracked)
+/// and unknown parts.
 pub fn typeName(r: *Resolver, a: std.mem.Allocator, t: Index) resolve.Error!?[]const u8 {
     var out: Io.Writer.Allocating = .init(a);
     var q: QualifiedNames = .{ .r = r, .w = &out.writer };
@@ -446,9 +448,54 @@ const QualifiedNames = struct {
                 try q.writeType(u);
                 try w.writeAll(").@\"union\".tag_type.?");
             },
+            .fn_type => |f| {
+                if (f.params.len > 32 or !f.cc.isKnown()) return error.Unnamed;
+                if (f.is_noinline) try w.writeAll("noinline ");
+                try w.writeAll("fn (");
+                for (f.params, 0..) |p, i| {
+                    if (i != 0) try w.writeAll(", ");
+                    if (InternPool.FnType.paramBit(f.comptime_bits, i)) try w.writeAll("comptime ");
+                    if (InternPool.FnType.paramBit(f.noalias_bits, i)) try w.writeAll("noalias ");
+                    if (InternPool.FnType.paramBit(f.generic_bits, i)) try w.writeAll("anytype") else try q.writeType(p);
+                }
+                if (f.varargs) try w.writeAll(if (f.params.len != 0) ", ..." else "...");
+                try w.writeAll(") ");
+                // The options of other calling conventions hold no types
+                try ip.writeCallConv(f.cc, w, ContainerNames{ .r = q.r, .full = true });
+                if (f.generic_ret) {
+                    if (f.genericRetErrorSet(ip)) |es| {
+                        try q.writeType(es);
+                        try w.writeAll("!");
+                    }
+                    try w.writeAll("anytype");
+                } else try q.writeType(f.ret);
+            },
+            // Named after the function whose return type it is part of
+            .inferred_error_set => |s| {
+                try w.writeAll("@typeInfo(@typeInfo(@TypeOf(");
+                try q.writeFn(s.file, s.decl, s.inst);
+                try w.writeAll(")).@\"fn\".return_type.?).error_union.error_set");
+            },
             .container_type => |c| try q.writeContainer(c),
             else => return error.Unnamed,
         }
+    }
+
+    /// The function declaration `decl` in instance `inst` (as in its `queries.DeclType`)
+    fn writeFn(q: *QualifiedNames, file: FileId, decl: AstId, inst: ?Index) Error!void {
+        const ip = q.r.ctx.db.env.ip;
+        // An instance of the generic function itself, which the compiler names after a global
+        // counter (`f__func_10`)
+        if (inst) |i| switch (ip.key(i)) {
+            .instance => |k| if (k.file == file and k.decl == decl) return error.Unnamed,
+            else => {},
+        };
+        const tree = try q.r.itemTree(file);
+        const item = for (tree.items) |it| {
+            if (it.ast_id == decl) break it;
+        } else return error.Unnamed;
+        try q.writeType(try queries.containerType(q.r, .{ .file = file, .container = item.container }, inst));
+        try q.w.print(".{s}", .{item.name orelse return error.Unnamed});
     }
 
     /// Values in types: sentinels, comptime fields of tuples and the arguments in the names of

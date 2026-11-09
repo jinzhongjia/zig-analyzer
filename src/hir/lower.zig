@@ -53,7 +53,7 @@ pub fn lower(gpa: Allocator, member: SyntaxNode, owner: Owner) Error!Body {
                     // bound with an empty name so that parameters still correspond by position;
                     // `...` is not bound
                     const name = param.name() orelse if (ty != null) SyntaxToken{ .kind = .identifier, .text = "", .offset = p.offset } else continue;
-                    const b = try l.bind(name, .param, .{ .ty = ty, .is_comptime = param.isComptime() });
+                    const b = try l.bind(name, .param, .{ .ty = ty, .is_comptime = param.isComptime(), .is_noalias = param.isNoalias() });
                     try params.append(l.a, b);
                     _ = try l.pushScope(&.{b});
                 }
@@ -186,7 +186,7 @@ const Lowerer = struct {
         return id;
     }
 
-    fn bind(l: *Lowerer, name: SyntaxToken, kind: Body.Binding.Kind, extra: struct { ty: ?ExprId = null, init: ?ExprId = null, @"align": ?ExprId = null, is_ptr: bool = false, is_comptime: bool = false }) Error!BindingId {
+    fn bind(l: *Lowerer, name: SyntaxToken, kind: Body.Binding.Kind, extra: struct { ty: ?ExprId = null, init: ?ExprId = null, @"align": ?ExprId = null, is_ptr: bool = false, is_comptime: bool = false, is_noalias: bool = false }) Error!BindingId {
         const id: BindingId = @fromBackingInt(@as(u32, @intCast(l.bindings.items.len)));
         const r = name.range();
         try l.bindings.append(l.gpa, .{
@@ -198,6 +198,7 @@ const Lowerer = struct {
             .@"align" = extra.@"align",
             .is_ptr = extra.is_ptr,
             .is_comptime = extra.is_comptime,
+            .is_noalias = extra.is_noalias,
         });
         return id;
     }
@@ -351,18 +352,16 @@ const Lowerer = struct {
             .container_decl => .{ .container = .{ .arg = try l.optExpr((ast.ContainerDecl{ .syntax = n }).argExpr()) } },
             .fn_proto => blk: {
                 const proto = ast.FnProto{ .syntax = n };
-                var params: std.ArrayList(ExprId) = .empty;
+                var params: std.ArrayList(Body.FnTypeParam) = .empty;
                 var varargs = false;
-                var is_generic = false;
                 var it = proto.params();
                 while (it.next()) |p| {
                     const param = ast.Param{ .syntax = p };
                     if (param.isVarargs()) {
                         varargs = true;
-                    } else if (param.typeExpr()) |t| {
-                        try params.append(l.a, try l.expr(t));
-                        if (param.isComptime()) is_generic = true;
-                    } else is_generic = true;
+                        continue;
+                    }
+                    try params.append(l.a, .{ .ty = try l.optExpr(param.typeExpr()), .is_comptime = param.isComptime(), .is_noalias = param.isNoalias() });
                 }
                 const proto_clauses = proto.clauses();
                 for (proto_clauses[0..3]) |c| if (c) |cn| {
@@ -370,7 +369,7 @@ const Lowerer = struct {
                 };
                 const cc_items: []const ExprId = if (proto_clauses[3]) |cn| try l.clauseItems(cn) else &.{};
                 const cc: ?ExprId = if (cc_items.len == 1) cc_items[0] else null;
-                break :blk .{ .fn_type = .{ .params = params.items, .ret = try l.optExpr(proto.returnType()), .varargs = varargs, .is_generic = is_generic, .@"callconv" = cc } };
+                break :blk .{ .fn_type = .{ .params = params.items, .ret = try l.optExpr(proto.returnType()), .varargs = varargs, .@"callconv" = cc } };
             },
             .return_expr => .{ .@"return" = try l.optExpr(firstChild(n)) },
             .break_expr => blk: {
