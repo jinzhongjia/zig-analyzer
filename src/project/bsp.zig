@@ -303,11 +303,20 @@ pub const Client = struct {
         return if (c.reader.err) |e| e else null;
     }
 
+    /// Sends a build request. On `error.WriteFailed`, `writeError` tells the cause:
+    /// `error.BrokenPipe` when the maker has closed its end of the pipe, i.e. it has exited.
     pub fn buildSteps(c: *Client, steps: []const u32) Io.Writer.Error!void {
         c.write_mutex.lockUncancelable(c.io);
         defer c.write_mutex.unlock(c.io);
         try encodeBuildSteps(&c.writer.interface, steps);
         try c.writer.interface.flush();
+    }
+
+    /// The underlying error when `buildSteps` returns `error.WriteFailed`
+    pub fn writeError(c: *Client) ?anyerror {
+        c.write_mutex.lockUncancelable(c.io);
+        defer c.write_mutex.unlock(c.io);
+        return if (c.writer.err) |e| e else null;
     }
 
     /// Immediately ends the maker and all its child processes, without waiting or reaping (it does

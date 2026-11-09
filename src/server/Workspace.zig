@@ -360,13 +360,7 @@ pub fn requestBuild(ws: *Workspace) void {
             ws.building = true;
             ws.server.busyBegin();
             ws.build_progress = ws.server.progress.begin(ws.server, buildTitle(model, ws.config.compiler_diagnostics), true);
-            sendBuild(ws, client, model, steps) catch |err| {
-                log.err("failed to send build request: {t}", .{err});
-                ws.building = false;
-                ws.server.progress.end(ws.server, ws.build_progress, "Failed to send build request");
-                ws.build_progress = null;
-                ws.server.busyEnd();
-            };
+            ws.startBuild(client, model, steps);
             return;
         }
         // The empty result below covers the requests made so far
@@ -414,6 +408,30 @@ fn buildTitle(model: *const ProjectModel, with_diagnostics: bool) []const u8 {
     w.writeAll("zig build") catch {};
     for (model.diagnostics_steps) |s| w.print(" {s}", .{model.steps[s].name}) catch break;
     return w.buffered();
+}
+
+/// Sends the build request of a round that is `building` (with its busy count and progress); the
+/// caller holds mutex. When the maker has exited (it closed its end of the pipe: the 0.17 maker can
+/// panic right after a build, see docs/zig-maker-build-request-race.md), the round stays in
+/// progress like one the maker exits during: the reading task reads the end of the stream, ends
+/// the round and restarts the project, whose first build covers this request. The maker is ended
+/// so that the end of the stream comes. Other failures end the round without a build.
+fn startBuild(ws: *Workspace, client: *bsp.Client, model: *const ProjectModel, steps: []const u32) void {
+    sendBuild(ws, client, model, steps) catch |err| {
+        const cause = if (err == error.WriteFailed) client.writeError() else null;
+        const exited = if (cause) |c| c == error.BrokenPipe else false;
+        if (exited) {
+            log.info("{s}: build system exited before reading the build request ({t}, {?t})", .{ ws.root, err, cause });
+            client.terminate();
+            return;
+        }
+        log.err("{s}: failed to send build request: {t} ({?t})", .{ ws.root, err, cause });
+        ws.building = false;
+        ws.rebuild = false;
+        ws.server.progress.end(ws.server, ws.build_progress, "Failed to send build request");
+        ws.build_progress = null;
+        ws.server.busyEnd();
+    };
 }
 
 /// Sends a build request and resets the progress counters; the caller holds mutex
@@ -836,7 +854,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 if (ws.client) |c| if (ws.model) |*m| {
                     const steps = m.buildSteps(ws.gpa, ws.config.compiler_diagnostics) catch return;
                     defer ws.gpa.free(steps);
-                    sendBuild(ws, c, m, steps) catch {};
+                    ws.startBuild(c, m, steps);
                 };
                 return;
             }
