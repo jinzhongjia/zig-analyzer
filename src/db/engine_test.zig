@@ -425,6 +425,36 @@ const CachedLen = struct {
     }
 };
 
+/// A query with an LRU capacity and a fingerprint: the value is the first 3 bytes of the text
+const Prefix = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = []const u8;
+    pub const lru: usize = 2;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        const text = try ctx.get(Text, key);
+        return ctx.db.gpa.dupe(u8, text[0..@min(3, text.len)]);
+    }
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(u8, a, b);
+    }
+    pub fn fingerprint(v: Value) u128 {
+        return std.hash.Wyhash.hash(0, v);
+    }
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.*);
+    }
+};
+
+const PrefixLen = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = usize;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return (try ctx.get(Prefix, key)).len;
+    }
+};
+
 /// Reads Number, then stops until `gate.release` is set, without checking for cancellation: a test
 /// holds the claim of the first read transaction computing it while others need it
 const Gated = struct {
@@ -514,7 +544,7 @@ fn crossStarted(which: usize) void {
     while (!cross_started[1 - which].load(.acquire)) std.Thread.yield() catch {};
 }
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Gated, CrossA, CrossB, FixA, FixB, OwnedCycleA, OwnedCycleB, OwnedCycleLen, ReadBounded, ReadBoundedLen, ReadBoundedHolder });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Prefix, PrefixLen, Gated, CrossA, CrossB, FixA, FixB, OwnedCycleA, OwnedCycleB, OwnedCycleLen, ReadBounded, ReadBoundedLen, ReadBoundedHolder });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions(Q);
@@ -1800,6 +1830,35 @@ test "lru: evicted values are restored without invalidating dependents" {
     try setText(&d, 1, "abcdef");
     try testing.expectEqual(6, try read(&d, CachedLen, 1));
     try testing.expectEqual(5, executions(&d, CachedLen));
+}
+
+test "lru: an evicted value recomputed with the same fingerprint keeps its changed_at" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    for (1..5) |k| try setText(&d, @intCast(k), "abc");
+    for (1..5) |k| try testing.expectEqual(3, try read(&d, PrefixLen, @intCast(k)));
+    // Capacity 2: evict down to 1; the least recently used 1, 2, 3 are evicted
+    try testing.expect(d.trySweep());
+    try testing.expectEqual(1, d.tables[comptime Db.queryIndex(Prefix)].live);
+
+    // The text changes but the prefix does not: the evicted Prefix(1) is recomputed with the same
+    // fingerprint, so PrefixLen(1) is not recomputed
+    try setText(&d, 1, "abcd");
+    try testing.expectEqual(3, try read(&d, PrefixLen, 1));
+    try testing.expectEqual(5, executions(&d, Prefix));
+    try testing.expectEqual(4, executions(&d, PrefixLen));
+
+    // Evicted again, and the prefix changes: PrefixLen(1) is recomputed
+    for (2..5) |k| _ = try read(&d, Prefix, @intCast(k));
+    try testing.expect(d.trySweep());
+    {
+        var ctx = d.beginRead(testing.allocator);
+        defer ctx.end();
+        try testing.expect(ctx.memoized(Prefix, 1) == .evicted);
+    }
+    try setText(&d, 1, "xy");
+    try testing.expectEqual(2, try read(&d, PrefixLen, 1));
+    try testing.expectEqual(5, executions(&d, PrefixLen));
 }
 
 test "stats: executions, hits, cutoffs and timing; trace records the call tree" {

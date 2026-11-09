@@ -58,6 +58,13 @@
 //! transaction or in `trySweep` (when no read transaction holds values). `lru` and `lru_bytes` are
 //! the default capacities and can be changed at run time with `setLru`.
 //!
+//! Such a query may also declare `pub fn fingerprint(v: Value) u128`; values with the same
+//! fingerprint must be equal by `eql` (a 128-bit hash of what `eql` compares, or of what the value
+//! is computed from). An evicted memo keeps the fingerprint of its value, and when its
+//! dependencies have changed, a recomputed value with the same fingerprint keeps the original
+//! changed_at, so the early cutoff also holds for evicted memos. Without it, an evicted memo whose
+//! dependencies changed counts as changed, and everything that depends on it is recomputed.
+//!
 //! Concurrency model: read transactions (`beginRead`) hold a shared lock and may run concurrently;
 //! a write transaction (`beginWrite`) first registers in `pending_write` so that in-flight read
 //! queries exit with `error.Canceled` as soon as possible, then acquires the exclusive lock. A read
@@ -379,6 +386,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     deps: []const DepKey,
                     evicted: bool = false,
                     last_used: u64 = 0,
+                    /// `Q.fingerprint` of the value, kept when it is evicted
+                    fingerprint: if (@hasDecl(Q, "fingerprint")) u128 else void = if (@hasDecl(Q, "fingerprint")) 0 else {},
                 };
             };
         }
@@ -737,6 +746,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 const m = &table.slots.items[e.slot].memo.?;
                 table.live_bytes -= Q.bytes(m.value);
                 table.live -= 1;
+                if (@hasDecl(Q, "fingerprint")) m.fingerprint = Q.fingerprint(m.value);
                 evicted[count] = m.value;
                 count += 1;
                 m.value = undefined;
@@ -762,6 +772,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
         fn evictMemo(comptime Q: type, table: *Table(Q), m: *Table(Q).Memo, gpa: Allocator) void {
             if (@hasDecl(Q, "lru_bytes")) table.live_bytes -= Q.bytes(m.value);
+            if (@hasDecl(Q, "fingerprint")) m.fingerprint = Q.fingerprint(m.value);
             deinitValue(Q, &m.value, gpa);
             m.value = undefined;
             m.evicted = true;
@@ -1792,7 +1803,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
                 var changed_at = db.revision;
                 if (slot.memo) |*old| {
-                    const same = !old.evicted and valueEql(Q, old.value, value);
+                    const same = if (old.evicted) !restore and evictedEql(Q, old.fingerprint, value) else valueEql(Q, old.value, value);
                     db.garbage_mutex.lockUncancelable(db.io);
                     defer db.garbage_mutex.unlock(db.io);
                     // Do all allocations that can fail before transferring the old memo's
@@ -1802,7 +1813,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     // Nothing fails from here on
                     db.garbage.appendAssumeCapacity(.{ .deps = old.deps });
                     if (old.evicted) {
-                        if (restore) changed_at = old.changed_at;
+                        if (restore or same) changed_at = old.changed_at;
+                        if (same) _ = db.counters[qi].cutoffs.fetchAdd(1, .monotonic);
                         if (@hasDecl(Q, "lru")) table.live += 1;
                         if (@hasDecl(Q, "lru_bytes")) table.live_bytes += Q.bytes(value);
                     } else if (same) {
@@ -1953,6 +1965,12 @@ test containsPointer {
 
 fn valueEql(comptime Q: type, a: Q.Value, b: Q.Value) bool {
     return if (@hasDecl(Q, "eql")) Q.eql(a, b) else std.meta.eql(a, b);
+}
+
+/// Whether `value` equals an evicted value, of which only the fingerprint is left (see
+/// `fingerprint`); without `Q.fingerprint` it cannot be known
+fn evictedEql(comptime Q: type, evicted_fingerprint: anytype, value: Q.Value) bool {
+    return if (@hasDecl(Q, "fingerprint")) evicted_fingerprint == Q.fingerprint(value) else false;
 }
 
 fn deinitValue(comptime Q: type, value: *Q.Value, gpa: Allocator) void {
