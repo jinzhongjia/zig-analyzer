@@ -519,9 +519,10 @@ const Inferrer = struct {
     }
 
     /// Value of the `i`-th parameter `p` in the function's own instance `own`: in an instance, a
-    /// comptime parameter takes the argument value (coerced to the parameter type), a comptime
-    /// anytype parameter takes the argument value and the argument type the instance records
-    /// (`InternPool.Instance.arg_types`), and an anytype parameter takes the type of the argument;
+    /// comptime parameter takes the argument value (coerced to the parameter type), an anytype
+    /// parameter recorded by value (such as `comptime x: anytype`, see
+    /// `InternPool.Instance.arg_types`) takes the argument value and the argument type the
+    /// instance records, and another anytype parameter takes the type of the argument;
     /// without a concrete argument, a type parameter (`comptime T: type`, or `T: type` without
     /// comptime) is an abstract parameter
     fn paramValue(inf: *Inferrer, p: Body.BindingId, own: ?InternPool.Instance, i: usize) Error!TypedValue {
@@ -529,7 +530,7 @@ const Inferrer = struct {
         const binding = inf.body.binding(p);
         const ty_e = binding.ty orelse {
             const a = arg orelse return .unknown;
-            if (binding.is_comptime) {
+            if (binding.is_comptime or own.?.byValue(i)) {
                 // The value does not always give back the argument type (a non-null optional is
                 // its payload): without a recorded type the parameter is unknown
                 const t = own.?.argType(i);
@@ -4555,13 +4556,15 @@ fn literalFieldValue(ip: *InternPool, t: Index, name: []const u8) ?Index {
     return if (v == .runtime or v == .unknown) null else v;
 }
 
-/// `comptime_anytype` (`comptime x: anytype`) records the argument value in the instance, and its
-/// type in `InternPool.Instance.arg_types`; `anytype_type` records the argument type
+/// `comptime_anytype` (`comptime x: anytype`, or any anytype parameter of a function returning a
+/// comptime-only type) records the argument value in the instance, and its type in
+/// `InternPool.Instance.arg_types`; `anytype_type` records the argument type
 pub const ParamKind = enum { runtime, comptime_value, comptime_anytype, anytype_type };
 
 /// A callee that needs instantiation: it has comptime parameters (including implicit ones of
 /// comptime-only types) or anytype parameters, or returns a comptime-only type (e.g. `type`, in
-/// which case the call executes at comptime and all arguments take part in the instance)
+/// which case the call executes at comptime and the values of all arguments, anytype ones
+/// included, take part in the instance)
 pub const Generic = struct {
     owner: hir.OwnerKey,
     body: *const Body,
@@ -4591,7 +4594,9 @@ pub fn genericCallee(r: *Resolver, scratch: Allocator, callee: TypedValue, f: Fn
     var generic = all_comptime;
     for (forms, kinds, 0..) |form, *k, i| {
         k.* = switch (form) {
-            .any => .anytype_type,
+            // A call that executes at comptime is memoized by the argument values in the compiler
+            // (`analyzeCall`), so an anytype argument takes part in the instance by its value
+            .any => if (all_comptime) .comptime_anytype else .anytype_type,
             .comptime_any => .comptime_anytype,
             .typed, .comptime_typed => if (all_comptime or form == .comptime_typed or (i < f.params.len and value.isComptimeOnly(ip, f.params[i])))
                 .comptime_value

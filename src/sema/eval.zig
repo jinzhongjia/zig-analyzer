@@ -62,7 +62,8 @@ const EvalError = Error || error{ Abort, Break, Continue, Return };
 /// comptime call: the instance of the callee and the values of the arguments
 pub const CallKey = struct {
     /// Same as the instance in type inference (comptime parameters take the value, anytype takes
-    /// the type, others are `runtime`); determines the identity of containers defined in the body
+    /// the type unless the instance records it by value (`InternPool.Instance.arg_types`), others
+    /// are `runtime`); determines the identity of containers defined in the body
     inst: Index,
     /// Values of the arguments: an `aggregate` whose elements correspond one-to-one to the
     /// parameters, with unknown for unknown values. Its type is the tuple of the argument types:
@@ -185,10 +186,10 @@ pub fn localValue(ctx: *Db.Ctx, key: queries.LocalKey) Error!TypedValue {
     const vals = try ev.a.alloc(Val, body.params.len);
     for (body.params, vals, 0..) |p, *v, i| {
         const x: Index = if (i < inst.args.len) inst.args[i] else .unknown;
-        // The instance records only the type of the argument of an anytype parameter, which
-        // `runFunction` takes from the instance
+        // Unless it records the argument by value, the instance records only the type of the
+        // argument of an anytype parameter, which `runFunction` takes from the instance
         const param = body.binding(p);
-        const type_only = param.ty == null and !param.is_comptime;
+        const type_only = param.ty == null and !param.is_comptime and !inst.byValue(i);
         v.* = if (x == .unknown or x == .runtime or type_only) .unknown else Val.of(value.typeOfValue(ip, x), x);
     }
     _ = ev.runFunction(key.owner, run, vals) catch |err| switch (err) {
@@ -2122,7 +2123,8 @@ const Evaluator = struct {
             // anytype or comptime parameter: the callee may write through it or return it, so the
             // call runs on the caller's storage, as in the compiler, which does not memoize a
             // comptime call when an argument can mutate comptime state. The instance of an anytype
-            // parameter records only the type; a comptime parameter still takes the value.
+            // parameter recorded by type records only the type; a comptime parameter, or an
+            // anytype parameter recorded by value, still takes the value.
             if (refersToMutableStorage(a, max_freeze_depth)) {
                 local = true;
                 if (kind == .anytype_type) {
@@ -2247,12 +2249,12 @@ const Evaluator = struct {
         for (body.params, 0..) |p, i| {
             const arg: Val = if (i < args.len) args[i] else .unknown;
             // The type of an anytype parameter is the type of the argument (also what the instance
-            // records; for comptime anytype the instance records the argument's value, and its
-            // type in `arg_types`)
+            // records; for an anytype parameter recorded by value, such as comptime anytype, the
+            // instance records the argument's value, and its type in `arg_types`)
             const binding = body.binding(p);
-            const comptime_anytype = binding.ty == null and binding.is_comptime;
+            const by_value = binding.ty == null and (binding.is_comptime or inst_key.byValue(i));
             const recorded = i < inst_args.len and inst_args[i] != .unknown and inst_args[i] != .runtime;
-            const ty: Index = if (comptime_anytype)
+            const ty: Index = if (by_value)
                 inst_key.argType(i)
             else if (binding.ty == null)
                 (if (!recorded) arg.ty else inst_args[i])
@@ -2260,7 +2262,7 @@ const Evaluator = struct {
             // The type of a `CallEval` argument is taken from its value, which does not always give
             // back the argument type (a non-null optional is its payload): without a recorded type
             // the parameter is unknown
-            if (comptime_anytype and ty == .unknown) {
+            if (by_value and ty == .unknown) {
                 frame.slots[@backingInt(p)] = .unknown;
                 continue;
             }
