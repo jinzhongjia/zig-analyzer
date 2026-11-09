@@ -157,6 +157,38 @@ test "without file watching from the client, the server watches files on disk" {
     try h.notify("exit", {});
 }
 
+test "the server watches files on disk: directories a build creates do not schedule a scan for source files" {
+    const main_text = "const lib = @import(\"lib.zig\");\npub fn first() void {\n    lib.\n}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = main_text },
+        .{ .path = "lib.zig", .text = "pub fn hello() void {}\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // The client cannot register file watching dynamically
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const lib_path = try project.path(a, "lib.zig");
+    // Notifications arrive in order: once this change is noticed, the earlier ones (FSEvents also
+    // reports the creation of the fixture's files) have been handled
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = "pub fn goodbye() void {}\n" });
+    try waitWatched(&h, Labels{ .uri = main_uri, .text = main_text, .after = "    lib.", .want = "goodbye" });
+    const scans = h.server.scan_generation.load(.acquire);
+    for ([_][]const u8{ "zig-out/bin", ".zig-cache/o/0123", ".zig-cache/tmp" }) |sub| try project.tmp.dir.createDirPath(testing.io, sub);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = "pub fn again() void {}\n" });
+    try waitWatched(&h, Labels{ .uri = main_uri, .text = main_text, .after = "    lib.", .want = "again" });
+    // A scan for them would find nothing new, and find references and rename would wait for it
+    try testing.expectEqual(scans, h.server.scan_generation.load(.acquire));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "the server watches files on disk: a change notified under another spelling of a file counts for it" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const main_text = "const lib = @import(\"lib.zig\");\npub fn first() void {\n    lib.\n}\n";

@@ -6,6 +6,7 @@ const testing = std.testing;
 const za = @import("../zig_analyzer.zig");
 const fixture = za.project.fixture;
 const Harness = @import("test_harness.zig").Harness;
+const Server = @import("Server.zig");
 
 const Empty = struct {};
 /// Code action literal support, without which no code actions are returned (each carries an edit)
@@ -369,11 +370,16 @@ test "rename refuses when a reference cannot be confirmed" {
     try h.notify("exit", {});
 }
 
-/// "file:line:column" of every edit in a rename result, sorted
+/// "file:line:column" of every edit in a rename result, sorted; prints the response when it has no
+/// result
 fn renameEdits(h: *Harness, resp: std.json.Value) ![]const u8 {
     const a = h.arena.allocator();
+    const result = resp.object.get("result") orelse {
+        std.debug.print("rename failed: {f}\n", .{std.json.fmt(resp, .{})});
+        return error.RenameFailed;
+    };
     var out: std.ArrayList([]const u8) = .empty;
-    var it = resp.object.get("result").?.object.get("changes").?.object.iterator();
+    var it = result.object.get("changes").?.object.iterator();
     while (it.next()) |kv| for (kv.value_ptr.array.items) |e| try out.append(a, try loc(h, kv.key_ptr.*, e.object.get("range").?));
     std.mem.sort([]const u8, out.items, {}, struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
@@ -398,8 +404,7 @@ test "references and rename reach closed files outside any build graph" {
     try h.start();
     defer h.finish();
     const a = h.arena.allocator();
-    // The client watches the files: a server-side notification of the file created below could
-    // arrive after waitIdle and start another scan, during which rename is refused
+    // The client watches the files: the file created below joins the scope through its notification
     _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } } });
     try h.notify("initialized", Empty{});
     const lib_uri = try za.base.uri.fromPath(a, try project.path(a, "lib.zig"));
@@ -435,6 +440,74 @@ test "references and rename reach closed files outside any build graph" {
         const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .newName = "double" });
         try testing.expectEqualStrings("lib.zig:0:7 main.zig:2:12 other.zig:2:12", try renameEdits(&h, renamed));
     }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "rename waits for a scan of the workspace folders in progress instead of failing" {
+    const scale_text = "pub fn scale(x: u32) u32 {\n    return x * 2;\n}\n";
+    const files = [_]fixture.File{
+        .{ .path = "lib.zig", .text = scale_text },
+        .{ .path = "main.zig", .text = "const lib = @import(\"lib.zig\");\npub fn main() void {\n    _ = lib.scale(3);\n}\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // The client watches the files, so the scan below is the only one
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } } });
+    try h.notify("initialized", Empty{});
+    const lib_uri = try za.base.uri.fromPath(a, try project.path(a, "lib.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = lib_uri, .languageId = "zig", .version = 1, .text = scale_text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // The rename stops in its read transaction. A file created meanwhile schedules a scan, which
+    // cannot finish before that read transaction ends: the scan writes the files it found.
+    var gate: Server.TestGate = .{ .method = "textDocument/rename", .point = .in_read };
+    h.server.test_gate = &gate;
+    defer h.server.test_gate = null;
+    const id = try h.send("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = position(scale_text, "scale"), .newName = "double" });
+    try gate.entered.wait(testing.io);
+    const scans = h.server.scan_generation.load(.acquire);
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "other.zig", .data = "const lib = @import(\"lib.zig\");\ntest {\n    _ = lib.scale(1);\n}\n" });
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, try project.path(a, "other.zig")), .type = 1 }} });
+    while (h.server.scan_generation.load(.acquire) == scans) std.Thread.yield() catch {};
+    gate.release.set(testing.io);
+    // Answered after the scan, with the new file, instead of failing with "the workspace folders
+    // are still being searched"
+    try testing.expectEqualStrings("lib.zig:0:7 main.zig:2:12 other.zig:2:12", try renameEdits(&h, try h.response(id)));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "rename answers while scans of the workspace folders keep being scheduled" {
+    const scale_text = "pub fn scale(x: u32) u32 {\n    return x * 2;\n}\n";
+    const files = [_]fixture.File{
+        .{ .path = "lib.zig", .text = scale_text },
+        .{ .path = "main.zig", .text = "const lib = @import(\"lib.zig\");\npub fn main() void {\n    _ = lib.scale(3);\n}\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // The client watches the files, so the scans below are the only ones
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } } });
+    try h.notify("initialized", Empty{});
+    const lib_uri = try za.base.uri.fromPath(a, try project.path(a, "lib.zig"));
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = lib_uri, .languageId = "zig", .version = 1, .text = scale_text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // Each scan schedules another before it finishes, as while source files keep being created: a
+    // scan is always pending, and a rename that waited until none was pending did not end
+    h.server.test_rescan.store(true, .release);
+    const renamed = blk: {
+        defer h.server.test_rescan.store(false, .release);
+        h.server.scheduleScan();
+        break :blk try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = position(scale_text, "scale"), .newName = "double" });
+    };
+    try testing.expectEqualStrings("lib.zig:0:7 main.zig:2:12", try renameEdits(&h, renamed));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }

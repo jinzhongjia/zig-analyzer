@@ -547,9 +547,10 @@ pub const Watcher = struct {
         var dirs: std.StringHashMapUnmanaged(void) = .empty;
         var all = false;
         // Source files the server does not know yet may belong to the workspace (see
-        // `Server.scheduleScan`), and so may directories that appear or disappear
+        // `Server.scheduleScan`), and directories that appear or disappear may hold some
         var rescan = false;
         var created: std.ArrayList([]const u8) = .empty;
+        var dirs_changed: std.ArrayList([]const u8) = .empty;
         // Names created or removed that are not files of interest: they may be directories
         // (Windows notifications do not tell), moved or renamed with files of interest in them
         var unknown: std.StringHashMapUnmanaged(void) = .empty;
@@ -582,11 +583,15 @@ pub const Watcher = struct {
                 }
             },
             .dir_created, .dir_gone, .overflow => {
-                rescan = true;
-                if (ev.path.len == 0) all = true else {
+                if (ev.path.len == 0) {
+                    all = true;
+                    rescan = true;
+                } else {
                     const k = try w.key(a, ev.path);
                     try dirs.put(a, k, {});
                     if (ev.kind != .overflow and w.inEntryDir(k)) try pending.add(a, ev.path, if (ev.kind == .dir_created) .created else .changed);
+                    // Lost notifications may hide changes anywhere
+                    if (ev.kind == .overflow) rescan = true else try dirs_changed.append(a, ev.path);
                 }
             },
         };
@@ -598,10 +603,15 @@ pub const Watcher = struct {
             try pending.add(a, path, .changed);
         };
         if (moved) rescan = true;
-        if (!rescan and created.items.len != 0) {
+        // Every build creates directories in `.zig-cache` and `zig-out`: a scan for them would find
+        // nothing new, and find references and rename would wait for it after every build
+        if (!rescan and (created.items.len != 0 or dirs_changed.items.len != 0)) {
             const rules = try w.server.originRules(a);
             for (created.items) |path| {
                 if (workspace_files.contains(&w.server.vfs, rules, path)) rescan = true;
+            }
+            for (dirs_changed.items) |dir| {
+                if (workspace_files.affectsScan(&w.server.vfs, rules, dir)) rescan = true;
             }
         }
         if (rescan) w.server.scheduleScan();
