@@ -8826,6 +8826,36 @@ test "comptime evaluation: vector operators, @reduce, @select and @shuffle" {
     });
 }
 
+test "comptime evaluation: vector operators on integers wider than 128 bits" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1: element-wise comparison and
+    // arithmetic take the arbitrary-precision path of the scalar operators
+    try expectTypes(
+        \\const A: @Vector(2, u256) = .{ 1 << 200, 3 };
+        \\const B: @Vector(2, u256) = .{ 1 << 199, 1 << 255 };
+        \\const lt = @reduce(.Or, A < B);
+        \\const lt0 = (A < B)[0];
+        \\const lt1 = (A < B)[1];
+        \\const eq = @reduce(.And, A == A);
+        \\const add = (A + B)[0] == (1 << 200) + (1 << 199);
+        \\const add_val = (A + B)[1];
+        \\const wrap = (B +% B)[1];
+        \\const max = @reduce(.Max, B);
+        \\const S: @Vector(2, i200) = .{ -(1 << 90), 5 };
+        \\const neg_lt = (S < @as(@Vector(2, i200), @splat(0)))[0];
+        \\const mul = (S * S)[0];
+    , &.{
+        .{ "lt", "bool = true" },
+        .{ "lt0", "bool = false" },
+        .{ "lt1", "bool = true" },
+        .{ "eq", "bool = true" },
+        .{ "add", "bool = true" },
+        .{ "add_val", "u256 = 57896044618658097711785492504343953926634992332820282019728792003956564819971" },
+        .{ "wrap", "u256 = 0" },
+        .{ "max", "u256 = 57896044618658097711785492504343953926634992332820282019728792003956564819968" },
+        .{ "neg_lt", "bool = true" },
+        .{ "mul", "i200 = 1532495540865888858358347027150309183618739122183602176" },
+    });
+}
 test "comptime evaluation: pointer arithmetic on many-item and C pointers" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both). `p + n` and
     // `p - n` move by `n` elements within the array, `p - q` is the number of elements between
