@@ -1122,6 +1122,9 @@ pub fn refreshImports(ws: *Workspace, files: []const FileId) Allocator.Error!voi
     const changed = while (true) {
         var arena: std.heap.ArenaAllocator = .init(ws.gpa);
         defer arena.deinit();
+        // A canceled read begins again only once the pending writes have the lock (see
+        // `Db.waitPendingWrites`)
+        ws.server.db.waitPendingWrites();
         var ctx = ws.server.db.beginRead(arena.allocator());
         defer ctx.end();
         break ws.importsChanged(&ctx, files) catch |err| switch (err) {
@@ -1228,6 +1231,9 @@ fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
         var missing: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
         defer missing.deinit(gpa);
         const canceled = blk: {
+            // A canceled read begins again only once the pending writes have the lock (see
+            // `Db.waitPendingWrites`)
+            ws.server.db.waitPendingWrites();
             var ctx = ws.server.db.beginRead(arena.allocator());
             defer ctx.end();
             for (found.list, results) |p, *r| {
@@ -1319,6 +1325,9 @@ fn computeSet(ws: *Workspace, steps: []const u32, read: *std.AutoHashMapUnmanage
         defer arena.deinit();
         round_read.clearRetainingCapacity();
         var result = blk: {
+            // A canceled read begins again only once the pending writes have the lock (see
+            // `Db.waitPendingWrites`)
+            ws.server.db.waitPendingWrites();
             var ctx = ws.server.db.beginRead(arena.allocator());
             defer ctx.end();
             ws.mutex.lockUncancelable(io);

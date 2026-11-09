@@ -1464,6 +1464,9 @@ fn indexOnce(server: *Server, generation: u64) Io.Cancelable!void {
     const Files = struct { symbols: []const Vfs.FileId, project: []const Vfs.FileId };
     const files: Files = while (true) {
         if (server.isShuttingDown()) return;
+        // A canceled read begins again only once the pending writes have the lock (see
+        // `Db.waitPendingWrites`)
+        server.db.waitPendingWrites();
         var ctx = server.db.beginRead(arena_state.allocator());
         defer ctx.end();
         var r: Resolver = .{ .ctx = &ctx, .arena = arena_state.allocator() };
@@ -1502,6 +1505,9 @@ fn indexOnce(server: *Server, generation: u64) Io.Cancelable!void {
     // usable, rather than being left to the first completion
     while (true) {
         if (server.isShuttingDown() or !server.autoImportEnabled()) return;
+        // A canceled read begins again only once the pending writes have the lock (see
+        // `Db.waitPendingWrites`)
+        server.db.waitPendingWrites();
         var ctx = server.db.beginRead(arena_state.allocator());
         defer ctx.end();
         _ = ctx.get(za.ide_db.imports.TestOnlyFiles, {}) catch |err| switch (err) {
@@ -1531,6 +1537,9 @@ fn indexBatches(server: *Server, files: []const Vfs.FileId, title: []const u8, a
         const end = @min(done + index_batch, files.len);
         _ = scratch.reset(.retain_capacity);
         {
+            // A canceled read begins again only once the pending writes have the lock (see
+            // `Db.waitPendingWrites`)
+            server.db.waitPendingWrites();
             var ctx = server.db.beginRead(scratch.allocator());
             defer ctx.end();
             indexFiles(&ctx, files[done..end], auto_import) catch |err| switch (err) {
@@ -1646,6 +1655,9 @@ fn warmImportRoots(server: *Server) Allocator.Error!bool {
     defer seen.deinit(server.gpa);
     while (true) {
         if (server.isShuttingDown() or !server.autoImportEnabled()) return false;
+        // A canceled read begins again only once the pending writes have the lock (see
+        // `Db.waitPendingWrites`)
+        server.db.waitPendingWrites();
         var ctx = server.db.beginRead(scratch.allocator());
         defer ctx.end();
         const graph = (ctx.get(ModuleGraph.Input, {}) catch |err| switch (err) {
@@ -1671,6 +1683,9 @@ fn warmImportRoots(server: *Server) Allocator.Error!bool {
         var found: std.ArrayList(Vfs.FileId) = .empty;
         var canceled = false;
         {
+            // A canceled read begins again only once the pending writes have the lock (see
+            // `Db.waitPendingWrites`)
+            server.db.waitPendingWrites();
             var ctx = server.db.beginRead(scratch.allocator());
             defer ctx.end();
             for (files.items[done..end]) |file| {
@@ -1695,6 +1710,9 @@ fn warmImportRoots(server: *Server) Allocator.Error!bool {
     while (!server.isShuttingDown()) {
         if (!server.autoImportEnabled()) return false;
         _ = scratch.reset(.retain_capacity);
+        // A canceled read begins again only once the pending writes have the lock (see
+        // `Db.waitPendingWrites`)
+        server.db.waitPendingWrites();
         var ctx = server.db.beginRead(scratch.allocator());
         defer ctx.end();
         var canceled = false;
