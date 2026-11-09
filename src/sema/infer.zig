@@ -3124,8 +3124,11 @@ const Inferrer = struct {
                     else => {},
                 };
                 // A pointer to a comptime-known constant (`parseEx(Id, &params, ...)`,
-                // `@field(x, &name)`) is comptime-known: its value points to the constant's value
+                // `@field(x, &name)`) is comptime-known: its value points to the constant's value,
+                // and to its place when that is inside a container-level declaration
                 if (is_const) if (v.val) |pointee| {
+                    if (try inf.mayBeInDeclaration(operand_e))
+                        return .{ .ty = ty, .val = try eval.addressValue(inf.r, inf.file, inf.item, inf.body, operand_e, inf.inst, inf.bindings, ty, pointee) };
                     return .{ .ty = ty, .val = try eval.constPointer(inf.r, ty, pointee) };
                 };
                 return .{ .ty = ty };
@@ -3589,6 +3592,24 @@ const Inferrer = struct {
     /// `&x`: see `placeIsConst`
     fn isConstPlace(inf: *Inferrer, e: ExprId) Error!bool {
         return placeIsConst(inf.r, inf.file, inf.item, inf.body, inf, e);
+    }
+
+    /// Whether place `e` may be inside a container-level declaration: a declaration, a member of
+    /// a type, or a field or element reached from one or through a pointer
+    fn mayBeInDeclaration(inf: *Inferrer, e: ExprId) Error!bool {
+        const b = inf.body;
+        return switch (b.expr(e)) {
+            .name_ref => |name| {
+                if (inf.ip.key(inf.get(e).ty) == .ptr_type) return true;
+                const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return false;
+                return def == .item;
+            },
+            .field_access => |fa| inf.get(fa.lhs).isType() or try inf.mayBeInDeclaration(fa.lhs),
+            .index => |x| inf.mayBeInDeclaration(x.lhs),
+            .@"comptime" => |x| inf.mayBeInDeclaration(x),
+            .deref => true,
+            else => false,
+        };
     }
 
     /// Attributes of a pointer to the place `e` (`&e`, pointer captures): the `align(...)` of a
