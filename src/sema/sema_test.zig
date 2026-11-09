@@ -6075,6 +6075,24 @@ test "variables whose inferred type has unknown parts take the type of the inter
     });
 }
 
+test "constants whose value is a type with unknown parts take the value of the interpreter" {
+    // Inference does not execute non-inline loops, so `[n]u8` with a length computed in one was
+    // `[_]u8`, and the interpreter did not run since inference had a value.
+    try expectTypes(
+        \\extern fn ext() usize;
+        \\const array_type = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk [n]u8; };
+        \\const annotated: type = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk [n]u8; };
+        \\const optional_type = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk ?[n]u16; };
+        \\const gives_up = blk: { var n: usize = 0; for (0..3) |_| n += 1; break :blk [n + ext()]u8; };
+    , &.{
+        .{ "array_type", "type = [3]u8" },
+        .{ "annotated", "type = [3]u8" },
+        .{ "optional_type", "type = ?[3]u16" },
+        // The interpreter cannot call an extern function, so the length stays unknown
+        .{ "gives_up", "type = [_]u8" },
+    });
+}
+
 test "anytype arguments do not expand large arrays" {
     // Previously: anytype arguments were evaluated as a comptime context,
     // and slicing a huge array expanded its elements one by one in the interpreter
