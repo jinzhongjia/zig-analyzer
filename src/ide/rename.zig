@@ -303,16 +303,17 @@ pub fn astGenErrors(r: *Resolver, file: FileId, edits: []const Edit) resolve.Err
     }
     try edited.appendSlice(r.arena, text[pos..]);
     const backend = try ctx.get(live.LiveBackend, {});
+    const environ_map = ctx.db.env.zig_environ.load(.acquire);
     const mode = live.modeOf(ctx.db.env.vfs.path(file));
     // Result for the current text: for open files it has already been computed when publishing
     // diagnostics (`AstCheck` reads `FileText`)
     var own_before: ?*live.Result = null;
     defer if (own_before) |b| b.destroy(gpa);
     const before = if (try ctx.get(database.inputs.FileText, file) != null) try ctx.get(live.AstCheck, file) else blk: {
-        own_before = try live.checkWith(gpa, ctx.db.io, backend, text, mode);
+        own_before = try live.checkWith(gpa, ctx.db.io, backend, environ_map, text, mode);
         break :blk own_before.?;
     };
-    const after = try live.checkWith(gpa, ctx.db.io, backend, edited.items, mode);
+    const after = try live.checkWith(gpa, ctx.db.io, backend, environ_map, edited.items, mode);
     defer after.destroy(gpa);
     const out_before = try r.arena.alloc(AstGenError, before.items.len);
     for (before.items, out_before) |d, *o| o.* = .{ .start = d.start, .message = try r.arena.dupe(u8, d.message) };

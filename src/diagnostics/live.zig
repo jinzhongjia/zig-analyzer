@@ -8,6 +8,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Ast = std.zig.Ast;
 const ErrorBundle = std.zig.ErrorBundle;
+const Environ = std.process.Environ;
 
 const engine = @import("../db/engine.zig");
 const Vfs = @import("../base/Vfs.zig");
@@ -169,7 +170,7 @@ pub const AstCheck = struct {
         const mode = modeOf(vfs.path(file));
         const backend = try ctx.get(LiveBackend, {});
         if (ctx.db.env.live_prepared) |p| if (p.take(ctx.db.io, text, mode, backend)) |r| return r;
-        return checkWith(ctx.db.gpa, ctx.db.io, backend, text, mode);
+        return checkWith(ctx.db.gpa, ctx.db.io, backend, ctx.db.env.zig_environ.load(.acquire), text, mode);
     }
 
     pub fn eql(a: Value, b: Value) bool {
@@ -185,11 +186,12 @@ pub const AstCheck = struct {
     }
 };
 
-/// Runs the live check on the text with the given backend
-pub fn checkWith(gpa: Allocator, io: Io, backend: Backend, text: []const u8, mode: Mode) (Allocator.Error || Io.Cancelable)!*Result {
+/// Runs the live check on the text with the given backend; `environ_map` is passed to the
+/// `zig ast-check` child process of the subprocess backend (null: the current process's)
+pub fn checkWith(gpa: Allocator, io: Io, backend: Backend, environ_map: ?*const Environ.Map, text: []const u8, mode: Mode) (Allocator.Error || Io.Cancelable)!*Result {
     return switch (backend) {
         .in_process => check(gpa, text, mode),
-        .subprocess => |zig_exe| checkSubprocess(gpa, io, zig_exe, text, mode) catch |err| switch (err) {
+        .subprocess => |zig_exe| checkSubprocess(gpa, io, zig_exe, environ_map, text, mode) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.Canceled => error.Canceled,
             // zig cannot be run: no live diagnostics (compiler diagnostics are still available)
@@ -296,12 +298,13 @@ fn empty(gpa: Allocator) Allocator.Error!*Result {
 // ── Subprocess backend: zig ast-check ────────────────────────────────
 
 /// Passes the text to `zig ast-check --color off` through stdin and parses its error output.
-pub fn checkSubprocess(gpa: Allocator, io: std.Io, zig_exe: []const u8, text: []const u8, mode: Mode) !*Result {
+/// `environ_map`: the environment of the child process (null: the current process's).
+pub fn checkSubprocess(gpa: Allocator, io: std.Io, zig_exe: []const u8, environ_map: ?*const Environ.Map, text: []const u8, mode: Mode) !*Result {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.appendSlice(gpa, &.{ zig_exe, "ast-check", "--color", "off" });
     if (mode == .zon) try argv.append(gpa, "--zon");
-    var child = try child_process.spawn(io, .{ .argv = argv.items, .stdin = .pipe, .stdout = .ignore, .stderr = .pipe });
+    var child = try child_process.spawn(io, .{ .argv = argv.items, .environ_map = environ_map, .stdin = .pipe, .stdout = .ignore, .stderr = .pipe });
     defer child.kill(io);
     var watchdog: Watchdog = .{};
     watchdog.start(io, child.id.?, .{ .duration = .{ .raw = Io.Duration.fromSeconds(30), .clock = .awake } });
@@ -495,7 +498,7 @@ test "subprocess backend matches in-process (skipped when zig is not in PATH)" {
     for (samples) |sample| {
         const in_process = try check(gpa, sample.text, sample.mode);
         defer in_process.destroy(gpa);
-        const sub = try checkSubprocess(gpa, testing.io, env.zig_exe, sample.text, sample.mode);
+        const sub = try checkSubprocess(gpa, testing.io, env.zig_exe, env.childEnviron(), sample.text, sample.mode);
         defer sub.destroy(gpa);
         try testing.expectEqual(in_process.items.len, sub.items.len);
         for (in_process.items, sub.items) |x, y| {

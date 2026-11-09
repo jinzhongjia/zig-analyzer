@@ -35,9 +35,15 @@ pub const Env = struct {
     /// Live diagnostics precomputed outside the read transaction (see `live.Prepared`); when null,
     /// they are always computed in the query
     live_prepared: ?*live.Prepared = null,
+    /// Environment variables of the `zig ast-check` child processes of live diagnostics: those of
+    /// the effective zig environment (see `ZigEnv.childEnviron`), so that they run with the zig path
+    /// overrides as every other zig process does; null inherits those of the current process. Does
+    /// not affect query results: `zig ast-check` reads only the text passed to it.
+    zig_environ: *const std.atomic.Value(?*const std.process.Environ.Map) = &no_environ,
 };
 
 var always_on: std.atomic.Value(bool) = .init(true);
+var no_environ: std.atomic.Value(?*const std.process.Environ.Map) = .init(null);
 
 pub const Db = engine.Engine(*const Env, &.{
     inputs.FileText,

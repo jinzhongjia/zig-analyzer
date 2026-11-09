@@ -2172,6 +2172,39 @@ fn hasLine(lines: []const []const u8, line: []const u8) bool {
     return false;
 }
 
+/// The subcommand and the ZIG_LIB_DIR of a line recorded by the wrapper script (see `zigCalls`)
+fn splitCall(line: []const u8) struct { []const u8, []const u8 } {
+    const sep = std.mem.indexOfScalar(u8, line, ' ') orelse return .{ line, "" };
+    return .{ line[0..sep], line[sep + 1 ..] };
+}
+
+/// Checks the zig commands recorded by the wrapper script (see `zigCalls`): each of `subcommands`
+/// ran, and every command ran with ZIG_LIB_DIR set to `lib_dir` (empty: not set); prints the
+/// recorded commands otherwise
+fn expectZigCalls(lines: []const []const u8, subcommands: []const []const u8, lib_dir: []const u8) !void {
+    var ok = true;
+    for (subcommands) |sub| {
+        var ran = false;
+        for (lines) |l| ran = ran or std.mem.eql(u8, splitCall(l)[0], sub);
+        ok = ok and ran;
+    }
+    for (lines) |l| ok = ok and std.mem.eql(u8, splitCall(l)[1], lib_dir);
+    if (ok) return;
+    std.debug.print("expected zig commands to include", .{});
+    for (subcommands) |sub| std.debug.print(" {s}", .{sub});
+    std.debug.print(", all with ZIG_LIB_DIR=\"{s}\"; recorded (subcommand ZIG_LIB_DIR):\n", .{lib_dir});
+    for (lines) |l| std.debug.print("  {s}\n", .{l});
+    return error.TestUnexpectedResult;
+}
+
+/// A supported zig version other than the one zig-analyzer was built with (`supported_versions`
+/// has more than one): when `zig env` reports it, projects still load and live diagnostics run
+/// `zig ast-check` (see `ZigEnv.matchesBuiltin`)
+fn otherSupportedVersion() []const u8 {
+    for (za.project.ZigEnv.supported_versions) |v| if (!std.mem.eql(u8, v, @import("builtin").zig_version_string)) return v;
+    unreachable;
+}
+
 const lib_path_main =
     \\const std = @import("std");
     \\pub fn main() void {
@@ -2202,7 +2235,9 @@ test "settings: zig.lib_path: std resolves under it and zig runs with it, removi
     const other_root = try other.dir.realPathFileAlloc(testing.io, ".", a);
     const lib = try std.fs.path.join(a, &.{ other_root, "zig-lib" });
     // Script zigw wrapping the user's zig: records the subcommand and ZIG_LIB_DIR of each command;
-    // `zig env` reports the script itself as zig, and other commands run as usual
+    // `zig env` reports the script itself as zig and another supported version, so that live
+    // diagnostics run `zig ast-check` through it whichever zig is in PATH; other commands run as
+    // usual
     const zig = project.env.zig_exe;
     const calls = try project.path(a, "zig-calls");
     const zigw = try project.path(a, "zigw");
@@ -2210,16 +2245,16 @@ test "settings: zig.lib_path: std resolves under it and zig runs with it, removi
         \\#!/bin/sh
         \\echo "$1 $ZIG_LIB_DIR" >> "{s}"
         \\case "$1" in
-        \\env) "{s}" env | sed 's|\.zig_exe = "[^"]*"|.zig_exe = "{s}"|' ;;
+        \\env) "{s}" env | sed 's|\.zig_exe = "[^"]*"|.zig_exe = "{s}"|; s|\.version = "[^"]*"|.version = "{s}"|' ;;
         \\*) exec "{s}" "$@" ;;
         \\esac
         \\
-    , .{ calls, zig, zigw, zig });
+    , .{ calls, zig, zigw, otherSupportedVersion(), zig });
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "zigw", .data = script, .flags = .{ .permissions = .executable_file } });
 
     try initializeWith(&h, project.root, false, try settingsValue(&h, .{ .zig = .{ .path = zigw, .lib_path = lib } }));
     const main_uri = try open(&h, try project.path(a, "main.zig"), lib_path_main);
-    _ = try open(&h, try std.fs.path.join(a, &.{ other_root, "solo.zig" }), lib_path_main);
+    const solo_uri = try open(&h, try std.fs.path.join(a, &.{ other_root, "solo.zig" }), lib_path_main);
     try waitIdle(&h);
     const lib_std = try std.fs.path.join(a, &.{ lib, "std" });
     try testing.expectEqualStrings(try std.fs.path.join(a, &.{ lib_std, "std.zig" }), try stdRoot(&h));
@@ -2230,23 +2265,23 @@ test "settings: zig.lib_path: std resolves under it and zig runs with it, removi
     var diags = try h.diagnostics();
     try expectDiagnostics(diags, "main.zig", &.{"2:19 zig: expected type 'u32'"});
     try expectDiagnostics(diags, "solo.zig", &.{"2:19 zig: expected type 'u32'"});
-    // The project build, single-file compiles and other zig child processes all use the overriding
-    // lib directory (when the cache has no record of the default builtin.zig, the command
-    // generating it runs before the build)
+    // The project build, single-file compiles, the `zig ast-check` of live diagnostics and other
+    // zig child processes all use the overriding lib directory (when the cache has no record of the
+    // default builtin.zig, the command generating it runs before the build)
     const before = try zigCalls(&h, calls);
-    try testing.expect(hasLine(before, try std.fmt.allocPrint(a, "build {s}", .{lib})));
-    try testing.expect(hasLine(before, try std.fmt.allocPrint(a, "build-obj {s}", .{lib})));
-    for (before) |line| try testing.expect(std.mem.endsWith(u8, line, lib));
+    try expectZigCalls(before, &.{ "build", "build-obj", "ast-check" }, lib);
 
     // Remove the override: the standard library is reloaded, the project restarts with the lib
-    // directory reported by `zig env`, and standalone files are recompiled
+    // directory reported by `zig env`, and standalone files are recompiled; an edit runs
+    // `zig ast-check` without it as well
     try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .zig = .{ .path = zigw } } });
     try waitIdle(&h);
     try testing.expectEqualStrings(try std.fs.path.join(a, &.{ project.env.std_dir, "std.zig" }), try stdRoot(&h));
     try testing.expectEqualStrings(try std.fs.path.join(a, &.{ project.env.std_dir, "mem.zig" }), try definitionPath(&h, main_uri, lib_path_main, "Allocator"));
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = solo_uri, .version = 2 }, .contentChanges = &.{.{ .text = lib_path_main ++ "// edited\n" }} });
+    try waitIdle(&h);
     const after = (try zigCalls(&h, calls))[before.len..];
-    try testing.expect(hasLine(after, "build ") and hasLine(after, "build-obj "));
-    for (after) |line| try testing.expect(std.mem.endsWith(u8, line, " "));
+    try expectZigCalls(after, &.{ "build", "build-obj", "ast-check" }, "");
     diags = try h.diagnostics();
     try expectDiagnostics(diags, "main.zig", &.{"2:19 zig: expected type 'u32'"});
     try expectDiagnostics(diags, "solo.zig", &.{"2:19 zig: expected type 'u32'"});
