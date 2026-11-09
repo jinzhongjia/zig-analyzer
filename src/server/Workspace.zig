@@ -115,6 +115,14 @@ result_generation: u64 = 0,
 result_at_ms: i64 = 0,
 /// FileId → entry in `result`
 result_files: std.AutoArrayHashMapUnmanaged(FileId, *const compiler.FileResult) = .empty,
+/// `Server.build_requests` when `result` was stored: the requests it covers (one arriving during
+/// the build starts another round)
+requests_built: u64 = 0,
+/// This instance replaces one whose maker exited while idle after a completed build (the 0.17
+/// maker can panic right after a build, see docs/zig-maker-build-request-race.md): the
+/// `requests_built` of that instance. While no build has been requested since, the first build of
+/// this instance only repeats that one, and is counted in `Server.repeated_builds`.
+repeats: ?u64 = null,
 building: bool = false,
 /// At least one build has completed (used to decide whether crashes are "consecutive")
 built: bool = false,
@@ -1037,6 +1045,12 @@ fn storeResult(ws: *Workspace, target: *Workspace) Allocator.Error!void {
         target.result_files.deinit(ws.gpa);
         target.result = result;
         target.result_generation = ws.server.nextCompileGeneration();
+        const requests = ws.server.build_requests.load(.acquire);
+        if (target.repeats) |r| {
+            if (r == requests) _ = ws.server.repeated_builds.fetchAdd(1, .acq_rel);
+            target.repeats = null;
+        }
+        target.requests_built = requests;
         target.result_at_ms = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
         target.result_files = files;
     }

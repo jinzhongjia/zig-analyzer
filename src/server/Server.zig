@@ -108,6 +108,12 @@ single_compiles: za.project.bsp.SingleFileCompiles = .{},
 /// Sequence number of the last compile result taken (shared by project builds and single-file
 /// compiles; see `nextCompileGeneration`)
 compile_generation: std.atomic.Value(u64) = .init(0),
+/// Builds requested for saves and changes on disk (`requestBuild`, `deferChanges`), counted before
+/// a project instance handles them, so that a request an instance being replaced drops counts too
+build_requests: std.atomic.Value(u64) = .init(0),
+/// Compile results that only repeated a completed build after the maker exited (see
+/// `Workspace.repeats`): tests leave them out when they count builds
+repeated_builds: std.atomic.Value(u64) = .init(0),
 /// Environment variables of the process: zig child processes are started with the zig path
 /// overrides applied on top of them (see `ZigEnv.withOverrides`)
 environ: std.process.Environ = .empty,
@@ -4021,6 +4027,13 @@ fn didChangeWorkspaceFolders(server: *Server, arena: Allocator, params: types.Di
 /// set and compiler diagnostics stay in effect, and build requests are forwarded to the new
 /// instance (see `requestBuild`).
 pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) void {
+    // The maker exited while idle after a completed build: the new instance's first build repeats
+    // that build unless another is requested meanwhile (see `Workspace.repeats`)
+    const repeats: ?u64 = if (crash_restarts == 0) null else blk: {
+        ws.mutex.lockUncancelable(server.io);
+        defer ws.mutex.unlock(server.io);
+        break :blk if (ws.built and !ws.building) ws.requests_built else null;
+    };
     // Stopping ends this instance's load before the new instance is known
     const first_load = !ws.inModuleGraph();
     if (first_load) _ = server.first_load_restarts.fetchAdd(1, .acq_rel);
@@ -4042,6 +4055,11 @@ pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) voi
         log.err("{s}: failed to restart build system protocol: {t}", .{ ws.root, err });
         return;
     };
+    {
+        fresh.mutex.lockUncancelable(server.io);
+        defer fresh.mutex.unlock(server.io);
+        fresh.repeats = repeats;
+    }
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
     // The server began shutting down while the new instance was starting, or the project has been
@@ -4154,6 +4172,7 @@ fn stopProject(server: *Server, ws: *Workspace) void {
 /// current instance by root directory: the caller's snapshot of the list
 /// may be stale); during a restart, the request goes to the new instance
 pub fn requestBuild(server: *Server, ws: *Workspace) void {
+    _ = server.build_requests.fetchAdd(1, .acq_rel);
     const target = blk: {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
@@ -4171,6 +4190,7 @@ pub fn requestBuild(server: *Server, ws: *Workspace) void {
 /// current instance is in the middle of a build, it decides whether to rebuild for them when the
 /// build completes (see `Workspace.deferChanges`) and this returns true
 pub fn deferChanges(server: *Server, ws: *Workspace, files: []const Vfs.FileId) bool {
+    _ = server.build_requests.fetchAdd(1, .acq_rel);
     const target = blk: {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
