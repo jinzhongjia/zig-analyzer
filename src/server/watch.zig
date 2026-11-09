@@ -1461,6 +1461,55 @@ const RootAliases = struct {
 /// dynamically, with no dependency on the SDK; callbacks run on a serial queue created by this
 /// backend, the received changes are buffered on that queue, and the background task takes them
 /// via `dispatch_sync`.
+/// The IDs of the events a FSEvents stream reports before its HistoryDone event (the changes after
+/// the event it starts at, made before it was registered). FSEvents may report events of this
+/// history again after the HistoryDone event, with the same IDs: an event ID names one change, so
+/// the second report says nothing new. Handled again, the creation of a watch root it reports would
+/// schedule another scan of the workspace.
+const HistoryIds = struct {
+    ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// The largest of `ids`
+    max: u64 = 0,
+    /// The stream is still reporting its history
+    in_history: bool = false,
+
+    /// A stream starts; it reports a history unless it starts at `since_now`
+    fn start(h: *HistoryIds, gpa: Allocator, history: bool) void {
+        h.ids.clearAndFree(gpa);
+        h.max = 0;
+        h.in_history = history;
+    }
+
+    /// The stream has reported its HistoryDone event
+    fn done(h: *HistoryIds) void {
+        h.in_history = false;
+    }
+
+    /// Whether the stream has reported event `id` before; otherwise, during the history, records it
+    fn again(h: *HistoryIds, gpa: Allocator, id: u64) bool {
+        // Some events (the root changed, a volume mounted) carry no ID
+        if (id == 0) return false;
+        if (h.in_history) {
+            // Without memory, the event may be handled twice, which costs a scan at most
+            const gop = h.ids.getOrPut(gpa, id) catch return false;
+            if (gop.found_existing) return true;
+            h.max = @max(h.max, id);
+            return false;
+        }
+        if (h.ids.count() == 0) return false;
+        // Live events arrive in the order of their IDs: after one past the history, none repeats it
+        if (id > h.max) {
+            h.ids.clearAndFree(gpa);
+            return false;
+        }
+        return h.ids.remove(id);
+    }
+
+    fn deinit(h: *HistoryIds, gpa: Allocator) void {
+        h.ids.deinit(gpa);
+    }
+};
+
 const FsEvents = struct {
     const dispatch = std.c.dispatch;
 
@@ -1484,6 +1533,8 @@ const FsEvents = struct {
     /// started, then the latest event it delivered (accessed only on `queue` while the stream
     /// runs)
     reported: u64 = 0,
+    /// The events of the current stream's history (accessed only on `queue` while the stream runs)
+    history: HistoryIds = .{},
     /// Changes received from a replaced stream, already mapped back to the written form with the
     /// roots of that stream (accessed only by the background task; paths are owned by `gpa`)
     carried: std.ArrayList(Event) = .empty,
@@ -1587,6 +1638,7 @@ const FsEvents = struct {
         f.queued.deinit(gpa);
         for (f.carried.items) |e| gpa.free(e.path);
         f.carried.deinit(gpa);
+        f.history.deinit(gpa);
         f.queue.as_object().release();
         f.sem.as_object().release();
         f.lib.close();
@@ -1683,6 +1735,7 @@ const FsEvents = struct {
         }) orelse return error.StartFailed;
         // No callback runs before the stream starts
         f.reported = since;
+        f.history.start(f.gpa, since != since_now);
         s.FSEventStreamSetDispatchQueue(stream, f.queue);
         if (!s.FSEventStreamStart(stream)) {
             s.FSEventStreamInvalidate(stream);
@@ -1726,7 +1779,11 @@ const FsEvents = struct {
         for (paths[0..count], flags_ptr[0..count], ids[0..count]) |p, fl, id| {
             // Some events (the root changed, a volume mounted) carry no ID
             f.reported = @max(f.reported, id);
-            if (fl.history_done) continue;
+            if (fl.history_done) {
+                f.history.done();
+                continue;
+            }
+            if (f.history.again(f.gpa, id)) continue;
             const kind: Event.Kind = if (fl.must_scan_sub_dirs or fl.user_dropped or fl.kernel_dropped)
                 .overflow
             else if (fl.root_changed)
