@@ -1322,7 +1322,7 @@ const Inferrer = struct {
                 .int => |v| return .{ .ty = .comptime_int_type, .val = try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = v } }) },
                 .big_int => |base| {
                     const b = try bigint.fromLiteral(inf.scratch, text, @backingInt(base)) orelse return .{ .ty = .comptime_int_type };
-                    return .{ .ty = .comptime_int_type, .val = try value.internComptimeInt(ip, inf.scratch, b) };
+                    return .{ .ty = .comptime_int_type, .val = try value.internInt(ip, inf.scratch, .comptime_int_type, b) };
                 },
                 .float => {
                     const x = std.fmt.parseFloat(f128, text) catch return .{ .ty = .comptime_float_type };
@@ -1731,9 +1731,10 @@ const Inferrer = struct {
         }
         if (value.intOf(ip, a)) |x| if (value.intOf(ip, b)) |y| return value.compareInts(ip, op, lhs.ty, rhs.ty, x, y);
         if (ip.key(a) == .float_value or ip.key(b) == .float_value) if (value.floatOf(ip, a)) |x| if (value.floatOf(ip, b)) |y| return order(op, x, y);
-        if (lhs.ty == .comptime_int_type or rhs.ty == .comptime_int_type) {
-            const x = try value.bigValueOfAny(ip, inf.scratch, a) orelse return null;
-            const y = try value.bigValueOfAny(ip, inf.scratch, b) orelse return null;
+        // Integers outside i128's range
+        if (ip.key(a) == .big_int or ip.key(b) == .big_int) {
+            const x = try value.bigValueOf(ip, inf.scratch, a) orelse return null;
+            const y = try value.bigValueOf(ip, inf.scratch, b) orelse return null;
             const ord = bigint.order(x, y);
             return switch (op) {
                 .equal_equal => ord == .eq,
@@ -2046,7 +2047,7 @@ const Inferrer = struct {
                 for (types.items) |t| if (ip.isFloat(t)) return .{ .ty = value.minMaxFloatType(ip, types.items) orelse try inf.peer(types.items) };
                 const operands = try inf.scratch.alloc(TypedValue, args.len);
                 for (args, operands) |a, *o| o.* = inf.get(a);
-                return .{ .ty = try value.minMaxIntType(ip, eq(u8, name, "@min"), operands) orelse try inf.peer(types.items) };
+                return .{ .ty = try value.minMaxIntType(ip, inf.scratch, eq(u8, name, "@min"), operands) orelse try inf.peer(types.items) };
             }
             // The absolute value of a signed integer is the unsigned integer of the same bit width
             if (eq(u8, name, "@abs")) return .{ .ty = try value.absType(ip, types.items[0]) orelse .unknown };
@@ -3055,13 +3056,13 @@ const Inferrer = struct {
                 if (value.binaryInt(ip, op, ty, a, b)) |v| return .{ .ty = ty, .val = try ip.get(.{ .int_value = .{ .ty = ty, .value = v } }) };
             }
         }
-        // A comptime_int operand may not fit i128 (or the result may not): compute at arbitrary
-        // precision
-        if (ty == .comptime_int_type) {
-            const a = try value.bigValueOfAny(ip, inf.scratch, lhs.val) orelse return .{ .ty = ty };
-            const b = try value.bigValueOfAny(ip, inf.scratch, rhs.val) orelse return .{ .ty = ty };
-            const r = try bigint.binary(inf.scratch, op, a, b) orelse return .{ .ty = ty };
-            return .{ .ty = ty, .val = try value.internComptimeInt(ip, inf.scratch, r) };
+        // A comptime_int operand may not fit i128 (or the result may not), and types wider than
+        // 128 bits are computed at arbitrary precision
+        if (lhs.val != null and rhs.val != null and value.isBigIntType(ip, ty)) {
+            const a = try value.bigValueOf(ip, inf.scratch, lhs.val) orelse return .{ .ty = ty };
+            const b = try value.bigValueOf(ip, inf.scratch, rhs.val) orelse return .{ .ty = ty };
+            const r = try value.binaryBig(ip, inf.scratch, op, ty, a, b) orelse return .{ .ty = ty };
+            return .{ .ty = ty, .val = try value.internInt(ip, inf.scratch, ty, r) };
         }
         return .{ .ty = ty };
     }
@@ -3130,9 +3131,9 @@ const Inferrer = struct {
                 return .{ .ty = ty };
             },
             .minus, .minus_percent, .tilde => {
-                // Number literals are computed as comptime_int first, and the result is then
-                // converted to the expected type (`const x: i8 = -128`)
-                const v = try inf.infer(operand_e, if (inf.body.expr(operand_e) == .literal) null else expected);
+                // Matches the compiler: the operand has no result type, and the result is then
+                // converted to the expected type (`const x: i8 = -128`, `@as(i8, -(1 << 7))`)
+                const v = try inf.infer(operand_e, null);
                 if (op == .minus and ip.isFloat(v.ty)) {
                     const x = value.floatOf(ip, v.val) orelse return .{ .ty = v.ty };
                     return .{ .ty = v.ty, .val = try value.floatValue(ip, v.ty, -x) };
@@ -3143,14 +3144,10 @@ const Inferrer = struct {
                         else => value.negate(ip, v.ty, a, op == .minus_percent),
                     }) |r| return .{ .ty = v.ty, .val = try ip.get(.{ .int_value = .{ .ty = v.ty, .value = r } }) };
                 }
-                if (v.ty == .comptime_int_type) {
-                    const a = try value.bigValueOfAny(ip, inf.scratch, v.val) orelse return .{ .ty = v.ty };
-                    const r: bigint.Big = switch (op) {
-                        // `~` is not defined for comptime_int
-                        .minus => bigint.negate(a),
-                        else => return .{ .ty = v.ty },
-                    };
-                    return .{ .ty = v.ty, .val = try value.internComptimeInt(ip, inf.scratch, r) };
+                if (v.val != null and value.isBigIntType(ip, v.ty)) {
+                    const a = try value.bigValueOf(ip, inf.scratch, v.val) orelse return .{ .ty = v.ty };
+                    const r = try value.unaryBig(ip, inf.scratch, op, v.ty, a) orelse return .{ .ty = v.ty };
+                    return .{ .ty = v.ty, .val = try value.internInt(ip, inf.scratch, v.ty, r) };
                 }
                 return .{ .ty = v.ty };
             },

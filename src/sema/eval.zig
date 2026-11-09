@@ -763,7 +763,8 @@ const Val = struct {
         return .{ .ty = ty, .v = .{ .int = x } };
     }
 
-    /// An integer that may not fit i128; a value that fits is stored inline
+    /// An integer of type `ty` that may not fit i128 (`ty` is comptime_int or wider than 128
+    /// bits); a value that fits is stored inline
     fn ofBig(ty: Index, b: bigint.Big) Val {
         return if (bigint.toInt(b)) |x| .{ .ty = ty, .v = .{ .int = x } } else .{ .ty = ty, .v = .{ .big = b } };
     }
@@ -782,7 +783,8 @@ const Repr = union(enum) {
     /// Integer: intermediate results of arithmetic are not interned; they are interned only when
     /// `freeze` hands out the result, so large comptime loops do not bloat the InternPool
     int: i128 align(8),
-    /// A `comptime_int` outside the range of i128: intermediate results are not interned
+    /// An integer outside the range of i128 (comptime_int, or a type wider than 128 bits):
+    /// intermediate results are not interned
     big: bigint.Big,
     /// Mutable aggregate inside the interpreter: arrays, vectors, tuples, structs (in field order)
     agg: *Agg,
@@ -974,7 +976,7 @@ const Evaluator = struct {
             .undef => return .undefined_value,
             .ip => |x| return x,
             .int => |x| return try ev.ip.get(.{ .int_value = .{ .ty = v.ty, .value = x } }),
-            .big => |b| return try value.internComptimeInt(ev.ip, ev.a, b),
+            .big => |b| return try value.internInt(ev.ip, ev.a, v.ty, b),
             .agg, .ref => {},
         }
         if (ev.freeze_depth >= max_freeze_depth) return null;
@@ -1004,7 +1006,7 @@ const Evaluator = struct {
         return switch (v.v) {
             .ip => |x| x,
             .int => |x| try ev.ip.get(.{ .int_value = .{ .ty = v.ty, .value = x } }),
-            .big => |b| try value.internComptimeInt(ev.ip, ev.a, b),
+            .big => |b| try value.internInt(ev.ip, ev.a, v.ty, b),
             else => null,
         };
     }
@@ -1022,16 +1024,26 @@ const Evaluator = struct {
     fn bigOf(ev: *Evaluator, v: Val) EvalError!?bigint.Big {
         return switch (v.v) {
             .big => |b| b,
-            .int => |x| try bigint.fromInt(ev.a, x),
-            .ip => |x| if (try value.bigValueOf(ev.ip, ev.a, x)) |b| b else if (value.intOf(ev.ip, x)) |n| try bigint.fromInt(ev.a, n) else null,
+            .int => |x| try value.bigOfInt(ev.ip, ev.a, v.ty, x),
+            .ip => |x| try value.bigValueOf(ev.ip, ev.a, x),
             else => null,
         };
+    }
+
+    /// `a op b` for a comparison operator `op` on integer values: as machine integers when both
+    /// are (reading u128 values above i128's range as unsigned), otherwise at arbitrary precision.
+    /// Null when either is not a known integer.
+    fn compareIntVals(ev: *Evaluator, op: SyntaxKind, a: Val, b: Val) EvalError!?bool {
+        if (ev.intOf(a)) |x| if (ev.intOf(b)) |y| return value.compareInts(ev.ip, op, a.ty, b.ty, x, y);
+        const x = try ev.bigOf(a) orelse return null;
+        const y = try ev.bigOf(b) orelse return null;
+        return compareBig(op, x, y);
     }
 
     /// Float value (integers as floats); null when it is not a known number
     fn floatOf(ev: *Evaluator, v: Val) ?f128 {
         return switch (v.v) {
-            .int => |x| @floatFromInt(x),
+            .int => |x| if (x < 0 and value.isUnsigned128(ev.ip, v.ty)) @floatFromInt(@as(u128, @bitCast(x))) else @floatFromInt(x),
             .big => |b| bigint.toFloat(b),
             .ip => |x| value.floatOf(ev.ip, x),
             else => null,
@@ -1701,7 +1713,8 @@ const Evaluator = struct {
                     const x = std.fmt.parseFloat(f128, text) catch return error.Abort;
                     return Val.of(.comptime_float_type, (try value.floatValue(ip, .comptime_float_type, x)).?);
                 },
-                .big_int, .failure => return error.Abort,
+                .big_int => |base| return Val.ofBig(.comptime_int_type, try bigint.fromLiteral(ev.a, text, @backingInt(base)) orelse return error.Abort),
+                .failure => return error.Abort,
             },
         }
     }
@@ -2031,7 +2044,7 @@ const Evaluator = struct {
                     try key.appendSlice(ka, std.mem.asBytes(&x));
                 },
                 .big => |b| {
-                    const i: u32 = @backingInt(try value.internComptimeInt(ev.ip, ev.a, b));
+                    const i: u32 = @backingInt(try value.internInt(ev.ip, ev.a, a.ty, b));
                     try key.append(ka, 2);
                     try key.appendSlice(ka, std.mem.asBytes(&i));
                 },
@@ -2432,10 +2445,11 @@ const Evaluator = struct {
             // `a...b`
             .other => |range| {
                 if (range.len != 2) return error.Abort;
-                const x = ev.intOf(operand) orelse return error.Abort;
-                const lo = try ev.evalInt(f, range[0], operand.ty);
-                const hi = try ev.evalInt(f, range[1], operand.ty);
-                return lo <= x and x <= hi;
+                const lo = try ev.eval(f, range[0], operand.ty);
+                const hi = try ev.eval(f, range[1], operand.ty);
+                const above = try ev.compareIntVals(.angle_bracket_right_equal, operand, lo) orelse return error.Abort;
+                const below = try ev.compareIntVals(.angle_bracket_left_equal, operand, hi) orelse return error.Abort;
+                return above and below;
             },
             else => {
                 // The prong items of a union are tags
@@ -2510,7 +2524,7 @@ const Evaluator = struct {
                     return boolVal(eq == (op == .equal_equal));
                 }
                 if (ev.intOf(lhs)) |x| if (ev.intOf(rhs)) |y| return boolVal(value.compareInts(ip, op, lhs.ty, rhs.ty, x, y));
-                if (lhs.ty == .comptime_int_type or rhs.ty == .comptime_int_type) {
+                if (lhs.v == .big or rhs.v == .big or value.isBigIntType(ip, lhs.ty) or value.isBigIntType(ip, rhs.ty)) {
                     if (try ev.bigOf(lhs)) |x| {
                         if (try ev.bigOf(rhs)) |y| return boolVal(compareBig(op, x, y));
                     }
@@ -2575,12 +2589,12 @@ const Evaluator = struct {
                 if (value.binaryInt(ip, op, ty, a, b)) |r| return Val.ofInt(ty, r);
             }
         }
-        // A comptime_int operand may not fit i128 (or the result may not): compute at
-        // arbitrary precision
-        if (ty == .comptime_int_type) {
+        // A comptime_int operand may not fit i128 (or the result may not), and types wider than
+        // 128 bits are computed at arbitrary precision
+        if (value.isBigIntType(ip, ty)) {
             const a = try ev.bigOf(lhs) orelse return error.Abort;
             const b = try ev.bigOf(rhs) orelse return error.Abort;
-            const r = try bigint.binary(ev.a, op, a, b) orelse return error.Abort;
+            const r = try value.binaryBig(ip, ev.a, op, ty, a, b) orelse return error.Abort;
             return Val.ofBig(ty, r);
         }
         return error.Abort;
@@ -2670,7 +2684,8 @@ const Evaluator = struct {
         switch (op) {
             .bang => return boolVal(!(try ev.condition(try ev.eval(f, operand_e, .bool_type))).yes),
             .minus, .minus_percent, .tilde => {
-                const v = try ev.eval(f, operand_e, if (f.body.expr(operand_e) == .literal) null else want);
+                // Matches the compiler: the operand has no result type
+                const v = try ev.eval(f, operand_e, null);
                 if (op == .minus and ip.isFloat(v.ty)) {
                     const x = ev.floatOf(v) orelse return error.Abort;
                     return Val.of(v.ty, try value.floatValue(ip, v.ty, -x) orelse return error.Abort);
@@ -2681,13 +2696,9 @@ const Evaluator = struct {
                         else => value.negate(ip, v.ty, a, op == .minus_percent),
                     }) |r| return Val.ofInt(v.ty, r);
                 }
-                if (v.ty == .comptime_int_type) {
+                if (value.isBigIntType(ip, v.ty)) {
                     const a = try ev.bigOf(v) orelse return error.Abort;
-                    const r: bigint.Big = switch (op) {
-                        // `~` is not defined for comptime_int
-                        .minus => bigint.negate(a),
-                        else => return error.Abort,
-                    };
+                    const r = try value.unaryBig(ip, ev.a, op, v.ty, a) orelse return error.Abort;
                     return Val.ofBig(v.ty, r);
                 }
                 return error.Abort;
@@ -3237,14 +3248,11 @@ const Evaluator = struct {
             else => {},
         }
         if (v.v == .int) {
-            if (ip.isInt(t)) {
-                if (!value.intFits(ip, t, v.v.int)) return error.Abort;
-                return Val.ofInt(t, v.v.int);
-            }
+            if (ip.isInt(t)) return try ev.convertInt(v.ty, t, v.v.int) orelse error.Abort;
             // Coercion to floats, enums, etc.: coerce the interned value
             return ev.coerceValue(Val.of(v.ty, (try ev.ipOf(v)).?), want);
         }
-        if (v.v == .big) return ev.coerceValue(Val.of(v.ty, try value.internComptimeInt(ip, ev.a, v.v.big)), want);
+        if (v.v == .big) return ev.coerceValue(Val.of(v.ty, try value.internInt(ip, ev.a, v.ty, v.v.big)), want);
         switch (v.v) {
             .ip => |x| switch (ip.key(x)) {
                 .int_value, .enum_literal => {
@@ -3257,8 +3265,8 @@ const Evaluator = struct {
                     }
                     return Val.of(t, cx);
                 },
-                // A comptime_int outside i128: an integer type takes the value if it fits, a
-                // float type rounds it
+                // An integer outside i128: an integer type takes the value if it fits, a float
+                // type rounds it
                 .big_int => if (ip.isFloat(t) or ip.isInt(t)) {
                     const cx = try value.coerceValue(ip, x, t) orelse return error.Abort;
                     return Val.of(t, cx);
@@ -3763,7 +3771,18 @@ const Evaluator = struct {
             }
             // The result type is the smallest integer type that can hold the result (e.g.
             // `@min(@as(u8, 3), @as(u16, 5))` is u2)
-            const ty = try value.minMaxIntType(ip, op == .min, operands) orelse return error.Abort;
+            const ty = try value.minMaxIntType(ip, ev.a, op == .min, operands) orelse return error.Abort;
+            // Values outside i128 (including u128 values stored as the bit pattern) are compared
+            // at arbitrary precision
+            for (vals) |v| if (v.v == .big or value.isBigIntType(ip, v.ty) or value.isUnsigned128(ip, v.ty)) {
+                var best = try ev.bigOf(vals[0]) orelse return error.Abort;
+                for (vals[1..]) |w| {
+                    const x = try ev.bigOf(w) orelse return error.Abort;
+                    const ord = bigint.order(x, best);
+                    if ((op == .min and ord == .lt) or (op == .max and ord == .gt)) best = x;
+                }
+                return ev.intFromBig(ty, best);
+            };
             var best = try ev.intArg(vals[0]);
             for (vals[1..]) |v| {
                 const x = try ev.intArg(v);
@@ -3774,14 +3793,11 @@ const Evaluator = struct {
         if (eq(u8, name, "@abs")) {
             if (vals.len != 1) return error.Abort;
             if (ip.isFloat(vals[0].ty)) return try floatResult(vals[0].ty, try value.floatUnary(ip, .abs, vals[0].ty, try ev.floatArg(vals[0])));
-            if (vals[0].ty == .comptime_int_type) {
-                const b = try ev.bigOf(vals[0]) orelse return error.Abort;
-                return Val.ofBig(vals[0].ty, if (b.positive) b else bigint.negate(b));
-            }
-            const x = try ev.intArg(vals[0]);
-            if (x == std.math.minInt(i128)) return error.Abort;
             const ty = try value.absType(ip, vals[0].ty) orelse return error.Abort;
-            return try ev.int(ty, @abs(x));
+            if (ev.intOf(vals[0])) |x| if (x != std.math.minInt(i128) and !value.isUnsigned128(ip, vals[0].ty)) return try ev.int(ty, @abs(x));
+            // Values outside i128, the minimum of i128, and u128 values stored as the bit pattern
+            const b = try ev.bigOf(vals[0]) orelse return error.Abort;
+            return ev.intFromBig(ty, if (b.positive) b else bigint.negate(b));
         }
         // Unary float math functions: compute in the float type of the argument
         if (name.len > 1) if (std.meta.stringToEnum(value.FloatFn, name[1..])) |op| {
@@ -3804,37 +3820,38 @@ const Evaluator = struct {
                 return try floatResult(ty, try value.floatBinary(ip, d[1], ty, try ev.floatArg(vals[0]), try ev.floatArg(vals[1])));
             }
             const ty = value.peerIntType(ip, vals[0].ty, vals[1].ty) orelse return error.Abort;
-            if (ty == .comptime_int_type) {
-                const a = try ev.bigOf(vals[0]) orelse return error.Abort;
-                const b = try ev.bigOf(vals[1]) orelse return error.Abort;
-                const mode: bigint.DivMode = switch (d[1]) {
-                    .div_trunc => .trunc,
-                    .div_floor => .floor,
-                    .div_ceil => .ceil,
-                    .div_exact => .exact,
-                    .mod => .mod,
-                    .rem => .rem,
-                    else => unreachable,
+            // The minimum of i128 divided by -1 overflows i128, and u128 values above i128's range
+            // are stored as the bit pattern: both are computed at arbitrary precision
+            if (!value.isBigIntType(ip, ty) and !value.isUnsigned128(ip, ty)) if (ev.intOf(vals[0])) |x| if (ev.intOf(vals[1])) |y| if (x != std.math.minInt(i128)) {
+                if (y == 0) return error.Abort;
+                const r: i128 = switch (d[1]) {
+                    .div_trunc => @divTrunc(x, y),
+                    .div_floor => @divFloor(x, y),
+                    .div_ceil => @divCeil(x, y),
+                    .div_exact => if (@divTrunc(x, y) * y != x) return error.Abort else @divTrunc(x, y),
+                    .mod => @mod(x, y),
+                    .rem => @rem(x, y),
+                    .min, .max => unreachable,
                 };
-                const r = try bigint.divide(ev.a, mode, a, b) orelse return error.Abort;
-                return Val.ofBig(ty, r);
-            }
-            const x = try ev.intArg(vals[0]);
-            const y = try ev.intArg(vals[1]);
-            // The minimum of i128 divided by -1 overflows (the safety check in the interpreter
-            // would crash the process)
-            if (y == 0 or x == std.math.minInt(i128)) return error.Abort;
-            const r: i128 = switch (d[1]) {
-                .div_trunc => @divTrunc(x, y),
-                .div_floor => @divFloor(x, y),
-                .div_ceil => @divCeil(x, y),
-                .div_exact => if (@divTrunc(x, y) * y != x) return error.Abort else @divTrunc(x, y),
-                .mod => @mod(x, y),
-                .rem => @rem(x, y),
-                .min, .max => unreachable,
+                if (!value.intFits(ip, ty, r)) return error.Abort;
+                return try ev.int(ty, r);
             };
-            if (!value.intFits(ip, ty, r)) return error.Abort;
-            return try ev.int(ty, r);
+            const a = try ev.bigOf(vals[0]) orelse return error.Abort;
+            const b = try ev.bigOf(vals[1]) orelse return error.Abort;
+            const mode: bigint.DivMode = switch (d[1]) {
+                .div_trunc => .trunc,
+                .div_floor => .floor,
+                .div_ceil => .ceil,
+                .div_exact => .exact,
+                .mod => .mod,
+                .rem => .rem,
+                else => unreachable,
+            };
+            const r = if (ty == .comptime_int_type)
+                try bigint.divide(ev.a, mode, a, b)
+            else
+                try bigint.divideTyped(ev.a, mode, value.intInfo(ip, ty) orelse return error.Abort, a, b);
+            return ev.intFromBig(ty, r orelse return error.Abort);
         };
         const overflow_ops = [_]struct { []const u8, value.OverflowOp }{
             .{ "@addWithOverflow", .add }, .{ "@subWithOverflow", .sub }, .{ "@mulWithOverflow", .mul }, .{ "@shlWithOverflow", .shl },
@@ -3844,32 +3861,62 @@ const Evaluator = struct {
             // The result type is the peer type of both sides (for `@shlWithOverflow`, the type of
             // the left side)
             const ty = if (o[1] == .shl) vals[0].ty else value.peerIntType(ip, vals[0].ty, vals[1].ty) orelse return error.Abort;
-            const result, const overflow = value.overflowInt(ip, o[1], ty, try ev.intArg(vals[0]), try ev.intArg(vals[1])) orelse return error.Abort;
+            const result: Val, const overflow: bool = if (value.wideIntType(ip, ty)) |t| blk: {
+                const a = try ev.bigOf(vals[0]) orelse return error.Abort;
+                const b = try ev.bigOf(vals[1]) orelse return error.Abort;
+                const bin: SyntaxKind = switch (o[1]) {
+                    .add => .plus,
+                    .sub => .minus,
+                    .mul => .asterisk,
+                    .shl => .angle_bracket_angle_bracket_left,
+                };
+                const r, const overflow = try bigint.overflowTyped(ev.a, bin, t, a, b) orelse return error.Abort;
+                break :blk .{ Val.ofBig(ty, r), overflow };
+            } else blk: {
+                const r, const overflow = value.overflowInt(ip, o[1], ty, try ev.intArg(vals[0]), try ev.intArg(vals[1])) orelse return error.Abort;
+                break :blk .{ try ev.int(ty, r), overflow };
+            };
             const tuple = try ip.get(.{ .tuple_type = .{ .types = &.{ ty, .u1_type } } });
-            const elems = [_]Index{ (try ev.freeze(try ev.int(ty, result))).?, (try ev.freeze(try ev.int(.u1_type, @intFromBool(overflow)))).? };
+            const elems = [_]Index{ (try ev.freeze(result)).?, (try ev.freeze(try ev.int(.u1_type, @intFromBool(overflow)))).? };
             return Val.of(tuple, try ev.aggregate(tuple, &elems));
         };
         if (eq(u8, name, "@shlExact") or eq(u8, name, "@shrExact")) {
             if (vals.len != 2) return error.Abort;
+            const left = eq(u8, name, "@shlExact");
             if (vals[0].ty == .comptime_int_type) {
                 const a = try ev.bigOf(vals[0]) orelse return error.Abort;
                 const n = try ev.intArg(vals[1]);
-                if (n < 0) return error.Abort;
-                const r = try bigint.exactShift(ev.a, eq(u8, name, "@shlExact"), a, @intCast(n)) orelse return error.Abort;
+                const r = try bigint.exactShift(ev.a, left, a, std.math.cast(usize, n) orelse return error.Abort) orelse return error.Abort;
                 return Val.ofBig(vals[0].ty, r);
             }
-            const r = value.exactShift(ip, eq(u8, name, "@shlExact"), vals[0].ty, try ev.intArg(vals[0]), try ev.intArg(vals[1])) orelse return error.Abort;
+            if (value.wideIntType(ip, vals[0].ty)) |t| {
+                const a = try ev.bigOf(vals[0]) orelse return error.Abort;
+                const b = try ev.bigOf(vals[1]) orelse return error.Abort;
+                return Val.ofBig(vals[0].ty, try bigint.exactShiftTyped(ev.a, left, t, a, b) orelse return error.Abort);
+            }
+            const r = value.exactShift(ip, left, vals[0].ty, try ev.intArg(vals[0]), try ev.intArg(vals[1])) orelse return error.Abort;
             return try ev.int(vals[0].ty, r);
         }
         if (eq(u8, name, "@byteSwap") or eq(u8, name, "@bitReverse")) {
             if (vals.len != 1) return error.Abort;
-            const r = value.reverseBits(ip, eq(u8, name, "@byteSwap"), vals[0].ty, try ev.intArg(vals[0])) orelse return error.Abort;
+            const bytes = eq(u8, name, "@byteSwap");
+            if (value.wideIntType(ip, vals[0].ty)) |t| {
+                const a = try ev.bigOf(vals[0]) orelse return error.Abort;
+                return Val.ofBig(vals[0].ty, try bigint.reverseBitsTyped(ev.a, bytes, t, a) orelse return error.Abort);
+            }
+            const r = value.reverseBits(ip, bytes, vals[0].ty, try ev.intArg(vals[0])) orelse return error.Abort;
             return try ev.int(vals[0].ty, r);
         }
         if (eq(u8, name, "@clz") or eq(u8, name, "@ctz") or eq(u8, name, "@popCount")) {
             if (vals.len != 1) return error.Abort;
             const info = value.intInfo(ip, vals[0].ty) orelse return error.Abort;
-            if (info.bits > 128) return error.Abort;
+            // Result type: an unsigned integer that can hold the bit width
+            const result_ty = try ip.intType(.unsigned, @intCast(128 - @clz(@as(u128, info.bits))));
+            if (info.bits > 128) {
+                const a = try ev.bigOf(vals[0]) orelse return error.Abort;
+                const which: bigint.BitCount = if (eq(u8, name, "@popCount")) .pop_count else if (eq(u8, name, "@clz")) .clz else .ctz;
+                return try ev.int(result_ty, bigint.bitCountTyped(info, a, which) orelse return error.Abort);
+            }
             const x = try ev.intArg(vals[0]);
             // Take the two's complement representation at the bit width
             const bits: u128 = if (info.bits == 128) @bitCast(x) else @as(u128, @bitCast(x)) & ((@as(u128, 1) << @intCast(info.bits)) - 1);
@@ -3881,9 +3928,7 @@ const Evaluator = struct {
                 @intCast(@clz(bits) - (128 - info.bits))
             else
                 @ctz(bits);
-            // Result type: an unsigned integer that can hold the bit width
-            const result_bits: u16 = @intCast(128 - @clz(@as(u128, info.bits)));
-            return try ev.int(try ip.intType(.unsigned, result_bits), n);
+            return try ev.int(result_ty, n);
         }
         return null;
     }
@@ -4233,29 +4278,29 @@ const Evaluator = struct {
         if (eq(u8, name, "@bitCast")) if (try ev.floatBitCast(v, t)) |r| return r;
         if (eq(u8, name, "@intCast") or eq(u8, name, "@truncate") or eq(u8, name, "@bitCast")) {
             if (ev.intOf(v)) |x| {
-                if (eq(u8, name, "@intCast")) {
-                    if (!value.intFitsFrom(ip, v.ty, t, x)) return error.Abort;
-                    return ev.int(t, x);
-                }
+                if (eq(u8, name, "@intCast")) return try ev.convertInt(v.ty, t, x) orelse error.Abort;
                 const info = value.intInfo(ip, t) orelse return error.Abort;
                 if (eq(u8, name, "@bitCast")) {
                     const src = value.intInfo(ip, v.ty) orelse return error.Abort;
                     if (src.bits != info.bits) return error.Abort;
                 }
+                if (info.bits > 128) return ev.intFromBig(t, try bigint.wrap(ev.a, try value.bigOfInt(ip, ev.a, v.ty, x), info));
                 const r = value.binaryInt(ip, .plus_percent, t, x, 0) orelse return error.Abort;
                 return ev.int(t, r);
             }
-            // A comptime_int outside i128
+            // An integer outside i128
             if (try ev.bigOf(v)) |b| {
                 if (!ip.isInt(t)) return error.Abort;
                 const info = value.intInfo(ip, t) orelse return error.Abort;
-                if (eq(u8, name, "@truncate")) {
-                    const r = try bigint.truncate(ev.a, b, info.signed, info.bits) orelse return error.Abort;
-                    return ev.int(t, r);
+                if (eq(u8, name, "@intCast")) {
+                    if (!bigint.fits(b, info)) return error.Abort;
+                    return ev.intFromBig(t, b);
                 }
-                if (!eq(u8, name, "@intCast")) return error.Abort;
-                const cx = try value.coerceValue(ip, try ev.ipOf(v) orelse return .{ .ty = t }, t) orelse return error.Abort;
-                return Val.of(t, cx);
+                if (eq(u8, name, "@bitCast")) {
+                    const src = value.intInfo(ip, v.ty) orelse return error.Abort;
+                    if (src.bits != info.bits) return error.Abort;
+                }
+                return ev.intFromBig(t, try bigint.wrap(ev.a, b, info));
             }
             return .{ .ty = t };
         }
@@ -4280,7 +4325,14 @@ const Evaluator = struct {
         }
         if (eq(u8, name, "@intFromFloat")) {
             const x = ev.floatOf(v) orelse return .{ .ty = t };
-            if (@abs(x) > 1e38) return error.Abort;
+            if (std.math.isNan(x)) return error.Abort;
+            if (@abs(x) > 1e38) {
+                // Types wider than 128 bits hold larger values
+                const info = value.wideIntType(ip, t) orelse return error.Abort;
+                const b = try bigint.fromFloat(ev.a, x) orelse return error.Abort;
+                if (!bigint.fits(b, info)) return error.Abort;
+                return ev.intFromBig(t, b);
+            }
             const i: i128 = @intFromFloat(@trunc(x));
             if (!value.intFits(ip, t, i)) return error.Abort;
             return ev.int(t, i);
@@ -4340,6 +4392,28 @@ const Evaluator = struct {
     fn int(ev: *Evaluator, ty: Index, x: anytype) Error!Val {
         _ = ev;
         return Val.ofInt(ty, @intCast(x));
+    }
+
+    /// A value of the integer type `ty` (or comptime_int) from an arbitrary-precision value in its
+    /// range; a u128 value above i128's range is stored as the bit pattern
+    fn intFromBig(ev: *Evaluator, ty: Index, b: bigint.Big) Val {
+        if (bigint.toInt(b)) |x| return Val.ofInt(ty, x);
+        if (value.isUnsigned128(ev.ip, ty)) if (b.toInt(u128)) |x| return Val.ofInt(ty, @bitCast(x)) else |_| {};
+        return .{ .ty = ty, .v = .{ .big = b } };
+    }
+
+    /// The integer `x`, stored as a value of type `from` (an integer type or comptime_int), as a
+    /// value of the integer type `to`; null when it is out of range
+    fn convertInt(ev: *Evaluator, from: Index, to: Index, x: i128) EvalError!?Val {
+        const ip = ev.ip;
+        // A u128 value above i128's range is stored as its bit pattern (a negative i128)
+        if (x < 0 and value.isUnsigned128(ip, from)) {
+            if (value.isUnsigned128(ip, to)) return Val.ofInt(to, x);
+            if (!value.isBigIntType(ip, to)) return null;
+            return Val.ofBig(to, try value.bigOfInt(ip, ev.a, from, x));
+        }
+        if (!value.intFits(ip, to, x)) return null;
+        return Val.ofInt(to, x);
     }
 
     fn intArg(ev: *Evaluator, v: Val) EvalError!i128 {

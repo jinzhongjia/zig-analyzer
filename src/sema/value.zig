@@ -19,7 +19,7 @@ const bigint = @import("bigint.zig");
 
 // ── Integers ─────────────────────────────────────────────────────────
 
-pub const IntInfo = struct { signed: bool, bits: u16 };
+pub const IntInfo = bigint.IntType;
 
 /// Signedness and bit width of a fixed-width integer type (usize and C integer types per the
 /// target); null for comptime_int and when the bit width or signedness is unknown
@@ -36,6 +36,20 @@ pub fn intInfo(ip: *InternPool, t: Index) ?IntInfo {
         },
         else => null,
     };
+}
+
+/// Signedness and bit width of a fixed-width integer type wider than 128 bits. Values of these
+/// types are computed with arbitrary precision (`bigint`); a value outside the range of i128 is
+/// interned as `big_int`. Null for other types.
+pub fn wideIntType(ip: *InternPool, t: Index) ?IntInfo {
+    const info = intInfo(ip, t) orelse return null;
+    return if (info.bits > 128) info else null;
+}
+
+/// Whether integer values of the type are computed with arbitrary precision when they are
+/// outside the range of i128: comptime_int and fixed-width types wider than 128 bits
+pub fn isBigIntType(ip: *InternPool, t: Index) bool {
+    return t == .comptime_int_type or wideIntType(ip, t) != null;
 }
 
 /// Result type of `@abs` (matches the compiler's `zirAbs` and `Type.toUnsigned`): signed integer
@@ -88,7 +102,7 @@ const Wide = i256;
 
 const Bounds = struct { min: Wide, max: Wide };
 
-/// Null when the bit width exceeds 128 (values are stored as i128; anything wider is not folded)
+/// Null when the bit width exceeds 128: such types are computed by `bigint`
 fn bounds(info: IntInfo) ?Bounds {
     if (info.bits > 128) return null;
     if (info.bits == 0) return .{ .min = 0, .max = 0 };
@@ -152,32 +166,23 @@ fn fit(ip: *InternPool, ty: Index, v: Wide, mode: Overflow) ?i128 {
 }
 
 /// Comparison of two integer values of the given types: unsigned 128-bit values above i128's
-/// range are stored as the bit pattern, so they are compared as u128
+/// range are stored as the bit pattern, so each side is first read as the number it stores
 pub fn compareInts(ip: *InternPool, op: SyntaxKind, a_ty: Index, b_ty: Index, a: i128, b: i128) bool {
-    if (isUnsigned128(ip, a_ty) or isUnsigned128(ip, b_ty)) {
-        const x: u128 = @bitCast(a);
-        const y: u128 = @bitCast(b);
-        return switch (op) {
-            .equal_equal => x == y,
-            .bang_equal => x != y,
-            .angle_bracket_left => x < y,
-            .angle_bracket_right => x > y,
-            .angle_bracket_left_equal => x <= y,
-            else => x >= y,
-        };
-    }
+    const x: Wide = if (isUnsigned128(ip, a_ty)) @as(u128, @bitCast(a)) else a;
+    const y: Wide = if (isUnsigned128(ip, b_ty)) @as(u128, @bitCast(b)) else b;
     return switch (op) {
-        .equal_equal => a == b,
-        .bang_equal => a != b,
-        .angle_bracket_left => a < b,
-        .angle_bracket_right => a > b,
-        .angle_bracket_left_equal => a <= b,
-        else => a >= b,
+        .equal_equal => x == y,
+        .bang_equal => x != y,
+        .angle_bracket_left => x < y,
+        .angle_bracket_right => x > y,
+        .angle_bracket_left_equal => x <= y,
+        else => x >= y,
     };
 }
 
 /// Result type of a binary integer operation at comptime (`ty` is the result type); null when the
-/// result is not determined or the compiler would report an error
+/// result is not determined or the compiler would report an error. Types wider than 128 bits
+/// give null: they are computed by `bigint.binaryTyped`.
 pub fn binaryInt(ip: *InternPool, op: SyntaxKind, ty: Index, a: i128, b: i128) ?i128 {
     const info: ?IntInfo = if (ty == .comptime_int_type) null else intInfo(ip, ty) orelse return null;
     const x: Wide = if (info) |i| toWide(i, a) else a;
@@ -327,9 +332,11 @@ pub fn negate(ip: *InternPool, ty: Index, a: i128, wrapping: bool) ?i128 {
     return fit(ip, ty, -x, if (wrapping) .wrap else .check);
 }
 
-/// `~x`: defined only for fixed-width integers
+/// `~x`: defined only for fixed-width integers of at most 128 bits (wider ones are computed by
+/// `bigint.bitNotTyped`)
 pub fn bitNot(ip: *InternPool, ty: Index, a: i128) ?i128 {
     const info = intInfo(ip, ty) orelse return null;
+    if (info.bits > 128) return null;
     return fit(ip, ty, truncate(info, ~toWide(info, a)), .check);
 }
 
@@ -338,7 +345,7 @@ pub fn bitNot(ip: *InternPool, ty: Index, a: i128) ?i128 {
 pub fn typeOfValue(ip: *InternPool, v: Index) Index {
     return switch (ip.key(v)) {
         .int_value => |i| i.ty,
-        .big_int => .comptime_int_type,
+        .big_int => |b| b.ty,
         .enum_literal => .enum_literal_type,
         .enum_tag => |t| t.ty,
         .enum_unnamed => |u| u.ty,
@@ -377,14 +384,34 @@ pub fn peerIntType(ip: *InternPool, a: Index, b: Index) ?Index {
 
 /// Whether the value is in the range of the integer type (always true for comptime_int)
 pub fn intFits(ip: *InternPool, ty: Index, v: i128) bool {
-    return fit(ip, ty, v, .check) != null;
+    if (ty == .comptime_int_type) return true;
+    const info = intInfo(ip, ty) orelse return false;
+    // Every i128 value is in the range of a signed type wider than 128 bits, and every
+    // nonnegative one in the range of an unsigned one
+    const b = bounds(info) orelse return info.signed or v >= 0;
+    return v >= b.min and v <= b.max;
 }
 
 /// Whether the value, stored as a value of type `from`, is in the range of the integer type `to`
+/// and stored there as the same i128 (a u128 value above i128's range is a `big_int` in wider
+/// types; see `convertInt`)
 pub fn intFitsFrom(ip: *InternPool, from: Index, to: Index, v: i128) bool {
     if (from == .comptime_int_type) return intFits(ip, to, v);
     const info = intInfo(ip, from) orelse return intFits(ip, to, v);
+    if (!wideStorage(info) or v >= 0) return intFits(ip, to, v);
     return fit(ip, to, toWide(info, v), .check) != null;
+}
+
+/// The integer value `v`, stored as a value of type `from` (an integer type or comptime_int),
+/// converted to the integer type `to`; null when it is out of range
+pub fn convertInt(ip: *InternPool, from: Index, to: Index, v: i128) Allocator.Error!?Index {
+    if (intFitsFrom(ip, from, to, v)) return try ip.get(.{ .int_value = .{ .ty = to, .value = v } });
+    // A u128 value above i128's range: the bit pattern is a negative i128
+    if (!isUnsigned128(ip, from) or !isBigIntType(ip, to)) return null;
+    var limbs: [2]std.math.big.Limb = undefined;
+    var m: std.math.big.int.Mutable = .init(&limbs, @as(u128, @bitCast(v)));
+    var buf: [64]u8 = undefined;
+    return try internBigWith(ip, to, m.toConst(), std.fmt.bufPrint(&buf, "{d}", .{@as(u128, @bitCast(v))}) catch unreachable);
 }
 
 /// Result type of `@min` / `@max` with integer operands (matches the compiler's `analyzeMinMax`):
@@ -394,11 +421,20 @@ pub fn intFitsFrom(ip: *InternPool, from: Index, to: Index, v: i128) bool {
 /// same length) give a vector of that type, the range of a known vector value spanning its
 /// elements. Null when an operand is not an integer (or a vector of integers) or a range cannot
 /// be computed.
-pub fn minMaxIntType(ip: *InternPool, is_min: bool, operands: []const InternPool.TypedValue) Allocator.Error!?Index {
+pub fn minMaxIntType(ip: *InternPool, allocator: Allocator, is_min: bool, operands: []const InternPool.TypedValue) Allocator.Error!?Index {
     const vector_len: ?u32 = switch (ip.key(operands[0].ty)) {
         .vector_type => |v| v.len,
         else => null,
     };
+    // Types wider than 128 bits, values outside i128's range, and u128 (whose values above
+    // i128's range are stored as the bit pattern) need arbitrary precision
+    for (operands) |o| {
+        const scalar = switch (ip.key(o.ty)) {
+            .vector_type => |v| v.child,
+            else => o.ty,
+        };
+        if (wideIntType(ip, scalar) != null or isUnsigned128(ip, scalar) or (o.val != null and hasBigInt(ip, o.val.?))) return minMaxIntTypeBig(ip, allocator, is_min, operands, vector_len);
+    }
     var result: Bounds = undefined;
     var all_comptime = true;
     for (operands, 0..) |o, i| {
@@ -421,6 +457,72 @@ pub fn minMaxIntType(ip: *InternPool, is_min: bool, operands: []const InternPool
     const signed = result.min < 0;
     const scalar = if (all_comptime) .comptime_int_type else try ip.intType(if (signed) .signed else .unsigned, @max(bitsFor(result.min, signed), bitsFor(result.max, signed)));
     return if (vector_len) |len| try ip.get(.{ .vector_type = .{ .len = len, .child = scalar } }) else scalar;
+}
+
+/// Whether the value or one of its elements is a `big_int`
+fn hasBigInt(ip: *InternPool, v: Index) bool {
+    return switch (ip.key(v)) {
+        .big_int => true,
+        .aggregate => |a| for (a.elems) |e| {
+            if (ip.key(e) == .big_int) break true;
+        } else false,
+        else => false,
+    };
+}
+
+/// `minMaxIntType` at arbitrary precision
+fn minMaxIntTypeBig(ip: *InternPool, allocator: Allocator, is_min: bool, operands: []const InternPool.TypedValue, vector_len: ?u32) Allocator.Error!?Index {
+    const Range = struct { min: bigint.Big, max: bigint.Big };
+    var result: Range = undefined;
+    var all_comptime = true;
+    for (operands, 0..) |o, i| {
+        const scalar = switch (ip.key(o.ty)) {
+            .vector_type => |v| if (v.len == vector_len) v.child else return null,
+            else => if (vector_len == null) o.ty else return null,
+        };
+        const known: ?Range = if (vector_len != null) blk: {
+            const elems = switch (ip.key(o.val orelse break :blk null)) {
+                .aggregate => |a| a.elems,
+                else => break :blk null,
+            };
+            if (elems.len == 0) break :blk null;
+            var r: Range = undefined;
+            for (elems, 0..) |e, j| {
+                const x = try bigValueOf(ip, allocator, e) orelse break :blk null;
+                r = if (j == 0) .{ .min = x, .max = x } else .{
+                    .min = if (bigint.order(x, r.min) == .lt) x else r.min,
+                    .max = if (bigint.order(x, r.max) == .gt) x else r.max,
+                };
+            }
+            break :blk r;
+        } else if (try bigValueOf(ip, allocator, o.val)) |x| .{ .min = x, .max = x } else null;
+        const r: Range = known orelse blk: {
+            if (scalar == .comptime_int_type) return null;
+            const t = intInfo(ip, scalar) orelse return null;
+            break :blk .{ .min = try bigint.limit(allocator, t, false), .max = try bigint.limit(allocator, t, true) };
+        };
+        if (scalar != .comptime_int_type) all_comptime = false;
+        result = if (i == 0) r else .{
+            .min = pick(is_min, result.min, r.min),
+            .max = pick(is_min, result.max, r.max),
+        };
+    }
+    // Same as the compiler's `intFittingRange`
+    const signed = !result.min.positive;
+    const bits = @max(bigBitsFor(result.min, signed), bigBitsFor(result.max, signed));
+    const scalar = if (all_comptime) .comptime_int_type else try ip.intType(if (signed) .signed else .unsigned, std.math.cast(u16, bits) orelse return null);
+    return if (vector_len) |len| try ip.get(.{ .vector_type = .{ .len = len, .child = scalar } }) else scalar;
+}
+
+/// The smaller (`is_min`) or larger of two values
+fn pick(is_min: bool, a: bigint.Big, b: bigint.Big) bigint.Big {
+    const a_greater = bigint.order(a, b) == .gt;
+    return if (is_min == a_greater) b else a;
+}
+
+/// `bitsFor` at arbitrary precision
+fn bigBitsFor(x: bigint.Big, signed: bool) usize {
+    return if (signed) x.bitCountTwosCompForSignedness(.signed) else x.bitCountAbs();
 }
 
 /// Smallest and largest element of a known vector value of integers
@@ -698,26 +800,56 @@ pub fn intOf(ip: *InternPool, v: ?Index) ?i128 {
     };
 }
 
-/// The arbitrary-precision value of an interned `comptime_int`
-pub fn bigValueOf(ip: *InternPool, allocator: Allocator, v: Index) Allocator.Error!?bigint.Big {
-    return switch (ip.key(v)) {
+/// The arbitrary-precision value of an interned integer value (of any integer type)
+pub fn bigValueOf(ip: *InternPool, allocator: Allocator, v: ?Index) Allocator.Error!?bigint.Big {
+    return switch (ip.key(v orelse return null)) {
         .big_int => |b| .{ .limbs = b.limbs, .positive = b.positive },
-        .int_value => |i| if (i.ty == .comptime_int_type) try bigint.fromInt(allocator, i.value) else null,
+        .int_value => |i| try bigOfInt(ip, allocator, i.ty, i.value),
         else => null,
     };
 }
 
-/// Like `bigValueOf`, also converting other integer values (a shift amount of a fixed-width
-/// type)
-pub fn bigValueOfAny(ip: *InternPool, allocator: Allocator, v: ?Index) Allocator.Error!?bigint.Big {
-    if (try bigValueOf(ip, allocator, v orelse return null)) |b| return b;
-    return try bigint.fromInt(allocator, intOf(ip, v) orelse return null);
+/// The number stored as `v` in a value of the integer type `ty` (or comptime_int)
+pub fn bigOfInt(ip: *InternPool, allocator: Allocator, ty: Index, v: i128) Allocator.Error!bigint.Big {
+    if (v < 0 and isUnsigned128(ip, ty)) return bigint.fromUnsigned128(allocator, @bitCast(v));
+    return bigint.fromInt(allocator, v);
 }
 
-/// Interns a `comptime_int` value; a value in the range of i128 is interned as `int_value`
-pub fn internComptimeInt(ip: *InternPool, allocator: Allocator, b: bigint.Big) Allocator.Error!Index {
-    if (bigint.toInt(b)) |x| return ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = x } });
-    return ip.get(.{ .big_int = .{ .positive = b.positive, .limbs = b.limbs, .decimal = try bigint.decimalAlloc(allocator, b) } });
+/// Binary integer operation at arbitrary precision with result type `ty` (see `isBigIntType`;
+/// for shifts, the type of the left side); null when it is not such a type or the result is not
+/// defined
+pub fn binaryBig(ip: *InternPool, allocator: Allocator, op: SyntaxKind, ty: Index, a: bigint.Big, b: bigint.Big) Allocator.Error!?bigint.Big {
+    if (ty == .comptime_int_type) return bigint.binary(allocator, op, a, b);
+    return bigint.binaryTyped(allocator, op, wideIntType(ip, ty) orelse return null, a, b);
+}
+
+/// `-x` / `-%x` / `~x` at arbitrary precision on a value of type `ty` (see `isBigIntType`); null
+/// when it is not such a type or the result is not defined
+pub fn unaryBig(ip: *InternPool, allocator: Allocator, op: SyntaxKind, ty: Index, a: bigint.Big) Allocator.Error!?bigint.Big {
+    // Only `-` is folded for comptime_int (`~` is not defined for it)
+    if (ty == .comptime_int_type) return if (op == .minus) bigint.negate(a) else null;
+    const t = wideIntType(ip, ty) orelse return null;
+    return switch (op) {
+        .minus => bigint.negateTyped(allocator, t, a, false),
+        .minus_percent => bigint.negateTyped(allocator, t, a, true),
+        .tilde => bigint.bitNotTyped(allocator, t, a),
+        else => null,
+    };
+}
+
+/// Interns the value `b` of type `ty` (comptime_int, or a fixed-width integer type whose range
+/// holds `b`): as `int_value` when it is in the range of i128 (for u128, the range of u128),
+/// otherwise as `big_int`
+pub fn internInt(ip: *InternPool, allocator: Allocator, ty: Index, b: bigint.Big) Allocator.Error!Index {
+    if (bigint.toInt(b)) |x| return ip.get(.{ .int_value = .{ .ty = ty, .value = x } });
+    if (isUnsigned128(ip, ty)) if (b.toInt(u128)) |x| return ip.get(.{ .int_value = .{ .ty = ty, .value = @bitCast(x) } }) else |_| {};
+    return internBigWith(ip, ty, b, try bigint.decimalAlloc(allocator, b));
+}
+
+/// Interns `b`, which is outside i128's range, as a `big_int` of type `ty`; `decimal` holds the
+/// digits of its magnitude
+fn internBigWith(ip: *InternPool, ty: Index, b: bigint.Big, decimal: []const u8) Allocator.Error!Index {
+    return ip.get(.{ .big_int = .{ .ty = ty, .positive = b.positive, .limbs = b.limbs, .decimal = decimal } });
 }
 
 // ── Size and alignment ───────────────────────────────────────────────
@@ -856,12 +988,11 @@ pub fn bitsOf(bytes: u64) ?u64 {
 /// Layout (`std.zig.target.intAlignment` / `intByteSize`) of a fixed-width integer type,
 /// including the backing integer of a packed container and the tag of an enum: the alignment is
 /// the byte size rounded up to a power of 2, but no larger than the target's maximum integer
-/// alignment. Null when the maximum alignment differs between modules and affects the alignment
-/// of this bit width.
+/// alignment; the same rule applies to every bit width. Null when the maximum alignment differs
+/// between modules and affects the alignment of this bit width.
 pub fn intLayout(ip: *InternPool, bits: u16) ?Layout {
     if (bits == 0) return .{ .size = 0, .alignment = 1, .bits = 0 };
-    if (bits > 128) return null;
-    const bytes: u64 = (bits + 7) / 8;
+    const bytes: u64 = (@as(u64, bits) + 7) / 8;
     const natural = std.math.ceilPowerOfTwoAssert(u64, bytes);
     const max_align = ip.scalarAbi().max_int_align;
     const alignment = @min(natural, max_align.min);
@@ -1275,13 +1406,14 @@ pub fn eqlValues(ip: *InternPool, a: Index, b: Index) ?bool {
         .int_value => |x| switch (kb) {
             .int_value => |y| x.value == y.value,
             // An integer that does not fit i128 is outside the range of every stored int_value
-            .big_int => false,
+            // other than the bit patterns of u128
+            .big_int => |y| eqlUnsigned128(ip, x, y),
             .float_value => |y| @as(f128, @floatFromInt(x.value)) == @as(f128, @bitCast(y.bits)),
             else => null,
         },
         .big_int => |x| switch (kb) {
             .big_int => |y| x.positive == y.positive and std.mem.eql(std.math.big.Limb, x.limbs, y.limbs),
-            .int_value => false,
+            .int_value => |y| eqlUnsigned128(ip, y, x),
             .float_value => |y| bigint.toFloat(.{ .limbs = x.limbs, .positive = x.positive }) == @as(f128, @bitCast(y.bits)),
             else => null,
         },
@@ -1332,6 +1464,13 @@ pub fn eqlValues(ip: *InternPool, a: Index, b: Index) ?bool {
         },
         else => null,
     };
+}
+
+/// Whether the stored u128 value `x` above i128's range equals `y`
+fn eqlUnsigned128(ip: *InternPool, x: @FieldType(InternPool.Key, "int_value"), y: @FieldType(InternPool.Key, "big_int")) bool {
+    if (x.value >= 0 or !y.positive or !isUnsigned128(ip, x.ty)) return false;
+    const b: bigint.Big = .{ .limbs = y.limbs, .positive = y.positive };
+    return (b.toInt(u128) catch return false) == @as(u128, @bitCast(x.value));
 }
 
 /// Interns an aggregate value: when all elements are u8 integers it is represented as a string
@@ -1406,7 +1545,15 @@ pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index 
     if (ip.isInt(to)) switch (ip.key(v)) {
         .float_value => |f| {
             const x: f128 = @bitCast(f.bits);
-            if (@trunc(x) != x or @abs(x) > 1e38) return null;
+            if (@trunc(x) != x) return null;
+            if (@abs(x) > 1e38) {
+                if (!isBigIntType(ip, to)) return null;
+                var arena: std.heap.ArenaAllocator = .init(ip.gpa);
+                defer arena.deinit();
+                const b = try bigint.fromFloat(arena.allocator(), x) orelse return null;
+                if (wideIntType(ip, to)) |t| if (!bigint.fits(b, t)) return null;
+                return try internInt(ip, arena.allocator(), to, b);
+            }
             const i: i128 = @intFromFloat(x);
             if (!intFits(ip, to, i)) return null;
             return try ip.get(.{ .int_value = .{ .ty = to, .value = i } });
@@ -1415,17 +1562,18 @@ pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index 
     };
     if (ip.isInt(to)) switch (ip.key(v)) {
         .big_int => |b| {
-            const info = intInfo(ip, to) orelse return null;
-            if (info.bits > 128) return null;
+            if (b.ty == to) return v;
             const big: bigint.Big = .{ .limbs = b.limbs, .positive = b.positive };
-            if (!big.fitsInTwosComp(if (info.signed) .signed else .unsigned, info.bits)) return null;
+            if (to == .comptime_int_type) return try internBigWith(ip, to, big, b.decimal);
+            const info = intInfo(ip, to) orelse return null;
+            if (!bigint.fits(big, info)) return null;
+            if (info.bits > 128) return try internBigWith(ip, to, big, b.decimal);
             const x: i128 = if (info.signed) big.toInt(i128) catch return null else @bitCast(big.toInt(u128) catch return null);
             return try ip.get(.{ .int_value = .{ .ty = to, .value = x } });
         },
         .int_value => |i| {
             if (i.ty == to) return v;
-            if (!intFitsFrom(ip, i.ty, to, i.value)) return null;
-            return try ip.get(.{ .int_value = .{ .ty = to, .value = i.value } });
+            return convertInt(ip, i.ty, to, i.value);
         },
         else => {},
     };
@@ -1596,8 +1744,8 @@ test "integer folding follows the type's width" {
     try testing.expectEqual(@as(?i128, 2), binaryInt(&ip, .angle_bracket_angle_bracket_left, u8_t, 0x81, 1));
     try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .angle_bracket_angle_bracket_left, u8_t, 1, 8));
     try testing.expectEqual(@as(?i128, 1 << 100), binaryInt(&ip, .angle_bracket_angle_bracket_left, .comptime_int_type, 1, 100));
-    // Types wider than 128 bits are not folded: a shift amount above 255 cannot be @intCast
-    // to u8
+    // Types wider than 128 bits are left to `binaryBig` (a shift amount above 255 does not fit
+    // the u8 shift of the machine integer)
     const u1000_t = try ip.intType(.unsigned, 1000);
     try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .angle_bracket_angle_bracket_right, u1000_t, 5, 300));
     try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .slash, i8_t, -4, 2));
