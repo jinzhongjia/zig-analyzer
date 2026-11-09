@@ -1433,15 +1433,21 @@ fn scanOnce(server: *Server) Allocator.Error!void {
         }
     }.lt);
     // A write transaction cancels in-flight requests: write only when the files differ. Scans run
-    // one at a time, so nobody else changes the input after the comparison.
-    const unchanged = blk: {
-        var ctx = server.db.beginRead(a);
-        defer ctx.end();
-        const current = ctx.get(WorkspaceFiles, {}) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Canceled => break :blk false,
+    // one at a time, so nobody else changes the input after the comparison. A comparison canceled
+    // by a write transaction (an edit) tells nothing about the files: it is made again once that
+    // write has taken the lock (see `Db.waitPendingWrites`)
+    const unchanged = while (true) {
+        const same: ?bool = blk: {
+            var ctx = server.db.beginRead(a);
+            defer ctx.end();
+            const current = ctx.get(WorkspaceFiles, {}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Canceled => break :blk null,
+            };
+            break :blk std.mem.eql(Vfs.FileId, current, files);
         };
-        break :blk std.mem.eql(Vfs.FileId, current, files);
+        if (same) |s| break s;
+        server.db.waitPendingWrites();
     };
     if (unchanged) return;
     {
@@ -5078,6 +5084,40 @@ test "updateModuleGraph takes no write transaction when nothing changed" {
     server.default_builtin = try std.testing.allocator.dupe(u8, "/zig-analyzer-test/builtin.zig");
     try server.updateModuleGraphInner();
     try std.testing.expectEqual(writes + 1, server.db.writes.load(.monotonic));
+}
+
+test "scanOnce: a comparison canceled by an edit is made again instead of writing the same files" {
+    // Guards against a scan that found the files already recorded writing them again when an
+    // edit's write transaction canceled its comparison: that write advanced the revision and
+    // canceled the requests in flight
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, std.testing.allocator, &writer);
+    defer server.deinit();
+    const revision = server.db.revision;
+    const writes = server.db.writes.load(.monotonic);
+    // An edit's write transaction has registered and has not taken the lock yet, as between
+    // `Db.beginWriteOf` registering it and locking: the scan's comparison is canceled
+    _ = server.db.pending_write.fetchAdd(1, .seq_cst);
+    var done: std.atomic.Value(bool) = .init(false);
+    const Scan = struct {
+        fn run(s: *Server, d: *std.atomic.Value(bool)) void {
+            defer d.store(true, .release);
+            s.scanOnce() catch |err| std.debug.panic("scan failed: {t}", .{err});
+        }
+    };
+    const scan = try std.Thread.spawn(.{}, Scan.run, .{ &server, &done });
+    // The scan either waits for the edit or finishes without waiting for it
+    while (!done.load(.acquire) and server.db.pending_write_waiters.load(.seq_cst) == 0) std.Thread.yield() catch {};
+    // The edit takes the lock
+    _ = server.db.pending_write.fetchSub(1, .seq_cst);
+    std.testing.io.futexWake(u32, &server.db.pending_write.raw, std.math.maxInt(u32));
+    scan.join();
+    // No root directories, so no source files: the same as recorded, nothing to write
+    try std.testing.expectEqual(writes, server.db.writes.load(.monotonic));
+    try std.testing.expectEqual(revision, server.db.revision);
 }
 
 /// Whether to publish live diagnostics for the file: it belongs to no project, or one of the
