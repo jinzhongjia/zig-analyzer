@@ -1175,6 +1175,135 @@ fn allPrecise(ip: *InternPool, items: []const Index) bool {
     return true;
 }
 
+/// Whether `full` is `partial` with unknown parts filled in: every part that `partial` knows is
+/// the same in `full`. The parts that can be filled in are `unknown` (as a type, a comptime field
+/// value of a tuple or anonymous struct, or an argument of an instance), an array length that
+/// cannot be evaluated (`InternPool.Key.abstract_array_type` without `len`), a pointer alignment,
+/// an address space or a calling convention that cannot be evaluated, and an undetermined loop
+/// iteration of an instance. A part that depends on an abstract parameter is known only as itself,
+/// since no evaluation outside an instance determines it.
+pub fn completes(ip: *InternPool, partial: Index, full: Index) bool {
+    if (partial == full or partial == .unknown) return true;
+    if (full == .unknown) return false;
+    const kf = ip.key(full);
+    return switch (ip.key(partial)) {
+        .unknown => true,
+        .abstract_array_type => |a| a.len == null and switch (kf) {
+            .array_type => |b| completes(ip, a.child, b.child) and completesOptional(ip, a.sentinel, b.sentinel),
+            .abstract_array_type => |b| b.len == null and completes(ip, a.child, b.child) and completesOptional(ip, a.sentinel, b.sentinel),
+            else => false,
+        },
+        .array_type => |a| switch (kf) {
+            .array_type => |b| a.len == b.len and completes(ip, a.child, b.child) and completesOptional(ip, a.sentinel, b.sentinel),
+            else => false,
+        },
+        .ptr_type => |p| switch (kf) {
+            .ptr_type => |q| p.size == q.size and p.is_const == q.is_const and completesPtrAttrs(p.attrs, q.attrs) and
+                completes(ip, p.child, q.child) and completesOptional(ip, p.sentinel, q.sentinel),
+            else => false,
+        },
+        .optional_type => |c| switch (kf) {
+            .optional_type => |d| completes(ip, c, d),
+            else => false,
+        },
+        .error_union_type => |e| switch (kf) {
+            .error_union_type => |f| completes(ip, e.err, f.err) and completes(ip, e.payload, f.payload),
+            else => false,
+        },
+        .fn_type => |f| switch (kf) {
+            .fn_type => |g| completesFn(ip, f, g),
+            else => false,
+        },
+        .container_type => |c| switch (kf) {
+            .container_type => |d| c.file == d.file and c.ast_id == d.ast_id and c.kind == d.kind and completesOptional(ip, c.inst, d.inst),
+            else => false,
+        },
+        .tuple_type => |t| switch (kf) {
+            .tuple_type => |u| allComplete(ip, t.types, u.types) and completesFieldValues(ip, t.values, u.values, t.types.len),
+            else => false,
+        },
+        .vector_type => |v| switch (kf) {
+            .vector_type => |w| v.len == w.len and completes(ip, v.child, w.child),
+            else => false,
+        },
+        .anon_struct_type => |t| switch (kf) {
+            .anon_struct_type => |u| eqlNames(t.names, u.names) and eqlOrigins(t.origin, u.origin) and
+                allComplete(ip, t.types, u.types) and completesFieldValues(ip, t.values, u.values, t.types.len),
+            else => false,
+        },
+        .union_tag_type => |u| switch (kf) {
+            .union_tag_type => |w| completes(ip, u, w),
+            else => false,
+        },
+        .instance => |i| switch (kf) {
+            .instance => |j| i.file == j.file and i.decl == j.decl and allComplete(ip, i.args, j.args) and
+                allComplete(ip, i.arg_types, j.arg_types) and completesOptional(ip, i.parent, j.parent) and
+                completesIteration(i.iteration, j.iteration) and completesCaptured(ip, i.captured, j.captured),
+            else => false,
+        },
+        // Interning gives equal keys the same Index, so a known part that is not `full` differs
+        // from it
+        else => false,
+    };
+}
+
+fn allComplete(ip: *InternPool, partial: []const Index, full: []const Index) bool {
+    if (partial.len != full.len) return false;
+    for (partial, full) |p, f| if (!completes(ip, p, f)) return false;
+    return true;
+}
+
+/// Generic parameter and return types are not part of the identity of a function type (see
+/// `InternPool.FnType.generic_bits`), so they need not complete each other; of a generic return
+/// type only the inferred error set is
+fn completesFn(ip: *InternPool, f: InternPool.FnType, g: InternPool.FnType) bool {
+    if (f.params.len != g.params.len or f.varargs != g.varargs or f.is_noinline != g.is_noinline) return false;
+    if (f.comptime_bits != g.comptime_bits or f.noalias_bits != g.noalias_bits or f.generic_bits != g.generic_bits or f.generic_ret != g.generic_ret) return false;
+    if (f.cc.isKnown() and !std.meta.eql(f.cc, g.cc)) return false;
+    for (f.params, g.params, 0..) |x, y, i| {
+        if (!InternPool.FnType.paramBit(f.generic_bits, i) and !completes(ip, x, y)) return false;
+    }
+    if (!f.generic_ret) return completes(ip, f.ret, g.ret);
+    const x = f.genericRetErrorSet(ip) orelse return g.genericRetErrorSet(ip) == null;
+    return completes(ip, x, g.genericRetErrorSet(ip) orelse return false);
+}
+
+fn completesOptional(ip: *InternPool, partial: ?Index, full: ?Index) bool {
+    if (partial == null or full == null) return partial == null and full == null;
+    return completes(ip, partial.?, full.?);
+}
+
+/// A field whose comptime-ness cannot be determined (`unknown`) may become a runtime field or a
+/// comptime field with any value
+fn completesFieldValues(ip: *InternPool, partial: []const Index, full: []const Index, n: usize) bool {
+    for (0..n) |i| if (!completes(ip, InternPool.fieldValue(partial, i), InternPool.fieldValue(full, i))) return false;
+    return true;
+}
+
+fn completesPtrAttrs(partial: InternPool.PtrAttrs, full: InternPool.PtrAttrs) bool {
+    if (partial.host_size != full.host_size or partial.bit_offset != full.bit_offset or partial.is_volatile != full.is_volatile or partial.is_allowzero != full.is_allowzero) return false;
+    if (partial.alignment != .unknown and partial.alignment != full.alignment) return false;
+    return partial.address_space == null or partial.address_space == full.address_space;
+}
+
+fn completesIteration(partial: ?InternPool.Instance.Iteration, full: ?InternPool.Instance.Iteration) bool {
+    const p = partial orelse return full == null;
+    const f = full orelse return false;
+    if (p.binding != f.binding or p.abstract != f.abstract) return false;
+    return p.index == InternPool.Instance.Iteration.unknown_index or p.index == f.index;
+}
+
+/// The values captured by the containers of an instance are part of its identity: `full`
+/// captures the same locals, with types and values that complete those of `partial`. An empty
+/// list states that nothing is captured, so a non-empty one does not complete it.
+fn completesCaptured(ip: *InternPool, partial: []const InternPool.CapturedLocal, full: []const InternPool.CapturedLocal) bool {
+    if (partial.len != full.len) return false;
+    for (partial, full) |p, f| {
+        if (p.binding != f.binding or !completes(ip, p.ty, f.ty) or !completes(ip, p.val, f.val)) return false;
+    }
+    return true;
+}
+
 /// A type without abstract parameters or unknown parts: it can be used outside the instance that
 /// defines it (e.g. as the caller's expected type)
 pub fn isConcrete(ip: *InternPool, t: Index) bool {
@@ -1365,6 +1494,12 @@ fn eqlNames(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
     return true;
+}
+
+fn eqlOrigins(a: ?InternPool.ZonLiteral, b: ?InternPool.ZonLiteral) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    return x.file == y.file and std.mem.eql(u32, x.path, y.path);
 }
 
 fn eqlSentinel(ip: *InternPool, a: ?Index, b: ?Index) ?bool {
@@ -1904,4 +2039,76 @@ test "pointer values are equal by the place they point to, not by the data" {
     const to4 = try ip.get(.{ .ptr_value = .{ .ty = one, .pointee = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 4 } }) } });
     try testing.expectEqual(@as(?bool, null), eqlValues(&ip, to3, to3));
     try testing.expectEqual(@as(?bool, false), eqlValues(&ip, to3, to4));
+}
+
+test "a type completes another only where that one has unknown parts" {
+    var ip: InternPool = try .init(testing.allocator, testing.io);
+    defer ip.deinit();
+    const any_len = try ip.get(.{ .abstract_array_type = .{ .len = null, .child = .u8_type } });
+    const three = try ip.get(.{ .array_type = .{ .len = 3, .child = .u8_type } });
+    const two = try ip.get(.{ .array_type = .{ .len = 2, .child = .u8_type } });
+    const three_u16 = try ip.get(.{ .array_type = .{ .len = 3, .child = try ip.intType(.unsigned, 16) } });
+    const three_z = try ip.get(.{ .array_type = .{ .len = 3, .child = .u8_type, .sentinel = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 0 } }) } });
+    try testing.expect(completes(&ip, any_len, three));
+    try testing.expect(completes(&ip, .unknown, three));
+    try testing.expect(completes(&ip, three, three));
+    try testing.expect(!completes(&ip, any_len, three_u16));
+    try testing.expect(!completes(&ip, any_len, three_z));
+    try testing.expect(!completes(&ip, two, three));
+    try testing.expect(!completes(&ip, three, .unknown));
+    // A length that depends on an abstract parameter is known only as itself
+    const param_len = try ip.get(.{ .abstract_array_type = .{ .len = "n", .child = .u8_type } });
+    try testing.expect(!completes(&ip, param_len, three));
+
+    try testing.expect(completes(&ip, try ip.get(.{ .optional_type = any_len }), try ip.get(.{ .optional_type = three })));
+    try testing.expect(!completes(&ip, try ip.get(.{ .optional_type = any_len }), three));
+    try testing.expect(completes(&ip, try ip.ptrTo(any_len, .one, true), try ip.ptrTo(three, .one, true)));
+    try testing.expect(!completes(&ip, try ip.ptrTo(any_len, .one, true), try ip.ptrTo(three, .one, false)));
+    try testing.expect(completes(&ip, try ip.ptrTo(any_len, .slice, true), try ip.ptrTo(three, .slice, true)));
+    try testing.expect(!completes(&ip, try ip.ptrTo(any_len, .slice, true), try ip.ptrTo(three, .many, true)));
+    const nested = try ip.get(.{ .array_type = .{ .len = 2, .child = any_len } });
+    try testing.expect(completes(&ip, nested, try ip.get(.{ .array_type = .{ .len = 2, .child = three } })));
+    try testing.expect(!completes(&ip, nested, try ip.get(.{ .array_type = .{ .len = 3, .child = three } })));
+
+    // A tuple field whose comptime-ness is unknown may become a comptime field; a runtime field
+    // stays one
+    const two_u8 = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 2 } });
+    const zeros = try ip.get(.{ .bytes = .{ .ty = three, .bytes = &.{ 0, 0, 0 } } });
+    const partial_tuple = try ip.get(.{ .tuple_type = .{ .types = &.{ any_len, .u8_type }, .values = &.{ .unknown, two_u8 } } });
+    try testing.expect(completes(&ip, partial_tuple, try ip.get(.{ .tuple_type = .{ .types = &.{ three, .u8_type }, .values = &.{ zeros, two_u8 } } })));
+    try testing.expect(!completes(&ip, partial_tuple, try ip.get(.{ .tuple_type = .{ .types = &.{ three, .u8_type }, .values = &.{ zeros, .runtime } } })));
+    const runtime_tuple = try ip.get(.{ .tuple_type = .{ .types = &.{any_len} } });
+    try testing.expect(completes(&ip, runtime_tuple, try ip.get(.{ .tuple_type = .{ .types = &.{three} } })));
+    try testing.expect(!completes(&ip, runtime_tuple, try ip.get(.{ .tuple_type = .{ .types = &.{three}, .values = &.{zeros} } })));
+
+    // The type of a generic parameter is not part of the identity of a function type; the
+    // parameter attributes and the other parameter types are
+    const generic_fn = try ip.get(.{ .fn_type = .{ .params = &.{ .bool_type, any_len }, .ret = .void_type, .generic_bits = 1 } });
+    try testing.expect(completes(&ip, generic_fn, try ip.get(.{ .fn_type = .{ .params = &.{ .u8_type, three }, .ret = .void_type, .generic_bits = 1 } })));
+    try testing.expect(!completes(&ip, generic_fn, try ip.get(.{ .fn_type = .{ .params = &.{ .bool_type, three }, .ret = .void_type } })));
+    try testing.expect(!completes(&ip, generic_fn, try ip.get(.{ .fn_type = .{ .params = &.{ .u8_type, three }, .ret = .void_type, .generic_bits = 1, .comptime_bits = 2 } })));
+    try testing.expect(!completes(&ip, generic_fn, try ip.get(.{ .fn_type = .{ .params = &.{ .u8_type, three_u16 }, .ret = .void_type, .generic_bits = 1 } })));
+
+    // Instances with the same arguments of different types are different instances
+    const arg = try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = 3 } });
+    const u16_type = try ip.intType(.unsigned, 16);
+    const inst_any = try ip.get(.{ .instance = .{ .file = @fromBackingInt(@intCast(0)), .decl = @fromBackingInt(@intCast(0)), .args = &.{arg}, .arg_types = &.{.unknown} } });
+    const inst_u8 = try ip.get(.{ .instance = .{ .file = @fromBackingInt(@intCast(0)), .decl = @fromBackingInt(@intCast(0)), .args = &.{arg}, .arg_types = &.{.u8_type} } });
+    const inst_u16 = try ip.get(.{ .instance = .{ .file = @fromBackingInt(@intCast(0)), .decl = @fromBackingInt(@intCast(0)), .args = &.{arg}, .arg_types = &.{u16_type} } });
+    try testing.expect(completes(&ip, inst_any, inst_u8));
+    try testing.expect(!completes(&ip, inst_u8, inst_u16));
+
+    // The values captured by the containers of an instance are part of its identity
+    const cap_val3 = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 3 } });
+    const cap_val4 = try ip.get(.{ .int_value = .{ .ty = .u8_type, .value = 4 } });
+    const cap_none = try ip.get(.{ .instance = .{ .file = @fromBackingInt(@intCast(0)), .decl = @fromBackingInt(@intCast(1)), .args = &.{} } });
+    const cap_any = try ip.get(.{ .instance = .{ .file = @fromBackingInt(@intCast(0)), .decl = @fromBackingInt(@intCast(1)), .args = &.{}, .captured = &.{.{ .binding = 0, .ty = .u8_type, .val = .unknown }} } });
+    const cap_3 = try ip.get(.{ .instance = .{ .file = @fromBackingInt(@intCast(0)), .decl = @fromBackingInt(@intCast(1)), .args = &.{}, .captured = &.{.{ .binding = 0, .ty = .u8_type, .val = cap_val3 }} } });
+    const cap_4 = try ip.get(.{ .instance = .{ .file = @fromBackingInt(@intCast(0)), .decl = @fromBackingInt(@intCast(1)), .args = &.{}, .captured = &.{.{ .binding = 0, .ty = .u8_type, .val = cap_val4 }} } });
+    const cap_other = try ip.get(.{ .instance = .{ .file = @fromBackingInt(@intCast(0)), .decl = @fromBackingInt(@intCast(1)), .args = &.{}, .captured = &.{.{ .binding = 1, .ty = .u8_type, .val = cap_val3 }} } });
+    try testing.expect(completes(&ip, cap_any, cap_3));
+    try testing.expect(!completes(&ip, cap_3, cap_4));
+    try testing.expect(!completes(&ip, cap_any, cap_other));
+    try testing.expect(!completes(&ip, cap_none, cap_3));
+    try testing.expect(!completes(&ip, cap_3, cap_none));
 }
