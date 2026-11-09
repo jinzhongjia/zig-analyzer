@@ -37,6 +37,7 @@ Line numbers refer to Zig 0.17.0, with Zig 0.17.1 in parentheses. The parts of `
 - A maker that exits before sending a build graph failed to configure and is not restarted (see "Restarts" in [design.md](design.md)).
 - Cost: each crash costs one configure of the project (the build runner comes from the cache) and one more build of its steps, during which the "Loading project" progress is shown.
 - Tests (`src/server/workspace_e2e_test.zig`, the maker is ended with `SIGKILL`): "a maker that exits during a build or between builds is restarted, and the new instance builds the saved files", "a maker that keeps exiting before a build completes is restarted three times in a row, then not until build.zig is saved", and "restarting a project keeps the previous compiler diagnostics until the new instance has built".
+- Effect on other tests: the crash can also come after `zig-analyzer/waitIdle` has returned, and the new instance's load, configure and build then add write transactions, a build and publishes of their own. A test that compares such counts checks after counting whether the project was restarted after a crash (`restartedAfterCrash` in `src/server/workspace_e2e_test.zig`), and if so runs again with a new project ("rewriting files on disk without changing their content is not a change").
 
 ## Reproduction
 
