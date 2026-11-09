@@ -217,6 +217,143 @@ test "the server watches files on disk: a change notified under another spelling
     try h.notify("exit", {});
 }
 
+// Prevents missing source files created in directories that held no files of interest, which
+// were not watched (inotify watches each directory on its own; Windows notifications do not tell
+// that a created name is a directory)
+test "the server watches files on disk: source files created in new directories join the workspace" {
+    const main_text = "pub fn shared() void {}\n";
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = main_text },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // The client cannot register file watching dynamically
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "main.zig"));
+    try open(&h, main_uri, main_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    // An empty directory, then a source file in it: workspace symbol and references find it
+    var before = scanDone(&h);
+    try project.tmp.dir.createDirPath(testing.io, "fresh");
+    try waitScanAfter(&h, before);
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "fresh/later.zig", .data = "const main = @import(\"../main.zig\");\npub fn createdLater() void {\n    main.shared();\n}\n" });
+    try waitScanned(&h, Symbol{ .query = "createdLater", .file = "fresh/later.zig" });
+    try testing.expect(try referencedIn(&h, main_uri, main_text, "pub fn shar", "fresh/later.zig"));
+
+    // Nested empty directories created at once, then a source file in the innermost
+    before = scanDone(&h);
+    try project.tmp.dir.createDirPath(testing.io, "fresh/outer/inner");
+    try waitScanAfter(&h, before);
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "fresh/outer/inner/deep.zig", .data = "const main = @import(\"../../../main.zig\");\npub fn createdDeep() void {\n    main.shared();\n}\n" });
+    try waitScanned(&h, Symbol{ .query = "createdDeep", .file = "fresh/outer/inner/deep.zig" });
+    try testing.expect(try referencedIn(&h, main_uri, main_text, "pub fn shar", "fresh/outer/inner/deep.zig"));
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+// Prevents missing the source files of a directory moved into the workspace (no notification names
+// them), and those created later in its empty subdirectories
+test "the server watches files on disk: a directory moved into the workspace joins it" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = "pub fn main() void {}\n" },
+        // Hidden directories are not scanned
+        .{ .path = ".staging/pkg/root.zig", .text = "pub fn movedIn() void {}\n" },
+        .{ .path = ".staging/pkg/inner/deep.zig", .text = "pub fn movedInDeep() void {}\n" },
+    });
+    defer project.deinit();
+    try project.tmp.dir.createDirPath(testing.io, ".staging/pkg/empty");
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(!try (Symbol{ .query = "movedIn", .file = "pkg/root.zig" }).done(&h));
+
+    try project.tmp.dir.rename(".staging/pkg", project.tmp.dir, "pkg", testing.io);
+    try waitScanned(&h, Symbol{ .query = "movedInDeep", .file = "pkg/inner/deep.zig" });
+    try testing.expect(try (Symbol{ .query = "movedIn", .file = "pkg/root.zig" }).done(&h));
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "pkg/empty/later.zig", .data = "pub fn createdInMoved() void {}\n" });
+    try waitScanned(&h, Symbol{ .query = "createdInMoved", .file = "pkg/empty/later.zig" });
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+/// The generation of the last finished pass of the workspace file scan (see `Server.scan_done`):
+/// increases with each pass
+fn scanDone(h: *Harness) u64 {
+    return h.server.scan_done.load(.acquire);
+}
+
+/// The references to the declaration at the end of `needle` in `uri` include one in the file whose
+/// URI ends with `file`
+fn referencedIn(h: *Harness, uri: []const u8, text: []const u8, needle: []const u8, file: []const u8) !bool {
+    const resp = try h.request("textDocument/references", .{ .textDocument = .{ .uri = uri }, .position = position(text, needle), .context = .{ .includeDeclaration = true } });
+    const result = resp.object.get("result").?;
+    if (result != .array) return false;
+    for (result.array.items) |l| {
+        if (std.mem.endsWith(u8, l.object.get("uri").?.string, file)) return true;
+    }
+    return false;
+}
+
+/// Waits for the server to finish a scan pass after pass `after`, and then to be idle; fails if
+/// none finishes within 10 seconds
+fn waitScanAfter(h: *Harness, after: u64) !void {
+    try waitScanPass(h, after);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+}
+
+/// Waits for a scan pass to finish after the pass of generation `after`; fails if none finishes
+/// within 10 seconds
+fn waitScanPass(h: *Harness, after: u64) !void {
+    const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(10));
+    h.server.scan_wait_mutex.lockUncancelable(testing.io);
+    defer h.server.scan_wait_mutex.unlock(testing.io);
+    while (h.server.scan_done.load(.acquire) <= after) {
+        h.server.scan_wait_cond.waitTimeout(testing.io, &h.server.scan_wait_mutex, .{ .deadline = .{ .raw = deadline, .clock = .awake } }) catch return error.ChangeNotNoticed;
+    }
+}
+
+/// Waits for the server to find source files on disk until `cond.done(h)`: checks once each time
+/// the server finishes a scan pass (and is idle). Fails when no new pass finishes within 10
+/// seconds.
+fn waitScanned(h: *Harness, cond: anytype) !void {
+    for (0..50) |_| {
+        const done = scanDone(h);
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        if (try cond.done(h)) return;
+        try waitScanPass(h, done);
+    }
+    return error.ChangeNotNoticed;
+}
+
+/// Condition for `waitScanned`: workspace symbol finds `query` in the file whose URI ends with
+/// `file`
+const Symbol = struct {
+    query: []const u8,
+    file: []const u8,
+
+    fn done(c: Symbol, h: *Harness) !bool {
+        const resp = try h.request("workspace/symbol", .{ .query = c.query });
+        const result = resp.object.get("result").?;
+        if (result != .array) return false;
+        for (result.array.items) |s| {
+            const uri = s.object.get("location").?.object.get("uri").?.string;
+            if (std.mem.eql(u8, s.object.get("name").?.string, c.query) and std.mem.endsWith(u8, uri, c.file)) return true;
+        }
+        return false;
+    }
+};
+
 /// Number of batches of external changes the server has handled
 fn watchBatches(h: *Harness) u64 {
     h.server.watch_mutex.lockUncancelable(testing.io);
