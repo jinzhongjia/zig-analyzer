@@ -8153,6 +8153,112 @@ test "comptime evaluation: pointers stored in declarations keep the place they p
     });
 }
 
+test "comptime evaluation: pointers to different declarations with equal values are unequal" {
+    try expectTypes(
+        \\const arr = [_]u8{ 1, 2, 3, 4 };
+        \\const arr2 = [_]u8{ 1, 2, 3, 4 };
+        \\const arr3 = arr;
+        \\const gp: [*]const u8 = &arr;
+        \\const gp2: [*]const u8 = &arr2;
+        \\const gs: []const u8 = &arr;
+        \\const gs2: []const u8 = &arr2;
+        \\const ap = &arr;
+        \\const ap2 = &arr2;
+        \\const word = [_]u8{ 'a', 'b', 'c' };
+        \\const from_word: []const u8 = &word;
+        \\const lit_a: []const u8 = "abc";
+        \\const lit_b: []const u8 = "abc";
+        \\const S = struct { a: u32, b: u32 };
+        \\const sa = S{ .a = 1, .b = 2 };
+        \\const sb = S{ .a = 1, .b = 2 };
+        \\const spa = &sa;
+        \\const spb = &sb;
+        \\fn eql(a: []const u8, b: []const u8) bool {
+        \\    if (a.len != b.len) return false;
+        \\    if (a.len == 0 or a.ptr == b.ptr) return true;
+        \\    for (a, b) |x, y| if (x != y) return false;
+        \\    return true;
+        \\}
+        \\fn same(a: [*]const u8, b: [*]const u8) bool {
+        \\    return a == b;
+        \\}
+        \\fn twoDecls() bool {
+        \\    return gp == gp2;
+        \\}
+        \\fn arrayPtrs() bool {
+        \\    return ap == ap2;
+        \\}
+        \\fn slicePtrs() bool {
+        \\    return gs.ptr == gs2.ptr;
+        \\}
+        \\fn wordLit() bool {
+        \\    return from_word.ptr == lit_a.ptr;
+        \\}
+        \\fn samePlace() bool {
+        \\    return gs.ptr == gp;
+        \\}
+        \\const c_two_decls = gp == gp2;
+        \\const c_addr = &arr == &arr2;
+        \\const c_alias = &arr == &arr3;
+        \\const c_temp_decl = &[_]u8{ 1, 2, 3, 4 } == &arr;
+        \\const c_word_lit = from_word.ptr == lit_a.ptr;
+        \\const c_slice_ptrs = gs.ptr == gs2.ptr;
+        \\const c_array_ptrs = ap == ap2;
+        \\const c_elem_ptrs = &ap[1] == &ap2[1];
+        \\const c_sub_slices = gs[1..].ptr == gs2[1..].ptr;
+        \\const c_struct_ptrs = spa == spb;
+        \\const c_field_ptrs = &spa.a == &spb.a;
+        \\const c_ne = gp != gp2;
+        \\const c_same = gp == gp;
+        \\const c_same_place = gs.ptr == gp;
+        \\const c_addr_same = &arr == ap;
+        \\const c_elem_same = &gs[1] == &arr[1];
+        \\const c_lits = lit_a.ptr == lit_b.ptr;
+        \\const c_temps = &[_]u8{ 1, 2, 3 } == &[_]u8{ 1, 2, 3 };
+        \\const c_eql_decls = eql(&arr, &arr2);
+        \\const c_eql_lits = eql(lit_a, lit_b);
+        \\const r_two_decls = twoDecls();
+        \\const r_array_ptrs = arrayPtrs();
+        \\const r_slice_ptrs = slicePtrs();
+        \\const r_word_lit = wordLit();
+        \\const r_same_place = samePlace();
+        \\const r_passed = same(gp, gp2);
+        \\const r_passed_same = same(gp, &arr);
+    , &.{
+        // Every container-level declaration has an address of its own, whatever its value:
+        // pointers to equal data in different declarations are unequal
+        .{ "c_two_decls", "bool = false" },
+        .{ "c_addr", "bool = false" },
+        .{ "c_alias", "bool = false" },
+        .{ "c_temp_decl", "bool = false" },
+        .{ "c_word_lit", "bool = false" },
+        .{ "c_slice_ptrs", "bool = false" },
+        .{ "c_array_ptrs", "bool = false" },
+        .{ "c_elem_ptrs", "bool = false" },
+        .{ "c_sub_slices", "bool = false" },
+        .{ "c_struct_ptrs", "bool = false" },
+        .{ "c_field_ptrs", "bool = false" },
+        .{ "c_ne", "bool = true" },
+        .{ "r_two_decls", "bool = false" },
+        .{ "r_array_ptrs", "bool = false" },
+        .{ "r_slice_ptrs", "bool = false" },
+        .{ "r_word_lit", "bool = false" },
+        .{ "r_passed", "bool = false" },
+        // Pointers to the same place, and to equal literals and temporaries, which are one
+        // constant, stay equal; the fast path of `std.mem.eql` relies on it
+        .{ "c_same", "bool = true" },
+        .{ "c_same_place", "bool = true" },
+        .{ "c_addr_same", "bool = true" },
+        .{ "c_elem_same", "bool = true" },
+        .{ "c_lits", "bool = true" },
+        .{ "c_temps", "bool = true" },
+        .{ "c_eql_decls", "bool = true" },
+        .{ "c_eql_lits", "bool = true" },
+        .{ "r_same_place", "bool = true" },
+        .{ "r_passed_same", "bool = true" },
+    });
+}
+
 test "comptime evaluation: element-wise work is not limited by steps, but large copies hit the memory limit" {
     // The compiler counts only backward branches: a `@memcpy` writing hundreds of thousands of
     // elements one by one is not limited. Evaluation gives up when a large array exceeding the
