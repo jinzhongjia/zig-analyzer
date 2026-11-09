@@ -384,8 +384,9 @@ pub const Key = union(enum) {
 
     /// One instantiation of a generic function: the function + the value of each parameter (the
     /// argument value for comptime parameters, unknown when it is not known; the argument type
-    /// for anytype parameters; `runtime` for non-comptime parameters), with the argument types
-    /// of `comptime x: anytype` parameters in `Instance.arg_types`.
+    /// for anytype parameters, or the argument value for those recorded by value; `runtime` for
+    /// non-comptime parameters), with the argument types of the anytype parameters recorded by
+    /// value in `Instance.arg_types`.
     /// `parent` is the instance the function itself belongs to (for a function defined in another
     /// instantiated container), or the `context` of a function outside every generic function.
     instance: Instance,
@@ -457,13 +458,17 @@ pub const Instance = struct {
     file: FileId,
     decl: AstId,
     args: []const Index,
-    /// The argument type of each `comptime x: anytype` parameter (unknown when it is not known),
-    /// parallel to `args`, with `runtime` at the other parameters; empty when the function has no
-    /// such parameter. Such a parameter takes the type of the argument, which a value does not
-    /// always give back: a value of an optional or error union type is represented by its
-    /// payload, `null` and `undefined` are the same value whatever their type, an error value
-    /// does not record its error set. The compiler records the argument as a value of its type,
-    /// so arguments of different types are different instances.
+    /// The argument type of each anytype parameter recorded by value (unknown when it is not
+    /// known), parallel to `args`, with `runtime` at the other parameters; empty when the function
+    /// has no such parameter. `comptime x: anytype` parameters are recorded by value, and so are
+    /// all anytype parameters of a function returning a comptime-only type: every call of such a
+    /// function executes at comptime, and the compiler memoizes it by the argument values, so
+    /// calls with different values of the same type are different instances and the containers
+    /// defined in the body capture those values. Such a parameter takes the type of the argument,
+    /// which a value does not always give back: a value of an optional or error union type is
+    /// represented by its payload, `null` and `undefined` are the same value whatever their type,
+    /// an error value does not record its error set. The compiler records the argument as a value
+    /// of its type, so arguments of different types are different instances.
     arg_types: []const Index = &.{},
     parent: ?Index = null,
     /// When inferring per iteration, the instance that containers defined inside a loop body (or
@@ -474,10 +479,16 @@ pub const Instance = struct {
     iteration: ?Iteration = null,
 
     /// The argument type `arg_types` records for parameter `i`; unknown when it records none
-    /// (the parameter is not `comptime x: anytype`, or the type is not known)
+    /// (the parameter is not recorded by value, or the type is not known)
     pub fn argType(inst: Instance, i: usize) Index {
         const t = if (i < inst.arg_types.len) inst.arg_types[i] else return .unknown;
         return if (t == .runtime) .unknown else t;
+    }
+
+    /// Whether the instance records the argument of anytype parameter `i` by value, with its type
+    /// in `arg_types`, rather than by its type
+    pub fn byValue(inst: Instance, i: usize) bool {
+        return i < inst.arg_types.len and inst.arg_types[i] != .runtime;
     }
 
     /// When `index` is `unknown_index`, the iteration is undetermined (containers in a loop body

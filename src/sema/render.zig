@@ -592,12 +592,13 @@ const QualifiedNames = struct {
             if (b.params.len != 0) return error.Unnamed;
             return q.w.writeAll("()");
         };
-        // The instance records the type of an `anytype` argument, not its value
+        // Unless it records the argument by value, the instance records the type of an `anytype`
+        // argument, not its value
         const forms = try q.r.ctx.get(database.hir.ParamForms, .{ .file = c.file, .item = k.decl });
         try q.w.writeAll("(");
         for (k.args, 0..) |arg, i| {
             if (arg == .runtime or arg == .unknown) return error.Unnamed;
-            if (i < forms.len and forms[i] == .any) return error.Unnamed;
+            if (i < forms.len and forms[i] == .any and !k.byValue(i)) return error.Unnamed;
             if (i != 0) try q.w.writeAll(",");
             try q.writeValue(arg);
         }
