@@ -1374,9 +1374,9 @@ const Inferrer = struct {
         const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return .unknown;
         if (inf.lazy) |range| if (def == .local) {
             const l = def.local;
-            // A local binding of this member (those of outer members are queried by defType
-            // through LocalValue)
-            if (l.file != inf.file or l.item != inf.item) return queries.defType(inf.r, def, null, inf.inst);
+            // A local binding of this member (those of outer members are queried by
+            // `queries.outerLocal`)
+            if (l.file != inf.file or l.item != inf.item) return queries.outerLocal(inf.r, l, try queries.memberNamespace(inf.r, inf.file, inf.item), inf.inst);
             const binding = b.binding(l.binding);
             if (binding.kind != .param and !range.contains(binding.range.start)) {
                 return inf.r.ctx.get(queries.LocalValue, .{ .owner = try inf.r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = try inf.iterationInstance() orelse inf.inst });

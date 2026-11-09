@@ -4500,7 +4500,7 @@ fn maybeResetSema(server: *Server, start: SemaUsage) void {
 const sema_reset_keys = 200_000;
 
 /// Queries cleared by a whole-generation reclaim
-const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.LocalEval, database.sema.SignatureInst, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.sema.ZonValue, database.sema.ZonImports, database.sema.ZonResultType, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
+const sema_queries = .{ database.sema.Infer, database.sema.LocalValue, database.sema.LocalEval, database.sema.CapturedVar, database.sema.SignatureInst, database.sema.DeclType, database.sema.CallEval, database.sema.ComptimeOnly, database.sema.ErrorSetOf, database.sema.InactiveRanges, database.sema.ZonValue, database.sema.ZonImports, database.sema.ZonResultType, database.ide_db.seed.Query, database.ide_db.seed.Instances, database.ide_db.seed.AllInstances, database.ide_db.seed.RootCallers, database.ide_db.seed.CallsIn };
 
 fn semaKeys(server: *Server) usize {
     var n: usize = 0;

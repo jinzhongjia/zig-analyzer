@@ -65,6 +65,7 @@ pub const Db = engine.Engine(*const Env, &.{
     sema.Infer,
     sema.LocalValue,
     sema.LocalEval,
+    sema.CapturedVar,
     sema.SignatureInst,
     sema.DeclType,
     sema.CallEval,
