@@ -3475,6 +3475,76 @@ test "later loop iterations see edits that change only the comptime vars an iter
     try testing.expectEqualStrings("[3]u16 = undefined", try iterationTypeAt(&w, f.file, after, "x", "T", 1));
 }
 
+test "containers in an inline loop body read the loop variables without a value" {
+    // Prevents a container in the loop body from reading the loop variables of iteration
+    // 4294967295, the index of an undetermined iteration. Expected values: zig 0.17.0 and 0.17.1
+    // give each unrolled iteration its own value (`range_v` is 0, 1 and 2, `index_v` 5 and 6,
+    // `counted_v` 0, 1 and 2, `len_a` `[1]u8` and `[2]u8`, `len_n` 1 and 2, `elem_p`
+    // `*align(4) const u8`, `*align(1) const u8` and `*align(2) const u8`), so the loop as a whole has
+    // none; `prong_t` is `u8` in both prongs.
+    try expectTypes(
+        \\const arr align(4) = [_]u8{ 1, 2, 3 };
+        \\const U = union(enum) { a: u8, b: u8 };
+        \\fn range() void {
+        \\    inline for (0..3) |i| {
+        \\        const S = struct { const v = i; };
+        \\        const range_v = S.v;
+        \\        _ = range_v;
+        \\    }
+        \\}
+        \\fn indexed() void {
+        \\    inline for (.{ 'a', 'b' }, 5..) |c, idx| {
+        \\        const S = struct { const v = idx; const ch = c; };
+        \\        const index_v = S.v;
+        \\        const index_c = S.ch;
+        \\        _ = .{ index_v, index_c };
+        \\    }
+        \\}
+        \\fn counted() void {
+        \\    comptime var sum: usize = 0;
+        \\    inline for (0..3) |i| {
+        \\        sum += i;
+        \\        const S = struct { const v = i; };
+        \\        const counted_v = S.v;
+        \\        _ = counted_v;
+        \\    }
+        \\}
+        \\fn lengths() void {
+        \\    inline for (1..3) |i| {
+        \\        const S = struct { const A = [i]u8; const n = @sizeOf([i]u8); };
+        \\        const len_a = S.A;
+        \\        const len_n = S.n;
+        \\        _ = .{ len_a, len_n };
+        \\    }
+        \\}
+        \\fn aligned() void {
+        \\    inline for (&arr) |*p| {
+        \\        const S = struct { const q = p; };
+        \\        const elem_p = S.q;
+        \\        _ = elem_p;
+        \\    }
+        \\}
+        \\fn prong(u: U) void {
+        \\    switch (u) {
+        \\        inline else => |payload| {
+        \\            const S = struct { const T = @TypeOf(payload); };
+        \\            const prong_t = S.T;
+        \\            _ = prong_t;
+        \\        },
+        \\    }
+        \\}
+    , &.{
+        .{ "range_v", "usize" },
+        .{ "index_v", "usize" },
+        .{ "index_c", "comptime_int" },
+        .{ "counted_v", "usize" },
+        .{ "len_a", "type = [i]u8" },
+        .{ "len_n", "comptime_int" },
+        .{ "elem_p", "*align(unknown) const u8" },
+        .{ "prong_t", "type = u8" },
+    });
+}
+
 test "comptime evaluation runs loops, mutation and calls" {
     try expectTypes(
         \\fn double(n: usize) usize { return n * 2; }
