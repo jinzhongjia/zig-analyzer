@@ -143,6 +143,53 @@ fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
+/// A 128-bit hash of everything `eql` compares, in the same order, so that trees `eql` considers
+/// equal have the same fingerprint. The engine keeps it for an evicted `FileItemTree`.
+pub fn fingerprint(self: *const ItemTree) u128 {
+    var h: Fingerprinter = .{ .sip = .init(&@splat(0)) };
+    h.word(self.containers.len);
+    h.word(self.items.len);
+    h.word(self.member_list.len);
+    h.sip.update(std.mem.sliceAsBytes(self.member_list));
+    for (self.containers) |c| {
+        h.word(@backingInt(c.ast_id));
+        h.word(@backingInt(c.kind));
+        h.word(if (c.parent_item) |p| @as(u64, p) + 1 else 0);
+        h.word(@backingInt(c.layout));
+        h.word(@as(u64, @intFromBool(c.auto_enum)) | @as(u64, @intFromBool(c.nonexhaustive)) << 1 |
+            @as(u64, @intFromBool(c.is_value)) << 2 | @as(u64, @intFromBool(c.in_signature)) << 3);
+        h.optStr(c.name);
+        h.word(c.members.start);
+        h.word(c.members.len);
+    }
+    for (self.items) |it| {
+        h.word(@backingInt(it.ast_id));
+        h.word(@backingInt(it.kind));
+        h.word(it.container);
+        h.word(@as(u16, @bitCast(it.flags)));
+        h.word(it.sig_hash);
+        h.optStr(it.name);
+        h.optStr(it.doc);
+    }
+    return h.sip.finalInt();
+}
+
+/// Every field is written as a fixed-size integer and strings with their length, so that
+/// different sequences of fields cannot produce the same input bytes
+const Fingerprinter = struct {
+    sip: std.crypto.auth.siphash.SipHash128(1, 3),
+
+    fn word(h: *Fingerprinter, v: u64) void {
+        h.sip.update(std.mem.asBytes(&v));
+    }
+
+    fn optStr(h: *Fingerprinter, s: ?[]const u8) void {
+        const str = s orelse return h.word(0);
+        h.word(@as(u64, str.len) + 1);
+        h.sip.update(str);
+    }
+};
+
 // ── Build ────────────────────────────────────────────────────────────
 
 /// The root expression of a ZON file (the only child of the root node that is not an error node)

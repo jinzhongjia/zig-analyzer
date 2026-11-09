@@ -8545,6 +8545,33 @@ test "all instances include anytype calls in files that do not import the method
     try testing.expect(all.complete);
 }
 
+test "all instances of targets in different files share the callers inside generic functions" {
+    // Prevents looking up the callers of `call` (in a file that imports neither target) inside
+    // generic functions again for every target file
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = (try w.add("/p/a.zig", "pub const S = struct {\n    pub fn run(self: *S, comptime n: u8) void {\n        _ = self;\n        _ = n;\n    }\n};\n")).file;
+    const b = (try w.add("/p/b.zig", "pub const T = struct {\n    pub fn run(self: *T, comptime n: u8) void {\n        _ = self;\n        _ = n;\n    }\n};\n")).file;
+    const c = (try w.add("/p/c.zig", "pub fn call(x: anytype) void {\n    x.run(3);\n}\n")).file;
+    const main = (try w.add("/p/main.zig", "const a = @import(\"a.zig\");\nconst b = @import(\"b.zig\");\nconst c = @import(\"c.zig\");\npub fn main() void {\n    var s: a.S = .{};\n    var t: b.T = .{};\n    c.call(&s);\n    c.call(&t);\n}\n")).file;
+    try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{
+        .{ .file = main, .module = 0, .compile = 0 },
+        .{ .file = a, .module = 0, .compile = 0 },
+        .{ .file = b, .module = 0, .compile = 0 },
+        .{ .file = c, .module = 0, .compile = 0 },
+    });
+    const in_a = try allInstancesOf(&w, a, "run");
+    try testing.expectEqual(1, in_a.count);
+    try testing.expect(in_a.complete);
+    // Only those of `T.run` itself are new
+    const before = w.db.executions(seed.GenericCallers);
+    const in_b = try allInstancesOf(&w, b, "run");
+    try testing.expectEqual(1, in_b.count);
+    try testing.expect(in_b.complete);
+    try testing.expectEqual(before + 1, w.db.executions(seed.GenericCallers));
+}
+
 test "callsite seeding uses an iteration of a loop over a comptime list of values" {
     // The loop variable has a type but no value (the loop is over a comptime-known list of values):
     // the instance of `PT` used to be unresolvable

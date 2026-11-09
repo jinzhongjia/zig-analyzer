@@ -666,84 +666,133 @@ pub fn allInstances(r: *Resolver, file: FileId, item: u32) resolve.Error!struct 
     return .{ .insts = insts, .complete = all.complete };
 }
 
-/// Callers of the generic function (`root`), in order: the instances each caller gives directly
-/// when inferred outside generic functions; callers inside other generic functions also record
-/// that function (`from`), and the closure infers them under each of its instances (see
-/// `CallsIn`). Last come the instances given by type flow (starting at `flow_start`).
-/// Depends only on the target function, `strict` and `target`, so it is shared by the closures of
-/// all targets. When `target` is not null (the target function is in a file that does not import
-/// `target`; see `Closure.importers`), only callers that can pass arguments leading to `target`
-/// are taken: callers in files that import `target`, and callers in generic functions.
-pub const RootCallers = struct {
-    pub const kind: engine.Kind = .derived;
-    pub const Key = struct { root: hir.OwnerKey, strict: bool, target: ?FileId = null };
-    pub const Caller = struct { in: FileId, i: u32, from: ?hir.OwnerKey, found_start: usize, found_len: usize };
-    pub const Value = struct { found: []const Found, callers: []const Caller, flow_start: usize, cut: bool };
+/// A caller of a generic function (see `rootCallers`): member `i` of file `in`, at position `order`
+/// in the lookup order. When inferred outside generic functions it gives the instances
+/// `found[found_start..][0..found_len]` of its list; a caller inside another generic function also
+/// records that function (`from`), and the closure infers it under each of its instances (see
+/// `CallsIn`).
+pub const Caller = struct { in: FileId, i: u32, order: u64, from: ?hir.OwnerKey, found_start: usize, found_len: usize };
 
-    pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
-        var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
-        defer scratch.deinit();
-        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-        const empty: Value = .{ .found = &.{}, .callers = &.{}, .flow_start = 0, .cut = false };
-        const tree = try r.itemTree(key.root.file);
-        const item: u32 = for (tree.items, 0..) |it, i| {
-            if (it.ast_id == key.root.item) break @intCast(i);
-        } else return empty;
-        const candidates = try ctx.get(Candidates, key.root);
-        const files = candidates.all_files;
-        var importers: std.AutoHashMapUnmanaged(FileId, void) = .empty;
-        for (candidates.files) |f| try importers.put(r.arena, f, {});
-        var target_importers: std.AutoHashMapUnmanaged(FileId, void) = .empty;
-        if (key.target) |t| {
-            for (try ctx.get(search.ProjectImporters, t)) |f| try target_importers.put(r.arena, f, {});
-            try target_importers.put(r.arena, t, {});
-        }
-        var out: Collector = .{ .limit = std.math.maxInt(usize), .strict = key.strict };
-        var callers: std.ArrayList(Caller) = .empty;
-        const mention = try mentioning(&r, key.root.file, candidates.names);
-        for (0..files.len + 1) |fi| {
-            const f = if (fi == 0) key.root.file else files[fi - 1];
-            if (fi != 0 and (f == key.root.file or !mention.contains(f))) continue;
-            for (try ctx.get(Callers, .{ .root = key.root, .in = f })) |i| {
-                // In a file that does not import the target's file, code outside generic functions
-                // cannot name the target's types, so it does not call the target; likewise it
-                // cannot pass arguments leading to `target`
-                const outside = (f != key.root.file and !importers.contains(f)) or
-                    (key.target != null and !target_importers.contains(f));
-                if (outside and try genericRoot(&r, f, i) == null) continue;
-                const owner = try r.ownerKey(f, i);
-                const body = try ctx.get(hir.ItemBody, owner);
-                const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
-                const start = out.found.items.len;
-                _ = try callIn(&r, f, i, body, res, key.root.file, item, key.root, &out, key.strict);
-                _ = try loopCall(&r, f, i, owner, body, res, null, candidates.names, key.root.file, item, key.root, &out, key.strict);
-                const outer = try genericRoot(&r, f, i);
-                const from: ?hir.OwnerKey = if (outer != null and mayCall(ctx.db.env.ip, body, res, key.root)) try r.ownerKey(f, outer.?) else null;
-                if (from == null and out.found.items.len == start) continue;
-                try callers.append(r.arena, .{ .in = f, .i = i, .from = from, .found_start = start, .found_len = out.found.items.len - start });
-            }
-        }
-        const flow_start = out.found.items.len;
-        var cut = false;
-        _ = try typeFlow(&r, key.root.file, item, item, files, max_closure_flow_depth, &out, key.strict, &cut);
-        const gpa = ctx.db.gpa;
-        const found = try gpa.dupe(Found, out.found.items);
-        errdefer gpa.free(found);
-        return .{ .found = found, .callers = try gpa.dupe(Caller, callers.items), .flow_start = flow_start, .cut = cut };
-    }
+/// Callers in lookup order, then the instances given by type flow (from `flow_start` on). An
+/// instance is listed only for the first caller in the list that gives it.
+pub const CallerList = struct {
+    found: []const Found,
+    callers: []const Caller,
+    flow_start: usize,
+    cut: bool,
 
-    pub fn eql(a: Value, b: Value) bool {
+    fn eql(a: CallerList, b: CallerList) bool {
         if (a.cut != b.cut or a.flow_start != b.flow_start or a.found.len != b.found.len or a.callers.len != b.callers.len) return false;
         for (a.found, b.found) |x, y| if (!std.meta.eql(x, y)) return false;
         for (a.callers, b.callers) |x, y| if (!std.meta.eql(x, y)) return false;
         return true;
     }
 
-    pub fn deinit(v: *Value, gpa: std.mem.Allocator) void {
+    fn deinit(v: *CallerList, gpa: std.mem.Allocator) void {
         gpa.free(v.found);
         gpa.free(v.callers);
     }
 };
+
+/// The callers of generic function `root` inside generic functions, and the instances given by
+/// type flow. Depends only on the function and `strict`, so it is shared by the closures of all
+/// targets.
+pub const GenericCallers = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = struct { root: hir.OwnerKey, strict: bool };
+    pub const Value = CallerList;
+
+    pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
+        return rootCallers(ctx, key.root, key.strict, .generic);
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return a.eql(b);
+    }
+
+    pub fn deinit(v: *Value, gpa: std.mem.Allocator) void {
+        v.deinit(gpa);
+    }
+};
+
+/// The callers of generic function `root` outside generic functions. When `target` is not null
+/// (the function is in a file that does not import `target`; see `Closure.importers`), only the
+/// callers in files that import `target` are taken: other code outside generic functions cannot
+/// pass arguments leading to `target`.
+pub const RootCallers = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = struct { root: hir.OwnerKey, strict: bool, target: ?FileId = null };
+    pub const Value = CallerList;
+
+    pub fn compute(ctx: *database.Db.Ctx, key: Key) engine.Error!Value {
+        return rootCallers(ctx, key.root, key.strict, .{ .outside = key.target });
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return a.eql(b);
+    }
+
+    pub fn deinit(v: *Value, gpa: std.mem.Allocator) void {
+        v.deinit(gpa);
+    }
+};
+
+/// The callers of generic function `root` in `part` (see `GenericCallers` and `RootCallers`), in
+/// lookup order: the function's own file, then the files of `Candidates` that mention its names.
+/// The closure merges both parts by `order` into one sequence, the same for every target. In a
+/// file that does not import the function's file, code outside generic functions cannot name the
+/// function's types, so it does not call the function.
+fn rootCallers(ctx: *database.Db.Ctx, root: hir.OwnerKey, strict: bool, part: union(enum) { generic, outside: ?FileId }) engine.Error!CallerList {
+    var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
+    defer scratch.deinit();
+    var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+    const empty: CallerList = .{ .found = &.{}, .callers = &.{}, .flow_start = 0, .cut = false };
+    const tree = try r.itemTree(root.file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.ast_id == root.item) break @intCast(i);
+    } else return empty;
+    const candidates = try ctx.get(Candidates, root);
+    const files = candidates.all_files;
+    var importers: std.AutoHashMapUnmanaged(FileId, void) = .empty;
+    for (candidates.files) |f| try importers.put(r.arena, f, {});
+    var target_importers: std.AutoHashMapUnmanaged(FileId, void) = .empty;
+    const target: ?FileId = switch (part) {
+        .generic => null,
+        .outside => |t| t,
+    };
+    if (target) |t| {
+        for (try ctx.get(search.ProjectImporters, t)) |f| try target_importers.put(r.arena, f, {});
+        try target_importers.put(r.arena, t, {});
+    }
+    var out: Collector = .{ .limit = std.math.maxInt(usize), .strict = strict };
+    var callers: std.ArrayList(Caller) = .empty;
+    const mention = try mentioning(&r, root.file, candidates.names);
+    for (0..files.len + 1) |fi| {
+        const f = if (fi == 0) root.file else files[fi - 1];
+        if (fi != 0 and (f == root.file or !mention.contains(f))) continue;
+        for (try ctx.get(Callers, .{ .root = root, .in = f }), 0..) |i, k| {
+            const outer = try genericRoot(&r, f, i);
+            if ((outer != null) != (part == .generic)) continue;
+            if (outer == null and ((f != root.file and !importers.contains(f)) or (target != null and !target_importers.contains(f)))) continue;
+            const owner = try r.ownerKey(f, i);
+            const body = try ctx.get(hir.ItemBody, owner);
+            const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+            const start = out.found.items.len;
+            _ = try callIn(&r, f, i, body, res, root.file, item, root, &out, strict);
+            _ = try loopCall(&r, f, i, owner, body, res, null, candidates.names, root.file, item, root, &out, strict);
+            const from: ?hir.OwnerKey = if (outer != null and mayCall(ctx.db.env.ip, body, res, root)) try r.ownerKey(f, outer.?) else null;
+            if (from == null and out.found.items.len == start) continue;
+            try callers.append(r.arena, .{ .in = f, .i = i, .order = @as(u64, fi) << 32 | k, .from = from, .found_start = start, .found_len = out.found.items.len - start });
+        }
+    }
+    const flow_start = out.found.items.len;
+    var cut = false;
+    if (part == .generic) _ = try typeFlow(&r, root.file, item, item, files, max_closure_flow_depth, &out, strict, &cut);
+    const gpa = ctx.db.gpa;
+    const found = try gpa.dupe(Found, out.found.items);
+    errdefer gpa.free(found);
+    return .{ .found = found, .callers = try gpa.dupe(Caller, callers.items), .flow_start = flow_start, .cut = cut };
+}
 
 /// Instances given by the calls of caller `owner` to generic function `target` under instance
 /// `inst` (including calls in loops inferred per iteration). Shared by the closures of all targets.
@@ -1002,29 +1051,43 @@ const Closure = struct {
         }
     }
 
-    /// Callers of generic function `g` (see `RootCallers`): directly given instances are added;
-    /// callers inside other generic functions are registered as depending on that function's
-    /// instances and are inferred under the instances it already has
+    /// Callers of generic function `g` (see `rootCallers`), inside and outside generic functions
+    /// in one sequence: directly given instances are added; callers inside other generic
+    /// functions are registered as depending on that function's instances and are inferred under
+    /// the instances it already has
     fn scan(c: *Closure, g: usize) resolve.Error!void {
         const r = c.r;
         if (c.roots.items[g].scanned) return;
         c.roots.items[g].scanned = true;
-        const rc = try r.ctx.get(RootCallers, .{
-            .root = c.roots.items[g].key,
-            .strict = c.roots.items[g].found.strict,
-            .target = if (c.roots.items[g].filtered) c.target_file else null,
-        });
-        if (rc.cut) c.complete = false;
-        for (rc.callers) |caller| {
-            for (rc.found[caller.found_start..][0..caller.found_len]) |found| try c.add(g, found);
-            const from = caller.from orelse continue;
-            const h = try c.root(from) orelse continue;
-            const edge = c.roots.items[g].callers.items.len;
-            try c.roots.items[g].callers.append(r.arena, .{ .in = caller.in, .i = caller.i, .from = h });
-            try c.roots.items[h].outs.append(r.arena, .{ .to = g, .edge = edge });
-            for (0..c.roots.items[h].found.found.items.len) |k| try c.propagate(g, edge, k);
+        const key = c.roots.items[g].key;
+        const strict = c.roots.items[g].found.strict;
+        const inside = try r.ctx.get(GenericCallers, .{ .root = key, .strict = strict });
+        const outside = try r.ctx.get(RootCallers, .{ .root = key, .strict = strict, .target = if (c.roots.items[g].filtered) c.target_file else null });
+        if (inside.cut) c.complete = false;
+        var a: usize = 0;
+        var b: usize = 0;
+        while (a < inside.callers.len or b < outside.callers.len) {
+            if (b == outside.callers.len or (a < inside.callers.len and inside.callers[a].order < outside.callers[b].order)) {
+                try c.visit(g, inside, inside.callers[a]);
+                a += 1;
+            } else {
+                try c.visit(g, outside, outside.callers[b]);
+                b += 1;
+            }
         }
-        for (rc.found[rc.flow_start..]) |found| try c.add(g, found);
+        for (inside.found[inside.flow_start..]) |found| try c.add(g, found);
+    }
+
+    /// Caller `caller` of generic function `g`, from `list`. An instance the other list gave for
+    /// an earlier caller adds nothing (`add` keeps the first).
+    fn visit(c: *Closure, g: usize, list: CallerList, caller: Caller) resolve.Error!void {
+        for (list.found[caller.found_start..][0..caller.found_len]) |found| try c.add(g, found);
+        const from = caller.from orelse return;
+        const h = try c.root(from) orelse return;
+        const edge = c.roots.items[g].callers.items.len;
+        try c.roots.items[g].callers.append(c.r.arena, .{ .in = caller.in, .i = caller.i, .from = h });
+        try c.roots.items[h].outs.append(c.r.arena, .{ .to = g, .edge = edge });
+        for (0..c.roots.items[h].found.found.items.len) |k| try c.propagate(g, edge, k);
     }
 
     /// Rescan after relaxing: registered generic callers get registered again, so clear them first
