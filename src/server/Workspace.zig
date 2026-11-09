@@ -115,6 +115,17 @@ result_generation: u64 = 0,
 result_at_ms: i64 = 0,
 /// FileId → entry in `result`
 result_files: std.AutoArrayHashMapUnmanaged(FileId, *const compiler.FileResult) = .empty,
+/// `Server.build_requests` when the current build was sent: the requests its result covers (one
+/// arriving during the build discards the result or starts another round, see `rebuild`)
+requests_sent: u64 = 0,
+/// `requests_sent` of the build whose result was stored last
+requests_built: u64 = 0,
+/// This instance replaces one whose maker exited while idle after a completed build (the 0.17
+/// maker can panic right after a build, see docs/zig-maker-build-request-race.md): the
+/// `requests_built` of that instance, or its own `repeats` when it exited before storing a
+/// result. When no build has been requested since, the first result of this instance only
+/// repeats that build, and is counted in `Server.repeated_builds`.
+repeats: ?u64 = null,
 building: bool = false,
 /// At least one build has completed (used to decide whether crashes are "consecutive")
 built: bool = false,
@@ -349,15 +360,11 @@ pub fn requestBuild(ws: *Workspace) void {
             ws.building = true;
             ws.server.busyBegin();
             ws.build_progress = ws.server.progress.begin(ws.server, buildTitle(model, ws.config.compiler_diagnostics), true);
-            sendBuild(ws, client, model, steps) catch |err| {
-                log.err("failed to send build request: {t}", .{err});
-                ws.building = false;
-                ws.server.progress.end(ws.server, ws.build_progress, "Failed to send build request");
-                ws.build_progress = null;
-                ws.server.busyEnd();
-            };
+            ws.startBuild(client, model, steps);
             return;
         }
+        // The empty result below covers the requests made so far
+        ws.requests_sent = ws.server.build_requests.load(.acquire);
         break :blk false;
     };
     if (replaced) {
@@ -403,12 +410,37 @@ fn buildTitle(model: *const ProjectModel, with_diagnostics: bool) []const u8 {
     return w.buffered();
 }
 
+/// Sends the build request of a round that is `building` (with its busy count and progress); the
+/// caller holds mutex. When the maker has exited (it closed its end of the pipe: the 0.17 maker can
+/// panic right after a build, see docs/zig-maker-build-request-race.md), the round stays in
+/// progress like one the maker exits during: the reading task reads the end of the stream, ends
+/// the round and restarts the project, whose first build covers this request. The maker is ended
+/// so that the end of the stream comes. Other failures end the round without a build.
+fn startBuild(ws: *Workspace, client: *bsp.Client, model: *const ProjectModel, steps: []const u32) void {
+    sendBuild(ws, client, model, steps) catch |err| {
+        const cause = if (err == error.WriteFailed) client.writeError() else null;
+        const exited = if (cause) |c| c == error.BrokenPipe else false;
+        if (exited) {
+            log.info("{s}: build system exited before reading the build request ({t}, {?t})", .{ ws.root, err, cause });
+            client.terminate();
+            return;
+        }
+        log.err("{s}: failed to send build request: {t} ({?t})", .{ ws.root, err, cause });
+        ws.building = false;
+        ws.rebuild = false;
+        ws.server.progress.end(ws.server, ws.build_progress, "Failed to send build request");
+        ws.build_progress = null;
+        ws.server.busyEnd();
+    };
+}
+
 /// Sends a build request and resets the progress counters; the caller holds mutex
 fn sendBuild(ws: *Workspace, client: *bsp.Client, model: *const ProjectModel, steps: []const u32) !void {
     var closure = try model.dependencyClosure(ws.gpa, steps);
     defer closure.deinit(ws.gpa);
     ws.build_total = @intCast(closure.count());
     ws.build_done = 0;
+    ws.requests_sent = ws.server.build_requests.load(.acquire);
     try client.buildSteps(steps);
 }
 
@@ -534,6 +566,21 @@ pub fn configureInputDirs(ws: *Workspace, arena: Allocator, out: *std.ArrayList(
 
 // ── Background task ──────────────────────────────────────────────────
 
+/// Test hook (`Server.maker_exit_pause`): holds the reading task of a project once, when the
+/// maker's stream has ended and before the exit is handled
+pub const ExitPause = struct {
+    /// Set when the reading task has stopped
+    entered: Io.Event = .unset,
+    release: Io.Event = .unset,
+};
+
+fn testExitPause(ws: *Workspace) void {
+    if (!@import("builtin").is_test) return;
+    const pause = ws.server.maker_exit_pause.swap(null, .acq_rel) orelse return;
+    pause.entered.set(ws.server.io);
+    pause.release.waitUncancelable(ws.server.io);
+}
+
 fn run(ws: *Workspace) Io.Cancelable!void {
     var started = true;
     // maker exits when build.zig fails to compile, which is expected (it is restarted when
@@ -546,6 +593,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     ws.computeBuildScripts() catch log.err("{s}: out of memory while finding build scripts", .{ws.root});
     while (true) {
         var event = client.next() catch |err| {
+            if (err != error.Canceled) ws.testExitPause();
             if (err == error.Canceled or ws.server.isShuttingDown()) {
                 // Server shutting down: the reading task was canceled, not a maker problem
             } else if (config_failed) {
@@ -806,6 +854,8 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             defer changed.deinit(ws.gpa);
             // The steps that may write the files are done (see `deferChanges`)
             const differs = ws.server.changedSinceBuilt(changed.keys()) catch return;
+            // A change to build for, counted like a requested build (see `Server.build_requests`)
+            if (differs) _ = ws.server.build_requests.fetchAdd(1, .acq_rel);
             ws.mutex.lockUncancelable(io);
             const rebuild = ws.rebuild or differs;
             ws.rebuild = false;
@@ -820,7 +870,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 if (ws.client) |c| if (ws.model) |*m| {
                     const steps = m.buildSteps(ws.gpa, ws.config.compiler_diagnostics) catch return;
                     defer ws.gpa.free(steps);
-                    sendBuild(ws, c, m, steps) catch {};
+                    ws.startBuild(c, m, steps);
                 };
                 return;
             }
@@ -905,7 +955,10 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 }
                 ws.mutex.unlock(io);
                 defer late.deinit(ws.gpa);
-                if (ws.server.changedSinceBuilt(late.keys()) catch true) again = true;
+                if (ws.server.changedSinceBuilt(late.keys()) catch true) {
+                    _ = ws.server.build_requests.fetchAdd(1, .acq_rel);
+                    again = true;
+                }
             }
             // More files were saved while the result was being published: `requestBuild` only
             // recorded `rebuild` then, so the next round starts here. Start the new build before
@@ -1037,6 +1090,14 @@ fn storeResult(ws: *Workspace, target: *Workspace) Allocator.Error!void {
         target.result_files.deinit(ws.gpa);
         target.result = result;
         target.result_generation = ws.server.nextCompileGeneration();
+        // A result stored into the old instance is that of a failed configuration, not a build
+        if (target == ws) {
+            if (ws.repeats) |r| {
+                if (r == ws.requests_sent) _ = ws.server.repeated_builds.fetchAdd(1, .acq_rel);
+                ws.repeats = null;
+            }
+            ws.requests_built = ws.requests_sent;
+        }
         target.result_at_ms = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
         target.result_files = files;
     }
