@@ -2984,6 +2984,36 @@ test "comptime @bitCast reinterprets arrays, vectors, enums and packed container
     });
 }
 
+test "comptime @bitCast of integers wider than 128 bits" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1: wide integers take part in the
+    // packed bit order like other integers, in both directions
+    try expectTypes(
+        \\const P = packed struct(u256) { a: u56, b: u200 };
+        \\const from_bytes = @as(u256, @bitCast([_]u8{1} ++ @as([30]u8, @splat(0)) ++ [_]u8{0x80}));
+        \\const to_signed = @as(i256, @bitCast(@as(u256, (1 << 256) - 1)));
+        \\const from_signed = @as(u256, @bitCast(@as(i256, -2)));
+        \\const halves = @as([2]u128, @bitCast(@as(u256, (5 << 128) | 7)))[1];
+        \\const halves0 = @as([2]u128, @bitCast(@as(u256, (5 << 128) | 7)))[0];
+        \\const packed_b = @as(P, @bitCast(@as(u256, (3 << 56) | 9))).b;
+        \\const packed_back = @as(u256, @bitCast(P{ .a = 1, .b = 1 << 199 }));
+        \\const vec = @as(@Vector(2, u128), @bitCast(@as(u256, 1 << 200)))[1];
+        \\const to_bytes = @as([32]u8, @bitCast(@as(u256, 0xab << 248)))[31];
+        \\const i200_neg = @as(u200, @bitCast(@as(i200, -1))) == (1 << 200) - 1;
+        \\const from_u64s = @as(u256, @bitCast([4]u64{ 0, 0, 0, 1 }));
+    , &.{
+        .{ "from_bytes", "u256 = 57896044618658097711785492504343953926634992332820282019728792003956564819969" },
+        .{ "to_signed", "i256 = -1" },
+        .{ "from_signed", "u256 = 115792089237316195423570985008687907853269984665640564039457584007913129639934" },
+        .{ "halves", "u128 = 5" },
+        .{ "halves0", "u128 = 7" },
+        .{ "packed_b", "u200 = 3" },
+        .{ "packed_back", "u256 = 57896044618658097711785492504343953926634992332820282019728792003956564819969" },
+        .{ "vec", "u128 = 4722366482869645213696" },
+        .{ "to_bytes", "u8 = 171" },
+        .{ "i200_neg", "bool = true" },
+        .{ "from_u64s", "u256 = 6277101735386680763835789423207666416102355444464034512896" },
+    });
+}
 test "comptime memory reinterpretation through @ptrCast follows the target's byte order" {
     const src =
         \\const X = extern struct { a: u8, b: u16, c: u8 };
