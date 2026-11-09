@@ -974,6 +974,9 @@ const Evaluator = struct {
     calls: ?*CallMemo = null,
     /// `calls` is created by this interpreter and freed in `deinit`
     owns_calls: bool = false,
+    /// Constant storage cells, by the interned array they hold, for the elements interned
+    /// pointers point to when pointer arithmetic moves them (see `internedCell`); allocated in `a`
+    interned_cells: std.AutoHashMapUnmanaged(Index, *Val) = .empty,
     /// Target (index into `Frame.labels`) and value of break / continue; the value of return
     jump_target: usize = 0,
     jump_value: Val = .unknown,
@@ -2655,39 +2658,10 @@ const Evaluator = struct {
                 return ev.eval(f, rhs_e, want);
             },
             .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => {
-                // Matching the compiler, the operands have no result type and are coerced to their
-                // peer type: an enum literal to the other side's enum (by tag name, never as a
-                // decl literal; a name that is not a tag is a compile error), a comptime number to
-                // the other side's float type (rounding it). A tagged union compared with a tag
-                // keeps the literal as it is.
-                var lhs = try ev.eval(f, lhs_e, null);
-                var rhs = try ev.eval(f, rhs_e, null);
-                if (ev.peerOperand(lhs.ty, rhs.ty)) lhs = try ev.coerce(lhs, rhs.ty);
-                if (ev.peerOperand(rhs.ty, lhs.ty)) rhs = try ev.coerce(rhs, lhs.ty);
-                // Optionals of different depths are compared at the deeper one, their peer type:
-                // a null `?u8` equals a `??u8` holding it
-                switch (value.deeperOptional(ip, lhs.ty, rhs.ty)) {
-                    .lhs => rhs = try ev.coerce(rhs, lhs.ty),
-                    .rhs => lhs = try ev.coerce(lhs, rhs.ty),
-                    .neither => {},
-                }
-                if ((op == .equal_equal or op == .bang_equal) and ip.key(lhs.ty) == .ptr_type and ip.key(rhs.ty) == .ptr_type) {
-                    const eq = try ev.pointerEql(lhs, rhs) orelse return error.Abort;
-                    return boolVal(eq == (op == .equal_equal));
-                }
-                if (ev.intOf(lhs)) |x| if (ev.intOf(rhs)) |y| return boolVal(value.compareInts(ip, op, lhs.ty, rhs.ty, x, y));
-                if (lhs.v == .big or rhs.v == .big or value.isBigIntType(ip, lhs.ty) or value.isBigIntType(ip, rhs.ty)) {
-                    if (try ev.bigOf(lhs)) |x| {
-                        if (try ev.bigOf(rhs)) |y| return boolVal(compareBig(op, x, y));
-                    }
-                }
-                const a = try ev.freeze(lhs) orelse return error.Abort;
-                const b = try ev.freeze(rhs) orelse return error.Abort;
-                if (value.intOf(ip, a)) |x| if (value.intOf(ip, b)) |y| return boolVal(value.compareInts(ip, op, value.typeOfValue(ip, a), value.typeOfValue(ip, b), x, y));
-                if (ip.key(a) == .float_value or ip.key(b) == .float_value) if (value.floatOf(ip, a)) |x| if (value.floatOf(ip, b)) |y| return boolVal(compareNumbers(op, x, y));
-                if (op != .equal_equal and op != .bang_equal) return error.Abort;
-                const eq = try eqlValues(ev.r, a, b) orelse return error.Abort;
-                return boolVal(eq == (op == .equal_equal));
+                // Matching the compiler, the operands have no result type
+                const lhs = try ev.eval(f, lhs_e, null);
+                const rhs = try ev.eval(f, rhs_e, null);
+                return ev.compare(op, lhs, rhs);
             },
             .plus_plus => return ev.concat(try ev.eval(f, lhs_e, null), try ev.eval(f, rhs_e, null)),
             .pipe_pipe => {
@@ -2712,11 +2686,49 @@ const Evaluator = struct {
         }
     }
 
+    /// Comparison `lhs op rhs` of evaluated operands. Matching the compiler, the operands are
+    /// coerced to their peer type: an enum literal to the other side's enum (by tag name, never
+    /// as a decl literal; a name that is not a tag is a compile error), a comptime number to the
+    /// other side's float type (rounding it). A tagged union compared with a tag keeps the literal
+    /// as it is. Vectors are compared element by element.
+    fn compare(ev: *Evaluator, op: SyntaxKind, lhs_in: Val, rhs_in: Val) EvalError!Val {
+        const ip = ev.ip;
+        var lhs = lhs_in;
+        var rhs = rhs_in;
+        if (ev.peerOperand(lhs.ty, rhs.ty)) lhs = try ev.coerce(lhs, rhs.ty);
+        if (ev.peerOperand(rhs.ty, lhs.ty)) rhs = try ev.coerce(rhs, lhs.ty);
+        // Optionals of different depths are compared at the deeper one, their peer type:
+        // a null `?u8` equals a `??u8` holding it
+        switch (value.deeperOptional(ip, lhs.ty, rhs.ty)) {
+            .lhs => rhs = try ev.coerce(rhs, lhs.ty),
+            .rhs => lhs = try ev.coerce(lhs, rhs.ty),
+            .neither => {},
+        }
+        if ((op == .equal_equal or op == .bang_equal) and ip.key(lhs.ty) == .ptr_type and ip.key(rhs.ty) == .ptr_type) {
+            const eq = try ev.pointerEql(lhs, rhs) orelse return error.Abort;
+            return boolVal(eq == (op == .equal_equal));
+        }
+        if (ev.intOf(lhs)) |x| if (ev.intOf(rhs)) |y| return boolVal(value.compareInts(ip, op, lhs.ty, rhs.ty, x, y));
+        if (lhs.v == .big or rhs.v == .big or value.isBigIntType(ip, lhs.ty) or value.isBigIntType(ip, rhs.ty)) {
+            if (try ev.bigOf(lhs)) |x| {
+                if (try ev.bigOf(rhs)) |y| return boolVal(compareBig(op, x, y));
+            }
+        }
+        if (ip.key(lhs.ty) == .vector_type or ip.key(rhs.ty) == .vector_type) return ev.vectorCompare(op, lhs, rhs);
+        const a = try ev.freeze(lhs) orelse return error.Abort;
+        const b = try ev.freeze(rhs) orelse return error.Abort;
+        if (value.intOf(ip, a)) |x| if (value.intOf(ip, b)) |y| return boolVal(value.compareInts(ip, op, value.typeOfValue(ip, a), value.typeOfValue(ip, b), x, y));
+        if (ip.key(a) == .float_value or ip.key(b) == .float_value) if (value.floatOf(ip, a)) |x| if (value.floatOf(ip, b)) |y| return boolVal(compareNumbers(op, x, y));
+        if (op != .equal_equal and op != .bang_equal) return error.Abort;
+        const eq = try eqlValues(ev.r, a, b) orelse return error.Abort;
+        return boolVal(eq == (op == .equal_equal));
+    }
+
     /// Arithmetic, bitwise and shift operator `op` on evaluated operands: the binary expression
     /// `a op b`, and the operator of the compound assignment `a op= b`
     fn arith(ev: *Evaluator, op: SyntaxKind, lhs: Val, rhs: Val) EvalError!Val {
         const ip = ev.ip;
-        const is_shift = op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right or op == .angle_bracket_angle_bracket_left_pipe;
+        const is_shift = isShift(op);
         // Bitwise operations on bool
         if (lhs.ty == .bool_type and rhs.ty == .bool_type) {
             const x = (try ev.condition(lhs)).yes;
@@ -2735,7 +2747,7 @@ const Evaluator = struct {
             const y = ev.floatOf(try ev.coerce(rhs, ty)) orelse return error.Abort;
             return Val.of(ty, try value.binaryFloat(ip, op, ty, x, y) orelse return error.Abort);
         }
-        const ty = if (is_shift) lhs.ty else value.peerIntType(ip, lhs.ty, rhs.ty) orelse return error.Abort;
+        const ty = if (is_shift) lhs.ty else value.peerIntType(ip, lhs.ty, rhs.ty) orelse return ev.aggregateArith(op, lhs, rhs);
         if (ev.intOf(lhs)) |a| {
             if (ev.intOf(rhs)) |b| {
                 if (value.binaryInt(ip, op, ty, a, b)) |r| return Val.ofInt(ty, r);
@@ -2749,7 +2761,184 @@ const Evaluator = struct {
             const r = try value.binaryBig(ip, ev.a, op, ty, a, b) orelse return error.Abort;
             return Val.ofBig(ty, r);
         }
+        return ev.aggregateArith(op, lhs, rhs);
+    }
+
+    /// `op` on operands that are not numbers or bools: vectors are computed element by element,
+    /// and many-item and C pointers support pointer arithmetic
+    fn aggregateArith(ev: *Evaluator, op: SyntaxKind, lhs: Val, rhs: Val) EvalError!Val {
+        const ip = ev.ip;
+        if (ip.key(lhs.ty) == .vector_type or ip.key(rhs.ty) == .vector_type) return ev.vectorArith(op, lhs, rhs);
+        if (op == .plus or op == .minus) switch (ip.key(lhs.ty)) {
+            .ptr_type => |p| if (p.size != .slice) return ev.pointerArith(op, p, lhs, rhs),
+            else => {},
+        };
         return error.Abort;
+    }
+
+    /// Element-wise operator on vectors (`Sema.checkVectorizableBinaryOperands`, `Sema/arith.zig`):
+    /// both operands are vectors, or a vector and an array, of the same length (a scalar operand
+    /// is a compile error). The operands are coerced to their peer vector type; for a shift, the
+    /// result has the type of the left operand and each shift amount keeps its type.
+    fn vectorArith(ev: *Evaluator, op: SyntaxKind, lhs: Val, rhs: Val) EvalError!Val {
+        const ip = ev.ip;
+        const n = try ev.vectorOperandLen(lhs.ty, rhs.ty);
+        const is_shift = isShift(op);
+        const ty = if (is_shift) lhs.ty else try ev.vectorPeer(lhs.ty, rhs.ty, n);
+        const child = switch (ip.key(ty)) {
+            .vector_type => |v| v.child,
+            else => return error.Abort,
+        };
+        const elems = try ev.allocElems(n);
+        for (elems, 0..) |*o, i| {
+            var a = try ev.elemAt(lhs, i);
+            var b = try ev.elemAt(rhs, i);
+            if (!is_shift) {
+                a = try ev.coerce(a, child);
+                b = try ev.coerce(b, child);
+            }
+            o.* = try ev.arith(op, a, b);
+        }
+        return ev.makeAgg(ty, elems);
+    }
+
+    /// Element-wise comparison of vectors (`Sema.cmpVector`): both operands are vectors, or a
+    /// vector and an array, of the same length; the result is a vector of bools
+    fn vectorCompare(ev: *Evaluator, op: SyntaxKind, lhs: Val, rhs: Val) EvalError!Val {
+        const n = try ev.vectorOperandLen(lhs.ty, rhs.ty);
+        const ty = try ev.ip.get(.{ .vector_type = .{ .len = @intCast(n), .child = .bool_type } });
+        // An undefined operand gives an undefined result
+        if (lhs.v == .undef or rhs.v == .undef) return .{ .ty = ty, .v = .undef };
+        const elems = try ev.allocElems(n);
+        for (elems, 0..) |*o, i| o.* = try ev.compare(op, try ev.elemAt(lhs, i), try ev.elemAt(rhs, i));
+        return ev.makeAgg(ty, elems);
+    }
+
+    /// Number of elements of the operands of an element-wise operator, at least one of which is
+    /// a vector: both must be vectors or arrays of the same length
+    fn vectorOperandLen(ev: *Evaluator, a: Index, b: Index) EvalError!usize {
+        const x = vectorShape(ev.ip, a) orelse return error.Abort;
+        const y = vectorShape(ev.ip, b) orelse return error.Abort;
+        if (x.len != y.len) return error.Abort;
+        const n = std.math.cast(u32, x.len) orelse return error.Abort;
+        return n;
+    }
+
+    /// Peer type of two operands of an element-wise operator of `n` elements
+    /// (`Sema.resolvePeerTypes`): a vector of the peer type of their elements
+    fn vectorPeer(ev: *Evaluator, a: Index, b: Index, n: usize) EvalError!Index {
+        const ip = ev.ip;
+        if (a == b) return a;
+        const x = vectorShape(ip, a).?.child;
+        const y = vectorShape(ip, b).?.child;
+        const child = if (x == y)
+            x
+        else if (ip.isFloat(x) or ip.isFloat(y))
+            peerFloatType(ip, x, y) orelse return error.Abort
+        else
+            value.peerIntType(ip, x, y) orelse return error.Abort;
+        return ip.get(.{ .vector_type = .{ .len = @intCast(n), .child = child } });
+    }
+
+    /// Coerces a vector or array to the vector type `ty` element by element
+    /// (`Sema.coerceArrayLike`; other operands are coerced as usual): the lengths must match
+    fn coerceToVector(ev: *Evaluator, v: Val, ty: Index) EvalError!Val {
+        if (v.ty == ty or v.v == .undef or vectorShape(ev.ip, v.ty) == null) return ev.coerce(v, ty);
+        const n = try ev.vectorOperandLen(v.ty, ty);
+        if (v.v == .unknown) return .{ .ty = ty };
+        const child = ev.ip.key(ty).vector_type.child;
+        const elems = try ev.allocElems(n);
+        for (elems, 0..) |*o, i| o.* = try ev.coerce(try ev.elemAt(v, i), child);
+        return ev.makeAgg(ty, elems);
+    }
+
+    /// `@reduce(op, v)` (`Sema.zirReduce`): the elements of the vector combined from the first
+    /// one on; integer addition and multiplication wrap, and `.Min` / `.Max` skip NaN
+    /// (`Value.numberMin` / `numberMax`)
+    fn reduce(ev: *Evaluator, op_name: []const u8, v: Val) EvalError!Val {
+        const ip = ev.ip;
+        const ReduceOp = enum { And, Or, Xor, Min, Max, Add, Mul };
+        const op = std.meta.stringToEnum(ReduceOp, op_name) orelse return error.Abort;
+        const vec = switch (ip.key(v.ty)) {
+            .vector_type => |x| x,
+            else => return error.Abort,
+        };
+        if (vec.len == 0) return error.Abort;
+        if (v.v == .undef) return .{ .ty = vec.child, .v = .undef };
+        const is_float = ip.isFloat(vec.child);
+        var acc = try ev.elemAt(v, 0);
+        for (1..vec.len) |i| {
+            const x = try ev.elemAt(v, i);
+            acc = switch (op) {
+                .And => try ev.arith(.ampersand, acc, x),
+                .Or => try ev.arith(.pipe, acc, x),
+                .Xor => try ev.arith(.caret, acc, x),
+                .Add => try ev.arith(if (is_float) .plus else .plus_percent, acc, x),
+                .Mul => try ev.arith(if (is_float) .asterisk else .asterisk_percent, acc, x),
+                .Min, .Max => blk: {
+                    if (ev.isNan(acc)) break :blk x;
+                    if (ev.isNan(x)) break :blk acc;
+                    const keep = try ev.compare(if (op == .Min) .angle_bracket_left else .angle_bracket_right, acc, x);
+                    break :blk if ((try ev.condition(keep)).yes) acc else x;
+                },
+            };
+        }
+        return acc;
+    }
+
+    fn isNan(ev: *Evaluator, v: Val) bool {
+        return v.v == .ip and ev.ip.key(v.v.ip) == .float_value and std.math.isNan(ev.floatOf(v) orelse return false);
+    }
+
+    /// `@select(T, pred, a, b)` (`Sema.zirSelect`): element `i` of `a` where element `i` of
+    /// `pred` is true, of `b` otherwise. An undefined operand gives an undefined result.
+    fn select(ev: *Evaluator, elem: Index, pred_in: Val, a_in: Val, b_in: Val) EvalError!Val {
+        const ip = ev.ip;
+        const n = std.math.cast(u32, (vectorShape(ip, pred_in.ty) orelse return error.Abort).len) orelse return error.Abort;
+        const ty = try ip.get(.{ .vector_type = .{ .len = n, .child = elem } });
+        const pred = try ev.coerceToVector(pred_in, try ip.get(.{ .vector_type = .{ .len = n, .child = .bool_type } }));
+        const a = try ev.coerceToVector(a_in, ty);
+        const b = try ev.coerceToVector(b_in, ty);
+        if (pred.v == .undef or a.v == .undef or b.v == .undef) return .{ .ty = ty, .v = .undef };
+        const elems = try ev.allocElems(n);
+        for (elems, 0..) |*o, i| {
+            const c = try ev.condition(try ev.elemAt(pred, i));
+            o.* = try ev.elemAt(if (c.yes) a else b, i);
+        }
+        return ev.makeAgg(ty, elems);
+    }
+
+    /// `@shuffle(T, a, b, mask)` (`Sema.analyzeShuffle`): element `i` is element `m` of `a` for
+    /// mask element `m >= 0`, element `~m` of `b` for `m < 0`, and undefined for an undefined
+    /// mask element. An operand the mask selects nothing from may be `undefined`.
+    fn shuffle(ev: *Evaluator, elem: Index, a_in: Val, b_in: Val, mask_in: Val) EvalError!Val {
+        const ip = ev.ip;
+        const n = std.math.cast(u32, (vectorShape(ip, mask_in.ty) orelse return error.Abort).len) orelse return error.Abort;
+        const mask = try ev.coerceToVector(mask_in, try ip.get(.{ .vector_type = .{ .len = n, .child = try ip.intType(.signed, 32) } }));
+        const a = try ev.shuffleOperand(elem, a_in);
+        const b = try ev.shuffleOperand(elem, b_in);
+        const elems = try ev.allocElems(n);
+        for (elems, 0..) |*o, i| {
+            const m = try ev.elemAt(mask, i);
+            if (m.v == .undef) {
+                o.* = .{ .ty = elem, .v = .undef };
+                continue;
+            }
+            const raw = ev.intOf(m) orelse return error.Abort;
+            const from = if (raw >= 0) a else b;
+            const index: u64 = @intCast(if (raw >= 0) raw else ~raw);
+            if (index >= from.len) return error.Abort;
+            o.* = try ev.elemAt(from.v, @intCast(index));
+        }
+        return ev.makeAgg(try ip.get(.{ .vector_type = .{ .len = n, .child = elem } }), elems);
+    }
+
+    /// Operand of `@shuffle` coerced to a vector of `elem`, and its length: `undefined` has none
+    fn shuffleOperand(ev: *Evaluator, elem: Index, v: Val) EvalError!struct { v: Val, len: u64 } {
+        if (v.ty == .undefined_type) return .{ .v = v, .len = 0 };
+        const len = (vectorShape(ev.ip, v.ty) orelse return error.Abort).len;
+        const ty = try ev.ip.get(.{ .vector_type = .{ .len = std.math.cast(u32, len) orelse return error.Abort, .child = elem } });
+        return .{ .v = try ev.coerceToVector(v, ty), .len = len };
     }
 
     /// Whether two comptime pointers are equal; null when it cannot be determined. As in the
@@ -2760,18 +2949,20 @@ const Evaluator = struct {
     /// matching the compiler's deduplication of identical literals) and carries no other
     /// identity: compared with a pointer into a declaration or an anonymous constant, it is
     /// unequal only when its data cannot be stored at that location (`mayAlias`).
+    /// Pointer arithmetic on interned data that records no place points into a cell holding
+    /// that data (see `internedCell`).
     fn pointerEql(ev: *Evaluator, a_in: Val, b_in: Val) EvalError!?bool {
         const a = try ev.withPlace(a_in);
         const b = try ev.withPlace(b_in);
         switch (a.v) {
             .ref => |x| switch (b.v) {
                 .ref => |y| return ev.refEql(x, a, y, b),
-                .ip => |y| return ev.refEqlInterned(x, y),
+                .ip => |y| return ev.refEqlInterned(x, b.ty, y),
                 else => return null,
             },
             .ip => |x| switch (b.v) {
                 .ip => |y| return x == y,
-                .ref => |y| return ev.refEqlInterned(y, x),
+                .ref => |y| return ev.refEqlInterned(y, a.ty, x),
                 else => return null,
             },
             else => return null,
@@ -2792,6 +2983,10 @@ const Evaluator = struct {
     /// Pointers `a` (into `x`) and `b` (into `y`)
     fn refEql(ev: *Evaluator, x: Ref, a: Val, y: Ref, b: Val) EvalError!?bool {
         if (x.cell == y.cell) return samePlace(x, y);
+        // The cell of interned data and another cell may hold the same storage: the other may
+        // be a copy taken by `addressOfValue`, or hold the elements of a pointer frozen after
+        // it was moved (see `refEqlInterned`)
+        if (ev.isInternedCell(x.cell) or ev.isInternedCell(y.cell)) return null;
         const ox = ev.cellOrigin(x.cell);
         const oy = ev.cellOrigin(y.cell);
         if (ox == .thread_local or oy == .thread_local) return null;
@@ -2827,8 +3022,17 @@ const Evaluator = struct {
         };
     }
 
-    /// Pointer into a storage cell `r` and interned pointer `q`
-    fn refEqlInterned(ev: *Evaluator, r: Ref, q: Index) EvalError!?bool {
+    /// Pointer into a storage cell `r` and interned pointer `q` of type `q_ty`. In the cell
+    /// holding the data of `q` (see `internedCell`), only the start is `q`. In the cell of other
+    /// interned data it cannot be determined: a pointer frozen after it was moved holds only
+    /// the elements from it on, so `q` may point into the middle of that data.
+    fn refEqlInterned(ev: *Evaluator, r: Ref, q_ty: Index, q: Index) EvalError!?bool {
+        if (ev.isInternedCell(r.cell)) {
+            const data = try ev.internedElems(q_ty, q) orelse return null;
+            if (ev.interned_cells.get(data.v.ip) != r.cell) return null;
+            if (r.path.len != 0) return null;
+            return (if (r.window) |w| w.start else 0) == 0;
+        }
         switch (ev.cellOrigin(r.cell)) {
             .storage, .variable => return false,
             .thread_local => return null,
@@ -2958,6 +3162,133 @@ const Evaluator = struct {
             .union_value => |u| holdsPointer(ip, u.payload),
             else => false,
         };
+    }
+
+    /// Pointer arithmetic (`Sema.analyzeArithmetic`, `Sema.analyzePtrArithmetic`) on a pointer `p`
+    /// that is not a slice: `p + n` / `p - n` on a many-item or C pointer moves it by `n`
+    /// elements, and `p - q` is the number of elements from `q` to `p`
+    fn pointerArith(ev: *Evaluator, op: SyntaxKind, p: InternPool.PtrType, lhs: Val, rhs: Val) EvalError!Val {
+        const ip = ev.ip;
+        switch (ip.key(rhs.ty)) {
+            .ptr_type => |q| {
+                if (op != .minus or q.size == .slice) return error.Abort;
+                return ev.pointerDifference(p, q, lhs, rhs);
+            },
+            else => {},
+        }
+        if (p.size != .many and p.size != .c) return error.Abort;
+        const n = std.math.cast(u64, ev.intOf(try ev.coerce(rhs, .usize_type)) orelse return error.Abort) orelse return error.Abort;
+        // Elements without runtime bits share one address, and an offset of zero keeps the
+        // pointer: the result is the operand itself, with its type
+        if (n == 0) return lhs;
+        if (try ev.typeLayout(p.child, 0)) |l| if (l.size == 0) return lhs;
+        var moved = p;
+        moved.attrs = try ev.elemPtrAttrs(p.attrs, p.child, n);
+        const ty = try ip.get(.{ .ptr_type = moved });
+        if (lhs.v == .undef) return .{ .ty = ty, .v = .undef };
+        const r = try ev.pointerRef(lhs) orelse return error.Abort;
+        // A pointer may move anywhere within the array it points into, up to just past its end;
+        // a `*T` → `*[1]T` view points into an array holding only the place
+        const total = if (r.as_array) 1 else try ev.elemCount(try ev.loadPath(r)) orelse return error.Abort;
+        const start: u64 = if (r.window) |w| w.start else 0;
+        const at = if (op == .plus) std.math.add(u64, start, n) catch return error.Abort else std.math.sub(u64, start, n) catch return error.Abort;
+        if (at > total) return error.Abort;
+        const window: Ref.Window = .{ .start = std.math.cast(u32, at) orelse return error.Abort, .len = std.math.cast(u32, total - at) orelse return error.Abort };
+        return .{ .ty = ty, .v = .{ .ref = .{ .cell = r.cell, .path = r.path, .window = window, .is_const = r.is_const, .as_array = r.as_array, .immutable = r.immutable } } };
+    }
+
+    /// `lhs - rhs` on pointers that are not slices: the number of elements from `rhs` to `lhs`,
+    /// pointing into the same array. The compiler requires the same element type with runtime
+    /// bits, and reports an error when `lhs` is before `rhs`.
+    fn pointerDifference(ev: *Evaluator, p: InternPool.PtrType, q: InternPool.PtrType, lhs: Val, rhs: Val) EvalError!Val {
+        const elem = ev.ptrArithElem(p);
+        if (elem != ev.ptrArithElem(q)) return error.Abort;
+        const l = try ev.typeLayout(elem, 0) orelse return error.Abort;
+        if (l.size == 0) return error.Abort;
+        const a = try ev.elementPosition(p, lhs) orelse return error.Abort;
+        const b = try ev.elementPosition(q, rhs) orelse return error.Abort;
+        if (a.cell != b.cell or !std.mem.eql(u32, a.path, b.path) or a.index < b.index) return error.Abort;
+        return ev.int(.usize_type, a.index - b.index);
+    }
+
+    /// Element type of pointer arithmetic: that of the array for a pointer to an array
+    fn ptrArithElem(ev: *Evaluator, p: InternPool.PtrType) Index {
+        if (p.size == .one) switch (ev.ip.key(p.child)) {
+            .array_type => |a| return a.child,
+            else => {},
+        };
+        return p.child;
+    }
+
+    const ElementPosition = struct { cell: *Val, path: []const u32, index: u64 };
+
+    /// Position of the element a pointer to elements (many-item, C, or a pointer to an array)
+    /// points to: the array containing it and its index there; null when it is not known
+    fn elementPosition(ev: *Evaluator, p: InternPool.PtrType, v: Val) EvalError!?ElementPosition {
+        if (p.size == .one and ev.ip.key(p.child) != .array_type) return null;
+        const r = try ev.pointerRef(v) orelse return null;
+        return .{ .cell = r.cell, .path = r.path, .index = if (r.window) |w| w.start else 0 };
+    }
+
+    /// A pointer to elements as a reference to the storage it points into; null when it is not
+    /// known. An interned pointer that records its place points there (`pointerPlace`), so
+    /// pointer arithmetic continues in the declaration's storage; other interned data is placed
+    /// in a constant cell (see `internedCell`).
+    fn pointerRef(ev: *Evaluator, v: Val) EvalError!?Ref {
+        if (try ev.pointerPlace(v)) |r| return r;
+        return switch (v.v) {
+            .ip => |x| .{ .cell = try ev.internedCell(try ev.internedElems(v.ty, x) orelse return null), .path = &.{}, .is_const = true },
+            else => null,
+        };
+    }
+
+    /// The elements the interned pointer `x` of type `ptr_ty` points to, as an interned array: for
+    /// a pointer to an array, the array (with its sentinel); for other pointers, the elements from
+    /// the pointer on, followed by the sentinel of the pointer type. Null when `x` holds no
+    /// elements (e.g. a pointer cast from an integer).
+    fn internedElems(ev: *Evaluator, ptr_ty: Index, x: Index) EvalError!?Val {
+        const ip = ev.ip;
+        const p = switch (ip.key(ptr_ty)) {
+            .ptr_type => |p| p,
+            else => return null,
+        };
+        const storage: Index, const len: usize = switch (ip.key(x)) {
+            .aggregate => |agg| .{ agg.ty, agg.elems.len },
+            .bytes => |b| .{ b.ty, b.bytes.len },
+            else => return null,
+        };
+        const sp = switch (ip.key(storage)) {
+            .ptr_type => |sp| sp,
+            else => return null,
+        };
+        const array: Index = if (sp.size == .one) switch (ip.key(sp.child)) {
+            .array_type => |a| if (a.len == len) sp.child else return null,
+            else => return null,
+        } else try ip.get(.{ .array_type = .{ .len = len, .child = sp.child, .sentinel = sp.sentinel } });
+        if (ip.key(array).array_type.child != ev.ptrArithElem(p)) return null;
+        const data = switch (ip.key(x)) {
+            .aggregate => |agg| try ev.aggregate(array, agg.elems),
+            .bytes => |b| try ip.get(.{ .bytes = .{ .ty = array, .bytes = b.bytes } }),
+            else => unreachable,
+        };
+        return .{ .ty = array, .v = .{ .ip = data } };
+    }
+
+    /// Constant storage cell holding the interned array `data`: the same cell for the same data
+    /// within an evaluation, so pointers computed from interned pointers to equal data compare
+    /// and subtract with each other
+    fn internedCell(ev: *Evaluator, data: Val) EvalError!*Val {
+        const gop = try ev.interned_cells.getOrPut(ev.a, data.v.ip);
+        if (!gop.found_existing) {
+            const cell = try ev.a.create(Val);
+            cell.* = data;
+            gop.value_ptr.* = cell;
+        }
+        return gop.value_ptr.*;
+    }
+
+    fn isInternedCell(ev: *Evaluator, cell: *Val) bool {
+        return cell.v == .ip and ev.interned_cells.get(cell.v.ip) == cell;
     }
 
     /// `++`: concatenation of arrays, strings, and tuples
@@ -3255,6 +3586,15 @@ const Evaluator = struct {
     /// interned pointer records (`basePlace`), the place it points to instead (automatic
     /// dereferencing)
     fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId, use: PlaceUse) EvalError!Ref {
+        // A pointer computed by pointer arithmetic (`(p + 1)[0] = x`) is not a place: the
+        // compiler takes the element pointer of the value
+        if (f.body.expr(e) == .binary) {
+            const p = try ev.eval(f, e, null);
+            return switch (p.v) {
+                .ref => |r| ev.through(r, p.ty),
+                else => error.Abort,
+            };
+        }
         const ref = try ev.placeFor(f, e, use);
         // The value of a range, or of a `*T` → `*[1]T` view, is an array, not a pointer
         if (ref.window != null or ref.as_array) return ref;
@@ -3362,6 +3702,8 @@ const Evaluator = struct {
             .ptr_type => |p| p.is_const,
             else => r.is_const,
         };
+        // Interned data is constant whatever the pointer type says
+        if (ev.isInternedCell(r.cell)) out.is_const = true;
         return out;
     }
 
@@ -4242,6 +4584,18 @@ const Evaluator = struct {
             if (vals.len != 2) return error.Abort;
             const bits = try ev.bitOffsetOf(try asType(vals[0]), try ev.stringOf(vals[1])) orelse return error.Abort;
             return try ev.int(.comptime_int_type, if (eq(u8, name, "@offsetOf")) bits / 8 else bits);
+        }
+        if (eq(u8, name, "@reduce")) {
+            if (vals.len != 2) return error.Abort;
+            return try ev.reduce(try ev.tagName(vals[0]), vals[1]);
+        }
+        if (eq(u8, name, "@select")) {
+            if (vals.len != 4) return error.Abort;
+            return try ev.select(try asType(vals[0]), vals[1], vals[2], vals[3]);
+        }
+        if (eq(u8, name, "@shuffle")) {
+            if (vals.len != 4) return error.Abort;
+            return try ev.shuffle(try asType(vals[0]), vals[1], vals[2], vals[3]);
         }
         if (eq(u8, name, "@min") or eq(u8, name, "@max")) {
             if (vals.len == 0) return error.Abort;
@@ -6158,4 +6512,18 @@ fn floatPeer(ip: *InternPool, a: Index, b: Index) ?Index {
 
 fn boolVal(b: bool) Val {
     return .{ .ty = .bool_type, .v = .{ .ip = if (b) .true_value else .false_value } };
+}
+
+fn isShift(op: SyntaxKind) bool {
+    return op == .angle_bracket_angle_bracket_left or op == .angle_bracket_angle_bracket_right or op == .angle_bracket_angle_bracket_left_pipe;
+}
+
+/// Length and element type of a vector or array type: the operand shapes element-wise
+/// operators accept
+fn vectorShape(ip: *InternPool, t: Index) ?struct { len: u64, child: Index } {
+    return switch (ip.key(t)) {
+        .vector_type => |v| .{ .len = v.len, .child = v.child },
+        .array_type => |a| .{ .len = a.len, .child = a.child },
+        else => null,
+    };
 }
