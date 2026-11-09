@@ -257,8 +257,18 @@ pub fn runLocal(ctx: *Db.Ctx, owner: hir.OwnerKey, target_ref: @FieldType(querie
             else
                 .{ .ty = v.ty };
         },
-        // A capture's value depends on control flow: take the whole member's inference result
+        // A capture's value depends on control flow: it is the binding the whole member's
+        // inference gives it
         .capture => {
+            // In one iteration of a loop or `inline` prong, the reader is a container defined in
+            // that iteration (`Inferrer.containerInst`), reached by the member's inference of the
+            // iteration, which is still in progress: the same inference runs here, up to where the
+            // capture is bound
+            if (inf.iterationSeed() != null) {
+                inf.stop_at = binding;
+                try inf.runOwner(tree.items[item].kind, .full);
+                return inf.bindings[@backingInt(binding)];
+            }
             const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = split.inst, .loop = split.seed });
             return if (@backingInt(binding) < res.bindings.len) res.bindings[@backingInt(binding)] else .unknown;
         },
@@ -347,6 +357,10 @@ const Inferrer = struct {
     /// Backward-branch quota of comptime evaluations started directly in the member (see
     /// `eval.bodyQuota`), computed on first use
     quota: ?u32 = null,
+    /// Inferring the member only up to where this capture is bound (see `runLocal`): once it is
+    /// bound, `stopped` is set and the rest of the member is not inferred
+    stop_at: ?Body.BindingId = null,
+    stopped: bool = false,
 
     /// Target of break. Only breaks actually reached are recorded (not those in branches known at
     /// comptime not to execute).
@@ -705,6 +719,7 @@ const Inferrer = struct {
     }
 
     fn inferWith(inf: *Inferrer, e: ExprId, expected: ?Index, comptime coerce_result: bool) Error!TypedValue {
+        if (inf.stopped) return .unknown;
         const i = @backingInt(e);
         if (inf.done.isSet(i)) return inf.exprs[i];
         inf.done.set(i);
@@ -890,7 +905,7 @@ const Inferrer = struct {
             }
             break :blk try inf.infer(e, expected);
         };
-        if (tv.val != null or inf.dead > 0) return tv;
+        if (tv.val != null or inf.dead > 0 or inf.stopped) return tv;
         // String literals in comptime arguments (the inferrer normally produces no values for
         // strings): matching the interpreter, the type of the value is `*const [N:0]u8`
         switch (inf.body.expr(e)) {
@@ -1025,6 +1040,8 @@ const Inferrer = struct {
                 const cond = try inf.infer(x.cond, null);
                 try inf.bindCaptures(x.capture, x.cond, cond, .if_then);
                 try inf.bindCaptures(x.else_capture, x.cond, cond, .if_else);
+                inf.captureBound(x.capture);
+                inf.captureBound(x.else_capture);
                 const taken = inf.condValue(cond);
                 if (taken == null) inf.uncertain += 1;
                 const then = try inf.inferArm(x.then, expected, taken == false);
@@ -1078,6 +1095,7 @@ const Inferrer = struct {
                 };
                 for (s.prongs, 0..) |prong, i| {
                     try inf.bindSwitchCapture(s.prongs, i, s.operand, operand, chosen != null and chosen.? == i);
+                    inf.captureBound(prong.capture);
                     const tv = try inf.inferArm(prong.body, expected, chosen != null and chosen.? != i);
                     if (chosen != null and chosen.? == i) chosen_tv = tv;
                     try types.append(inf.scratch, tv.ty);
@@ -1120,7 +1138,10 @@ const Inferrer = struct {
                 // taken gets only the result type of the whole expression
                 const ok = inf.condValue(lhs);
                 // The capture of a comptime-known error is that error
-                if (c.capture) |cap| inf.bindings[@backingInt(cap)] = .{ .ty = err, .val = if (ok == false) lhs.val else null };
+                if (c.capture) |cap| {
+                    inf.bindings[@backingInt(cap)] = .{ .ty = err, .val = if (ok == false) lhs.val else null };
+                    inf.captureBound(&.{cap});
+                }
                 const rhs = try inf.inferBranch(c.rhs, inf.fallbackType(expected, if (ok == false) .unknown else payload, c.rhs), ok == true);
                 if (ok) |o| return if (o) .{ .ty = payload, .val = lhs.val } else rhs;
                 return .{ .ty = try inf.peer(&.{ payload, rhs.ty }) };
@@ -2345,6 +2366,8 @@ const Inferrer = struct {
                 const cond = try inf.infer(l.inputs[0], null);
                 try inf.bindCaptures(l.capture, l.inputs[0], cond, .if_then);
                 try inf.bindCaptures(l.else_capture, l.inputs[0], cond, .if_else);
+                inf.captureBound(l.capture);
+                inf.captureBound(l.else_capture);
                 endless = inf.condValue(cond) == true and !try inf.assignsOuterComptimeVar(l.body) and
                     (if (l.cont) |c| !try inf.assignsOuterComptimeVar(c) else true);
             },
@@ -2358,8 +2381,11 @@ const Inferrer = struct {
                 else
                     null;
                 // When the loop body modifies an outer `comptime var`, at the start of iteration n
-                // it takes its value at the end of iteration n - 1
-                if (iteration) |n| if (n > 0) if (try inf.assignsOuterComptimeVar(l.body)) {
+                // it takes its value at the end of iteration n - 1. Inferring only up to a loop
+                // variable of this loop (see `runLocal`) does not read it: the compiler evaluates
+                // the operands once, before the loop (`AstGen.forExpr`), so the loop variables do
+                // not depend on what earlier iterations modify.
+                if (iteration) |n| if (n > 0) if (!inf.stopsAt(l.capture)) if (try inf.assignsOuterComptimeVar(l.body)) {
                     const prev = try inf.r.ctx.get(queries.Infer, .{
                         .owner = .{ .file = inf.file, .item = try inf.body_owner() },
                         .mode = inf.mode,
@@ -2369,6 +2395,7 @@ const Inferrer = struct {
                     for (prev.iteration_vars) |v| inf.bindings[@backingInt(v.binding)].val = v.val;
                 };
                 try inf.bindForCaptures(l, iteration);
+                inf.captureBound(l.capture);
             },
         }
         // Without per-iteration inference, the number of times the loop body runs is
@@ -2404,6 +2431,17 @@ const Inferrer = struct {
         const ty = try inf.peer(frame.types.items);
         for (frame.exprs.items) |x| try inf.peerLiteral(x, ty);
         return .{ .ty = ty };
+    }
+
+    /// Inferring only up to the capture `stop_at`, which is one of `caps`
+    fn stopsAt(inf: *const Inferrer, caps: []const Body.BindingId) bool {
+        const target = inf.stop_at orelse return false;
+        return std.mem.indexOfScalar(Body.BindingId, caps, target) != null;
+    }
+
+    /// `caps` have just been bound: when inferring only up to the capture `stop_at`, stops there
+    fn captureBound(inf: *Inferrer, caps: []const Body.BindingId) void {
+        if (inf.stopsAt(caps)) inf.stopped = true;
     }
 
     /// Loop variables of a `for` loop; when inferring the `iteration`-th iteration, they take the
