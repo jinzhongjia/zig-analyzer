@@ -520,7 +520,8 @@ pub fn constPointer(r: *Resolver, ptr_ty: Index, pointee: Index) Error!Index {
 
 /// `&e` where `e` has the comptime-known value `pointee`, under the given bindings: a pointer of
 /// type `ptr_ty` to that value (see `constPointer`), which records its place when `e` is a
-/// container-level declaration or a field or element inside one (`InternPool.Key.ptr_base`), as
+/// container-level declaration, a value captured from an enclosing function or declaration
+/// (`Evaluator.capturePlace`), or a field or element inside one (`InternPool.Key.ptr_base`), as
 /// the interpreter's `&` does
 pub fn addressValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, ptr_ty: Index, pointee: Index) Error!Index {
     const scope = if (r.context == null) try queries.enterContext(r, file, inst) else null;
@@ -949,11 +950,13 @@ const CellOrigin = enum {
     /// result that is a pointer points to such a constant too (`Sema.zirArrayCat`).
     temporary,
     /// A copy of storage outside this evaluation whose place is not known here (a field reached
-    /// through an interned pointer that records no place, a value captured from an enclosing
-    /// function): pointers into it compare as an interned pointer to that data would
+    /// through an interned pointer that records no place): pointers into it compare as an
+    /// interned pointer to that data would
     copy,
-    /// A constant local, a parameter, or a capture (see `constantCell`): an anonymous constant
-    /// in the compiler like `temporary`, the same constant as a temporary with an equal value
+    /// A constant local, a parameter, or a capture (see `constantCell`), or a value a container
+    /// captures from an enclosing function or declaration (see `capturePlace`): an anonymous
+    /// constant in the compiler like `temporary`, the same constant as a temporary with an equal
+    /// value
     constant,
     /// A constant local declared with `align`: an anonymous constant whose alignment is part of
     /// its identity. The alignment is not tracked here, so whether it is the same constant as
@@ -971,6 +974,10 @@ const CellOrigin = enum {
 
 /// A container-level declaration under the instance it belongs to (`queries.declInst`)
 const DeclKey = struct { file: FileId, item: u32, inst: ?Index };
+
+/// Local `local` of another member read by a member of container `from` inside it, in instance
+/// context `inst` (see `capturePlace`)
+const CaptureKey = struct { local: queries.Local, from: Namespace, inst: ?Index };
 
 /// An anonymous constant: its type and interned value (`InternPool.PtrBase.Root.constant`)
 const ConstantKey = struct { ty: Index, value: Index };
@@ -1093,6 +1100,9 @@ const Evaluator = struct {
     /// The locals each container defined in a loop of a function body captures (see
     /// `loopCaptures`), by container
     loop_captures: std.AutoHashMapUnmanaged(Namespace, []const Body.BindingId) = .empty,
+    /// Anonymous constants of the values captured from enclosing functions and declarations
+    /// (see `capturePlace`)
+    capture_cells: std.AutoHashMapUnmanaged(CaptureKey, *Val) = .empty,
     /// Cells of the anonymous constants interned pointers record (`InternPool.PtrBase.Root`),
     /// by type and value (see `constantPlace`)
     constant_places: std.AutoHashMapUnmanaged(ConstantKey, *Val) = .empty,
@@ -2009,9 +2019,15 @@ const Evaluator = struct {
             else => {},
         }
         return switch (def) {
-            .local => |l| ev.typedDeclValue(def, try queries.outerLocal(ev.r, l, try queries.memberNamespace(ev.r, f.file, f.item), f.inst)),
+            .local => ev.outerValue(f, def),
             else => ev.declValue(def, f.inst),
         };
+    }
+
+    /// Value of `def`, a local of an enclosing function or declaration that the member of frame
+    /// `f` reads through its container's captures (`queries.outerLocal`)
+    fn outerValue(ev: *Evaluator, f: *const Frame, def: resolve.Def) EvalError!Val {
+        return ev.typedDeclValue(def, try queries.outerLocal(ev.r, def.local, try queries.memberNamespace(ev.r, f.file, f.item), f.inst));
     }
 
     /// Value of a name that is not a local of the current frame
@@ -3771,8 +3787,8 @@ const Evaluator = struct {
 
     /// `&x` when x is not storage: a pointer to a new constant cell holding `v`. A value that is
     /// not a place (`isTemporary`) is a temporary constant; other operands (a field reached
-    /// through a pointer that records no place, a value captured from an enclosing function)
-    /// copy storage whose place is not known here (`CellOrigin.copy`).
+    /// through a pointer that records no place) copy storage whose place is not known here
+    /// (`CellOrigin.copy`).
     fn addressOfValue(ev: *Evaluator, f: *Frame, e: ExprId, v: Val) EvalError!Val {
         const temporary = isTemporary(f.body, e);
         if (temporary or f.body.expr(e) == .name_ref) if (try ev.functionPointer(v)) |p| return p;
@@ -3832,7 +3848,10 @@ const Evaluator = struct {
                 if (use == .address and !f.body.nameRefIsEscaped(e)) if (try infer.primitive(ev.ip, name) != null) return error.Abort;
                 const def = try ev.r.resolveName(f.file, f.item, f.body, f.body.expr_scopes[@backingInt(e)], name) orelse return error.Abort;
                 switch (def) {
-                    .local => |l| if (l.file == f.file and l.item == f.item) return ev.localPlace(f, l.binding),
+                    .local => |l| {
+                        if (l.file == f.file and l.item == f.item) return ev.localPlace(f, l.binding);
+                        if (use == .address) return ev.capturePlace(f, def);
+                    },
                     .item => |it| if (use == .address) return ev.declPlace(it.file, it.item, f.inst),
                     else => {},
                 }
@@ -3915,6 +3934,32 @@ const Evaluator = struct {
     fn localPlace(ev: *Evaluator, f: *Frame, b: Body.BindingId) EvalError!Ref {
         if (f.body.binding(b).kind == .local_var) return .{ .cell = &f.slots[@backingInt(b)], .path = &.{} };
         return .{ .cell = try ev.constantCell(f, b), .path = &.{}, .is_const = true, .immutable = true };
+    }
+
+    /// The anonymous constant that pointers to `def`, a local of another member that a container
+    /// reads from its enclosing function or declaration, point to. The compiler reads such a
+    /// value through the container's closure (`Sema.zirClosureGet`): `&` of it is `analyzeRef` of
+    /// the value, or the captured pointer to the enclosing constant's own anonymous constant
+    /// (`resolveComptimeKnownAllocPtr`), the same constant as a temporary with an equal value
+    /// either way. One cell per captured local and container reading it in an evaluation (the
+    /// containers of different loop iterations capture different values); a constant declared
+    /// with `align` is an aligned constant (see `CellOrigin.aligned_constant`).
+    /// A variable is not a place here: the compiler rejects `&` of a captured comptime var (the
+    /// container would capture a pointer to it).
+    fn capturePlace(ev: *Evaluator, f: *Frame, def: resolve.Def) EvalError!Ref {
+        const l = def.local;
+        const binding = (try ev.r.body(l.file, l.item)).binding(l.binding);
+        if (binding.kind == .local_var) return error.Abort;
+        const key: CaptureKey = .{ .local = l, .from = try queries.memberNamespace(ev.r, f.file, f.item), .inst = f.inst };
+        const cell = ev.capture_cells.get(key) orelse cell: {
+            const v = try ev.outerValue(f, def);
+            const cell = try ev.a.create(Val);
+            cell.* = v;
+            try ev.capture_cells.put(ev.a, key, cell);
+            try ev.cell_origins.put(ev.a, cell, if (binding.@"align" != null) .aligned_constant else .constant);
+            break :cell cell;
+        };
+        return .{ .cell = cell, .path = &.{}, .is_const = true, .immutable = true };
     }
 
     /// The anonymous constant that pointers to constant binding `b` (a constant local, a

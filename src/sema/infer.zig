@@ -3230,9 +3230,10 @@ const Inferrer = struct {
                 };
                 // A pointer to a comptime-known constant (`parseEx(Id, &params, ...)`,
                 // `@field(x, &name)`) is comptime-known: its value points to the constant's value,
-                // and to its place when that is inside a container-level declaration
+                // and to its place when that is inside a container-level declaration or a value
+                // captured from an enclosing function or declaration
                 if (is_const) if (v.val) |pointee| {
-                    if (try inf.mayBeInDeclaration(operand_e))
+                    if (try inf.mayHavePlace(operand_e))
                         return .{ .ty = ty, .val = try eval.addressValue(inf.r, inf.file, inf.item, inf.body, operand_e, inf.inst, inf.bindings, ty, pointee) };
                     return .{ .ty = ty, .val = try eval.constPointer(inf.r, ty, pointee) };
                 };
@@ -3699,19 +3700,25 @@ const Inferrer = struct {
         return placeIsConst(inf.r, inf.file, inf.item, inf.body, inf, e);
     }
 
-    /// Whether place `e` may be inside a container-level declaration: a declaration, a member of
-    /// a type, or a field or element reached from one or through a pointer
-    fn mayBeInDeclaration(inf: *Inferrer, e: ExprId) Error!bool {
+    /// Whether place `e` may be inside a container-level declaration or the anonymous constant of
+    /// a captured value, whose place a pointer to it records (`eval.addressValue`): a
+    /// declaration, a member of a type, a local of an enclosing function or declaration that
+    /// this container reads, or a field or element reached from one or through a pointer
+    fn mayHavePlace(inf: *Inferrer, e: ExprId) Error!bool {
         const b = inf.body;
         return switch (b.expr(e)) {
             .name_ref => |name| {
                 if (inf.ip.key(inf.get(e).ty) == .ptr_type) return true;
                 const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return false;
-                return def == .item;
+                return switch (def) {
+                    .item => true,
+                    .local => |l| l.file != inf.file or l.item != inf.item,
+                    else => false,
+                };
             },
-            .field_access => |fa| inf.get(fa.lhs).isType() or try inf.mayBeInDeclaration(fa.lhs),
-            .index => |x| inf.mayBeInDeclaration(x.lhs),
-            .@"comptime" => |x| inf.mayBeInDeclaration(x),
+            .field_access => |fa| inf.get(fa.lhs).isType() or try inf.mayHavePlace(fa.lhs),
+            .index => |x| inf.mayHavePlace(x.lhs),
+            .@"comptime" => |x| inf.mayHavePlace(x),
             .deref => true,
             else => false,
         };
