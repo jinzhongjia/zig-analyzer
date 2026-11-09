@@ -10482,6 +10482,117 @@ test "comptime evaluation: pointers to anonymous constants keep their identity a
     });
 }
 
+test "comptime evaluation: & through call results, held pointers and function bodies compares by place" {
+    try expectTypes(
+        \\fn retElem() *const u8 {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    return &a[1];
+        \\}
+        \\fn retElem0() *const u8 {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    return &a[0];
+        \\}
+        \\fn retElemOther() *const u8 {
+        \\    const a = [_]u8{ 1, 3 };
+        \\    return &a[1];
+        \\}
+        \\fn retArr() *const [2]u8 {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    return &a;
+        \\}
+        \\const Pt = struct { x: u8, y: u8 };
+        \\fn retPt() *const Pt {
+        \\    const s = Pt{ .x = 1, .y = 2 };
+        \\    return &s;
+        \\}
+        \\fn retConstPtr() *const u8 {
+        \\    const c: u8 = 5;
+        \\    return &c;
+        \\}
+        \\fn retConstPtr6() *const u8 {
+        \\    const c: u8 = 6;
+        \\    return &c;
+        \\}
+        \\fn mkHolder() type {
+        \\    const x: u8 = 5;
+        \\    const c = &x;
+        \\    return struct {
+        \\        const p = &c;
+        \\    };
+        \\}
+        \\fn mkFn() type {
+        \\    const f = retConstPtr;
+        \\    return struct {
+        \\        const p = &f;
+        \\    };
+        \\}
+        \\var gv: u8 = 5;
+        \\const gc: u8 = 5;
+        \\const blk_ptr = blk: {
+        \\    const x: u8 = 5;
+        \\    break :blk &x;
+        \\};
+        \\const p_elem = &retArr()[1] == retElem();
+        \\const p_elem_first = &retArr()[0] == retElem0();
+        \\const p_elem_other_index = &retArr()[0] == retElem();
+        \\const p_elem_other_value = &retArr()[1] == retElemOther();
+        \\const p_slice_elem = &retArr()[1..][0] == retElem();
+        \\const p_slice_offset = &retArr()[0..][1] == retElem();
+        \\const p_slice_other_index = &retArr()[1..][0] == retElem0();
+        \\const p_slice_other_value = &retArr()[1..][0] == retElemOther();
+        \\const p_field = &retPt().y == &retPt().y;
+        \\const p_field_other = &retPt().x == &retPt().y;
+        \\const p_field_temp = &retPt().y == &@as(u8, 2);
+        \\const p_holder = mkHolder().p.* == &@as(u8, 5);
+        \\const p_holder_ret = mkHolder().p.* == retConstPtr();
+        \\const p_holder_other = mkHolder().p.* == &@as(u8, 6);
+        \\const p_holder_ret_other = mkHolder().p.* == retConstPtr6();
+        \\const p_holder_var = mkHolder().p.* == &gv;
+        \\const p_holder_decl = mkHolder().p.* == &gc;
+        \\const p_blk = blk_ptr == &@as(u8, 5);
+        \\const p_blk_other = blk_ptr == &@as(u8, 6);
+        \\const p_blk_decl = blk_ptr == &gc;
+        \\const p_fn_body = retConstPtr == &retConstPtr;
+        \\const p_fn_body_ne = retConstPtr != &retConstPtr;
+        \\const p_fn_body_rhs = &retConstPtr == retConstPtr;
+        \\const p_fn_body_other = retConstPtr6 == &retConstPtr;
+        \\const p_fn_captured = mkFn().p.* == &retConstPtr;
+        \\const p_fn_captured_other = mkFn().p.* == &retConstPtr6;
+    , &.{
+        // `&` of an element or field of a pointer returned from a call, or of an element of a
+        // slice of one, points into the anonymous constant the pointer points to
+        .{ "p_elem", "bool = true" },
+        .{ "p_elem_first", "bool = true" },
+        .{ "p_elem_other_index", "bool = false" },
+        .{ "p_elem_other_value", "bool = false" },
+        .{ "p_slice_elem", "bool = true" },
+        .{ "p_slice_offset", "bool = true" },
+        .{ "p_slice_other_index", "bool = false" },
+        .{ "p_slice_other_value", "bool = false" },
+        .{ "p_field", "bool = true" },
+        .{ "p_field_other", "bool = false" },
+        .{ "p_field_temp", "bool = false" },
+        // A pointer to a constant local, held by another local constant or a declaration's
+        // initializer, points to the anonymous constant of its value in type inference as well
+        .{ "p_holder", "bool = true" },
+        .{ "p_holder_ret", "bool = true" },
+        .{ "p_holder_other", "bool = false" },
+        .{ "p_holder_ret_other", "bool = false" },
+        .{ "p_holder_var", "bool = false" },
+        .{ "p_holder_decl", "bool = false" },
+        .{ "p_blk", "bool = true" },
+        .{ "p_blk_other", "bool = false" },
+        .{ "p_blk_decl", "bool = false" },
+        // A function body compared with a pointer to a function is a pointer to the function
+        .{ "p_fn_body", "bool = true" },
+        .{ "p_fn_body_ne", "bool = false" },
+        .{ "p_fn_body_rhs", "bool = true" },
+        .{ "p_fn_body_other", "bool = false" },
+        .{ "p_fn_captured", "bool = true" },
+        .{ "p_fn_captured_other", "bool = false" },
+    });
+}
+
 test "comptime evaluation: slices of interpreter storage read elements in place" {
     // Guards against copying the whole range when taking an element or the length of a slice:
     // a loop that slices repeatedly (a common pattern in comptime tokenizers) would allocate in
