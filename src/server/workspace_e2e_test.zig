@@ -756,6 +756,55 @@ test "a change read while a build step is rewriting the file does not build once
     try h.notify("exit", {});
 }
 
+test "shutdown returns while a workspace scan waits for the watch task, which waits for the main loop" {
+    var project = try fixture.Project.create(&.{
+        .{ .path = "main.zig", .text = "const lib = @import(\"lib.zig\");\npub fn main() void {\n    _ = lib.value;\n}\n" },
+        .{ .path = "lib.zig", .text = "pub const value = 1;\n" },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    // The server watches: the client cannot register file watching dynamically
+    _ = try h.request("initialize", .{ .rootUri = try za.base.uri.fromPath(a, project.root), .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    try open(&h, try za.base.uri.fromPath(a, try project.path(a, "main.zig")), "const lib = @import(\"lib.zig\");\npub fn main() void {\n    _ = lib.value;\n}\n");
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const watcher = h.server.watcher.?;
+    // The watch task stops right before it takes write_mutex to hand over a change. The pause
+    // lives in the arena, which outlives the watch task.
+    const pause = try a.create(watch.Watcher.TestPause);
+    pause.* = .{};
+    watcher.test_apply_pause.store(pause, .release);
+    defer watcher.test_apply_pause.store(null, .release);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "lib.zig"), .data = "pub const value = 2;\n" });
+    pause.entered.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } }) catch return error.ChangeNotNoticed;
+    // A workspace scan ends meanwhile: it holds the busy count until the watch task handles it
+    const generation = h.server.scan_generation.load(.acquire) + 1;
+    h.server.scheduleScan();
+    const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(60));
+    while (h.server.scan_done.load(.acquire) < generation) {
+        if (std.Io.Clock.awake.now(testing.io).durationTo(deadline).nanoseconds <= 0) return error.ScanNotDone;
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    {
+        watcher.scan_mutex.lockUncancelable(testing.io);
+        defer watcher.scan_mutex.unlock(testing.io);
+        try testing.expect(watcher.scan_held);
+    }
+    // Shutdown holds write_mutex while it waits for idle. It stops the watch task, which then
+    // waits for write_mutex: the scan's hold must not keep shutdown waiting.
+    const id = try h.send("shutdown", {});
+    const response = h.response(id) catch |err| {
+        // Release the hold so that the server ends and the test fails instead of hanging
+        watcher.closeScan();
+        return err;
+    };
+    try testing.expect(response.object.get("error") == null);
+    try h.notify("exit", {});
+}
+
 test "workspace folders: added folders start a project, removed ones clear its diagnostics" {
     var first = try fixture.Project.create(&.{.{ .path = "a.zig", .text = "pub const a = 1;\n" }});
     defer first.deinit();

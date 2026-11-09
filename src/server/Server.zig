@@ -4310,7 +4310,10 @@ pub fn busyEnd(server: *Server) void {
 }
 
 /// Waits for all background tasks (builds, compile
-/// set computation, diagnostics publishing) to finish
+/// set computation, diagnostics publishing) to finish. Shutdown calls this while it holds
+/// `write_mutex`: whoever holds the busy count must not wait for that mutex (see
+/// `applyWatchedChanges`; shutdown first releases the hold of a workspace scan, see
+/// `watch.Watcher.scanned`)
 fn waitIdle(server: *Server) void {
     server.busy_mutex.lockUncancelable(server.io);
     defer server.busy_mutex.unlock(server.io);
@@ -5977,6 +5980,9 @@ fn shutdown(server: *Server, _: Allocator, _: void) HandlerError!void {
     // configuration request, stop waiting for it. After this the main loop blocks on await and
     // cannot handle a late response, so an in-flight `waitIdle` request can only end through this.
     server.abandonConfigRequests();
+    // Likewise a workspace scan's hold on the busy count: the watch task releases it only after it
+    // got `write_mutex`, which this request holds. Nobody waits for a scan's result any more.
+    if (server.watcher) |w| w.closeScan();
     // Stop the build system processes of all projects; wait for in-flight requests to complete,
     // then for background tasks (diagnostics publishing, etc.) to wind down
     server.stopWorkspaces();

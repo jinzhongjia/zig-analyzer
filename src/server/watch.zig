@@ -100,6 +100,9 @@ pub const Watcher = struct {
     /// Test hook (null outside tests): the background task stops before its next round until the
     /// pause is released, so that a test can change files before the task gets to them
     test_pause: std.atomic.Value(?*TestPause) = .init(null),
+    /// Test hook (null outside tests): the background task stops before it hands a batch of
+    /// changes to the server (which takes `Server.write_mutex`) until the pause is released
+    test_apply_pause: std.atomic.Value(?*TestPause) = .init(null),
     /// Incremented by the background task whenever it starts watching a directory it did not
     /// watch before, natively or by polling: a scan that started walking before then may have
     /// missed a source file created in that directory before the watch (see `scanned`)
@@ -116,9 +119,10 @@ pub const Watcher = struct {
     /// walking; null when there is none
     scan_epoch: ?u64 = null,
     /// `Server.busyBegin` was called for that scan: the server is not idle until the background
-    /// task has handled it
+    /// task has handled it, or until `closeScan`
     scan_held: bool = false,
-    /// The background task has ended: scans are no longer held for it
+    /// The background task has ended or the server is shutting down (see `closeScan`): scans
+    /// are no longer held
     scan_closed: bool = false,
 
     // ── The following fields are accessed only by the background task ──
@@ -239,6 +243,10 @@ pub const Watcher = struct {
     /// before the watch was neither found nor notified: the server scans again. The server is
     /// busy until the background task has handled this, so that a client waiting for the server
     /// to be idle sees the result of that scan. Called from any thread.
+    ///
+    /// The background task may be waiting for `Server.write_mutex` (see `apply`) when this is
+    /// called, and releases the hold only after it got the mutex: whoever waits for the server
+    /// to be idle while holding that mutex (shutdown) calls `closeScan` first.
     pub fn scanned(w: *Watcher, dirs: []const []const u8, epoch: u64) void {
         const server = w.server;
         {
@@ -296,8 +304,9 @@ pub const Watcher = struct {
         if (held) w.server.busyEnd();
     }
 
-    /// The background task ends: later scans are not held for it
-    fn closeScan(w: *Watcher) void {
+    /// The background task ends, or the server shuts down and nobody waits for a scan's result:
+    /// the scan not handled yet and later scans are not held. Called from any thread.
+    pub fn closeScan(w: *Watcher) void {
         {
             w.scan_mutex.lockUncancelable(w.server.io);
             defer w.scan_mutex.unlock(w.server.io);
@@ -313,9 +322,9 @@ pub const Watcher = struct {
         if (!w.resync_requested.swap(true, .acq_rel)) w.backend.wake();
     }
 
-    fn testPause(w: *Watcher) void {
+    fn testPause(w: *Watcher, hook: *std.atomic.Value(?*TestPause)) void {
         if (!builtin.is_test) return;
-        const pause = w.test_pause.load(.acquire) orelse return;
+        const pause = hook.load(.acquire) orelse return;
         const io = w.server.io;
         pause.entered.set(io);
         while (!w.stopping.load(.acquire)) {
@@ -329,7 +338,7 @@ pub const Watcher = struct {
         defer w.closeScan();
         defer w.deactivate();
         while (!w.stopping.load(.acquire)) {
-            w.testPause();
+            w.testPause(&w.test_pause);
             const scope = w.server.watchScope();
             // Files the server starts watching may have changed while nobody watched them: they
             // are compared with the disk. At startup, they were all just read.
@@ -836,6 +845,7 @@ pub const Watcher = struct {
     /// Open documents are included: their buffers take precedence, but builds read the disk.
     fn apply(w: *Watcher, a: Allocator, pending: *Pending) Allocator.Error!void {
         const server = w.server;
+        w.testPause(&w.test_apply_pause);
         var events: std.ArrayList(types.FileEvent) = .empty;
         var verified: std.ArrayList(types.FileEvent) = .empty;
         for (pending.paths.keys(), pending.paths.values()) |path, hint| {
