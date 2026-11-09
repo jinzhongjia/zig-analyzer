@@ -10573,6 +10573,92 @@ test "comptime evaluation gives builtin operands the compiler's result types" {
     });
 }
 
+test "comptime evaluation gives a list literal coerced to a slice an array of its length" {
+    // Prevents `&.{@splat(1)}` coerced to a slice or a many-item pointer from having no value in
+    // the interpreter: the literal is an array of its length with the sentinel of the pointer, so
+    // `@splat` has a result type (`Sema.zirValidateArrayInitRefTy`). The loops keep inference from
+    // computing the values. Expected values: zig 0.17.0 and 0.17.1 (identical).
+    try expectTypes(
+        \\fn sliceKnown() []const [3]u8 {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    return @as([]const [3]u8, &.{@splat(1)});
+        \\}
+        \\const fn_known = sliceKnown()[0];
+        \\const container_slice = blk: {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    break :blk @as([]const [3]u8, &.{@splat(@intCast(n))});
+        \\};
+        \\const container_known = container_slice[0];
+        \\fn sliceRow() []const [3]u8 {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    const row: [n]u8 = @splat(1);
+        \\    return @as([]const [n]u8, &.{row});
+        \\}
+        \\const fn_row = sliceRow()[0];
+        \\const container_array_ptr = blk: {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    break :blk @as(*const [1][3]u8, &.{@splat(1)});
+        \\};
+        \\const array_ptr_known = container_array_ptr[0];
+        \\fn sentinelSlice() [:0]const u8 {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    return @as([:0]const u8, &.{ @intCast(n), 7 });
+        \\}
+        \\const sentinel_slice = sentinelSlice();
+        \\const sentinel_end = sentinelSlice()[2];
+        \\fn manyItem() [*]const [3]u8 {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    return @as([*]const [3]u8, &.{ @splat(2), @splat(@intCast(n)) });
+        \\}
+        \\const many_item = manyItem()[1];
+        \\fn errorSlice() error{Fail}![]const [3]u8 {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    return &.{@splat(@intCast(n))};
+        \\}
+        \\const error_slice = (errorSlice() catch unreachable)[0];
+        \\fn errorArrayPtr() error{Fail}!*const [1][3]u8 {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    return &.{@splat(@intCast(n))};
+        \\}
+        \\const error_array_ptr = (errorArrayPtr() catch unreachable)[0];
+        \\fn optionalSlice() [3]u8 {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    const o: ?[]const [3]u8 = &.{@splat(@intCast(n))};
+        \\    return o.?[0];
+        \\}
+        \\const optional_slice = optionalSlice();
+        \\const infer_slice: []const [3]u8 = &.{@splat(4)};
+        \\const infer_slice_known = infer_slice[0];
+        \\const infer_optional: ?[]const [3]u8 = &.{@splat(6)};
+        \\const infer_optional_known = infer_optional.?[0];
+        \\const infer_error: error{Fail}![]const [3]u8 = &.{@splat(5)};
+        \\const infer_error_known = (infer_error catch unreachable)[0];
+    , &.{
+        .{ "fn_known", "[3]u8 = \"\\x01\\x01\\x01\"" },
+        .{ "container_known", "[3]u8 = \"\\x03\\x03\\x03\"" },
+        .{ "fn_row", "[3]u8 = \"\\x01\\x01\\x01\"" },
+        .{ "array_ptr_known", "[3]u8 = \"\\x01\\x01\\x01\"" },
+        .{ "sentinel_slice", "[:0]const u8 = \"\\x03\\x07\"" },
+        .{ "sentinel_end", "u8 = 0" },
+        .{ "many_item", "[3]u8 = \"\\x03\\x03\\x03\"" },
+        .{ "error_slice", "[3]u8 = \"\\x03\\x03\\x03\"" },
+        .{ "error_array_ptr", "[3]u8 = \"\\x03\\x03\\x03\"" },
+        .{ "optional_slice", "[3]u8 = \"\\x03\\x03\\x03\"" },
+        .{ "infer_slice_known", "[3]u8 = \"\\x04\\x04\\x04\"" },
+        .{ "infer_optional_known", "[3]u8 = \"\\x06\\x06\\x06\"" },
+        .{ "infer_error_known", "[3]u8 = \"\\x05\\x05\\x05\"" },
+    });
+}
+
 test "operands of float math builtins and @Vector get their result types" {
     try expectTypes(
         \\fn f(n: u32) void {

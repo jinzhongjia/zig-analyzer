@@ -3200,10 +3200,9 @@ const Inferrer = struct {
                 return .{ .ty = .bool_type };
             },
             .ampersand => {
-                const want: ?Index = if (expected) |x| switch (ip.key(x)) {
-                    .optional_type => |c| c,
-                    else => x,
-                } else null;
+                // The pointer under optionals and error unions, as in the compiler
+                // (`Type.optEuBaseType` in `Sema.zirValidateArrayInitRefTy`)
+                const want: ?Index = if (expected) |x| value.optEuBaseType(ip, x) else null;
                 const child_expected: ?Index = if (want) |x| switch (ip.key(x)) {
                     .ptr_type => |p| switch (p.size) {
                         .one => p.child,

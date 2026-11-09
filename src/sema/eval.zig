@@ -3515,9 +3515,20 @@ const Evaluator = struct {
                 }
                 if (try ev.addressPlace(f, operand_e)) |p| return p;
                 // The operand takes the child of the result type, except `anyopaque`: the pointer
-                // is coerced instead (the compiler's `coerce_ptr_elem_ty`)
-                const child_want: ?Index = if (want) |w| switch (ip.key(w)) {
-                    .ptr_type => |p| if (p.size == .one and p.child != .anyopaque_type) p.child else null,
+                // is coerced instead (the compiler's `coerce_ptr_elem_ty`). A list literal coerced
+                // to a slice or a many-item pointer is an array of its length with the sentinel of
+                // the pointer, so its elements take the child as their result type (`&.{@splat(1)}`
+                // as a `[]const [3]u8`, `Sema.zirValidateArrayInitRefTy`). Both look through
+                // optionals and error unions.
+                const child_want: ?Index = if (want) |w| switch (ip.key(value.optEuBaseType(ip, w))) {
+                    .ptr_type => |p| switch (p.size) {
+                        .one => if (p.child != .anyopaque_type) p.child else null,
+                        .slice, .many => switch (f.body.expr(operand_e)) {
+                            .init => |init| if (init.ty == null) try ip.get(.{ .array_type = .{ .len = init.fields.len, .child = p.child, .sentinel = p.sentinel } }) else null,
+                            else => null,
+                        },
+                        .c => null,
+                    },
                     else => null,
                 } else null;
                 return ev.addressOfValue(f, operand_e, try ev.addressOperand(f, operand_e, child_want));
