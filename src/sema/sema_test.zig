@@ -4308,6 +4308,64 @@ test "later loop iterations see edits that change only the comptime vars an iter
     try testing.expectEqualStrings("[3]u16 = undefined", try iterationTypeAt(&w, f.file, after, "x", "T", 1));
 }
 
+/// Type of the binding `needle` when each loop variable of `seeds` (outermost first) takes the
+/// value of the given iteration
+fn nestedIterationTypeAt(w: *World, file: FileId, text: []const u8, needle: []const u8, seeds: []const struct { []const u8, u32 }) ![]const u8 {
+    const offset = try wordAt(text, needle, 0);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const item = try r.ownerAt(file, offset, false) orelse return "no owner";
+    const node = (try r.itemNode(file, item)).?;
+    const owner = try r.ownerKey(file, item);
+    const body = try ctx.get(database.hir.ItemBody, owner);
+    const loop_seeds = try w.arena.allocator().alloc(infer.LoopSeed, seeds.len);
+    for (seeds, loop_seeds) |s, *ls| {
+        const seed_offset = try wordAt(text, s[0], 0);
+        const binding = for (body.bindings, 0..) |b, i| {
+            if (b.range.start == seed_offset - node.offset) break i;
+        } else return "no loop variable";
+        ls.* = .{ .binding = @intCast(binding), .index = s[1] };
+    }
+    const inst = try infer.iterationInst(ctx.db.env.ip, owner, null, loop_seeds[0 .. loop_seeds.len - 1]);
+    const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst, .loop = loop_seeds[loop_seeds.len - 1] });
+    for (body.bindings, 0..) |b, i| if (b.range.start == offset - node.offset) return render.typedValueAlloc(&r, res.bindings[i]);
+    return "no binding";
+}
+test "nested inline loops are inferred for a combination of iterations" {
+    // Prevents inferring the body of an inner inline loop with the loop variables of the enclosing
+    // loops abstract. Expected types are the results of zig 0.17.0 and 0.17.1, which analyze the
+    // inner body once per combination of iterations: `via` is [1]u8, [2]u8, [1]u16 and [2]u16,
+    // `b` [1]u8, [3]u8, [4]u16 and [6]u16.
+    const text =
+        \\pub fn main() void {
+        \\    comptime var acc: usize = 0;
+        \\    inline for (.{ u8, u16 }) |T| {
+        \\        inline for (.{ 1, 2 }) |c| {
+        \\            acc += c;
+        \\            const N = struct {
+        \\                const t = [c]T;
+        \\            };
+        \\            const via = N.t;
+        \\            const b = [acc]T;
+        \\            _ = .{ via, b };
+        \\        }
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", text);
+    // A container in the inner body is the instance of both iterations
+    try testing.expectEqualStrings("type = [2]u16", try nestedIterationTypeAt(&w, f.file, text, "via", &.{ .{ "T", 1 }, .{ "c", 1 } }));
+    try testing.expectEqualStrings("type = [1]u8", try nestedIterationTypeAt(&w, f.file, text, "via", &.{ .{ "T", 0 }, .{ "c", 0 } }));
+    try testing.expectEqualStrings("type = [1]u8", try nestedIterationTypeAt(&w, f.file, text, "b", &.{ .{ "T", 0 }, .{ "c", 0 } }));
+    // The second iteration of the inner loop starts from the value the first one leaves in the
+    // same iteration of the outer loop
+    try testing.expectEqualStrings("type = [3]u8", try nestedIterationTypeAt(&w, f.file, text, "b", &.{ .{ "T", 0 }, .{ "c", 1 } }));
+}
 test "containers in an inline loop body read the loop variables without a value" {
     // Prevents a container in the loop body from reading the loop variables of iteration
     // 4294967295, the index of an undetermined iteration. Expected values: zig 0.17.0 and 0.17.1

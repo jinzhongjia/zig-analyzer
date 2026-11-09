@@ -131,10 +131,16 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, 
         const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, s.file)).text;
         const line = std.mem.count(u8, text[0..@min(s.offset, text.len)], "\n") + 1;
         const where = std.fs.path.basename(r.ctx.db.env.vfs.path(s.file));
-        if (s.iteration) |n|
-            w.print("\n\ninferred from iteration {d} of the loop at {s}:{d}", .{ n + 1, where, line }) catch return error.OutOfMemory
-        else
-            w.print("\n\ninferred from the call at {s}:{d}", .{ where, line }) catch return error.OutOfMemory;
+        if (s.iteration) |n| {
+            // Nested loops: the iteration of each, outermost first
+            w.writeAll("\n\ninferred from ") catch return error.OutOfMemory;
+            for (s.enclosing, 0..) |outer, i| {
+                const outer_line = std.mem.count(u8, text[0..@min(outer.offset, text.len)], "\n") + 1;
+                const sep = if (i + 1 < s.enclosing.len) ", " else " and ";
+                w.print("iteration {d} of the loop at {s}:{d}{s}", .{ outer.iteration + 1, where, outer_line, sep }) catch return error.OutOfMemory;
+            }
+            w.print("iteration {d} of the loop at {s}:{d}", .{ n + 1, where, line }) catch return error.OutOfMemory;
+        } else w.print("\n\ninferred from the call at {s}:{d}", .{ where, line }) catch return error.OutOfMemory;
     }
     if (def) |d| if (try context.docOf(r, d, tv)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
     return .{ .text = out.written(), .start = tok.offset, .end = tok.offset + @as(u32, @intCast(tok.text.len)) };

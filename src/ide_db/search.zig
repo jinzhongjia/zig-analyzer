@@ -1021,11 +1021,11 @@ const Finder = struct {
         return if (miss) .miss else .unknown;
     }
 
-    /// Compares the member of `l` in each iteration of the per-iteration region containing `rel`
-    /// (see `seed.iterationResults`) with `def`
+    /// Compares the member of `l` in each combination of iterations of the per-iteration regions
+    /// containing `rel` (see `seed.iterationResults`) with `def`
     fn iterationMembers(f: *Finder, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?InternPool.Index, rel: u32, l: Lookup, hit: *bool, miss: *bool) resolve.Error!void {
         if (res.exprs.len != body.exprs.len) return;
-        for ((try seed.iterationResults(f.r, owner, body, res, inst, rel)).results) |iteration| {
+        for (try seed.iterationResults(f.r, owner, body, res, inst, rel)) |iteration| {
             const m = l.member(iteration) orelse continue;
             const d = try keyDef(f.r, m) orelse continue;
             if (deepEql(d, f.def)) hit.* = true else miss.* = true;

@@ -47,11 +47,14 @@ pub const InferKey = struct {
     owner: hir.OwnerKey,
     mode: infer.Mode,
     /// Instance of the owner itself or of its enclosing generic function (normalized, see
-    /// `normalizeInst`); null for non-generic code or the abstract instance
+    /// `normalizeInst`); null for non-generic code or the abstract instance. For a loop nested in
+    /// loops inferred per iteration, the chain of iteration instances that carries their seeds
+    /// (see `infer.iterationInst`).
     inst: ?Index = null,
     /// The loop variable of a loop over a list of types takes its value from one particular
     /// iteration (used when IDE features pick an instance for the loop body); when null, the loop
-    /// variable is abstract
+    /// variable is abstract. With nested loops, the seed of the innermost one (see
+    /// `infer.LoopSeed`).
     loop: ?infer.LoopSeed = null,
     /// The root expression of a `.zon` file is inferred with this result type instead of the one of
     /// its import sites (`ZonResultType`): for a file whose sites give several (see `zonSiteTypes`)
