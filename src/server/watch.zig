@@ -2409,6 +2409,65 @@ test "FSEvents: a change made just before the stream is replaced is reported" {
 
 // Prevents losing a change made after a file starts being polled but before its first check:
 // the state is recorded when the file joins the polled files, not at the first check
+test "FSEvents history: events of the history reported again after it are recognized" {
+    const gpa = testing.allocator;
+    var h: HistoryIds = .{};
+    defer h.deinit(gpa);
+    h.start(gpa, true);
+    // The history, in no particular order, with an event reported twice in it
+    for ([_]u64{ 325, 343, 334 }) |id| try testing.expect(!h.again(gpa, id));
+    try testing.expect(h.again(gpa, 334));
+    // Events without an ID are never recognized
+    try testing.expect(!h.again(gpa, 0));
+    try testing.expect(!h.again(gpa, 0));
+    h.done();
+    // Live: the history again, and a change between its events that it did not report
+    try testing.expect(h.again(gpa, 325));
+    try testing.expect(!h.again(gpa, 330));
+    try testing.expect(h.again(gpa, 334));
+    try testing.expect(h.again(gpa, 343));
+    // Past the history, nothing is recorded any more
+    try testing.expect(!h.again(gpa, 410));
+    try testing.expectEqual(0, h.ids.count());
+    // A stream starting at `since_now` reports no history
+    h.start(gpa, false);
+    try testing.expect(!h.again(gpa, 500));
+    try testing.expect(!h.again(gpa, 500));
+}
+
+// Prevents a second scan of the workspace: under load, FSEvents reported the creation of the watch
+// root (and of the files in it) before the HistoryDone event and again after it, with the same IDs
+test "FSEvents: events of the history reported again after it are dropped" {
+    if (Native != FsEvents) return error.SkipZigTest;
+    const n = try Native.create(testing.allocator, testing.io);
+    defer n.destroy(testing.allocator);
+    n.history.start(testing.allocator, true);
+    // The order and flags FSEvents used, the last event being a later change to lib.zig
+    var paths = [_][*:0]const u8{ "/p", "/p/lib.zig", "/p/main.zig", "/p", "/p", "/p/main.zig", "/p/lib.zig", "/p/lib.zig" };
+    const raw = [_]u32{ 0x28100, 0x19100, 0x19100, 0x10, 0x28100, 0x19100, 0x19100, 0x19500 };
+    const ids = [_]u64{ 325, 343, 334, 343, 325, 334, 343, 410 };
+    var flags: [raw.len]FsEvents.EventFlags = undefined;
+    for (raw, &flags) |r, *f| f.* = @bitCast(r);
+    FsEvents.callback(undefined, n, paths.len, @ptrCast(&paths), &flags, &ids);
+    var taken = n.takeQueued();
+    defer {
+        for (taken.events.items) |e| testing.allocator.free(e.path);
+        taken.events.deinit(testing.allocator);
+    }
+    const want = [_]Event{
+        .{ .path = "/p", .kind = .dir_created },
+        .{ .path = "/p/lib.zig", .kind = .created },
+        .{ .path = "/p/main.zig", .kind = .created },
+        .{ .path = "/p/lib.zig", .kind = .created },
+    };
+    try testing.expectEqual(want.len, taken.events.items.len);
+    for (want, taken.events.items) |w, e| {
+        try testing.expectEqualStrings(w.path, e.path);
+        try testing.expectEqual(w.kind, e.kind);
+    }
+    try testing.expectEqual(410, taken.reported);
+}
+
 test "poller: a change before the first check of a tracked file is reported" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
