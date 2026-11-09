@@ -104,9 +104,9 @@ Eviction normally waits for a moment without read transactions, but one read tra
 
 Release builds use `PagedAllocator`, one heap shared by all threads: cached values are allocated on worker threads but freed on the threads that sweep and run write transactions, so a block freed by any thread must be reusable by any thread. `std.heap.smp_allocator` splits its free lists by thread slot, so resident memory keeps growing over a session.
 
-- Blocks up to 32 KiB come from 64 KiB pages carved from 4 MiB segments; each page holds one size class. Larger allocations are mapped directly.
+- Blocks up to 32 KiB come from 64 KiB pages carved from 4 MiB segments; each page holds one size class. Larger allocations are mapped directly and unmapped when freed. Keeping freed mappings for reuse by allocations of the same length saves page faults but raises the peak resident memory of the long session (see `docs/perf.md`), so they are not kept.
 - A size class allocates from the page that most recently got room, reusing blocks likely still cached; pages with less than an eighth of their blocks in use get new blocks only when no other page has room, which lets the rest become empty.
-- Empty pages go to a pool shared by all classes, which keeps 256 committed and returns the others to the system. The analyzer has transient peaks of several GB, so memory that is never returned would stay near the peak; the cost is the system time of faulting pages in again.
+- Empty pages go to a pool shared by all classes, which keeps 256 committed and returns the others to the system. The analyzer has transient peaks of several GB, so memory that is never returned would stay near the peak; the cost is the system time of faulting pages in again. Segments stay mapped: once all its pages are returned, a segment keeps only its header page resident.
 - Returning pages differs per platform: `madvise(MADV_DONTNEED)` on Linux; a new mapping on macOS, where `madvise` leaves the resident size unchanged; decommit on Windows.
 - On Linux, segments are excluded from transparent huge pages: with THP `always`, touching a page would back the whole 2 MiB around it.
 
