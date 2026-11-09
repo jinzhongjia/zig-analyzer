@@ -1644,6 +1644,32 @@ fn recordsPlace(ip: *InternPool, k: InternPool.Key) bool {
     };
 }
 
+/// The place pointer value `x` records (`InternPool.Key.ptr_base`); null when it records none
+pub fn ptrBaseOf(ip: *InternPool, x: Index) ?InternPool.PtrBase {
+    const base = switch (ip.key(x)) {
+        .ptr_value => |p| p.base,
+        .aggregate => |a| a.base,
+        .bytes => |b| b.base,
+        else => null,
+    } orelse return null;
+    return ip.key(base).ptr_base;
+}
+
+/// Pointer value `x` without the anonymous constant it records it points into
+/// (`InternPool.PtrBase.Root.constant`); other values unchanged. Pointers to anonymous constants
+/// made outside the interpreter (string literals) record no place, so this is the form that does
+/// not depend on where the pointer was made.
+pub fn withoutConstantBase(ip: *InternPool, x: Index) Allocator.Error!Index {
+    const b = ptrBaseOf(ip, x) orelse return x;
+    if (b.root != .constant) return x;
+    return switch (ip.key(x)) {
+        .ptr_value => |p| ip.get(.{ .ptr_value = .{ .ty = p.ty, .pointee = p.pointee } }),
+        .aggregate => |a| ip.get(.{ .aggregate = .{ .ty = a.ty, .elems = a.elems } }),
+        .bytes => |s| ip.get(.{ .bytes = .{ .ty = s.ty, .bytes = s.bytes } }),
+        else => unreachable,
+    };
+}
+
 /// Whether pointers `a` and `b` show different data at a position both of them reach
 fn pointeesDiffer(ip: *InternPool, a: InternPool.Key, b: InternPool.Key) bool {
     switch (a) {
@@ -2024,7 +2050,7 @@ test "pointer values are equal by the place they point to, not by the data" {
     const data = try ip.get(.{ .bytes = .{ .ty = many, .bytes = "abc" } });
     const other = try ip.get(.{ .bytes = .{ .ty = many, .bytes = "abd" } });
     const prefix = try ip.get(.{ .bytes = .{ .ty = many, .bytes = "ab" } });
-    const base = try ip.get(.{ .ptr_base = .{ .file = @fromBackingInt(0), .item = 0, .inst = null, .path = &.{} } });
+    const base = try ip.get(.{ .ptr_base = .{ .root = .{ .decl = .{ .file = @fromBackingInt(0), .item = 0, .inst = null } }, .path = &.{} } });
     const placed = try ip.get(.{ .bytes = .{ .ty = many, .bytes = "abc", .base = base } });
     // Without a recorded place, one value may stand for two declarations with equal data
     try testing.expectEqual(@as(?bool, null), eqlValues(&ip, data, data));

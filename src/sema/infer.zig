@@ -3230,9 +3230,10 @@ const Inferrer = struct {
                 };
                 // A pointer to a comptime-known constant (`parseEx(Id, &params, ...)`,
                 // `@field(x, &name)`) is comptime-known: its value points to the constant's value,
-                // and to its place when that is inside a container-level declaration
+                // and to its place when that is inside a container-level declaration or a value
+                // captured from an enclosing function or declaration
                 if (is_const) if (v.val) |pointee| {
-                    if (try inf.mayBeInDeclaration(operand_e))
+                    if (try inf.mayHavePlace(operand_e))
                         return .{ .ty = ty, .val = try eval.addressValue(inf.r, inf.file, inf.item, inf.body, operand_e, inf.inst, inf.bindings, ty, pointee) };
                     return .{ .ty = ty, .val = try eval.constPointer(inf.r, ty, pointee) };
                 };
@@ -3699,19 +3700,25 @@ const Inferrer = struct {
         return placeIsConst(inf.r, inf.file, inf.item, inf.body, inf, e);
     }
 
-    /// Whether place `e` may be inside a container-level declaration: a declaration, a member of
-    /// a type, or a field or element reached from one or through a pointer
-    fn mayBeInDeclaration(inf: *Inferrer, e: ExprId) Error!bool {
+    /// Whether place `e` may be inside a container-level declaration or the anonymous constant of
+    /// a captured value, whose place a pointer to it records (`eval.addressValue`): a
+    /// declaration, a member of a type, a local of an enclosing function or declaration that
+    /// this container reads, or a field or element reached from one or through a pointer
+    fn mayHavePlace(inf: *Inferrer, e: ExprId) Error!bool {
         const b = inf.body;
         return switch (b.expr(e)) {
             .name_ref => |name| {
                 if (inf.ip.key(inf.get(e).ty) == .ptr_type) return true;
                 const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return false;
-                return def == .item;
+                return switch (def) {
+                    .item => true,
+                    .local => |l| l.file != inf.file or l.item != inf.item,
+                    else => false,
+                };
             },
-            .field_access => |fa| inf.get(fa.lhs).isType() or try inf.mayBeInDeclaration(fa.lhs),
-            .index => |x| inf.mayBeInDeclaration(x.lhs),
-            .@"comptime" => |x| inf.mayBeInDeclaration(x),
+            .field_access => |fa| inf.get(fa.lhs).isType() or try inf.mayHavePlace(fa.lhs),
+            .index => |x| inf.mayHavePlace(x.lhs),
+            .@"comptime" => |x| inf.mayHavePlace(x),
             .deref => true,
             else => false,
         };
@@ -4686,6 +4693,9 @@ pub fn genericCallee(r: *Resolver, scratch: Allocator, callee: TypedValue, f: Fn
 /// instance records such an argument by value, with its type in `InternPool.Instance.arg_types`,
 /// so `arrOf(3)` and `arrOf(4)` are different instances and the parameter has its value in the
 /// signature and the body.
+/// A pointer argument recorded by value is taken without the anonymous constant it records
+/// (`value.withoutConstantBase`), so `F("ab")` and `F(&a)` with `const a = "ab".*;` are the same
+/// instance, as in the compiler.
 pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args: []const TypedValue) Error!Index {
     const ip = r.ctx.db.env.ip;
     const inst_args = try scratch.alloc(Index, g.body.params.len);
@@ -4698,17 +4708,17 @@ pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args:
             .anytype_type => {
                 out.* = tv.ty;
                 if (!try anytypeByValue(r, tv)) continue;
-                out.* = tv.val.?;
+                out.* = try value.withoutConstantBase(ip, tv.val.?);
                 arg_types = try recordArgType(scratch, arg_types, inst_args.len, i, tv.ty);
             },
             // As in the compiler, the argument is a value of its type: values of different types
             // can have the same representation (`@as(?u8, 3)` and `@as(u8, 3)`)
             .comptime_anytype => {
-                out.* = tv.val orelse .unknown;
+                out.* = try value.withoutConstantBase(ip, tv.val orelse .unknown);
                 arg_types = try recordArgType(scratch, arg_types, inst_args.len, i, tv.ty);
             },
             .comptime_value => {
-                out.* = tv.val orelse .unknown;
+                out.* = try value.withoutConstantBase(ip, tv.val orelse .unknown);
                 if (out.* == .unknown) continue;
                 const pt = paramType(f, i) orelse .unknown;
                 if (value.isConcrete(ip, pt)) {
