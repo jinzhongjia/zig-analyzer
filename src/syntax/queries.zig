@@ -109,7 +109,9 @@ pub const FileItemTree = struct {
     /// Bounds memory in long sessions: every visited file has one, which can reach 50 MB in a
     /// large project (the Zig compiler sources and standard library).
     /// Evicted ones are rebuilt on demand; when the dependencies are unchanged, the original
-    /// changed_at is kept and downstream is not recomputed
+    /// changed_at is kept and downstream is not recomputed. When the file changed while its tree
+    /// was evicted, the rebuilt tree is compared by `fingerprint`: an edit in a function body or a
+    /// comment then does not recompute everything that depends on the tree
     pub const lru = 16 * 1024;
     pub const lru_bytes = 32 * 1024 * 1024;
 
@@ -128,6 +130,10 @@ pub const FileItemTree = struct {
 
     pub fn eql(a: Value, b: Value) bool {
         return a.eql(b);
+    }
+
+    pub fn fingerprint(v: Value) u128 {
+        return v.fingerprint();
     }
 
     pub fn deinit(v: *Value, gpa: Allocator) void {

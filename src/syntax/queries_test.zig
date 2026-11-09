@@ -126,6 +126,30 @@ test "body-only edit: reparse and rebuild ItemTree, downstream not recomputed" {
     try testing.expectEqual(2, executions(&db, ItemCount));
 }
 
+test "body-only edit while the ItemTree is evicted: downstream not recomputed" {
+    var db: Db = .init(testing.io, testing.allocator, {});
+    defer db.deinit();
+    const file: Vfs.FileId = @fromBackingInt(@intCast(0));
+    const other: Vfs.FileId = @fromBackingInt(@intCast(1));
+    try setText(&db, file, "const a = 1;\nfn f() void { _ = a; }\n");
+    try setText(&db, other, "const b = 2;\n");
+    try testing.expectEqual(2, try count(&db, file));
+    try testing.expectEqual(1, try count(&db, other));
+
+    // Capacity 1 with two trees: the next write transaction evicts both
+    db.setLru(q.FileItemTree, 1, null);
+    try setText(&db, file, "const a = 1;\nfn f() void {\n    _ = a + 1;\n}\n");
+    {
+        var ctx = db.beginRead(testing.allocator);
+        defer ctx.end();
+        try testing.expect(ctx.memoized(q.FileItemTree, file) == .evicted);
+    }
+    // The rebuilt tree has the fingerprint of the evicted one, so ItemCount is not recomputed
+    try testing.expectEqual(2, try count(&db, file));
+    try testing.expectEqual(3, executions(&db, q.FileItemTree));
+    try testing.expectEqual(2, executions(&db, ItemCount));
+}
+
 test "AstIdMap points to the latest tree" {
     var db: Db = .init(testing.io, testing.allocator, {});
     defer db.deinit();

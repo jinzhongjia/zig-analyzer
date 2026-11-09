@@ -92,7 +92,10 @@ fn treesEqualIn(mode: Parse.Mode, a: []const u8, b: []const u8) !bool {
     var y = try buildTreeIn(mode, b);
     defer y.parse.destroy();
     defer y.items.deinit(testing.allocator);
-    return x.items.eql(&y.items);
+    const equal = x.items.eql(&y.items);
+    // The fingerprint agrees with `eql`
+    try testing.expectEqual(equal, x.items.fingerprint() == y.items.fingerprint());
+    return equal;
 }
 
 test "ItemTree unchanged by body, comment or whitespace edits" {
