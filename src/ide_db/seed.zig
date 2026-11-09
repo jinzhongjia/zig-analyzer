@@ -938,7 +938,10 @@ const Closure = struct {
             // it points to are what lead to types
             .ptr_value => |p| (try c.reaches(p.ty)) or try c.reaches(p.pointee),
             .opt_payload => |o| (try c.reaches(o.ty)) or try c.reaches(o.payload),
-            .ptr_base => |b| c.importers.contains(b.file) or (if (b.inst) |i| try c.reaches(i) else false),
+            .ptr_base => |b| switch (b.root) {
+                .decl => |d| c.importers.contains(d.file) or (if (d.inst) |i| try c.reaches(i) else false),
+                .constant => |k| (try c.reaches(k.ty)) or try c.reaches(k.value),
+            },
             .instance => |i| blk: {
                 if (try c.anyReaches(i.args, i.arg_types)) break :blk true;
                 for (i.captured) |cap| if ((try c.reaches(cap.ty)) or try c.reaches(cap.val)) break :blk true;

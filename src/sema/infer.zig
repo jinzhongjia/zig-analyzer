@@ -4686,6 +4686,9 @@ pub fn genericCallee(r: *Resolver, scratch: Allocator, callee: TypedValue, f: Fn
 /// instance records such an argument by value, with its type in `InternPool.Instance.arg_types`,
 /// so `arrOf(3)` and `arrOf(4)` are different instances and the parameter has its value in the
 /// signature and the body.
+/// A pointer argument recorded by value is taken without the anonymous constant it records
+/// (`value.withoutConstantBase`), so `F("ab")` and `F(&a)` with `const a = "ab".*;` are the same
+/// instance, as in the compiler.
 pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args: []const TypedValue) Error!Index {
     const ip = r.ctx.db.env.ip;
     const inst_args = try scratch.alloc(Index, g.body.params.len);
@@ -4698,17 +4701,17 @@ pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args:
             .anytype_type => {
                 out.* = tv.ty;
                 if (!try anytypeByValue(r, tv)) continue;
-                out.* = tv.val.?;
+                out.* = try value.withoutConstantBase(ip, tv.val.?);
                 arg_types = try recordArgType(scratch, arg_types, inst_args.len, i, tv.ty);
             },
             // As in the compiler, the argument is a value of its type: values of different types
             // can have the same representation (`@as(?u8, 3)` and `@as(u8, 3)`)
             .comptime_anytype => {
-                out.* = tv.val orelse .unknown;
+                out.* = try value.withoutConstantBase(ip, tv.val orelse .unknown);
                 arg_types = try recordArgType(scratch, arg_types, inst_args.len, i, tv.ty);
             },
             .comptime_value => {
-                out.* = tv.val orelse .unknown;
+                out.* = try value.withoutConstantBase(ip, tv.val orelse .unknown);
                 if (out.* == .unknown) continue;
                 const pt = paramType(f, i) orelse .unknown;
                 if (value.isConcrete(ip, pt)) {

@@ -288,20 +288,27 @@ pub const CallConv = union(enum) {
 /// root value of the file
 pub const ZonLiteral = struct { file: FileId, path: []const u32 };
 
-/// See `Key.ptr_base`. The declaration is `item` of `file` in the instance context it belongs
-/// to (`queries.declInst`); `path` is the field or element index taken at each level of its
-/// value, and `window` the elements of the aggregate at `path` that a pointer to several elements
-/// starts from (a slice or a sliced array), as in the interpreter's storage cells. With
-/// `as_array`, the pointer is a `*T` → `*[1]T` view of the place at `path`.
+/// See `Key.ptr_base`. `root` is the storage the place is in; `path` is the field or element
+/// index taken at each level of its value, and `window` the elements of the aggregate at `path`
+/// that a pointer to several elements starts from (a slice or a sliced array), as in the
+/// interpreter's storage cells. With `as_array`, the pointer is a `*T` → `*[1]T` view of the place
+/// at `path`.
 pub const PtrBase = struct {
-    file: FileId,
-    item: u32,
-    inst: ?Index,
+    root: Root,
     path: []const u32,
     window: ?Window = null,
     as_array: bool = false,
 
     pub const Window = struct { start: u32, len: u32 };
+
+    pub const Root = union(enum) {
+        /// The storage of the container-level declaration `item` of `file` in the instance
+        /// context it belongs to (`queries.declInst`): the compiler's `nav`
+        decl: struct { file: FileId, item: u32, inst: ?Index },
+        /// The anonymous constant of type `ty` holding `value`, which holds no pointer: the
+        /// compiler's `uav`, the same constant for equal values of the same type
+        constant: struct { ty: Index, value: Index },
+    };
 };
 
 pub const Key = union(enum) {
@@ -371,10 +378,11 @@ pub const Key = union(enum) {
     /// (a `ptr_base`)
     ptr_value: struct { ty: Index, pointee: Index, base: ?Index = null },
     /// The place a comptime pointer points to when that is the storage of a container-level
-    /// declaration (the compiler's `nav` base address with its `field` / `arr_elem` steps).
-    /// Pointers record it so that they keep pointing there once interned: two pointers to one
-    /// place are equal, and pointers to different declarations are not, whatever the values.
-    /// Neither a type nor a value: only the `base` of pointer values refers to it.
+    /// declaration or an anonymous constant (the compiler's `nav` or `uav` base address with its
+    /// `field` / `arr_elem` steps). Pointers record it so that they keep pointing there once
+    /// interned: two pointers to one place are equal, and pointers to different storage are not,
+    /// whatever the values. Neither a type nor a value: only the `base` of pointer values refers
+    /// to it.
     ptr_base: PtrBase,
     /// A non-null value of optional type `ty` whose payload is itself represented as `null_value`
     /// (or as another `opt_payload`), such as a `??u8` holding a null `?u8`. Every other non-null

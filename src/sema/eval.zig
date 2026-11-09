@@ -972,6 +972,9 @@ const CellOrigin = enum {
 /// A container-level declaration under the instance it belongs to (`queries.declInst`)
 const DeclKey = struct { file: FileId, item: u32, inst: ?Index };
 
+/// An anonymous constant: its type and interned value (`InternPool.PtrBase.Root.constant`)
+const ConstantKey = struct { ty: Index, value: Index };
+
 /// The anonymous constant a constant binding's pointers point to, and the binding's value when
 /// it was made (see `constantCell`)
 const ConstantCell = struct { value: Val, cell: *Val };
@@ -1090,6 +1093,13 @@ const Evaluator = struct {
     /// The locals each container defined in a loop of a function body captures (see
     /// `loopCaptures`), by container
     loop_captures: std.AutoHashMapUnmanaged(Namespace, []const Body.BindingId) = .empty,
+    /// Cells of the anonymous constants interned pointers record (`InternPool.PtrBase.Root`),
+    /// by type and value (see `constantPlace`)
+    constant_places: std.AutoHashMapUnmanaged(ConstantKey, *Val) = .empty,
+    /// The interned value of each anonymous constant cell a pointer was interned from, or
+    /// `.unknown` when pointers into it record no place (see `constantRoot`). Anonymous constants
+    /// cannot be written, so it is computed once.
+    frozen_constants: std.AutoHashMapUnmanaged(*const Val, Index) = .empty,
 
     fn deinit(ev: *Evaluator) void {
         if (!ev.owns_calls) return;
@@ -1169,59 +1179,98 @@ const Evaluator = struct {
                     break :blk try ev.makeAgg(try ev.ip.get(.{ .array_type = .{ .len = elems.len, .child = ev.elemTypeOf(v.ty, 0) } }), elems);
                 } else try ev.load(ref);
                 const pointee = try ev.freeze(target) orelse return null;
-                return try ev.pointerTo(v.ty, pointee, try ev.ptrBase(ref));
+                return try ev.pointerTo(v.ty, pointee, try ev.ptrBase(ref, pointee));
             },
             .unknown, .undef, .ip, .int, .big => unreachable,
         }
     }
 
-    /// The `ptr_base` of a pointer to `ref`: null when the cell is not the storage of a
-    /// container-level declaration
-    fn ptrBase(ev: *Evaluator, ref: Ref) Error!?Index {
-        const decl = ev.cell_decls.get(ref.cell) orelse return null;
+    /// The `ptr_base` of a pointer to `ref`, which points to the interned value `pointee`: the
+    /// place in the storage of a container-level declaration or in an anonymous constant (see
+    /// `constantRoot`); null for other storage
+    fn ptrBase(ev: *Evaluator, ref: Ref, pointee: Index) EvalError!?Index {
+        const root: InternPool.PtrBase.Root = if (ev.cell_decls.get(ref.cell)) |decl|
+            .{ .decl = .{ .file = decl.file, .item = decl.item, .inst = decl.inst } }
+        else if (try ev.constantRoot(ref, pointee)) |c|
+            .{ .constant = .{ .ty = c.ty, .value = c.value } }
+        else
+            return null;
         return try ev.ip.get(.{ .ptr_base = .{
-            .file = decl.file,
-            .item = decl.item,
-            .inst = decl.inst,
+            .root = root,
             .path = ref.path,
             .window = if (ref.window) |w| .{ .start = w.start, .len = w.len } else null,
             .as_array = ref.as_array,
         } });
     }
 
-    /// The `ptr_base` of `&e` when `e` is a place inside a container-level declaration and holds
-    /// `pointee` there; null for other operands, and for functions, which are the identity of
-    /// pointers to them (`functionPointer`)
+    /// The anonymous constant `ref` is in, when its cell is a temporary or a constant (an aligned
+    /// constant's identity includes its alignment, which is not tracked) whose value is known and
+    /// holds no pointer, the values `temporaryEql` compares. `pointee` is the interned value at
+    /// `ref`.
+    fn constantRoot(ev: *Evaluator, ref: Ref, pointee: Index) EvalError!?ConstantKey {
+        switch (ev.cellOrigin(ref.cell)) {
+            .temporary, .constant => {},
+            .storage, .variable, .decl, .extern_decl, .thread_local, .copy, .aligned_constant => return null,
+        }
+        if (ref.cell.ty == .unknown or ev.isInternedCell(ref.cell)) return null;
+        const data = ev.frozen_constants.get(ref.cell) orelse blk: {
+            const whole = ref.path.len == 0 and ref.window == null and !ref.as_array;
+            const frozen = if (whole) pointee else try ev.freeze(ref.cell.*) orelse .unknown;
+            const x = if (frozen != .unknown and holdsPointer(ev.ip, frozen)) .unknown else frozen;
+            try ev.frozen_constants.put(ev.a, ref.cell, x);
+            break :blk x;
+        };
+        if (data == .unknown) return null;
+        return .{ .ty = ref.cell.ty, .value = data };
+    }
+
+    /// This evaluation's cell of the anonymous constant of type `ty` holding `value`: one cell per
+    /// constant, so that pointers into it compare by place, and with other anonymous constants by
+    /// value (`temporaryEql`)
+    fn constantPlace(ev: *Evaluator, ty: Index, v: Index) EvalError!*Val {
+        const gop = try ev.constant_places.getOrPut(ev.a, .{ .ty = ty, .value = v });
+        if (gop.found_existing) return gop.value_ptr.*;
+        const cell = try ev.a.create(Val);
+        cell.* = Val.of(ty, v);
+        gop.value_ptr.* = cell;
+        try ev.cell_origins.put(ev.a, cell, .temporary);
+        try ev.frozen_constants.put(ev.a, cell, v);
+        return cell;
+    }
+
+    /// The `ptr_base` of `&e` when `e` is a place inside a container-level declaration or an
+    /// anonymous constant and holds `pointee` there; null for other operands, and for functions,
+    /// which are the identity of pointers to them (`functionPointer`)
     fn addressBase(ev: *Evaluator, f: *Frame, e: ExprId, pointee: Index) EvalError!?Index {
         if (ev.ip.key(pointee) == .fn_value) return null;
         const ref = try ev.placeFor(f, e, .address);
         if (try ev.freeze(try ev.load(ref)) != pointee) return null;
-        return ev.ptrBase(ref);
+        return ev.ptrBase(ref, pointee);
     }
 
     /// The place interned pointer `p` points to when it records one (`InternPool.Key.ptr_base`):
-    /// in this evaluation's cell of that declaration (`declPlace`), which cannot be written. Null
-    /// for other values.
+    /// in this evaluation's cell of that declaration (`declPlace`) or anonymous constant
+    /// (`constantPlace`), which cannot be written. Null for other values.
     fn basePlace(ev: *Evaluator, p: Val) EvalError!?Ref {
         const x = switch (p.v) {
             .ip => |x| x,
             else => return null,
         };
-        const base = switch (ev.ip.key(x)) {
-            .ptr_value => |v| v.base,
-            .aggregate => |v| v.base,
-            .bytes => |v| v.base,
-            else => null,
-        } orelse return null;
-        const b = ev.ip.key(base).ptr_base;
-        const decl = try ev.declPlace(b.file, b.item, b.inst);
+        const b = value.ptrBaseOf(ev.ip, x) orelse return null;
+        const cell: *Val, const immutable = switch (b.root) {
+            .decl => |d| blk: {
+                const decl = try ev.declPlace(d.file, d.item, d.inst);
+                break :blk .{ decl.cell, decl.immutable };
+            },
+            .constant => |c| .{ try ev.constantPlace(c.ty, c.value), true },
+        };
         return .{
-            .cell = decl.cell,
+            .cell = cell,
             .path = b.path,
             .window = if (b.window) |w| .{ .start = w.start, .len = w.len } else null,
             .is_const = true,
             .as_array = b.as_array,
-            .immutable = decl.immutable,
+            .immutable = immutable,
         };
     }
 
@@ -3156,14 +3205,26 @@ const Evaluator = struct {
     /// Whether two comptime pointers are equal; null when it cannot be determined. As in the
     /// compiler, pointers are equal when they point to the same location of the same storage;
     /// what the storage of a cell is in the compiler is its `CellOrigin`. An interned pointer
-    /// that records the declaration it points into is compared at that place (`basePlace`).
-    /// Other interned constant data is distinguished by value (equal values are the same data,
-    /// matching the compiler's deduplication of identical literals) and carries no other
-    /// identity: compared with a pointer into a declaration or an anonymous constant, it is
-    /// unequal only when its data cannot be stored at that location (`mayAlias`).
+    /// that records the declaration or anonymous constant it points into is compared at that
+    /// place (`basePlace`). Other interned constant data is distinguished by value (equal values
+    /// are the same data, matching the compiler's deduplication of identical literals) and
+    /// carries no other identity: compared with a pointer into a declaration or an anonymous
+    /// constant, it is unequal only when its data cannot be stored at that location (`mayAlias`).
+    /// Compared with an interned pointer into an anonymous constant, it is compared as interned
+    /// data with that pointer's data, as pointers to anonymous constants made outside the
+    /// interpreter (string literals) record no place.
     /// Pointer arithmetic on interned data that records no place points into a cell holding
     /// that data (see `internedCell`).
     fn pointerEql(ev: *Evaluator, a_in: Val, b_in: Val) EvalError!?bool {
+        if (a_in.v == .ip and b_in.v == .ip) {
+            const x = a_in.v.ip;
+            const y = b_in.v.ip;
+            const bx = value.ptrBaseOf(ev.ip, x);
+            const by = value.ptrBaseOf(ev.ip, y);
+            const cx = bx != null and bx.?.root == .constant;
+            const cy = by != null and by.?.root == .constant;
+            if ((cx and by == null) or (cy and bx == null)) return try value.withoutConstantBase(ev.ip, x) == try value.withoutConstantBase(ev.ip, y);
+        }
         const a = try ev.withPlace(a_in);
         const b = try ev.withPlace(b_in);
         switch (a.v) {
