@@ -80,6 +80,10 @@ maker_exit_pause: std.atomic.Value(?*Workspace.ExitPause) = .init(null),
 /// (`applyFileChanges`) in its read transaction, before anything is compared, so that a test can
 /// make a write transaction wait for the lock during the comparison; always null outside tests
 compare_gate: ?*OnceGate = null,
+/// Test hook: holds the first comparison of a module graph update with the current module graph
+/// (`moduleGraphUnchanged`) in its read transaction, before anything is compared, so that a test
+/// can make a write transaction wait for the lock during the comparison; always null outside tests
+graph_gate: ?*OnceGate = null,
 
 /// Background tasks: reading projects' build system protocol, publishing diagnostics. Several
 /// threads submit tasks to it, and `Io.Group` does not allow submitting during an await, so it
@@ -457,7 +461,7 @@ pub const TestGate = struct {
 };
 
 /// Test hook: the first time the server reaches the point the gate is placed at (`publish_gate`,
-/// `compare_gate`), it stops there until `release` is set; later times pass
+/// `compare_gate`, `graph_gate`), it stops there until `release` is set; later times pass
 pub const OnceGate = struct {
     /// Set when the server stops at the gate
     entered: Io.Event = .unset,
@@ -1273,26 +1277,29 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
 
 /// The current module graph and targets already equal `graph`, `t` and `targets`. Called with
 /// graph_mutex held: the module graph is written only here, so nobody else can change it after
-/// the comparison.
+/// the comparison. A comparison canceled by a write transaction tells nothing about the module
+/// graph: it is made again once that write has taken the lock (see `Db.waitPendingWrites`).
+/// Waiting under graph_mutex is safe: no write transaction takes it.
 fn moduleGraphUnchanged(server: *Server, graph: *const ModuleGraph, t: za.sema.InternPool.Target, targets: []const za.sema.InternPool.Target) Allocator.Error!bool {
+    while (true) {
+        return server.sameModuleGraph(graph, t, targets) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => {
+                server.db.waitPendingWrites();
+                continue;
+            },
+        };
+    }
+}
+
+/// One comparison of `moduleGraphUnchanged`, in a read transaction of its own
+fn sameModuleGraph(server: *Server, graph: *const ModuleGraph, t: za.sema.InternPool.Target, targets: []const za.sema.InternPool.Target) za.db.Error!bool {
     var ctx = server.db.beginRead(server.gpa);
     defer ctx.end();
-    const current = ctx.get(ModuleGraph.Input, {}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        // Another write transaction is waiting: treat it as changed
-        error.Canceled => return false,
-    };
-    const target = ctx.get(za.sema.queries.TargetAbi, {}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Canceled => return false,
-    };
-    for (targets, 0..) |ct, i| {
-        const cur = ctx.get(za.sema.queries.ContextTarget, @intCast(i)) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Canceled => return false,
-        };
-        if (!std.meta.eql(cur, ct)) return false;
-    }
+    if (@import("builtin").is_test) if (server.graph_gate) |gate| gate.pass(server.io);
+    const current = try ctx.get(ModuleGraph.Input, {});
+    const target = try ctx.get(za.sema.queries.TargetAbi, {});
+    for (targets, 0..) |ct, i| if (!std.meta.eql(try ctx.get(za.sema.queries.ContextTarget, @intCast(i)), ct)) return false;
     return ModuleGraph.Input.eql(current, graph) and std.meta.eql(target, t);
 }
 

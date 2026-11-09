@@ -2187,6 +2187,41 @@ test "an external change compared while a write transaction waits for the lock i
     try h.notify("exit", {});
 }
 
+// Prevents a module graph comparison that a write transaction waiting for the lock canceled from
+// counting as a change: the module graph was written again with equal values
+test "a module graph update compared while a write transaction waits for the lock is compared again" {
+    const Harness = @import("test_harness.zig").Harness;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = struct {}{} });
+    try h.notify("initialized", struct {}{});
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // The module graph now equals what another update computes
+    h.server.updateModuleGraph();
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const writes = h.server.db.writes.load(.monotonic);
+
+    var gate: Server.OnceGate = .{};
+    h.server.graph_gate = &gate;
+    defer h.server.graph_gate = null;
+    {
+        const updater = try std.Thread.spawn(.{}, Server.updateModuleGraph, .{&h.server});
+        // Lets the held comparison finish when the test fails before releasing it
+        errdefer {
+            gate.release.set(testing.io);
+            updater.join();
+        }
+        try gate.entered.wait(testing.io);
+        (try releaseWithWriteWaiting(&h.server, &gate)).join();
+        updater.join();
+    }
+    // The only write transaction is the test's own
+    try testing.expectEqual(writes + 1, h.server.db.writes.load(.monotonic));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "file URIs without an authority name the same files and folders" {
     const Harness = @import("test_harness.zig").Harness;
     const prev_level = testing.log_level;
