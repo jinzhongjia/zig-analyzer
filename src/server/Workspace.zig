@@ -126,6 +126,9 @@ load_done: bool = false,
 /// Another build request arrived during the build: the result of this round is discarded, and the
 /// project is rebuilt as soon as the round finishes
 rebuild: bool = false,
+/// Files whose change on disk was notified during the build: whether it is rebuilt for them is
+/// decided when it completes (see `deferChanges`)
+changed_during_build: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
 /// New generated file paths became known during the build, but the compile set has not been
 /// recomputed yet (throttled, see `generated_recompute_interval_ms`)
 generated_dirty: bool = false,
@@ -295,10 +298,33 @@ fn destroy(ws: *Workspace) void {
     ws.bundles.deinit(gpa);
     ws.failed_steps.deinit(gpa);
     ws.silent_steps.deinit(gpa);
+    ws.changed_during_build.deinit(gpa);
     ws.loaded.deinit(gpa);
     ws.read_imports.deinit(gpa);
     gpa.free(ws.root);
     gpa.destroy(ws);
+}
+
+/// A change on disk of `files` (owned by the project) was notified. During a build, returns true:
+/// whether to rebuild for them is decided when the build completes, by comparing the disk with
+/// what the latest rebuild was based on (`Server.changedSinceBuilt`). The build may be writing
+/// them itself (a step that generates code into the source tree): what was read in the middle of
+/// such a write is not what any build reads, and taking it as the basis would rebuild once more
+/// when the write's own notification comes. Returns false when no build is in progress.
+pub fn deferChanges(ws: *Workspace, files: []const FileId) bool {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    if (!ws.building or ws.stopping) return false;
+    ws.changed_during_build.ensureUnusedCapacity(ws.gpa, files.len) catch return false;
+    for (files) |file| ws.changed_during_build.putAssumeCapacity(file, {});
+    return true;
+}
+
+/// Takes the files of `changed_during_build`; the caller holds `mutex`
+fn takeChanged(ws: *Workspace) std.AutoArrayHashMapUnmanaged(FileId, void) {
+    const changed = ws.changed_during_build;
+    ws.changed_during_build = .empty;
+    return changed;
 }
 
 /// Requests a build after a file is saved; while a build is in progress, marks it to be rebuilt
@@ -572,6 +598,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     ws.mutex.lockUncancelable(ws.server.io);
     const was_building = ws.building;
     ws.building = false;
+    ws.changed_during_build.clearRetainingCapacity();
     const c = ws.client;
     ws.client = null;
     ws.server.progress.end(ws.server, ws.build_progress, "Build interrupted");
@@ -774,12 +801,18 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
         .build_completed => {
             ws.mutex.lockUncancelable(io);
             ws.built = true;
-            const rebuild = ws.rebuild;
+            var changed = ws.takeChanged();
+            ws.mutex.unlock(io);
+            defer changed.deinit(ws.gpa);
+            // The steps that may write the files are done (see `deferChanges`)
+            const differs = ws.server.changedSinceBuilt(changed.keys()) catch return;
+            ws.mutex.lockUncancelable(io);
+            const rebuild = ws.rebuild or differs;
             ws.rebuild = false;
             ws.mutex.unlock(io);
             if (rebuild) {
-                // Files were saved again during the build: the result may not match the disk;
-                // discard it and rebuild
+                // Files were saved again during the build, or differ on disk from what the latest
+                // rebuild was based on: the result may not match the disk; discard it and rebuild
                 ws.clearBundles();
                 ws.mutex.lockUncancelable(io);
                 defer ws.mutex.unlock(io);
@@ -803,6 +836,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     ws.build_progress = null;
                     ws.building = false;
                     ws.rebuild = false;
+                    ws.changed_during_build.clearRetainingCapacity();
                 }
                 ws.mutex.unlock(io);
                 if (replaced) {
@@ -856,11 +890,23 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             try ws.finishBuild();
             ws.generated_dirty = false;
             try ws.recomputeCompileSet();
-            ws.mutex.lockUncancelable(io);
-            ws.building = false;
-            const again = ws.rebuild;
-            ws.rebuild = false;
-            ws.mutex.unlock(io);
+            // The build ends once no notified change is left to decide: changes notified while the
+            // result was being published are decided here
+            var again = false;
+            while (true) {
+                ws.mutex.lockUncancelable(io);
+                var late = ws.takeChanged();
+                if (late.count() == 0) {
+                    ws.building = false;
+                    again = again or ws.rebuild;
+                    ws.rebuild = false;
+                    ws.mutex.unlock(io);
+                    break;
+                }
+                ws.mutex.unlock(io);
+                defer late.deinit(ws.gpa);
+                if (ws.server.changedSinceBuilt(late.keys()) catch true) again = true;
+            }
             // More files were saved while the result was being published: `requestBuild` only
             // recorded `rebuild` then, so the next round starts here. Start the new build before
             // ending this round's busy, so a waiter for idle does not return between the rounds.
