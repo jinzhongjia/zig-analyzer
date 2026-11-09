@@ -5918,7 +5918,8 @@ const Evaluator = struct {
     }
 
     /// `@ptrCast` to a pointer of another pointee type: a pointer into storage inside the
-    /// interpreter gets a reinterpreting step (see `Ref.path`). The step starts at the outermost
+    /// interpreter, or to the place an interned pointer records (`pointerPlace`), gets a
+    /// reinterpreting step (see `Ref.path`). The step starts at the outermost
     /// value the pointer is a byte offset into, as with the compiler's pointers (elements of
     /// arrays and fields of extern structs are reached by offset). Unknown for other pointers, for
     /// slices and C pointers as the result, and for opaque pointees.
@@ -5935,9 +5936,10 @@ const Evaluator = struct {
         };
         if (src.size == .c or dest.size == .c or dest.size == .slice) return unknown;
         if (ev.isOpaque(src.child) or ev.isOpaque(dest.child)) return unknown;
-        var ref: Ref = switch (p.v) {
-            .ref => |r| r,
-            // Constant data cannot be written through any pointer: a copy of it is referenced
+        var ref: Ref = if (try ev.pointerPlace(p)) |r| r else switch (p.v) {
+            // Constant data whose place is not known here cannot be written through any
+            // pointer: a copy of it is referenced, which compares as the interned pointer would
+            // (`CellOrigin.copy`)
             .ip => |x| blk: {
                 if (!src.is_const or src.size == .many) return unknown;
                 switch (ip.key(x)) {
@@ -5946,6 +5948,7 @@ const Evaluator = struct {
                 }
                 const cell = try ev.a.create(Val);
                 cell.* = try ev.deref(p);
+                try ev.cell_origins.put(ev.a, cell, .copy);
                 break :blk .{ .cell = cell, .path = &.{}, .is_const = true, .immutable = true };
             },
             else => return unknown,

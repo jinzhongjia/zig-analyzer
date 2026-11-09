@@ -812,9 +812,9 @@ test "a pointer erased to *anyopaque keeps its value when cast back from a param
         .{ "from_optional", "u8 = 3" },
         .{ "from_align_cast", "u16 = 513" },
         .{ "from_double_pointer", "u8 = 3" },
-        // Another type: the compiler reinterprets the memory, which is not evaluated
-        .{ "signed_param", "i8" },
-        .{ "signed_global", "i8" },
+        // Another type: the memory of `big` is reinterpreted
+        .{ "signed_param", "i8 = -56" },
+        .{ "signed_global", "i8 = -56" },
     });
 }
 
@@ -886,9 +886,8 @@ test "a pointer erased to *anyopaque keeps its value when cast back: arrays, ran
         .{ "slice_elem", "u8 = 3" },
         .{ "field_param", "u16 = 2" },
         .{ "field_global", "u16 = 2" },
-        // An element of another shape: the compiler restructures the array, which is not
-        // evaluated
-        .{ "first_of_array", "u8" },
+        // An element of another shape: the memory of `arr` is reinterpreted
+        .{ "first_of_array", "u8 = 1" },
     });
 }
 
@@ -3175,6 +3174,69 @@ test "comptime @ptrCast of a *T coerced to *[1]T reinterprets the place" {
         .{ "view_cast_back", "u32 = 67305985" },
     });
 }
+test "comptime @ptrCast of an interned pointer reinterprets the place it records" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both). A pointer
+    // to a container-level declaration is cast in the declaration's storage, so it is the
+    // pointer cast from `&` of the declaration. Two casts of a pointer to a literal are copies
+    // of data whose place is not known here: their comparison is unknown, not false.
+    try expectTypesTargeted(try targetOf("x86_64-linux-musl", null),
+        \\const x: u32 = 0x04030201;
+        \\const px = &x;
+        \\const arr = [_]u16{ 0x0201, 0x0403 };
+        \\const tail: [*]const u16 = arr[1..].ptr;
+        \\const lit: *const [2]u8 = &.{ 5, 6 };
+        \\fn declSame() bool {
+        \\    const b1: *const [4]u8 = @ptrCast(px);
+        \\    const b2: *const [4]u8 = @ptrCast(&x);
+        \\    return b1 == b2;
+        \\}
+        \\fn declElem() bool {
+        \\    const b1: *const [4]u8 = @ptrCast(px);
+        \\    const b2: *const [4]u8 = @ptrCast(&x);
+        \\    return &b1[1] == &b2[1];
+        \\}
+        \\fn declByte() u8 {
+        \\    const b: *const [4]u8 = @ptrCast(px);
+        \\    return b[2];
+        \\}
+        \\fn manyByte() u8 {
+        \\    const b: [*]const u8 = @ptrCast(tail);
+        \\    return b[1];
+        \\}
+        \\fn litValue() u16 {
+        \\    const w: *align(1) const u16 = @ptrCast(lit);
+        \\    return w.*;
+        \\}
+        \\fn litSame() bool {
+        \\    const a: *align(1) const u16 = @ptrCast(lit);
+        \\    const b: *align(1) const u16 = @ptrCast(lit);
+        \\    return a == b;
+        \\}
+        \\fn litLocal() bool {
+        \\    var v: u16 = 0x0605;
+        \\    const a: *align(1) const u16 = @ptrCast(lit);
+        \\    return a == &v;
+        \\}
+        \\const decl_same = declSame();
+        \\const decl_elem = declElem();
+        \\const decl_byte = declByte();
+        \\const many_byte = manyByte();
+        \\const lit_value = litValue();
+        \\const lit_same = litSame();
+        \\const lit_local = litLocal();
+    , &.{
+        .{ "decl_same", "bool = true" },
+        .{ "decl_elem", "bool = true" },
+        .{ "decl_byte", "u8 = 3" },
+        .{ "many_byte", "u8 = 4" },
+        .{ "lit_value", "u16 = 1541" },
+        // The compiler gives true
+        .{ "lit_same", "bool" },
+        // A local variable is storage of this evaluation, never the literal's
+        .{ "lit_local", "bool = false" },
+    });
+}
+
 test "comptime @ptrCast of a pointer erased to *anyopaque reinterprets the original pointee" {
     // The cast reads and writes the memory of the value the pointer was erased from
     try expectTypesTargeted(try targetOf("x86_64-linux-musl", null),
