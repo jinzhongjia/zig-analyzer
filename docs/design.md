@@ -373,7 +373,7 @@ Files of interest are interned files, configure inputs, and root build files, ex
 
 **Unchanged contents are not a modification.** A build step that rewrites a source file unchanged would otherwise rebuild forever.
 
-- Writing and republishing compares against the known text. A file nothing has read is not changed: FSEvents reports writes from just before the stream started, which would cancel requests in flight. A notified file still being read is compared once the read is done, since what the read gets is not known yet; its rebuild does not wait.
+- Writing and republishing compares against the known text. A comparison canceled by a write waiting for the lock tells nothing either way and is made again (see `waitPendingWrites`). A file nothing has read is not changed: FSEvents reports writes from just before the stream started, which would cancel requests in flight. A notified file still being read is compared once the read is done, since what the read gets is not known yet; its rebuild does not wait.
 - Rebuilding compares against a hash of the disk contents at the last rebuild, because builds read the disk while the known text may come from elsewhere. The first unchanged rewrite therefore still rebuilds once.
 - A change notified while the project is building is compared when the build completes. The build may be writing the file itself, and contents read in the middle of that write are no basis: the write's own notification would then rebuild once more.
 - Root build files without a record compare with their contents just before the newest maker started, so such a late notification does not restart the project.

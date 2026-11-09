@@ -76,6 +76,10 @@ publish_gate: ?*OnceGate = null,
 /// Test hook: holds the reading task of a project once when the maker's stream has ended, before
 /// the exit is handled (see `Workspace.ExitPause`); always null outside tests
 maker_exit_pause: std.atomic.Value(?*Workspace.ExitPause) = .init(null),
+/// Test hook: holds the first comparison of external changes with the known text
+/// (`applyFileChanges`) in its read transaction, before anything is compared, so that a test can
+/// make a write transaction wait for the lock during the comparison; always null outside tests
+compare_gate: ?*OnceGate = null,
 
 /// Background tasks: reading projects' build system protocol, publishing diagnostics. Several
 /// threads submit tasks to it, and `Io.Group` does not allow submitting during an await, so it
@@ -452,8 +456,8 @@ pub const TestGate = struct {
     }
 };
 
-/// Test hook: the first time the server reaches the point the gate is placed at (`publish_gate`),
-/// it stops there until `release` is set; later times pass
+/// Test hook: the first time the server reaches the point the gate is placed at (`publish_gate`,
+/// `compare_gate`), it stops there until `release` is set; later times pass
 pub const OnceGate = struct {
     /// Set when the server stops at the gate
     entered: Io.Event = .unset,
@@ -2426,6 +2430,9 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
         durability: database.Durability,
         /// Hash of the disk contents; null if the file does not exist
         disk: ?u64,
+        /// Being read from disk (`SourceText`): compared with the disk again once the read is done
+        /// (see `deferred`)
+        reading: bool = false,
         /// Differs from the known text: write it and republish
         edited: bool = true,
         /// Differs from what `watched_built` recorded: rebuild
@@ -2526,15 +2533,28 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
     // not necessarily seen.
     if (changes.items.len != 0) {
         if (deferred) |list| try list.ensureUnusedCapacity(arena, changes.items.len);
-        var ctx = server.db.beginRead(arena);
-        defer ctx.end();
+        // A comparison canceled by a write transaction (a project loading files, the module graph
+        // update, a scan, ...) tells nothing about the files: all of them are compared again once
+        // that write has taken the lock (see `Db.waitPendingWrites`)
+        while (true) {
+            const canceled = blk: {
+                var ctx = server.db.beginRead(arena);
+                defer ctx.end();
+                if (@import("builtin").is_test) if (server.compare_gate) |gate| gate.pass(server.io);
+                for (changes.items) |*c| {
+                    // A notified file being read from disk, or a verified one whose read began
+                    // after the check above
+                    c.reading = deferred != null and !c.open and knownText(&ctx, c.file) == .reading;
+                    c.edited = !c.reading and !c.open and !(sameText(&ctx, c.file, c.text) catch break :blk true);
+                }
+                break :blk false;
+            };
+            if (!canceled) break;
+            server.db.waitPendingWrites();
+        }
         var kept: usize = 0;
         for (changes.items) |*c| {
-            // A notified file being read from disk, or a verified one whose read began after the
-            // check above
-            const reading = deferred != null and !c.open and knownText(&ctx, c.file) == .reading;
-            if (reading) deferred.?.appendAssumeCapacity(c.path);
-            c.edited = !reading and !c.open and !sameText(&ctx, c.file, c.text);
+            if (c.reading) deferred.?.appendAssumeCapacity(c.path);
             c.rebuild = if (source == .verified)
                 c.edited
             else if (server.watchedBuilt(c.file)) |built|
@@ -2710,13 +2730,18 @@ fn changesWorkspaceFiles(server: *Server, arena: Allocator, rules: origin.Rules,
     return false;
 }
 
-/// The file's known text is the same as `text` (including both being absent); a failed read counts
-/// as different. When the text was never set, the file is read from disk on demand (`SourceText`)
-/// and that read is kept until the text is set, even to absent: the known text is then that read,
-/// and a file never read has no text that anything was computed from. FSEvents reports writes
-/// made shortly before the stream started, which are not changes to such files.
-fn sameText(ctx: *Db.Ctx, file: Vfs.FileId, text: ?[]const u8) bool {
-    const current = ctx.get(FileText, file) catch return false;
+/// The file's known text is the same as `text` (including both being absent). A read that runs out
+/// of memory counts as different (writing the disk contents loses no change); one canceled by a
+/// write transaction waiting for the lock tells nothing about the file and fails with `Canceled`.
+/// When the text was never set, the file is read from disk on demand (`SourceText`) and that read
+/// is kept until the text is set, even to absent: the known text is then that read, and a file
+/// never read has no text that anything was computed from. FSEvents reports writes made shortly
+/// before the stream started, which are not changes to such files.
+fn sameText(ctx: *Db.Ctx, file: Vfs.FileId, text: ?[]const u8) error{Canceled}!bool {
+    const current = ctx.get(FileText, file) catch |err| switch (err) {
+        error.OutOfMemory => return false,
+        error.Canceled => return error.Canceled,
+    };
     if (current) |known| return std.mem.eql(u8, known, text orelse return false);
     if (ctx.isSet(FileText, file)) return text == null;
     return switch (ctx.memoized(syntax_q.SourceText, file)) {
