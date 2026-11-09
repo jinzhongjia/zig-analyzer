@@ -2035,7 +2035,7 @@ const Inferrer = struct {
         // The right-hand side is `Log2Int(T)`
         if (eq(u8, name, "@shlExact") or eq(u8, name, "@shrExact")) {
             const lhs: TypedValue = if (args.len > 0) try inf.infer(args[0], null) else .unknown;
-            for (args[@min(args.len, 1)..]) |a| _ = try inf.infer(a, try inf.log2IntType(lhs.ty));
+            for (args[@min(args.len, 1)..]) |a| _ = try inf.infer(a, try value.log2IntType(inf.ip, lhs.ty));
             return try inf.pureValue(name, args) orelse .{ .ty = lhs.ty };
         }
         // The result type of the init value is the field's type
@@ -2494,6 +2494,7 @@ const Inferrer = struct {
             .caret_equal => .caret,
             .angle_bracket_angle_bracket_left_equal => .angle_bracket_angle_bracket_left,
             .angle_bracket_angle_bracket_right_equal => .angle_bracket_angle_bracket_right,
+            .angle_bracket_angle_bracket_left_pipe_equal => .angle_bracket_angle_bracket_left_pipe,
             else => {
                 slot.val = null;
                 return;
@@ -2895,7 +2896,7 @@ const Inferrer = struct {
             // no result type
             .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right, .angle_bracket_angle_bracket_left_pipe => {
                 const lhs = try inf.infer(lhs_e, null);
-                const rhs = try inf.infer(rhs_e, if (op == .angle_bracket_angle_bracket_left_pipe) null else try inf.log2IntType(lhs.ty));
+                const rhs = try inf.infer(rhs_e, if (op == .angle_bracket_angle_bracket_left_pipe) null else try value.log2IntType(ip, lhs.ty));
                 return inf.foldInt(op, lhs.ty, lhs, rhs);
             },
             .plus_plus => return inf.concat(e, try inf.infer(lhs_e, null), try inf.infer(rhs_e, null)),
@@ -3490,28 +3491,12 @@ const Inferrer = struct {
         return inf.ip.get(.{ .ptr_type = p });
     }
 
-    /// Result type `Log2Int(T)` of the right-hand side of a shift (matches the compiler); null for
-    /// types other than integers and vectors of integers
-    fn log2IntType(inf: *Inferrer, t: Index) Error!?Index {
-        const ip = inf.ip;
-        if (t == .comptime_int_type) return .comptime_int_type;
-        switch (ip.key(t)) {
-            .vector_type => |v| {
-                const child = try inf.log2IntType(v.child) orelse return null;
-                return try ip.get(.{ .vector_type = .{ .len = v.len, .child = child } });
-            },
-            else => {},
-        }
-        const info = value.intInfo(ip, t) orelse return null;
-        return try ip.intType(.unsigned, if (info.bits == 0) 0 else std.math.log2_int_ceil(u16, info.bits));
-    }
-
     /// Result type of the right-hand side of an assignment (matches the compiler): `Log2Int(T)`
     /// for `<<=` / `>>=`, none for `<<|=`, and usize for `+=` / `-=` on many-item pointers
     fn assignRhsType(inf: *Inferrer, op: SyntaxKind, lhs: Index) Error!?Index {
         if (lhs == .unknown) return null;
         return switch (op) {
-            .angle_bracket_angle_bracket_left_equal, .angle_bracket_angle_bracket_right_equal => inf.log2IntType(lhs),
+            .angle_bracket_angle_bracket_left_equal, .angle_bracket_angle_bracket_right_equal => try value.log2IntType(inf.ip, lhs),
             .angle_bracket_angle_bracket_left_pipe_equal => null,
             .plus_equal, .minus_equal => if (isManyPtr(inf.ip, lhs)) .usize_type else lhs,
             else => lhs,

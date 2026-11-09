@@ -4589,6 +4589,25 @@ test "float formatting in std.fmt at comptime" {
     });
 }
 
+test "std.math.gcd and std.math.lcm at comptime" {
+    // std.math.gcd shifts by `@intCast(@ctz(x))`: without the shift amount's result type the
+    // calls had no value
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const gcd_u32 = std.math.gcd(@as(u32, 48), 18);
+        \\const gcd_ct = std.math.gcd(48, 18);
+        \\const gcd_u8 = std.math.gcd(@as(u8, 48), @as(u8, 18));
+        \\const gcd_u64 = std.math.gcd(@as(u64, 1 << 40), 3 << 20);
+        \\const lcm_u32 = std.math.lcm(@as(u32, 4), 6);
+    , &.{
+        .{ "gcd_u32", "u32 = 6" },
+        .{ "gcd_ct", "comptime_int = 6" },
+        .{ "gcd_u8", "u8 = 6" },
+        .{ "gcd_u64", "u64 = 1048576" },
+        .{ "lcm_u32", "u32 = 12" },
+    });
+}
+
 test "unsigned 128-bit integers above i128's range" {
     // The bit pattern of a u128 value at or above 2^127 was read back as a negative number.
     try expectStdTypes(
@@ -6639,6 +6658,111 @@ test "comptime @fromBackingInt coerces its operand to the backing integer of the
         // Stores through element places and pointer captures (the shape of std.enums.valuesFromFields)
         .{ "stored", "[2]Color = .{ .green, .blue }" },
         .{ "stored_by_ptr", "[3]Color = .{ .red, .green, .blue }" },
+    });
+}
+
+test "comptime evaluation gives the right operand of a shift the result type Log2Int(T)" {
+    // Without a result type, a result-type builtin in the shift amount (`x >> @intCast(n)`) could
+    // not be evaluated, and the whole computation had no value
+    try expectTypes(
+        \\fn shrCast(a: u32, n: u64) u32 {
+        \\    return a >> @intCast(n);
+        \\}
+        \\fn shlTruncate(a: u32, n: u64) u32 {
+        \\    return a << @truncate(n);
+        \\}
+        \\fn shrAssignCast(a: u32, n: u64) u32 {
+        \\    var x = a;
+        \\    x >>= @intCast(n);
+        \\    return x;
+        \\}
+        \\fn shlAssignCast(a: u32, n: u64) u32 {
+        \\    var x = a;
+        \\    x <<= @intCast(n);
+        \\    return x;
+        \\}
+        \\fn shlExactCast(a: u32, n: u64) u32 {
+        \\    return @shlExact(a, @intCast(n));
+        \\}
+        \\fn shrExactCast(a: u32, n: u64) u32 {
+        \\    return @shrExact(a, @intCast(n));
+        \\}
+        \\fn oddPart(a: u32) u32 {
+        \\    var x = a;
+        \\    x >>= @intCast(@ctz(x));
+        \\    return x;
+        \\}
+        \\const shr_cast = shrCast(256, 4);
+        \\const shl_truncate = shlTruncate(1, 64 + 4);
+        \\const shr_assign_cast = shrAssignCast(256, 4);
+        \\const shl_assign_cast = shlAssignCast(1, 4);
+        \\const shl_exact_cast = shlExactCast(1, 4);
+        \\const shr_exact_cast = shrExactCast(256, 4);
+        \\const odd_part = oddPart(48);
+        \\const direct = @as(u32, 1) << @intCast(@as(u64, 3));
+        \\const wide_lhs = @as(i64, -1) << @truncate(@as(u64, 64 + 63));
+        \\const big_lhs = (1 << 100) >> @intCast(@as(u64, 98));
+        \\const zero_width = @as(u0, 0) << @intCast(@as(u64, 0));
+        \\const zero_width_exact = @shrExact(@as(u0, 0), 0);
+        \\const too_far = shrCast(256, 32);
+    , &.{
+        .{ "shr_cast", "u32 = 16" },
+        .{ "shl_truncate", "u32 = 16" },
+        .{ "shr_assign_cast", "u32 = 16" },
+        .{ "shl_assign_cast", "u32 = 16" },
+        .{ "shl_exact_cast", "u32 = 16" },
+        .{ "shr_exact_cast", "u32 = 16" },
+        .{ "odd_part", "u32 = 3" },
+        .{ "direct", "u32 = 8" },
+        .{ "wide_lhs", "i64 = -9223372036854775808" },
+        // `Log2Int(comptime_int)` is comptime_int
+        .{ "big_lhs", "comptime_int = 4" },
+        // `Log2Int(u0)` is u0, and a shift by zero is the left operand
+        .{ "zero_width", "u0 = 0" },
+        .{ "zero_width_exact", "u0 = 0" },
+        // 32 does not fit the shift amount type u5: a compile error, no value
+        .{ "too_far", "u32" },
+    });
+}
+
+test "comptime saturating shift assignment" {
+    // `<<|=` was missing from the compound assignment operators: the evaluation gave up, and a
+    // `comptime var` lost its value
+    try expectTypes(
+        \\fn shlSat(a: u8, n: u8) u8 {
+        \\    var x = a;
+        \\    x <<|= n;
+        \\    return x;
+        \\}
+        \\fn shlSatSigned(a: i8, n: u64) i8 {
+        \\    var x = a;
+        \\    x <<|= n;
+        \\    return x;
+        \\}
+        \\fn shlSatComptime() comptime_int {
+        \\    var x: comptime_int = 3;
+        \\    x <<|= 200;
+        \\    return x;
+        \\}
+        \\const saturated = shlSat(3, 7);
+        \\const in_range = shlSat(3, 2);
+        \\const signed_saturated = shlSatSigned(-3, 100);
+        \\const comptime_shifted = shlSatComptime();
+        \\const big_shifted = 3 <<| 200;
+        \\export fn entry() u8 {
+        \\    comptime var s: u8 = 3;
+        \\    s <<|= 7;
+        \\    const s_v = s;
+        \\    return s_v;
+        \\}
+    , &.{
+        .{ "saturated", "u8 = 255" },
+        .{ "in_range", "u8 = 12" },
+        .{ "signed_saturated", "i8 = -128" },
+        // A comptime_int has no bound: `<<|` is `<<`
+        .{ "comptime_shifted", "comptime_int = 4820814132776970826625886277023487807566608981348378505904128" },
+        .{ "big_shifted", "comptime_int = 4820814132776970826625886277023487807566608981348378505904128" },
+        .{ "s_v", "u8 = 255" },
     });
 }
 
