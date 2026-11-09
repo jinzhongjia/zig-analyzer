@@ -1293,7 +1293,7 @@ const Evaluator = struct {
             .ip => |x| switch (ev.ip.key(x)) {
                 .aggregate => |agg| return agg.elems.len,
                 .bytes => |b| return b.bytes.len,
-                .ptr_value => |p| return ev.elemCount(Val.of(ev.pointeeType(v.ty), p.pointee)),
+                .ptr_value => |p| return ev.elemCount(ev.ptrValueTarget(v.ty, p.pointee)),
                 else => {},
             },
             else => {},
@@ -1306,6 +1306,26 @@ const Evaluator = struct {
             .ptr_type => |p| p.child,
             else => .unknown,
         };
+    }
+
+    /// What an interned `ptr_value` pointing to `pointee` holds when read through pointer type
+    /// `t`. `pointerTo` interns pointers to arrays and slices as the elements they point to,
+    /// except when the type they are interned with is an optional or error union holding them
+    /// (the result of a call returning `?[]const u16`): they are then a `ptr_value` to the array
+    /// of those elements. A slice or many-item pointer unwrapped from it reads that array as its
+    /// elements, the same as the elements representation with type `t`; the child type of `t` is
+    /// the element type, not the type of the array. Any other pointee is a value of the child
+    /// type.
+    fn ptrValueTarget(ev: *Evaluator, t: Index, pointee: Index) Val {
+        const ip = ev.ip;
+        switch (ip.key(t)) {
+            .ptr_type => |p| if (p.size != .one) switch (ip.key(value.typeOfValue(ip, pointee))) {
+                .array_type => |a| if (a.child == p.child) return Val.of(t, pointee),
+                else => {},
+            },
+            else => {},
+        }
+        return Val.of(ev.pointeeType(t), pointee);
     }
 
     /// The sentinel when `i` is its index in an array of type `t`
@@ -1404,7 +1424,7 @@ const Evaluator = struct {
                 // Aggregates whose elements are all u8 are also represented as bytes (e.g. a
                 // value of `struct { short: ?u8 }`): use the declared type of the element
                 .bytes => |b| return if (i < b.bytes.len) Val.of(if (ty != .unknown) ty else .u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else ev.elemPastEnd(v.ty, b.ty, i, b.bytes.len),
-                .ptr_value => |p| return ev.elemAt(Val.of(ev.pointeeType(v.ty), p.pointee), i),
+                .ptr_value => |p| return ev.elemAt(ev.ptrValueTarget(v.ty, p.pointee), i),
                 // Field `i` of a union (the place of `&u.y`): only the active field has a value
                 .union_value => |u| {
                     const fields = try ev.fieldsOf(u.ty) orelse return error.Abort;
@@ -3855,7 +3875,12 @@ const Evaluator = struct {
                 return ev.readAs(try ev.load(r), child);
             },
             .ip => |x| switch (ip.key(x)) {
-                .ptr_value => |pv| return Val.of(child, pv.pointee),
+                // A slice interned as `ptr_value` dereferences as its elements do (see
+                // `ptrValueTarget`)
+                .ptr_value => |pv| {
+                    const target = ev.ptrValueTarget(p.ty, pv.pointee);
+                    return if (target.ty != child) ev.deref(target) else target;
+                },
                 // Array pointers and slices are represented by their elements; dereferencing
                 // yields the array (for a slice, `[len:sentinel]T`)
                 .aggregate => |agg| {
@@ -5310,7 +5335,7 @@ const Evaluator = struct {
                 for (agg.elems, out) |e, *o| o.* = std.math.cast(u8, value.intOf(ev.ip, e) orelse return error.Abort) orelse return error.Abort;
                 break :blk out;
             },
-            .ptr_value => |p| ev.stringOf(Val.of(ev.pointeeType(v.ty), p.pointee)),
+            .ptr_value => |p| ev.stringOf(ev.ptrValueTarget(v.ty, p.pointee)),
             else => error.Abort,
         };
     }
