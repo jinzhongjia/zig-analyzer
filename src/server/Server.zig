@@ -320,8 +320,11 @@ write_mutex: Io.Mutex = .init,
 /// Disk contents of known files that are not open, read during external changes and already used
 /// as the basis of a rebuild (hash; null if the file does not exist); see `didChangeWatchedFiles`.
 /// Cleared when the document is opened: contents saved while it is open do not come through
-/// external changes. Accessed only under write_mutex.
+/// external changes. Protected by `watched_built_mutex`: besides message handling and external
+/// changes (under write_mutex), a project records it when a build completes during which a
+/// change was notified (see `Workspace.deferChanges`).
 watched_built: std.AutoHashMapUnmanaged(Vfs.FileId, ?u64) = .empty,
+watched_built_mutex: Io.Mutex = .init,
 /// Background task for server-side discovery of external changes (created by `startProjects`)
 watcher: ?*watch.Watcher = null,
 /// Minimum polling interval (ms) when native file watching is unavailable
@@ -2076,7 +2079,11 @@ const OpenDoc = struct {
 fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentParams) !void {
     try server.setVirtualLanguage(params.textDocument.uri, params.textDocument.languageId);
     const id = try server.documentFile(arena, params.textDocument.uri) orelse return;
-    _ = server.watched_built.remove(id);
+    {
+        server.watched_built_mutex.lockUncancelable(server.io);
+        defer server.watched_built_mutex.unlock(server.io);
+        _ = server.watched_built.remove(id);
+    }
     {
         const owned = try server.gpa.dupe(u8, params.textDocument.text);
         server.db.beginWrite();
@@ -2317,7 +2324,11 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
         error.OutOfMemory, error.Canceled => |e| return e,
         error.FileTooBig => null,
     };
-    if (saved) |t| server.watched_built.put(server.gpa, id, std.hash.Wyhash.hash(0, t)) catch {} else _ = server.watched_built.remove(id);
+    {
+        server.watched_built_mutex.lockUncancelable(server.io);
+        defer server.watched_built_mutex.unlock(server.io);
+        if (saved) |t| server.watched_built.put(server.gpa, id, std.hash.Wyhash.hash(0, t)) catch {} else _ = server.watched_built.remove(id);
+    }
 
     // A build.zig newly created in a root directory: start the project
     if (std.mem.eql(u8, base, "build.zig")) if (std.fs.path.dirname(path)) |dir| {
@@ -2385,12 +2396,13 @@ pub const ChangeSource = enum {
 /// / build.zig.zon / zig-analyzer.zon in a workspace root directory or to a project's build
 /// script restarts that project; creating or deleting build.zig in a root directory starts or
 /// stops the project; changes to other files rebuild projects and recompile single files; nothing
-/// is rebuilt when the disk contents equal those the last rebuild was based on (see `didSave`).
-/// Returns whether anything changed: a known file's text or rebuild basis, or a project started
-/// or stopped. When `deferred` is given, the files being read from disk are added to it instead
-/// of being compared with the disk: what the read gets is not known yet, so their text is compared
-/// again once the read is done (see `applyWatchedChanges`). The rebuild of a notified change does
-/// not wait for that, since the builds read the disk.
+/// is rebuilt when the disk contents equal those the last rebuild was based on (see `didSave`). A
+/// project in the middle of a build compares a notified change when the build completes (see
+/// `Workspace.deferChanges`). Returns whether anything changed: a known file's text or rebuild
+/// basis, or a project started or stopped. When `deferred` is given, the files being read from
+/// disk are added to it instead of being compared with the disk: what the read gets is not known
+/// yet, so their text is compared again once the read is done (see `applyWatchedChanges`). The
+/// rebuild of a notified change does not wait for that, since the builds read the disk.
 fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const types.FileEvent, source: ChangeSource, deferred: ?*std.ArrayList([]const u8)) !bool {
     const Change = struct {
         file: Vfs.FileId,
@@ -2512,7 +2524,7 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
             c.edited = !reading and !c.open and !sameText(&ctx, c.file, c.text);
             c.rebuild = if (source == .verified)
                 c.edited
-            else if (server.watched_built.get(c.file)) |built|
+            else if (server.watchedBuilt(c.file)) |built|
                 !std.meta.eql(built, c.disk)
             else
                 !(isProjectFile(std.fs.path.basename(c.path)) and server.projectStartedWith(c.path, c.disk));
@@ -2554,6 +2566,10 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
     for (build_zig_dirs.items) |dir| if (try server.refreshRoot(dir)) try refreshed.append(arena, dir);
     const changed = changes.items.len != 0 or build_files.items.len != 0 or refreshed.items.len != 0;
 
+    // Files whose rebuild a project in the middle of a build decides when the build completes, and
+    // those a rebuild was requested for right away
+    var deferred_files: std.AutoHashMapUnmanaged(Vfs.FileId, void) = .empty;
+    var requested_files: std.AutoHashMapUnmanaged(Vfs.FileId, void) = .empty;
     const list = try server.workspaceList(arena);
     defer server.releaseList(arena, list);
     for (list) |ws| {
@@ -2579,10 +2595,15 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
             if (!started) server.restartWorkspace(ws, 0);
             continue;
         }
-        for (rebuilt.items) |file| if (ws.owns(file)) {
-            server.requestBuild(ws);
-            break;
-        };
+        var owned: std.ArrayList(Vfs.FileId) = .empty;
+        for (rebuilt.items) |file| if (ws.owns(file)) try owned.append(arena, file);
+        if (owned.items.len == 0) continue;
+        if (source == .notified and server.deferChanges(ws, owned.items)) {
+            for (owned.items) |file| try deferred_files.put(arena, file, {});
+            continue;
+        }
+        server.requestBuild(ws);
+        for (owned.items) |file| try requested_files.put(arena, file, {});
     }
     if (edited.items.len != 0) {
         server.publishFiles(edited.items, true);
@@ -2596,8 +2617,14 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
     const open = try arena.dupe(Vfs.FileId, server.open_docs.keys());
     server.docs_mutex.unlock(server.io);
     server.recompileSingle(open, rebuilt.items);
-    // If it cannot be recorded, the next change rebuilds as usual
-    for (changes.items) |c| if (c.rebuild) server.watched_built.put(server.gpa, c.file, c.disk) catch {};
+    // If it cannot be recorded, the next change rebuilds as usual. The projects that decide when
+    // their build completes record what they then compare.
+    server.watched_built_mutex.lockUncancelable(server.io);
+    defer server.watched_built_mutex.unlock(server.io);
+    for (changes.items) |c| if (c.rebuild) {
+        if (deferred_files.contains(c.file) and !requested_files.contains(c.file)) continue;
+        server.watched_built.put(server.gpa, c.file, c.disk) catch {};
+    };
     return changed;
 }
 
@@ -4136,6 +4163,58 @@ pub fn requestBuild(server: *Server, ws: *Workspace) void {
     };
     defer target.release();
     target.requestBuild();
+}
+
+/// A change on disk of `files` (owned by the project of `ws`) was notified: if the project's
+/// current instance is in the middle of a build, it decides whether to rebuild for them when the
+/// build completes (see `Workspace.deferChanges`) and this returns true
+pub fn deferChanges(server: *Server, ws: *Workspace, files: []const Vfs.FileId) bool {
+    const target = blk: {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        const visible = server.visibleFor(ws.root) orelse return false;
+        const t = visible.successor orelse visible;
+        t.acquire();
+        break :blk t;
+    };
+    defer target.release();
+    return target.deferChanges(files);
+}
+
+/// The disk contents the latest rebuild for `file` was based on (see `watched_built`)
+fn watchedBuilt(server: *Server, file: Vfs.FileId) ??u64 {
+    server.watched_built_mutex.lockUncancelable(server.io);
+    defer server.watched_built_mutex.unlock(server.io);
+    return server.watched_built.get(file);
+}
+
+/// Whether the disk contents of any of `files` differ from those the latest rebuild was based on
+/// (see `watched_built`), recording the current contents as that basis: a project calls this when
+/// a build completes during which their change was notified (see `Workspace.deferChanges`)
+pub fn changedSinceBuilt(server: *Server, files: []const Vfs.FileId) Io.Cancelable!bool {
+    var changed = false;
+    for (files) |file| {
+        const read = server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.FileTooBig => null,
+            error.OutOfMemory => {
+                changed = true;
+                continue;
+            },
+        };
+        defer if (read) |t| server.gpa.free(t);
+        const disk: ?u64 = if (read) |t| std.hash.Wyhash.hash(0, t) else null;
+        server.watched_built_mutex.lockUncancelable(server.io);
+        defer server.watched_built_mutex.unlock(server.io);
+        const gop = server.watched_built.getOrPut(server.gpa, file) catch {
+            changed = true;
+            continue;
+        };
+        if (gop.found_existing and std.meta.eql(gop.value_ptr.*, disk)) continue;
+        gop.value_ptr.* = disk;
+        changed = true;
+    }
+    return changed;
 }
 
 /// The instance in the list for the project of root
