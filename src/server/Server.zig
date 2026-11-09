@@ -5083,6 +5083,40 @@ test "updateModuleGraph takes no write transaction when nothing changed" {
     try std.testing.expectEqual(writes + 1, server.db.writes.load(.monotonic));
 }
 
+test "scanOnce: a comparison canceled by an edit is made again instead of writing the same files" {
+    // Guards against a scan that found the files already recorded writing them again when an
+    // edit's write transaction canceled its comparison: that write advanced the revision and
+    // canceled the requests in flight
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, std.testing.allocator, &writer);
+    defer server.deinit();
+    const revision = server.db.revision;
+    const writes = server.db.writes.load(.monotonic);
+    // An edit's write transaction has registered and has not taken the lock yet, as between
+    // `Db.beginWriteOf` registering it and locking: the scan's comparison is canceled
+    _ = server.db.pending_write.fetchAdd(1, .seq_cst);
+    var done: std.atomic.Value(bool) = .init(false);
+    const Scan = struct {
+        fn run(s: *Server, d: *std.atomic.Value(bool)) void {
+            defer d.store(true, .release);
+            s.scanOnce() catch |err| std.debug.panic("scan failed: {t}", .{err});
+        }
+    };
+    const scan = try std.Thread.spawn(.{}, Scan.run, .{ &server, &done });
+    // The scan either waits for the edit or finishes without waiting for it
+    while (!done.load(.acquire) and server.db.pending_write_waiters.load(.seq_cst) == 0) std.Thread.yield() catch {};
+    // The edit takes the lock
+    _ = server.db.pending_write.fetchSub(1, .seq_cst);
+    std.testing.io.futexWake(u32, &server.db.pending_write.raw, std.math.maxInt(u32));
+    scan.join();
+    // No root directories, so no source files: the same as recorded, nothing to write
+    try std.testing.expectEqual(writes, server.db.writes.load(.monotonic));
+    try std.testing.expectEqual(revision, server.db.revision);
+}
+
 /// Whether to publish live diagnostics for the file: it belongs to no project, or one of the
 /// projects it belongs to wants them (see `Workspace.liveEligible`)
 fn liveEligible(server: *Server, file: Vfs.FileId) bool {
