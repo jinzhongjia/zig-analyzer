@@ -2622,6 +2622,39 @@ test "calls of a type function with different anytype argument values are differ
     });
 }
 
+test "inline type functions see the values of comptime-known anytype arguments" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1: an inline call passes on the
+    // comptime-known arguments, and a runtime argument has only its type. Prevents an inline call
+    // with a runtime argument from losing the argument type when anytype arguments are recorded by
+    // value.
+    try expectTypes(
+        \\inline fn InlCap(x: anytype) type {
+        \\    return struct {
+        \\        pub const v = x;
+        \\    };
+        \\}
+        \\inline fn InlLen(x: anytype) type {
+        \\    return [@sizeOf(@TypeOf(x))]u8;
+        \\}
+        \\const inl_eq = InlCap(@as(u8, 3)) == InlCap(@as(u8, 4));
+        \\const inl_same = InlCap(@as(u8, 3)) == InlCap(@as(u8, 3));
+        \\const inl_v = InlCap(@as(u8, 3)).v;
+        \\const inl_opt_v = InlCap(@as(?u8, 3)).v;
+        \\fn g() void {
+        \\    var rt: u16 = 3;
+        \\    _ = &rt;
+        \\    const rt_len = InlLen(rt);
+        \\    _ = rt_len;
+        \\}
+    , &.{
+        .{ "inl_eq", "bool = false" },
+        .{ "inl_same", "bool = true" },
+        .{ "inl_v", "u8 = 3" },
+        .{ "inl_opt_v", "?u8 = 3" },
+        .{ "rt_len", "type = [2]u8" },
+    });
+}
+
 test "containers in a type function capture the values its body computed" {
     // Prevents members from seeing only a re-inference of a captured constant's initializer,
     // which has no value for local arrays and for values derived from local variables
