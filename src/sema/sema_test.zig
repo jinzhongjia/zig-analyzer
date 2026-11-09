@@ -3145,6 +3145,38 @@ test "comptime @ptrCast of a *T coerced to *[1]T reinterprets the place" {
         .{ "view_cast_back", "u32 = 67305985" },
     });
 }
+test "comptime @ptrCast of a pointer erased to *anyopaque reinterprets the original pointee" {
+    // The cast reads and writes the memory of the value the pointer was erased from
+    try expectTypesTargeted(try targetOf("x86_64-linux-musl", null),
+        \\fn viaOpaque() u8 {
+        \\    var x: u32 = 0x04030201;
+        \\    const o: *anyopaque = &x;
+        \\    const b: *[4]u8 = @ptrCast(o);
+        \\    return b[1];
+        \\}
+        \\fn writeViaOpaque() u32 {
+        \\    var x: u32 = 0;
+        \\    const o: *anyopaque = &x;
+        \\    const b: *[4]u8 = @ptrCast(o);
+        \\    b[3] = 0xff;
+        \\    return x;
+        \\}
+        \\fn alignViaOpaque() u16 {
+        \\    var a: [2]u16 = .{ 0x1111, 0x2222 };
+        \\    const o: *anyopaque = &a;
+        \\    const w: *u32 = @ptrCast(@alignCast(o));
+        \\    w.* = 0xaaaabbbb;
+        \\    return a[1];
+        \\}
+        \\const via_opaque = viaOpaque();
+        \\const write_via_opaque = writeViaOpaque();
+        \\const align_via_opaque = alignViaOpaque();
+    , &.{
+        .{ "via_opaque", "u8 = 2" },
+        .{ "write_via_opaque", "u32 = 4278190080" },
+        .{ "align_via_opaque", "u16 = 43690" },
+    });
+}
 test "comptime @fieldParentPtr of a pointer cast to another pointee type" {
     // A field pointer made by reinterpreting bytes ends in a reinterpreting step, whose byte
     // offset must not be taken for a field index
