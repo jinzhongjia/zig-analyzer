@@ -16,19 +16,19 @@ Benchmark project: the Zig 0.17.0 compiler source (540k lines + standard library
 | | keystroke → hover (continuous typing) | — | `Sema.zig` p50 97 ms; other projects 5-21 ms | — |
 | | keystroke → name completion (typing words in a method) | — | `Sema.zig`: auto-import on p50 72-84 ms, p95 160-181 ms; off p50 43-45 ms, p95 67-73 ms (see below) | — |
 | | save → compiler diagnostics (`check` step) | < 1 s | small projects about 120 ms; Zig compiler 5.2 s | ⚠️ limited by the compiler |
-| | resident memory (long session) | does not grow over the session | Zig compiler source: 2.5-2.8 GB from round 120 on (Linux, see below) | ⚠️ the heap grows |
+| | resident memory (long session) | does not grow over the session | Zig compiler source: heap 0.4-0.7 GB from round 40 on, RSS 0.9-1.3 GB from round 120 on (macOS, see below) | ✅ |
 | Cold start | process start → `initialize` | < 100 ms | 1-9 ms | ✅ |
 | | open file → syntax features | < 200 ms | 53 ms (`Sema.zig`) | ✅ |
 | | open file → hover / goto / completion | < 3 s | project loading 1.5-4.4 s; hover is available before loading finishes (with incomplete name resolution, which the hover states; see Requests during project loading in `docs/design.md`) | ✅ |
 | | workspace symbol index (background) | < 30 s | 1.9 s | ✅ |
 
-Resident memory over a long session on the Zig compiler source:
+Resident memory and time over a long session on the Zig compiler source (`BENCH_QUICK=1 BENCH_SESSION=160`, `src/Sema.zig`, ReleaseSafe):
 
-- Linux, 160 rounds: RSS 2.5-2.8 GB from round 120 on, heap 2.1 GB at round 160, of which 1.8 GB are large allocations. Peak RSS 4.6 GB, with at most 1.55 GB assigned to size classes.
-- macOS, 160 rounds: RSS 2.1-2.3 GB from round 120 on, heap 1.5 GB at round 160, of which 1.2 GB are large allocations. Peak RSS about 4.2 GB, with at most 1.6 GB assigned to size classes.
-- Windows, 160 rounds: working set 2.9 GB and heap 2.1 GB at round 160. Peak working set 4.7-4.8 GB and peak commit 5.4-5.5 GB, with at most 1.55 GB assigned to size classes.
+- macOS, 160 rounds: the session takes 140 s. RSS 0.9-1.3 GB from round 120 on, heap 636 MB at round 160, of which 426 MB are large allocations. Peak RSS 2.9-3.0 GB, with at most 1.1 GB assigned to size classes; about 73,000 pages are returned to the system over the session.
+- Linux, 160 rounds: the session takes 153 s. Heap 629 MB at round 160, of which 410 MB are large allocations. Peak RSS 2.8 GB, with at most 1.1 GB assigned to size classes; about 73,000 pages are returned to the system over the session.
+- Windows: not measured on the current code.
 
-The heap grows over the session; from round 120 to 160 on macOS it grows from 1.4 to 1.5 GB, mostly in large allocations, while the recorded dependencies grow from 42 to 45 million. The peak comes from the hover that computes the largest instance closure (all instances of `Writer.printValue`): it infers about 900,000 results in one read transaction, which holds at most 512 MB of them. The memory is returned to the system afterwards.
+The heap does not grow over the session: from round 40 on it stays between 0.4 and 0.7 GB, and falls at each reclaim of type information (rounds 14, 47, and 130 on both platforms). The peak comes from the hover that computes the largest instance closure (all instances of `Writer.printValue`, in rounds 27 and 144): it executes about 350,000 queries in one read transaction, 135,000 of them `Infer`, which holds at most 512 MB of inference results. The memory is returned to the system afterwards. The rounds that take 4 s or more (on macOS rounds 1, 3, 27, 40, 49, 60, and 144, 4-12 s each, about 30% of the session) load the project or compute large closures from scratch, after the start or after a reclaim. The edits between them do not make those closures recompute, since evicted item trees and bodies that are rebuilt unchanged keep their changed_at (see Memory reclamation in `docs/design.md`).
 
 ## Real projects
 
