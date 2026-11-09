@@ -23,7 +23,8 @@
 //! server scan the root directories for source files again (see `Server.scheduleScan`).
 //! A file becomes of interest when it is interned, and the server may read it before this task
 //! watches it: once it is watched, its known text is compared with the disk, so a change in
-//! between is not lost.
+//! between is not lost. A file still being read then is compared once the read is done: what
+//! the read gets is not known before.
 //!
 //! Polling (periodically checking size and modification time) is only the last resort: when
 //! native notifications are unavailable (other platforms, initialization failure), or some
@@ -53,6 +54,9 @@ const max_debounce_ms = 500;
 /// When polling, the wait between two checks is at least this many times the duration of one
 /// check: with many files the interval grows, so polling takes no more than about 5% of the time
 const min_idle_factor = 20;
+/// A file being read from disk when it was to be compared with the disk is compared again after
+/// this long
+const reverify_ms = 10;
 
 /// One change reported by native notifications
 const Event = struct {
@@ -120,6 +124,9 @@ pub const Watcher = struct {
     /// Duration of the last poll (see `min_idle_factor`)
     poll_ns: i96 = 0,
     next_poll: ?Io.Timestamp = null,
+    /// Files to compare with the disk again: they were being read from disk when compared (see
+    /// `Server.ChangeSource`); allocated by `gpa`
+    reverify: std.ArrayList([]u8) = .empty,
 
     /// Ids of the requests sent by `registerClientGlobs` start with this
     pub const registration_prefix = "zig-analyzer/didChangeWatchedFiles/";
@@ -165,6 +172,8 @@ pub const Watcher = struct {
         w.entry_dirs.deinit(w.gpa);
         w.state_arena.deinit();
         w.poller.deinit();
+        w.clearReverify();
+        w.reverify.deinit(w.gpa);
         w.gpa.destroy(w);
     }
 
@@ -312,11 +321,13 @@ pub const Watcher = struct {
             if (pending.paths.count() != 0) return w.apply(a, &pending);
         }
 
-        // Wait for notifications; when some files need polling, wait at most until the next poll
-        const timeout_ns: ?u64 = if (w.next_poll) |at| blk: {
+        // Wait for notifications; when some files need polling or comparing again, wait at most
+        // until then
+        var timeout_ns: ?u64 = if (w.next_poll) |at| blk: {
             const left = Io.Clock.awake.now(io).durationTo(at).nanoseconds;
             break :blk if (left <= 0) 0 else @intCast(left);
         } else null;
+        if (w.reverify.items.len != 0) timeout_ns = @min(timeout_ns orelse std.math.maxInt(u64), reverify_ms * std.time.ns_per_ms);
         w.backend.wait(timeout_ns);
         if (w.stopping.load(.acquire)) return;
 
@@ -341,6 +352,8 @@ pub const Watcher = struct {
             w.poll_ns = start.durationTo(Io.Clock.awake.now(io)).nanoseconds;
             w.schedulePoll();
         };
+        for (w.reverify.items) |path| try pending.add(a, path, .verify);
+        w.clearReverify();
 
         // First add watches for newly appeared directories, then read the state of the files:
         // every later change will be notified
@@ -365,6 +378,12 @@ pub const Watcher = struct {
         _ = w.state_arena.reset(.retain_capacity);
         w.poller.reset();
         w.next_poll = null;
+        w.clearReverify();
+    }
+
+    fn clearReverify(w: *Watcher) void {
+        for (w.reverify.items) |path| w.gpa.free(path);
+        w.reverify.clearRetainingCapacity();
     }
 
     /// Identity key: consistent with Vfs file identity; lowercased on a case-insensitive volume
@@ -616,10 +635,16 @@ pub const Watcher = struct {
             const kind: types.FileChangeType = if (!exists) .Deleted else if (hint == .created) .Created else .Changed;
             try (if (hint == .verify) &verified else &events).append(a, .{ .uri = try uri.fromPath(a, path), .type = kind });
         }
-        if (verified.items.len != 0) server.applyWatchedChanges(a, verified.items, .verified);
+        if (verified.items.len != 0) for (server.applyWatchedChanges(a, verified.items, .verified)) |path| {
+            const owned = try w.gpa.dupe(u8, path);
+            w.reverify.append(w.gpa, owned) catch |err| {
+                w.gpa.free(owned);
+                return err;
+            };
+        };
         if (events.items.len == 0) return;
         log.debug("{d} file(s) changed on disk", .{events.items.len});
-        server.applyWatchedChanges(a, events.items, .notified);
+        _ = server.applyWatchedChanges(a, events.items, .notified);
     }
 };
 

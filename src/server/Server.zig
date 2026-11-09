@@ -2247,7 +2247,7 @@ fn projectStartedWith(server: *Server, path: []const u8, disk: ?u64) bool {
 }
 
 fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
-    _ = try server.applyFileChanges(arena, params.changes, .notified);
+    _ = try server.applyFileChanges(arena, params.changes, .notified, null);
 }
 
 /// How changes on disk were found
@@ -2257,7 +2257,8 @@ pub const ChangeSource = enum {
     /// Files compared with the disk because a change to them may not have been notified: nobody
     /// watched them for a while, or they were read before they were watched (see
     /// `watch.Watcher`). Only a known file whose known text differs from the disk changed; open
-    /// documents and files never loaded are skipped
+    /// documents and files never loaded are skipped, and files being read from disk are compared
+    /// again once the read is done (see `applyWatchedChanges`)
     verified,
 };
 
@@ -2270,8 +2271,8 @@ pub const ChangeSource = enum {
 /// stops the project; changes to other files rebuild projects and recompile single files; nothing
 /// is rebuilt when the disk contents equal those the last rebuild was based on (see `didSave`).
 /// Returns whether anything changed: a known file's text or rebuild basis, or a project started
-/// or stopped.
-fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const types.FileEvent, source: ChangeSource) !bool {
+/// or stopped. With `.verified`, the files being read from disk are added to `deferred`.
+fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const types.FileEvent, source: ChangeSource, deferred: ?*std.ArrayList([]const u8)) !bool {
     const Change = struct {
         file: Vfs.FileId,
         path: []const u8,
@@ -2340,9 +2341,17 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
             break :blk server.open_docs.contains(file);
         };
         if (is_open and source == .verified) continue;
-        // Nothing was computed from a file never read: it cannot differ (see `sameText`), so the
-        // disk is not read for it
-        if (source == .verified and !server.hasKnownText(arena, file)) continue;
+        if (source == .verified) switch (server.knownTextOf(arena, file)) {
+            // Nothing was computed from a file never read: it cannot differ (see `sameText`), so
+            // the disk is not read for it
+            .none => continue,
+            // What the read gets is not known yet
+            .reading => {
+                if (deferred) |list| try list.append(arena, path);
+                continue;
+            },
+            .known => {},
+        };
         const read = if (kind == .Deleted) null else server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
@@ -2372,11 +2381,15 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
     // from reads when documents were opened or closed or at the first load, which the build has
     // not necessarily seen.
     if (changes.items.len != 0) {
+        if (deferred) |list| try list.ensureUnusedCapacity(arena, changes.items.len);
         var ctx = server.db.beginRead(arena);
         defer ctx.end();
         var kept: usize = 0;
         for (changes.items) |*c| {
-            c.edited = !c.open and !sameText(&ctx, c.file, c.text);
+            // A verified file whose read from disk began after the check above
+            const reading = source == .verified and knownText(&ctx, c.file) == .reading;
+            if (reading) if (deferred) |list| list.appendAssumeCapacity(c.path);
+            c.edited = !reading and !c.open and !sameText(&ctx, c.file, c.text);
             c.rebuild = if (source == .verified)
                 c.edited
             else if (server.watched_built.get(c.file)) |built|
@@ -2553,18 +2566,37 @@ fn sameText(ctx: *Db.Ctx, file: Vfs.FileId, text: ?[]const u8) bool {
     };
 }
 
-/// The file has a known text that `sameText` compares: its text was set, or it was read from disk
-/// (or is being read)
-fn hasKnownText(server: *Server, arena: Allocator, file: Vfs.FileId) bool {
+/// What `sameText` compares the disk contents of a file with
+const KnownText = enum {
+    /// Nothing: its text was never set nor read from disk
+    none,
+    /// A read from disk (`SourceText`) in progress, whose result is not known yet
+    reading,
+    /// Its text as set, or as read from disk
+    known,
+};
+
+fn knownText(ctx: *Db.Ctx, file: Vfs.FileId) KnownText {
+    if (ctx.isSet(FileText, file)) return .known;
+    return switch (ctx.memoized(syntax_q.SourceText, file)) {
+        .none => .none,
+        .computing => .reading,
+        .evicted, .value => .known,
+    };
+}
+
+fn knownTextOf(server: *Server, arena: Allocator, file: Vfs.FileId) KnownText {
     var ctx = server.db.beginRead(arena);
     defer ctx.end();
-    return ctx.isSet(FileText, file) or ctx.memoized(syntax_q.SourceText, file) != .none;
+    return knownText(&ctx, file);
 }
 
 /// External changes discovered by the server: handled the same way as the client's
 /// `workspace/didChangeWatchedFiles` notification (see `applyFileChanges`), serialized with main
-/// loop message handling
-pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const types.FileEvent, source: ChangeSource) void {
+/// loop message handling. Returns the verified files being read from disk (allocated in `arena`),
+/// to be compared with the disk again.
+pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const types.FileEvent, source: ChangeSource) []const []const u8 {
+    var deferred: std.ArrayList([]const u8) = .empty;
     // A comparison with the disk that finds nothing changed is not a batch of external changes
     var counted = true;
     defer if (counted) {
@@ -2575,17 +2607,18 @@ pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const t
     };
     server.write_mutex.lockUncancelable(server.io);
     defer server.write_mutex.unlock(server.io);
-    if (server.state != .running or server.isShuttingDown()) return;
+    if (server.state != .running or server.isShuttingDown()) return &.{};
     // Count as busy during processing: when a project restarts, the old instance finishes before
     // the new instance counts as busy, and the watch task itself does not count as busy; whoever
     // waits for idle (waitIdle, shutdown) must not be allowed to return in between
     server.busyBegin();
     defer server.busyEnd();
-    const changed = server.applyFileChanges(arena, changes, source) catch |err| blk: {
+    const changed = server.applyFileChanges(arena, changes, source, &deferred) catch |err| blk: {
         log.err("applying changes on disk failed: {t}", .{err});
         break :blk true;
     };
     counted = changed or source == .notified;
+    return deferred.items;
 }
 
 /// Files watched when the server discovers external changes (besides the project files of each
