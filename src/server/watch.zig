@@ -26,10 +26,18 @@
 //! between is not lost. A file still being read then, or when a change to it is notified, is
 //! compared once the read is done: what the read gets is not known before.
 //!
+//! When the server watches the root directories too, source files created anywhere the workspace
+//! scan walks must be noticed (see `workspace_files`), also in directories without files of
+//! interest. FSEvents and Windows watch each root with its subdirectories; inotify watches each
+//! directory on its own, so every directory the last scan entered is watched as well (see
+//! `scanned`). A directory created or moved in makes the server scan again, which walks it and
+//! hands it over to be watched; a source file created in it before that is found by a scan that
+//! starts after the watch (see `epoch`).
+//!
 //! Polling (periodically checking size and modification time) is only the last resort: when
 //! native notifications are unavailable (other platforms, initialization failure), or some
 //! directories exceed the limit on the number of watches, only the files in those directories are
-//! polled.
+//! polled, and the modification times of the directories the scan entered.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -92,6 +100,26 @@ pub const Watcher = struct {
     /// Test hook (null outside tests): the background task stops before its next round until the
     /// pause is released, so that a test can change files before the task gets to them
     test_pause: std.atomic.Value(?*TestPause) = .init(null),
+    /// Incremented by the background task whenever it starts watching a directory it did not
+    /// watch before, natively or by polling: a scan that started walking before then may have
+    /// missed a source file created in that directory before the watch (see `scanned`)
+    epoch: std.atomic.Value(u64) = .init(0),
+
+    // ── Workspace scans handed over by `scanned`, protected by `scan_mutex` ──
+    scan_mutex: Io.Mutex = .init,
+    /// Arena holding `scan_dirs`; replaced as a whole by each scan
+    scan_arena: std.heap.ArenaAllocator,
+    /// The directories the last scan entered, kept when the backend does not watch
+    /// subdirectories (see `Backend.recursive`)
+    scan_dirs: []const []const u8 = &.{},
+    /// The value of `epoch` when the last scan not yet handled by the background task started
+    /// walking; null when there is none
+    scan_epoch: ?u64 = null,
+    /// `Server.busyBegin` was called for that scan: the server is not idle until the background
+    /// task has handled it
+    scan_held: bool = false,
+    /// The background task has ended: scans are no longer held for it
+    scan_closed: bool = false,
 
     // ── The following fields are accessed only by the background task ──
     /// What is being watched (see `Server.WatchScope`); `.none` while not watching
@@ -117,6 +145,12 @@ pub const Watcher = struct {
     /// Files polled because their directory cannot be watched (paths are in `state_arena`)
     fallback: std.ArrayList([]const u8) = .empty,
     poller: Poller,
+    /// Directories the last scan entered that cannot be watched: their modification times are
+    /// polled, and a change makes the server scan again (paths are in `state_arena`)
+    fallback_dirs: std.ArrayList([]const u8) = .empty,
+    dir_poller: Poller,
+    /// Already warned that a root directory cannot be watched with its subdirectories
+    tree_warned: bool = false,
     /// Other files additionally registered by file name when the client detects external changes
     /// (`registerClientGlobs`); keys are allocated by `gpa`
     client_names: std.StringHashMapUnmanaged(void) = .empty,
@@ -154,7 +188,9 @@ pub const Watcher = struct {
             .backend = backend,
             .listener = .{ .ctx = w, .notify = onNewPath },
             .state_arena = .init(gpa),
+            .scan_arena = .init(gpa),
             .poller = .{ .gpa = gpa },
+            .dir_poller = .{ .gpa = gpa, .dirs = true },
         };
         return w;
     }
@@ -166,14 +202,17 @@ pub const Watcher = struct {
         w.client_names.deinit(w.gpa);
         w.backend.destroy(w.gpa);
         w.fallback.deinit(w.gpa);
+        w.fallback_dirs.deinit(w.gpa);
         w.files.deinit(w.gpa);
         w.spellings.deinit(w.gpa);
         w.missing.deinit(w.gpa);
         w.entry_dirs.deinit(w.gpa);
         w.state_arena.deinit();
+        w.scan_arena.deinit();
         w.poller.deinit();
         w.clearReverify();
         w.reverify.deinit(w.gpa);
+        w.dir_poller.deinit();
         w.gpa.destroy(w);
     }
 
@@ -188,6 +227,83 @@ pub const Watcher = struct {
     pub fn stop(w: *Watcher) void {
         w.stopping.store(true, .release);
         w.backend.wake();
+    }
+
+    /// The current value of `epoch`: read by a workspace scan before it starts walking
+    pub fn watchEpoch(w: *Watcher) u64 {
+        return w.epoch.load(.acquire);
+    }
+
+    /// A workspace scan that started walking at `epoch` (see `watchEpoch`) entered `dirs`. When
+    /// the background task has started watching a directory since, a source file created there
+    /// before the watch was neither found nor notified: the server scans again. The server is
+    /// busy until the background task has handled this, so that a client waiting for the server
+    /// to be idle sees the result of that scan. Called from any thread.
+    pub fn scanned(w: *Watcher, dirs: []const []const u8, epoch: u64) void {
+        const server = w.server;
+        {
+            w.scan_mutex.lockUncancelable(server.io);
+            defer w.scan_mutex.unlock(server.io);
+            if (w.scan_closed) return;
+            if (!w.backend.recursive()) {
+                var next: std.heap.ArenaAllocator = .init(w.gpa);
+                if (dupePaths(next.allocator(), dirs)) |copy| {
+                    w.scan_arena.deinit();
+                    w.scan_arena = next;
+                    w.scan_dirs = copy;
+                } else |err| switch (err) {
+                    error.OutOfMemory => {
+                        next.deinit();
+                        log.err("out of memory while recording the directories to watch", .{});
+                    },
+                }
+            }
+            w.scan_epoch = epoch;
+            if (!w.scan_held) {
+                w.scan_held = true;
+                server.busyBegin();
+            }
+        }
+        w.requestResync();
+    }
+
+    /// What `scanned` handed over and the background task has not handled yet
+    const Scan = struct {
+        /// The directories the last scan entered (see `scan_dirs`)
+        dirs: []const []const u8,
+        epoch: ?u64,
+        held: bool,
+    };
+
+    /// Takes the scan to handle, with the directories copied into `a`; the caller calls
+    /// `Server.busyEnd` when it is `held`
+    fn takeScan(w: *Watcher, a: Allocator) Allocator.Error!Scan {
+        w.scan_mutex.lockUncancelable(w.server.io);
+        defer w.scan_mutex.unlock(w.server.io);
+        const s: Scan = .{ .dirs = try dupePaths(a, w.scan_dirs), .epoch = w.scan_epoch, .held = w.scan_held };
+        w.scan_epoch = null;
+        w.scan_held = false;
+        return s;
+    }
+
+    /// Drops the scan to handle while nothing is watched
+    fn dropScan(w: *Watcher) void {
+        w.scan_mutex.lockUncancelable(w.server.io);
+        const held = w.scan_held;
+        w.scan_held = false;
+        w.scan_epoch = null;
+        w.scan_mutex.unlock(w.server.io);
+        if (held) w.server.busyEnd();
+    }
+
+    /// The background task ends: later scans are not held for it
+    fn closeScan(w: *Watcher) void {
+        {
+            w.scan_mutex.lockUncancelable(w.server.io);
+            defer w.scan_mutex.unlock(w.server.io);
+            w.scan_closed = true;
+        }
+        w.dropScan();
     }
 
     fn onNewPath(ctx: *anyopaque) void {
@@ -210,6 +326,7 @@ pub const Watcher = struct {
 
     /// Background task: ends when the server shuts down
     pub fn run(w: *Watcher) Io.Cancelable!void {
+        defer w.closeScan();
         defer w.deactivate();
         while (!w.stopping.load(.acquire)) {
             w.testPause();
@@ -222,6 +339,7 @@ pub const Watcher = struct {
             w.last_scope = scope;
             if (scope == .none) {
                 w.deactivate();
+                w.dropScan();
                 // Clear first, then check: new files interned during the check wake the task
                 // again (see `onNewPath`)
                 w.resync_requested.store(false, .release);
@@ -349,6 +467,10 @@ pub const Watcher = struct {
         if (w.next_poll) |at| if (Io.Clock.awake.now(io).durationTo(at).nanoseconds <= 0) {
             const start = Io.Clock.awake.now(io);
             try w.poller.poll(io, a, w.fallback.items, &pending);
+            // Entries created, removed or renamed in a directory the scan entered
+            var dir_changes: Pending = .{};
+            try w.dir_poller.poll(io, a, w.fallback_dirs.items, &dir_changes);
+            if (dir_changes.paths.count() != 0) w.server.scheduleScan();
             w.poll_ns = start.durationTo(Io.Clock.awake.now(io)).nanoseconds;
             w.schedulePoll();
         };
@@ -368,15 +490,17 @@ pub const Watcher = struct {
         if (w.scope == .none) return;
         w.scope = .none;
         var none: std.ArrayList([]const u8) = .empty;
-        w.backend.setDirs(w.gpa, &.{}, &none) catch {};
+        _ = w.backend.setDirs(w.gpa, &.{}, &.{}, &none) catch {};
         none.deinit(w.gpa);
         w.files.clearRetainingCapacity();
         w.spellings.reset(w.gpa);
         w.missing.clearRetainingCapacity();
         w.entry_dirs.clearRetainingCapacity();
         w.fallback.clearRetainingCapacity();
+        w.fallback_dirs.clearRetainingCapacity();
         _ = w.state_arena.reset(.retain_capacity);
         w.poller.reset();
+        w.dir_poller.reset();
         w.next_poll = null;
         w.clearReverify();
     }
@@ -407,6 +531,8 @@ pub const Watcher = struct {
         var next_arena: std.heap.ArenaAllocator = .init(gpa);
         errdefer next_arena.deinit();
         const na = next_arena.allocator();
+        const scan = try w.takeScan(na);
+        defer if (scan.held) server.busyEnd();
 
         var files: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
         errdefer files.deinit(gpa);
@@ -471,10 +597,53 @@ pub const Watcher = struct {
             if (!gop.found_existing) gop.value_ptr.* = dir;
             try entry_watches.append(a, @intCast(gop.index));
         }
+        // Where the workspace scan walks (see `scanned`): the existing roots with their
+        // subdirectories when the backend watches those, otherwise the directories the last scan
+        // entered, each on its own
+        var trees: std.ArrayList([]const u8) = .empty;
+        var tree_keys: std.StringHashMapUnmanaged(void) = .empty;
+        var scan_watches: std.ArrayList(u32) = .empty;
+        if (scope == .all) {
+            if (w.backend.recursive()) {
+                var roots: std.ArrayList([]const u8) = .empty;
+                for (rules.roots) |root| {
+                    if (!isDir(server.io, root)) continue;
+                    try roots.append(a, root);
+                    try tree_keys.put(a, try w.key(a, root), {});
+                }
+                // A root inside another one is watched with it
+                for (roots.items) |root| {
+                    if (std.fs.path.dirname(try w.key(a, root))) |parent| if (underAny(parent, &tree_keys)) continue;
+                    try trees.append(a, root);
+                }
+            } else for (scan.dirs) |dir| {
+                const gop = try dirs.getOrPut(gpa, try w.key(na, dir));
+                if (!gop.found_existing) gop.value_ptr.* = dir;
+                try scan_watches.append(a, @intCast(gop.index));
+            }
+        }
+        // The directories under a tree are watched with it
+        var own: std.ArrayList([]const u8) = .empty;
+        for (dirs.keys(), dirs.values()) |k, dir| {
+            if (!underAny(k, &tree_keys)) try own.append(a, dir);
+        }
 
         var failed: std.ArrayList([]const u8) = .empty;
         defer failed.deinit(gpa);
-        try w.backend.setDirs(gpa, dirs.values(), &failed);
+        var added = try w.backend.setDirs(gpa, own.items, trees.items, &failed);
+        // A tree that cannot be watched as a whole: each directory is watched on its own instead
+        var tree_failed = false;
+        for (failed.items) |f| for (trees.items) |t| {
+            if (f.ptr == t.ptr) tree_failed = true;
+        };
+        if (tree_failed) {
+            if (!w.tree_warned) {
+                w.tree_warned = true;
+                log.warn("cannot watch the workspace folders with their subdirectories: source files in directories created later are noticed only when another change makes the server scan the folders", .{});
+            }
+            failed.clearRetainingCapacity();
+            if (try w.backend.setDirs(gpa, dirs.values(), &.{}, &failed)) added = true;
+        }
         var failed_set: std.StringHashMapUnmanaged(void) = .empty;
         defer failed_set.deinit(gpa);
         for (failed.items) |d| try failed_set.put(gpa, try w.key(a, d), {});
@@ -490,6 +659,15 @@ pub const Watcher = struct {
                 if (p.ptr == dir.ptr) break;
             } else try fallback.append(gpa, dir);
         };
+        // A directory the scan entered that cannot be watched: its modification time is polled
+        var fallback_dirs: std.ArrayList([]const u8) = .empty;
+        errdefer fallback_dirs.deinit(gpa);
+        for (scan_watches.items) |i| if (failed_set.contains(dirs.keys()[i])) try fallback_dirs.append(gpa, dirs.values()[i]);
+        // Like adding a watch, from now on: changes before the first poll are reported too
+        if (fallback.items.len == 0) w.poller.reset() else _ = try w.poller.track(server.io, a, fallback.items);
+        if (fallback_dirs.items.len == 0) w.dir_poller.reset() else if (try w.dir_poller.track(server.io, a, fallback_dirs.items)) {
+            added = true;
+        }
 
         // Directories that did not exist before but have appeared now: files of interest already in
         // them were created before watching started
@@ -519,18 +697,28 @@ pub const Watcher = struct {
         w.entry_dirs = entry_dirs;
         w.fallback.deinit(gpa);
         w.fallback = fallback;
+        w.fallback_dirs.deinit(gpa);
+        w.fallback_dirs = fallback_dirs;
         w.state_arena.deinit();
         w.state_arena = next_arena;
         w.scope = scope;
-        if (w.fallback.items.len == 0) {
+        if (w.fallback.items.len == 0 and w.fallback_dirs.items.len == 0) {
             w.next_poll = null;
-            w.poller.reset();
-        } else {
-            // Like adding a watch, from now on: changes before the first poll are reported too
-            try w.poller.track(server.io, a, w.fallback.items);
-            if (w.next_poll == null) w.schedulePoll();
+        } else if (w.next_poll == null) w.schedulePoll();
+        if (added) _ = w.epoch.fetchAdd(1, .acq_rel);
+        // A scan that started walking before a directory was watched (see `scanned`), and the
+        // root directories after nobody watched them (see `verify`), may miss source files
+        if (scope == .all) {
+            const missed = if (scan.epoch) |e| e != w.epoch.load(.monotonic) else false;
+            if (missed or w.verify) server.scheduleScan();
         }
-        log.debug("watching {d} directories for {d} files ({d} checked periodically)", .{ dirs.count(), w.files.count(), w.fallback.items.len });
+        log.debug("watching {d} directories ({d} with their subdirectories) for {d} files ({d} files and {d} directories checked periodically)", .{
+            own.items.len,
+            trees.items.len,
+            w.files.count(),
+            w.fallback.items.len,
+            w.fallback_dirs.items.len,
+        });
     }
 
     fn schedulePoll(w: *Watcher) void {
@@ -551,6 +739,9 @@ pub const Watcher = struct {
         var rescan = false;
         var created: std.ArrayList([]const u8) = .empty;
         var dirs_changed: std.ArrayList([]const u8) = .empty;
+        // Other names created: a directory among them may have been moved in with source files,
+        // which are not notified (when notifications do not tell directories apart)
+        var created_other: std.ArrayList([]const u8) = .empty;
         // Names created or removed that are not files of interest: they may be directories
         // (Windows notifications do not tell), moved or renamed with files of interest in them
         var unknown: std.StringHashMapUnmanaged(void) = .empty;
@@ -579,7 +770,9 @@ pub const Watcher = struct {
                 if (ev.kind == .created) {
                     // A path leading to a nonexistent directory has appeared
                     if (w.leadsToMissing(k)) try dirs.put(a, k, {});
-                    if (workspace_files.isSource(std.fs.path.basename(ev.path))) try created.append(a, ev.path);
+                    if (workspace_files.isSource(std.fs.path.basename(ev.path))) {
+                        try created.append(a, ev.path);
+                    } else if (Native.created_may_be_dir and w.backend == .native) try created_other.append(a, ev.path);
                 }
             },
             .dir_created, .dir_gone, .overflow => {
@@ -605,13 +798,18 @@ pub const Watcher = struct {
         if (moved) rescan = true;
         // Every build creates directories in `.zig-cache` and `zig-out`: a scan for them would find
         // nothing new, and find references and rename would wait for it after every build
-        if (!rescan and (created.items.len != 0 or dirs_changed.items.len != 0)) {
+        if (!rescan and (created.items.len != 0 or dirs_changed.items.len != 0 or created_other.items.len != 0)) {
             const rules = try w.server.originRules(a);
             for (created.items) |path| {
                 if (workspace_files.contains(&w.server.vfs, rules, path)) rescan = true;
             }
             for (dirs_changed.items) |dir| {
                 if (workspace_files.affectsScan(&w.server.vfs, rules, dir)) rescan = true;
+            }
+            // Only a name the scan would walk is looked up on disk
+            for (created_other.items) |path| {
+                if (rescan) break;
+                if (workspace_files.affectsScan(&w.server.vfs, rules, path) and isDir(w.server.io, path)) rescan = true;
             }
         }
         if (rescan) w.server.scheduleScan();
@@ -791,6 +989,13 @@ fn isDir(io: Io, path: []const u8) bool {
     return st.kind == .directory;
 }
 
+/// Copies of `paths` (the list and each path) in `a`
+fn dupePaths(a: Allocator, paths: []const []const u8) Allocator.Error![]const []const u8 {
+    const out = try a.alloc([]const u8, paths.len);
+    for (paths, out) |p, *o| o.* = try a.dupe(u8, p);
+    return out;
+}
+
 /// The nearest existing ancestor directory of `dir` (the root directory always exists)
 fn ancestor(io: Io, dir: []const u8) []const u8 {
     var cur = dir;
@@ -812,10 +1017,21 @@ fn stat(io: Io, path: []const u8) ?Stamp {
     return .{ .size = st.size, .mtime = st.mtime.nanoseconds };
 }
 
-/// Polling: checks the size and modification time of a set of files. The state of a file is
-/// recorded when it starts being polled (`track`, or its first check); only later changes count.
+/// State of a directory on disk: its modification time changes when entries are created, removed
+/// or renamed; null when it does not exist
+fn statDir(io: Io, path: []const u8) ?Stamp {
+    const st = Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    if (st.kind != .directory) return null;
+    return .{ .size = 0, .mtime = st.mtime.nanoseconds };
+}
+
+/// Polling: checks the size and modification time of a set of files (or of directories, see
+/// `statDir`). The state of a path is recorded when it starts being polled (`track`, or its first
+/// check); only later changes count.
 const Poller = struct {
     gpa: Allocator,
+    /// The paths are directories
+    dirs: bool = false,
     /// Path (owned by `gpa`) → state at the last check
     seen: std.StringArrayHashMapUnmanaged(?Stamp) = .empty,
 
@@ -829,12 +1045,18 @@ const Poller = struct {
         p.seen.clearRetainingCapacity();
     }
 
-    /// Starts tracking the files in `paths` not tracked yet, recording their current state, so
-    /// their changes from now on count; files not in `paths` are no longer tracked
-    fn track(p: *Poller, io: Io, a: Allocator, paths: []const []const u8) Allocator.Error!void {
+    fn stamp(p: *const Poller, io: Io, path: []const u8) ?Stamp {
+        return if (p.dirs) statDir(io, path) else stat(io, path);
+    }
+
+    /// Starts tracking the paths in `paths` not tracked yet, recording their current state, so
+    /// their changes from now on count; paths not in `paths` are no longer tracked. Returns whether
+    /// any path started being tracked.
+    fn track(p: *Poller, io: Io, a: Allocator, paths: []const []const u8) Allocator.Error!bool {
         var wanted: std.StringHashMapUnmanaged(void) = .empty;
         for (paths) |path| try wanted.put(a, path, {});
         p.retain(&wanted);
+        var added = false;
         for (paths) |path| {
             const gop = try p.seen.getOrPut(p.gpa, path);
             if (gop.found_existing) continue;
@@ -842,8 +1064,10 @@ const Poller = struct {
                 p.seen.swapRemoveAt(gop.index);
                 return err;
             };
-            gop.value_ptr.* = stat(io, path);
+            gop.value_ptr.* = p.stamp(io, path);
+            added = true;
         }
+        return added;
     }
 
     /// Stops tracking the files not in `wanted`
@@ -862,7 +1086,7 @@ const Poller = struct {
         var current: std.StringArrayHashMapUnmanaged(?Stamp) = .empty;
         var wanted: std.StringHashMapUnmanaged(void) = .empty;
         for (paths) |path| {
-            try current.put(a, path, stat(io, path));
+            try current.put(a, path, p.stamp(io, path));
             try wanted.put(a, path, {});
         }
         p.retain(&wanted);
@@ -904,12 +1128,23 @@ const Backend = union(enum) {
         }
     }
 
-    /// Changes the watched directories to `dirs` (absolute paths); directories that cannot be
-    /// watched are appended to `failed` (taken from `dirs`). Called only in the background task.
-    fn setDirs(b: Backend, gpa: Allocator, dirs: []const []const u8, failed: *std.ArrayList([]const u8)) Allocator.Error!void {
+    /// Changes the watched directories to `dirs` and `trees` (absolute paths), `trees` with their
+    /// subdirectories (empty unless `recursive`); directories that cannot be watched are appended
+    /// to `failed` (taken from `dirs` and `trees`). Returns whether a directory not watched
+    /// before is watched now. Called only in the background task.
+    fn setDirs(b: Backend, gpa: Allocator, dirs: []const []const u8, trees: []const []const u8, failed: *std.ArrayList([]const u8)) Allocator.Error!bool {
         switch (b) {
-            inline else => |x| try x.setDirs(gpa, dirs, failed),
+            inline else => |x| return x.setDirs(gpa, dirs, trees, failed),
         }
+    }
+
+    /// Directories can be watched with their subdirectories (see `setDirs`); does not change after
+    /// creation, so may be called from any thread
+    fn recursive(b: Backend) bool {
+        return switch (b) {
+            .native => Native.recursive,
+            .fallback => false,
+        };
     }
 
     /// Waits until there are notifications, a wake-up, or a timeout (null means no timeout)
@@ -935,6 +1170,9 @@ const Native = switch (builtin.os.tag) {
 };
 
 const Unsupported = struct {
+    const recursive = false;
+    const created_may_be_dir = false;
+
     fn create(_: Allocator, _: Io) error{Unsupported}!*Unsupported {
         return error.Unsupported;
     }
@@ -944,7 +1182,7 @@ const Unsupported = struct {
     fn wake(_: *Unsupported) void {
         unreachable;
     }
-    fn setDirs(_: *Unsupported, _: Allocator, _: []const []const u8, _: *std.ArrayList([]const u8)) Allocator.Error!void {
+    fn setDirs(_: *Unsupported, _: Allocator, _: []const []const u8, _: []const []const u8, _: *std.ArrayList([]const u8)) Allocator.Error!bool {
         unreachable;
     }
     fn wait(_: *Unsupported, _: ?u64) void {
@@ -980,8 +1218,10 @@ const Fallback = struct {
         f.cond.signal(f.io);
     }
 
-    fn setDirs(_: *Fallback, gpa: Allocator, dirs: []const []const u8, failed: *std.ArrayList([]const u8)) Allocator.Error!void {
+    fn setDirs(_: *Fallback, gpa: Allocator, dirs: []const []const u8, trees: []const []const u8, failed: *std.ArrayList([]const u8)) Allocator.Error!bool {
         try failed.appendSlice(gpa, dirs);
+        try failed.appendSlice(gpa, trees);
+        return false;
     }
 
     fn wait(f: *Fallback, timeout_ns: ?u64) void {
@@ -1003,6 +1243,8 @@ const Fallback = struct {
 const Inotify = struct {
     const linux = std.os.linux;
     const IN = linux.IN;
+    const recursive = false;
+    const created_may_be_dir = false;
 
     gpa: Allocator,
     fd: linux.fd_t,
@@ -1045,7 +1287,8 @@ const Inotify = struct {
         _ = linux.write(n.wake_fd, @ptrCast(&one), @sizeOf(u64));
     }
 
-    fn setDirs(n: *Inotify, gpa: Allocator, dirs: []const []const u8, failed: *std.ArrayList([]const u8)) Allocator.Error!void {
+    fn setDirs(n: *Inotify, gpa: Allocator, dirs: []const []const u8, trees: []const []const u8, failed: *std.ArrayList([]const u8)) Allocator.Error!bool {
+        std.debug.assert(trees.len == 0);
         var want: std.StringHashMapUnmanaged(void) = .empty;
         defer want.deinit(gpa);
         for (dirs) |d| try want.put(gpa, d, {});
@@ -1057,6 +1300,7 @@ const Inotify = struct {
             _ = linux.inotify_rm_watch(n.fd, wd);
             n.forget(wd);
         }
+        var added = false;
         for (dirs) |d| {
             if (n.by_path.contains(d)) continue;
             const z = try gpa.dupeSentinel(u8, d, 0);
@@ -1077,7 +1321,9 @@ const Inotify = struct {
             const wd: i32 = @intCast(rc);
             try n.by_wd.put(gpa, wd, z);
             try n.by_path.put(gpa, z, wd);
+            added = true;
         }
+        return added;
     }
 
     /// Stops tracking watch `wd` (already removed)
@@ -1230,6 +1476,8 @@ const FsEvents = struct {
 
     /// FSEvents has an undocumented limit on the number of watched paths (reportedly 4096)
     const max_roots = 2048;
+    const recursive = true;
+    const created_may_be_dir = false;
 
     const Symbols = struct {
         FSEventStreamCreate: *const fn (
@@ -1339,10 +1587,12 @@ const FsEvents = struct {
         _ = f.sem.wait(when);
     }
 
-    fn setDirs(f: *FsEvents, gpa: Allocator, dirs: []const []const u8, failed: *std.ArrayList([]const u8)) Allocator.Error!void {
+    fn setDirs(f: *FsEvents, gpa: Allocator, dirs: []const []const u8, trees: []const []const u8, failed: *std.ArrayList([]const u8)) Allocator.Error!bool {
         // Of nested directories, keep only the outermost: watching is recursive
-        const sorted = try gpa.dupe([]const u8, dirs);
+        const sorted = try gpa.alloc([]const u8, dirs.len + trees.len);
         defer gpa.free(sorted);
+        @memcpy(sorted[0..dirs.len], dirs);
+        @memcpy(sorted[dirs.len..], trees);
         std.mem.sort([]const u8, sorted, {}, struct {
             fn lt(_: void, x: []const u8, y: []const u8) bool {
                 return std.mem.lessThan(u8, x, y);
@@ -1363,7 +1613,7 @@ const FsEvents = struct {
         if (roots.items.len == f.roots.items.len) {
             for (roots.items, f.roots.items) |x, y| {
                 if (!std.mem.eql(u8, x, y)) break;
-            } else return;
+            } else return false;
         }
 
         // The changes the old stream still holds back (for its latency) are delivered now and
@@ -1380,11 +1630,15 @@ const FsEvents = struct {
         f.clearRoots();
         for (roots.items) |r| try f.roots.append(gpa, try gpa.dupeSentinel(u8, r, 0));
         try f.aliases.set(gpa, f.io, f.roots.items);
-        if (f.roots.items.len == 0) return;
+        if (f.roots.items.len == 0) return false;
         f.startStream() catch {
             log.warn("cannot start FSEvents stream, checking files on disk periodically instead", .{});
             try failed.appendSlice(gpa, dirs);
+            try failed.appendSlice(gpa, trees);
+            return false;
         };
+        // The new stream reports only changes from now on
+        return true;
     }
 
     fn startStream(f: *FsEvents) error{ OutOfMemory, StartFailed }!void {
@@ -1485,11 +1739,16 @@ const FsEvents = struct {
     }
 };
 
-/// Windows: change notifications for individual directories (non-recursive). A completed
-/// notification is delivered as an APC to the thread that issued it (the background task) and
-/// runs during an alertable wait; an event object is used for waking up.
+/// Windows: change notifications for directories, the roots with their subdirectories (see
+/// `Backend.setDirs`). A completed notification is delivered as an APC to the thread that issued
+/// it (the background task) and runs during an alertable wait; an event object is used for waking
+/// up. While a directory is open, its ancestors cannot be renamed or deleted: watching each root as
+/// a whole leaves the directories under it free to be.
 const DirNotify = struct {
     const windows = std.os.windows;
+    const recursive = true;
+    /// Notifications do not tell whether a name is a directory
+    const created_may_be_dir = true;
 
     gpa: Allocator,
     wake_event: windows.HANDLE,
@@ -1500,6 +1759,9 @@ const DirNotify = struct {
     const Directory = struct {
         path: []u8,
         handle: windows.HANDLE,
+        /// Notifications cover the subdirectories too, and name entries by their paths relative
+        /// to `path`
+        recursive: bool,
         state: enum { idle, listening, ready } = .idle,
         iosb: windows.IO_STATUS_BLOCK = undefined,
         /// A single notification for a directory on the network is at most 64 KB
@@ -1543,21 +1805,37 @@ const DirNotify = struct {
         }
     }
 
-    fn setDirs(d: *DirNotify, gpa: Allocator, dirs: []const []const u8, failed: *std.ArrayList([]const u8)) Allocator.Error!void {
-        var want: std.StringHashMapUnmanaged(void) = .empty;
+    fn setDirs(d: *DirNotify, gpa: Allocator, dirs: []const []const u8, trees: []const []const u8, failed: *std.ArrayList([]const u8)) Allocator.Error!bool {
+        // Path → watched with its subdirectories
+        var want: std.StringArrayHashMapUnmanaged(bool) = .empty;
         defer want.deinit(gpa);
-        for (dirs) |p| try want.put(gpa, p, {});
+        for (dirs) |p| try want.put(gpa, p, false);
+        for (trees) |p| try want.put(gpa, p, true);
+        // A directory watched the other way is closed after its replacement listens, so no change
+        // in between is lost
+        var replaced: std.ArrayList(*Directory) = .empty;
+        defer {
+            for (replaced.items) |dir| d.close(dir);
+            replaced.deinit(gpa);
+        }
         var i = d.dirs.count();
         while (i > 0) {
             i -= 1;
-            if (want.contains(d.dirs.keys()[i])) continue;
             const dir = d.dirs.values()[i];
+            const wanted = want.get(d.dirs.keys()[i]);
+            if (wanted != null and wanted.? == dir.recursive) continue;
             d.dirs.swapRemoveAt(i);
-            d.close(dir);
+            if (wanted == null) {
+                d.close(dir);
+            } else replaced.append(gpa, dir) catch |err| {
+                d.close(dir);
+                return err;
+            };
         }
-        for (dirs) |p| {
+        var added = false;
+        for (want.keys(), want.values()) |p, tree| {
             if (d.dirs.contains(p)) continue;
-            const dir = d.open(p) catch |err| switch (err) {
+            const dir = d.open(p, tree) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
                     try failed.append(gpa, p);
@@ -1568,10 +1846,12 @@ const DirNotify = struct {
                 d.close(dir);
                 return err;
             };
+            added = true;
         }
+        return added;
     }
 
-    fn open(d: *DirNotify, path: []const u8) !*Directory {
+    fn open(d: *DirNotify, path: []const u8, tree: bool) !*Directory {
         const path_w = try std.Io.Threaded.sliceToPrefixedFileW(null, path, .{});
         var handle: windows.HANDLE = undefined;
         var iosb: windows.IO_STATUS_BLOCK = undefined;
@@ -1598,7 +1878,7 @@ const DirNotify = struct {
         errdefer windows.CloseHandle(handle);
         const dir = try d.gpa.create(Directory);
         errdefer d.gpa.destroy(dir);
-        dir.* = .{ .path = try d.gpa.dupe(u8, path), .handle = handle };
+        dir.* = .{ .path = try d.gpa.dupe(u8, path), .handle = handle, .recursive = tree };
         errdefer d.gpa.free(dir.path);
         try d.listen(dir);
         return dir;
@@ -1614,7 +1894,7 @@ const DirNotify = struct {
             &dir.buffer,
             dir.buffer.len,
             .{ .FILE_NAME = true, .DIR_NAME = true, .SIZE = true, .LAST_WRITE = true, .CREATION = true },
-            .FALSE,
+            if (dir.recursive) .TRUE else .FALSE,
         )) {
             .SUCCESS, .PENDING => dir.state = .listening,
             else => return error.CannotWatchDirectory,
@@ -1791,7 +2071,7 @@ test "native watching reports changes, creation and removal in watched directori
     defer n.destroy(testing.allocator);
     var failed: std.ArrayList([]const u8) = .empty;
     defer failed.deinit(testing.allocator);
-    try n.setDirs(testing.allocator, &.{dir}, &failed);
+    _ = try n.setDirs(testing.allocator, &.{dir}, &.{}, &failed);
     try testing.expectEqual(0, failed.items.len);
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -1829,7 +2109,7 @@ test "DirNotify: a notification completed outside of waiting ends the next wait 
     defer n.destroy(testing.allocator);
     var failed: std.ArrayList([]const u8) = .empty;
     defer failed.deinit(testing.allocator);
-    try n.setDirs(testing.allocator, &.{dir}, &failed);
+    _ = try n.setDirs(testing.allocator, &.{dir}, &.{}, &failed);
     try testing.expectEqual(0, failed.items.len);
 
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "a" });
@@ -1890,9 +2170,9 @@ test "FSEvents: watch roots reached through a symbolic link are replaced and fre
     defer n.destroy(testing.allocator);
     var failed: std.ArrayList([]const u8) = .empty;
     defer failed.deinit(testing.allocator);
-    try n.setDirs(testing.allocator, &.{link}, &failed);
-    try n.setDirs(testing.allocator, &.{}, &failed);
-    try n.setDirs(testing.allocator, &.{link}, &failed);
+    _ = try n.setDirs(testing.allocator, &.{link}, &.{}, &failed);
+    _ = try n.setDirs(testing.allocator, &.{}, &.{}, &failed);
+    _ = try n.setDirs(testing.allocator, &.{link}, &.{}, &failed);
     try testing.expectEqual(0, failed.items.len);
 }
 
@@ -1945,13 +2225,13 @@ test "FSEvents: changes held back by a replaced stream are still reported" {
     defer n.destroy(testing.allocator);
     var failed: std.ArrayList([]const u8) = .empty;
     defer failed.deinit(testing.allocator);
-    try n.setDirs(testing.allocator, &.{dir_a}, &failed);
+    _ = try n.setDirs(testing.allocator, &.{dir_a}, &.{}, &failed);
     // FSEvents starts reporting shortly after the stream starts
     try testing.io.sleep(.fromMilliseconds(200), .awake);
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/f.zig", .data = "22" });
     // Within the stream's latency
     try testing.io.sleep(.fromMilliseconds(20), .awake);
-    try n.setDirs(testing.allocator, &.{ dir_a, dir_b }, &failed);
+    _ = try n.setDirs(testing.allocator, &.{ dir_a, dir_b }, &.{}, &failed);
     try testing.expectEqual(0, failed.items.len);
     try expectReported(n, a, &.{try std.fs.path.join(a, &.{ dir_a, "f.zig" })});
 }
@@ -1973,17 +2253,17 @@ test "poller: a change before the first check of a tracked file is reported" {
     var poller: Poller = .{ .gpa = testing.allocator };
     defer poller.deinit();
     const paths = [_][]const u8{ a_path, b_path };
-    try poller.track(testing.io, a, &paths);
+    _ = try poller.track(testing.io, a, &paths);
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "aa" });
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.zig", .data = "b" });
     // Tracking again keeps the recorded states
-    try poller.track(testing.io, a, &paths);
+    _ = try poller.track(testing.io, a, &paths);
     var pending: Pending = .{};
     try poller.poll(testing.io, a, &paths, &pending);
     try testing.expectEqual(Pending.Hint.changed, pending.paths.get(a_path).?);
     try testing.expectEqual(Pending.Hint.created, pending.paths.get(b_path).?);
     // Files no longer tracked are forgotten
-    try poller.track(testing.io, a, paths[0..1]);
+    _ = try poller.track(testing.io, a, paths[0..1]);
     try testing.expectEqual(1, poller.seen.count());
 }
 

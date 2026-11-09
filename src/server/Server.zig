@@ -1424,16 +1424,18 @@ fn wakeScanWaiters(server: *Server) void {
 }
 
 /// One scan: updates `WorkspaceFiles` when the files found differ, and then indexes them for
-/// workspace symbol
+/// workspace symbol. The directories entered go to the watcher (see `watch.Watcher.scanned`).
 fn scanOnce(server: *Server) Allocator.Error!void {
     if (server.isShuttingDown()) return;
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const rules = try server.originRules(a);
-    const paths = try workspace_files.scan(server.io, a, &server.vfs, rules);
+    const epoch = if (server.watcher) |w| w.watchEpoch() else 0;
+    const found = try workspace_files.scan(server.io, a, &server.vfs, rules);
+    defer if (server.watcher) |w| w.scanned(found.dirs, epoch);
     var set: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
-    for (paths) |p| try set.put(a, try server.vfs.intern(p), {});
+    for (found.files) |p| try set.put(a, try server.vfs.intern(p), {});
     const files = set.keys();
     std.mem.sort(Vfs.FileId, files, {}, struct {
         fn lt(_: void, x: Vfs.FileId, y: Vfs.FileId) bool {

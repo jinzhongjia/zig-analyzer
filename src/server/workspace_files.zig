@@ -20,12 +20,23 @@ fn skipped(name: []const u8) bool {
     return name.len == 0 or name[0] == '.' or std.mem.eql(u8, name, "zig-pkg") or std.mem.eql(u8, name, "zig-out");
 }
 
-/// Paths of the source files under `rules.roots` whose origin is user code (see `origin.classify`),
-/// allocated in `arena`. Directories are walked without following symbolic links to directories;
-/// skipped directories (see `skipped`) and the local caches and package directories in `rules` are
-/// not entered, and a directory under several roots is walked once.
-pub fn scan(io: Io, arena: Allocator, vfs: *Vfs, rules: origin.Rules) Allocator.Error![]const []const u8 {
+/// What `scan` found, allocated in its arena
+pub const Found = struct {
+    /// Paths of the source files whose origin is user code (see `origin.classify`)
+    files: []const []const u8,
+    /// The directories entered, roots included, each once: a source file created in any of them,
+    /// or in a directory created in any of them, is one of the files a later scan finds (see
+    /// `entersDir`)
+    dirs: []const []const u8,
+};
+
+/// The source files under `rules.roots` whose origin is user code, and the directories entered.
+/// Directories are walked without following symbolic links to directories; skipped directories
+/// (see `skipped`) and the local caches and package directories in `rules` are not entered, and a
+/// directory under several roots is walked once.
+pub fn scan(io: Io, arena: Allocator, vfs: *Vfs, rules: origin.Rules) Allocator.Error!Found {
     var out: std.ArrayList([]const u8) = .empty;
+    var dirs: std.ArrayList([]const u8) = .empty;
     var stack: std.ArrayList([]const u8) = .empty;
     var visited: std.StringHashMapUnmanaged(void) = .empty;
     for (rules.roots) |root| try stack.append(arena, root);
@@ -34,6 +45,7 @@ pub fn scan(io: Io, arena: Allocator, vfs: *Vfs, rules: origin.Rules) Allocator.
         if ((try visited.getOrPut(arena, key)).found_existing) continue;
         var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch continue;
         defer dir.close(io);
+        try dirs.append(arena, dir_path);
         var it = dir.iterate();
         while (it.next(io) catch null) |entry| switch (entry.kind) {
             .directory => {
@@ -50,7 +62,7 @@ pub fn scan(io: Io, arena: Allocator, vfs: *Vfs, rules: origin.Rules) Allocator.
             else => {},
         };
     }
-    return out.items;
+    return .{ .files = out.items, .dirs = dirs.items };
 }
 
 /// Whether `path` is one of the files `scan` finds (when it exists): a source file under a root,
@@ -122,6 +134,7 @@ test scan {
         if (std.fs.path.dirname(sub)) |d| try tmp.dir.createDirPath(testing.io, d);
         try tmp.dir.writeFile(testing.io, .{ .sub_path = sub, .data = "" });
     }
+    try tmp.dir.createDirPath(testing.io, "ws/empty/inner");
     const base = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(base);
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -138,12 +151,13 @@ test scan {
     };
     const found = try scan(testing.io, a, &vfs, rules);
     var names: std.ArrayList([]const u8) = .empty;
-    for (found) |p| try names.append(a, p[ws.len + 1 ..]);
-    std.mem.sort([]const u8, names.items, {}, struct {
+    for (found.files) |p| try names.append(a, p[ws.len + 1 ..]);
+    const lt = struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
             return std.mem.lessThan(u8, x, y);
         }
-    }.lt);
+    }.lt;
+    std.mem.sort([]const u8, names.items, {}, lt);
     const sep = std.fs.path.sep_str;
     const expected = [_][]const u8{
         ".hidden" ++ sep ++ "proj" ++ sep ++ "app.zig",
@@ -159,7 +173,7 @@ test scan {
     try testing.expectEqual(expected.len, names.items.len);
     for (expected, names.items) |e, n| try testing.expectEqualStrings(e, n);
     // `contains` agrees with `scan`, also for files that do not exist yet
-    for (found) |p| try testing.expect(contains(&vfs, rules, p));
+    for (found.files) |p| try testing.expect(contains(&vfs, rules, p));
     for ([_][]const u8{ "new.zig", "src" ++ sep ++ "new.zon", ".hidden" ++ sep ++ "proj" ++ sep ++ "new.zig" }) |sub| {
         try testing.expect(contains(&vfs, rules, try std.fs.path.join(a, &.{ ws, sub })));
     }
@@ -207,4 +221,23 @@ test scan {
         try testing.expect(!affectsScan(&vfs, rules, try std.fs.path.join(a, &.{ ws, sub })));
     }
     try testing.expect(!affectsScan(&vfs, rules, try std.fs.path.join(a, &.{ base, "outside" })));
+
+    // The directories entered, empty ones included
+    var dirs: std.ArrayList([]const u8) = .empty;
+    for (found.dirs) |d| try dirs.append(a, if (d.len == ws.len) "" else d[ws.len + 1 ..]);
+    std.mem.sort([]const u8, dirs.items, {}, lt);
+    const expected_dirs = [_][]const u8{
+        "",
+        ".hidden" ++ sep ++ "proj",
+        "empty",
+        "empty" ++ sep ++ "inner",
+        "examples",
+        "nested",
+        "src",
+        "vendor",
+        "zig-pkgs",
+    };
+    try testing.expectEqual(expected_dirs.len, dirs.items.len);
+    for (expected_dirs, dirs.items) |e, d| try testing.expectEqualStrings(e, d);
+    for (found.dirs) |d| try testing.expect(affectsScan(&vfs, rules, d));
 }
