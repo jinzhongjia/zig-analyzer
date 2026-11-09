@@ -185,9 +185,15 @@ pub const DeclType = struct {
                     if (value.val != null) value.ty = t;
                 };
                 const is_const = tree.items[item].kind == .@"const";
-                // Container-level constants are evaluated at comptime: when inference cannot
-                // compute the value, the interpreter executes the initializer expression
-                if (is_const and value.val == null and b.value != null and !ctx.incomplete()) {
+                // The initializer of every container-level declaration is evaluated at comptime,
+                // that of a variable too (its initial value must be comptime-known): when
+                // inference cannot compute the value of a constant, or the type of a variable
+                // without a type annotation, the interpreter executes the initializer expression.
+                // A variable takes only the type of the result, since its value can change at
+                // runtime. For a variable with an annotation, or one whose type inference knows,
+                // the result could not change the type.
+                const run = if (is_const) value.val == null else annotation == null and value.ty == .unknown;
+                if (run and b.value != null and !ctx.incomplete()) {
                     const ev = try eval.ownerValue(&r, key, dk.inst, annotation);
                     if (ev.val != null and (value.ty == .unknown or ev.ty == value.ty or annotation != null)) value = ev;
                 }
