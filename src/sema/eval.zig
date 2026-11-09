@@ -1831,20 +1831,32 @@ const Evaluator = struct {
     }
 
     /// The instance of container `ns`, whose expression `e` frame `f` evaluates: the instance of
-    /// the function, and for a container in a loop of the function that captures locals of the
-    /// function other than parameters, that instance with the values those locals have here
-    /// (`InternPool.Instance.captured`). The compiler analyzes the container's definition again
-    /// in every iteration and gives each set of captured values its own type (`getCaptures`).
+    /// the frame, and for a container in a loop of the frame's member that captures locals of the
+    /// member other than parameters, an instance with the values those locals have here
+    /// (`InternPool.Instance.captured`): for a function, its instance with these values; for
+    /// another member (the initializer of a container-level declaration, a field's default
+    /// value), which has no instance of its own, an instance of the member with these values in
+    /// the instance the container has otherwise. The compiler analyzes the container's definition
+    /// again in every iteration and gives each set of captured values its own type
+    /// (`getCaptures`), whatever the member.
     fn containerInst(ev: *Evaluator, f: *const Frame, ns: Namespace, e: ExprId) EvalError!?Index {
-        const inst = f.inst orelse return null;
+        const it = (try ev.r.itemTree(f.file)).items[f.item];
+        const is_fn = it.kind == .@"fn";
+        if (is_fn) {
+            const inst = f.inst orelse return null;
+            switch (ev.ip.key(inst)) {
+                .instance => |k| if (k.file != f.file or k.decl != it.ast_id or k.captured.len != 0) return inst,
+                else => return inst,
+            }
+        }
         const locals = try ev.loopCaptures(f, ns, e);
-        if (locals.len == 0) return inst;
-        var key = switch (ev.ip.key(inst)) {
-            .instance => |k| k,
-            else => return inst,
+        if (locals.len == 0) return f.inst;
+        var key: InternPool.Instance = if (is_fn) ev.ip.key(f.inst.?).instance else .{
+            .file = f.file,
+            .decl = it.ast_id,
+            .args = &.{},
+            .parent = try queries.containerInst(ev.r, ns, f.inst),
         };
-        const tree = try ev.r.itemTree(f.file);
-        if (key.file != f.file or key.decl != tree.items[f.item].ast_id or key.captured.len != 0) return inst;
         const captured = try ev.a.alloc(InternPool.CapturedLocal, locals.len);
         for (locals, captured) |b, *c| {
             const v = f.slots[@backingInt(b)];
@@ -1858,9 +1870,9 @@ const Evaluator = struct {
         return try ev.ip.get(.{ .instance = key });
     }
 
-    /// The locals of the function of frame `f` other than parameters that container `ns` (with
+    /// The locals of the member of frame `f` other than parameters that container `ns` (with
     /// expression `e`) captures, sorted by binding, when the container is in the body, the
-    /// condition, or the continue expression of a loop of the function; empty otherwise.
+    /// condition, or the continue expression of a loop of the member; empty otherwise.
     /// Parameters are recorded in the instance of the function.
     fn loopCaptures(ev: *Evaluator, f: *const Frame, ns: Namespace, e: ExprId) EvalError![]const Body.BindingId {
         if (ev.loop_captures.get(ns)) |locals| return locals;

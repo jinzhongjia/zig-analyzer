@@ -783,27 +783,32 @@ pub const Local = @FieldType(resolve.Def, "local");
 
 /// Type of local `l` of another member, read from a member of container `from` (null when not
 /// known) in instance context `inst`. Such a read comes from a container defined in the body of
-/// the function `l.item`, which captured the values the body computed for the locals it refers
-/// to when the body reached the container (the compiler's `getCaptures`):
+/// member `l.item` (a function, or the initializer of a declaration), which captured the values
+/// the body computed for the locals it refers to when the body reached the container (the
+/// compiler's `getCaptures`):
 /// - a constant has one value: `LocalValue` infers its initializer, and when that gives no value,
 ///   `LocalEval` takes it from an execution of the function;
 /// - a variable can change between containers, so its value is the one the container defined
 ///   directly in the body around `from` captured (`CapturedVar`); without `from`, only its type
 ///   is known.
-/// A container in a loop of the function has the values it captured in its instance
+/// A container in a loop of the body has the values it captured in its instance
 /// (`InternPool.Instance.captured`), one set per iteration; the locals it did not capture, and
-/// those whose captured value is unknown, are computed as above in the instance of the function.
+/// those whose captured value is unknown, are computed as above in the instance the body runs in.
 pub fn outerLocal(r: *Resolver, l: Local, from: ?Namespace, inst: ?Index) resolve.Error!TypedValue {
+    const ip = r.ctx.db.env.ip;
     const owner = try r.ownerKey(l.file, l.item);
-    var fn_inst = try normalizeInst(r, l.file, l.item, inst);
-    if (fn_inst) |i| switch (r.ctx.db.env.ip.key(i)) {
+    var owner_inst = try innerInst(r, l.file, l.item, inst);
+    if (owner_inst) |i| switch (ip.key(i)) {
         .instance => |k| if (k.captured.len != 0 and k.file == owner.file and k.decl == owner.item) {
             for (k.captured) |c| if (c.binding == @backingInt(l.binding) and c.val != .unknown) return .{ .ty = c.ty, .val = c.val };
-            fn_inst = try withoutCaptured(r.ctx.db.env.ip, i);
+            // A function body runs in the function's instance without the captured values, the
+            // body of another member in the instance enclosing the member
+            const is_fn = (try r.itemTree(l.file)).items[l.item].kind == .@"fn";
+            owner_inst = if (is_fn) try withoutCaptured(ip, i) else try normalizeInst(r, l.file, l.item, i);
         },
         else => {},
     };
-    const key: LocalKey = .{ .owner = owner, .target = .{ .binding = l.binding }, .inst = fn_inst };
+    const key: LocalKey = .{ .owner = owner, .target = .{ .binding = l.binding }, .inst = owner_inst };
     const tv = try r.ctx.get(LocalValue, key);
     if (tv.val != null or r.ctx.incomplete()) return tv;
     const run = switch ((try r.body(l.file, l.item)).binding(l.binding).kind) {
@@ -852,8 +857,20 @@ fn captureSite(r: *Resolver, ns: Namespace, item: u32) resolve.Error!?u32 {
 /// The instance in an instance context that applies to member `item`: the first instance along
 /// the instance chain that belongs to `item` itself (a function) or to an enclosing function.
 /// When the member is not inside any generic function, the compilation context (`rootInst`),
-/// which ensures the same member is not inferred repeatedly for different instances.
+/// which ensures the same member is not inferred repeatedly for different instances. The instance
+/// of a member that is not a function (see `InternPool.Instance.captured`) belongs to containers
+/// its body defines (`innerInst`), not to the body itself, which runs in the enclosing instance.
 pub fn normalizeInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolve.Error!?Index {
+    return applicableInst(r, file, item, inst, false);
+}
+
+/// `normalizeInst` for the code of a container defined in the body of member `item`: when `item`
+/// is not a function, its own instance applies too (see `InternPool.Instance.captured`)
+pub fn innerInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolve.Error!?Index {
+    return applicableInst(r, file, item, inst, true);
+}
+
+fn applicableInst(r: *Resolver, file: FileId, item: u32, inst: ?Index, inner: bool) resolve.Error!?Index {
     const ip = r.ctx.db.env.ip;
     var cur = inst;
     while (cur) |c| {
@@ -861,10 +878,27 @@ pub fn normalizeInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolv
             .instance => |i| i,
             else => break,
         };
-        if (i.file == file and try enclosedBy(r, file, item, i.decl)) return c;
+        if (i.file == file and try enclosedBy(r, file, item, i.decl)) {
+            if (inner or i.captured.len == 0 or !isMemberInstOf(try r.itemTree(file), item, i)) return c;
+        }
         cur = i.parent;
     }
     return rootInst(r, file, inst);
+}
+
+/// Whether `k` (an instance in the file of `tree`) is the instance of member `item` when that
+/// member is not a function: the instance of the containers its body defines in a loop, with the
+/// values they captured (see `InternPool.Instance.captured`)
+fn isMemberInstOf(tree: *const ItemTree, item: u32, k: InternPool.Instance) bool {
+    return k.captured.len != 0 and k.iteration == null and k.decl == tree.items[item].ast_id and tree.items[item].kind != .@"fn";
+}
+
+/// Whether `k` is the instance of a member that is not a function (see `isMemberInstOf`)
+pub fn isMemberInst(r: *Resolver, k: InternPool.Instance) resolve.Error!bool {
+    if (k.captured.len == 0 or k.iteration != null) return false;
+    const tree = try r.itemTree(k.file);
+    for (tree.items, 0..) |it, i| if (it.ast_id == k.decl) return isMemberInstOf(tree, @intCast(i), k);
+    return false;
 }
 
 /// The instance context of code in `file` outside every generic function, reached from instance
@@ -930,15 +964,15 @@ pub fn genericInst(ip: *InternPool, inst: ?Index) ?Index {
 }
 
 /// The instance that applies to a member declaration (DeclType). A function takes the instance of
-/// the generic function containing it, not its own instance: when a function body refers to
-/// itself recursively, the function value must not carry the instance of the current call
-/// (otherwise every level of recursion would be a new instance, and the cycle could not be
-/// recognized).
+/// its container (that of the generic function containing it), not its own instance: when a
+/// function body refers to itself recursively, the function value must not carry the instance of
+/// the current call (otherwise every level of recursion would be a new instance, and the cycle
+/// could not be recognized).
 pub fn declInst(r: *Resolver, file: FileId, item: u32, inst: ?Index) resolve.Error!?Index {
     const tree = try r.itemTree(file);
     if (tree.items[item].kind != .@"fn") return normalizeInst(r, file, item, inst);
     const parent = tree.containers[tree.items[item].container].parent_item orelse return rootInst(r, file, inst);
-    return normalizeInst(r, file, parent, inst);
+    return innerInst(r, file, parent, inst);
 }
 
 /// Whether `item` is `fn_decl` itself or lies inside it (through containers defined in its body)
@@ -957,9 +991,14 @@ pub fn enclosedBy(r: *Resolver, file: FileId, item: u32, fn_decl: @import("../sy
 /// none), and otherwise the compilation context (`rootInst`)
 pub fn containerType(r: *Resolver, ns: Namespace, inst: ?Index) resolve.Error!Index {
     const tree = try r.itemTree(ns.file);
-    const c = tree.containers[ns.container];
-    const container_inst = if (c.parent_item) |p| try abstractInst(r, ns.file, p, c.in_signature, try normalizeInst(r, ns.file, p, inst)) else try rootInst(r, ns.file, inst);
-    return containerTypeIn(r, tree, ns, c, container_inst);
+    return containerTypeIn(r, tree, ns, tree.containers[ns.container], try containerInst(r, ns, inst));
+}
+
+/// The instance that container `ns` carries in instance context `inst` (see `containerType`)
+pub fn containerInst(r: *Resolver, ns: Namespace, inst: ?Index) resolve.Error!?Index {
+    const c = (try r.itemTree(ns.file)).containers[ns.container];
+    const p = c.parent_item orelse return rootInst(r, ns.file, inst);
+    return abstractInst(r, ns.file, p, c.in_signature, try innerInst(r, ns.file, p, inst));
 }
 
 /// The type of a container as the function's own type sees it, when evaluating the prototype that
@@ -989,14 +1028,21 @@ fn containerTypeIn(r: *Resolver, tree: *const ItemTree, ns: Namespace, c: ItemTr
 /// unknown values): the instance the call `Pair(A, B)` written in the body of
 /// `fn Pair(comptime A: type, comptime B: type) type` refers to, so `@This()` there is the same
 /// type, as in the compiler. A container in the function's prototype (`in_signature`) goes through
-/// `SignatureInst`.
+/// `SignatureInst`. The instance of `item` or of a member between it and the function that is
+/// not a function itself (see `InternPool.Instance.captured`) is kept: it lies inside an instance
+/// of the function.
 fn abstractInst(r: *Resolver, file: FileId, item: u32, in_signature: bool, inst: ?Index) resolve.Error!?Index {
     const ip = r.ctx.db.env.ip;
     const tree = try r.itemTree(file);
+    const member: ?InternPool.Instance = if (inst) |i| switch (ip.key(i)) {
+        .instance => |k| if (k.file == file) k else null,
+        else => null,
+    } else null;
     var cur: ?u32 = item;
     var signature = in_signature;
     const f: u32 = while (cur) |it| {
         if (tree.items[it].kind == .@"fn") break it;
+        if (member) |k| if (isMemberInstOf(tree, it, k)) return inst;
         const outer = tree.containers[tree.items[it].container];
         signature = outer.in_signature;
         cur = outer.parent_item;

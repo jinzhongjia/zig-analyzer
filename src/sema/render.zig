@@ -181,23 +181,40 @@ const ContainerNames = struct {
     /// Types constructed by builtins: named after the function instance that constructs them
     /// (`FieldEnum(S)`); when not constructed in a function and exactly the value of a constant,
     /// named after the constant (`const Kind = blk: { ... break :blk @Enum(...); }` → `Kind`);
-    /// otherwise displayed by their contents
+    /// otherwise displayed by their contents. The instance of a member that is not a function
+    /// (`InternPool.Instance.captured`, for a type constructed in a container in a loop of the
+    /// member) is not a function instance: the type is named as outside the loop.
     pub fn writeReified(n: ContainerNames, t: InternPool.Reified, w: *Io.Writer) Io.Writer.Error!void {
         const ip = n.r.ctx.db.env.ip;
-        const i = switch (ip.key(t.inst orelse .unknown)) {
+        const shown = n.withoutMemberInst(t.inst);
+        const i = switch (ip.key(shown orelse .unknown)) {
             .instance => |i| i,
             else => {
                 const decl_name = n.constNaming(t) catch null orelse return ip.printReified(t, w, n);
                 return w.writeAll(decl_name);
             },
         };
-        const inst = t.inst.?;
+        const inst = shown.?;
         const tree = n.r.itemTree(i.file) catch return ip.printReified(t, w, n);
         for (tree.items) |it| if (it.ast_id == i.decl) {
             try w.writeAll(it.name orelse return ip.printReified(t, w, n));
             return n.writeArgs(inst, w);
         };
         return ip.printReified(t, w, n);
+    }
+
+    /// Instance context `inst` without the instances of members that are not functions
+    fn withoutMemberInst(n: ContainerNames, inst: ?Index) ?Index {
+        var cur = inst;
+        while (cur) |i| {
+            const key = switch (n.r.ctx.db.env.ip.key(i)) {
+                .instance => |key| key,
+                else => return i,
+            };
+            if (!(queries.isMemberInst(n.r, key) catch false)) return i;
+            cur = key.parent;
+        }
+        return null;
     }
 
     /// Name of the constant where the type is constructed, when its value is exactly this type
