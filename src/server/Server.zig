@@ -2324,8 +2324,7 @@ pub const ChangeSource = enum {
     /// Files compared with the disk because a change to them may not have been notified: nobody
     /// watched them for a while, or they were read before they were watched (see
     /// `watch.Watcher`). Only a known file whose known text differs from the disk changed; open
-    /// documents and files never loaded are skipped, and files being read from disk are compared
-    /// again once the read is done (see `applyWatchedChanges`)
+    /// documents and files never loaded are skipped
     verified,
 };
 
@@ -2338,7 +2337,10 @@ pub const ChangeSource = enum {
 /// stops the project; changes to other files rebuild projects and recompile single files; nothing
 /// is rebuilt when the disk contents equal those the last rebuild was based on (see `didSave`).
 /// Returns whether anything changed: a known file's text or rebuild basis, or a project started
-/// or stopped. With `.verified`, the files being read from disk are added to `deferred`.
+/// or stopped. When `deferred` is given, the files being read from disk are added to it instead
+/// of being compared with the disk: what the read gets is not known yet, so their text is compared
+/// again once the read is done (see `applyWatchedChanges`). The rebuild of a notified change does
+/// not wait for that, since the builds read the disk.
 fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const types.FileEvent, source: ChangeSource, deferred: ?*std.ArrayList([]const u8)) !bool {
     const Change = struct {
         file: Vfs.FileId,
@@ -2453,9 +2455,10 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
         defer ctx.end();
         var kept: usize = 0;
         for (changes.items) |*c| {
-            // A verified file whose read from disk began after the check above
-            const reading = source == .verified and knownText(&ctx, c.file) == .reading;
-            if (reading) if (deferred) |list| list.appendAssumeCapacity(c.path);
+            // A notified file being read from disk, or a verified one whose read began after the
+            // check above
+            const reading = deferred != null and !c.open and knownText(&ctx, c.file) == .reading;
+            if (reading) deferred.?.appendAssumeCapacity(c.path);
             c.edited = !reading and !c.open and !sameText(&ctx, c.file, c.text);
             c.rebuild = if (source == .verified)
                 c.edited
@@ -2660,8 +2663,8 @@ fn knownTextOf(server: *Server, arena: Allocator, file: Vfs.FileId) KnownText {
 
 /// External changes discovered by the server: handled the same way as the client's
 /// `workspace/didChangeWatchedFiles` notification (see `applyFileChanges`), serialized with main
-/// loop message handling. Returns the verified files being read from disk (allocated in `arena`),
-/// to be compared with the disk again.
+/// loop message handling. Returns the files being read from disk (allocated in `arena`), to be
+/// compared with the disk again.
 pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const types.FileEvent, source: ChangeSource) []const []const u8 {
     var deferred: std.ArrayList([]const u8) = .empty;
     // A comparison with the disk that finds nothing changed is not a batch of external changes
