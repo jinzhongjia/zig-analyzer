@@ -533,13 +533,14 @@ fn run(ws: *Workspace) Io.Cancelable!void {
                 configure_exited = true;
                 ws.reportConfigureExit(client);
             } else if (!ws.isStopping()) {
-                // maker crashed (e.g. the 0.17 maker has a race when it receives a new build
-                // request, easily triggered with few cores): restart automatically
+                // maker crashed (the 0.17 maker can panic right after a build, more often with few
+                // cores, see docs/zig-maker-build-request-race.md): restart automatically
                 ws.mutex.lockUncancelable(ws.server.io);
                 const next = if (ws.built) 1 else ws.crash_restarts + 1;
                 ws.mutex.unlock(ws.server.io);
                 if (next > max_crash_restarts) {
-                    log.err("{s}: build system exited unexpectedly: {t} ({?t})", .{ ws.root, err, client.readError() });
+                    // A failure of the maker, shown to the user: not an error of the server
+                    log.warn("{s}: build system exited unexpectedly: {t} ({?t})", .{ ws.root, err, client.readError() });
                     ws.server.showWarning("zig build keeps exiting unexpectedly, compiler diagnostics are unavailable until build.zig is saved");
                     ws.server.abandon(ws);
                 } else {
