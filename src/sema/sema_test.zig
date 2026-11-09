@@ -10233,6 +10233,255 @@ test "comptime evaluation: pointer identity of constants and concatenations" {
     });
 }
 
+test "comptime evaluation: & of a value a container captures points to an anonymous constant" {
+    try expectTypes(
+        \\fn mkNoLoop() type {
+        \\    const c: u8 = 5;
+        \\    return struct {
+        \\        const p = &c;
+        \\        const q = &c;
+        \\        fn get() *const u8 {
+        \\            return &c;
+        \\        }
+        \\    };
+        \\}
+        \\fn mkParam(comptime n: u8) type {
+        \\    return struct {
+        \\        const p = &n;
+        \\    };
+        \\}
+        \\const DeclNoLoop = blk: {
+        \\    const c: u8 = 5;
+        \\    break :blk struct {
+        \\        const p = &c;
+        \\    };
+        \\};
+        \\fn plainLocal() bool {
+        \\    const c: u8 = 5;
+        \\    return &c == &@as(u8, 5);
+        \\}
+        \\fn outerAndInner() bool {
+        \\    const c: u8 = 5;
+        \\    const S = struct {
+        \\        const p = &c;
+        \\    };
+        \\    return S.p == &c;
+        \\}
+        \\fn mkArr() type {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    return struct {
+        \\        const p = &a;
+        \\        const e = &a[1];
+        \\    };
+        \\}
+        \\const Pt = struct { x: u8, y: u8 };
+        \\fn mkStruct() type {
+        \\    const s: Pt = .{ .x = 1, .y = 2 };
+        \\    return struct {
+        \\        const p = &s;
+        \\        const f = &s.y;
+        \\    };
+        \\}
+        \\fn mkVarSnapshot() type {
+        \\    comptime var v: u8 = 4;
+        \\    v += 1;
+        \\    const snap = v;
+        \\    return struct {
+        \\        const p = &snap;
+        \\    };
+        \\}
+        \\fn mkVarCopy() type {
+        \\    comptime var v: u8 = 5;
+        \\    v += 1;
+        \\    return struct {
+        \\        const x = v;
+        \\        const p = &x;
+        \\    };
+        \\}
+        \\const loop_types = blk: {
+        \\    var types: [2]type = undefined;
+        \\    for (0..2) |i| {
+        \\        const c: u8 = @intCast(i + 5);
+        \\        types[i] = struct {
+        \\            const p = &c;
+        \\        };
+        \\    }
+        \\    break :blk types;
+        \\};
+        \\fn mkEq() type {
+        \\    const c: u8 = 5;
+        \\    return struct {
+        \\        const eq = &c == &@as(u8, 5);
+        \\        const ne = &c == &@as(u8, 6);
+        \\        const self_eq = &c == &c;
+        \\    };
+        \\}
+        \\fn mkNested() type {
+        \\    const c: u8 = 5;
+        \\    return struct {
+        \\        const Inner = struct {
+        \\            const p = &c;
+        \\        };
+        \\    };
+        \\}
+        \\fn mkAligned() type {
+        \\    const c: u8 align(4) = 5;
+        \\    return struct {
+        \\        const p = &c;
+        \\    };
+        \\}
+        \\fn mkHolder() type {
+        \\    const x: u8 = 5;
+        \\    const c = &x;
+        \\    return struct {
+        \\        const p = &c;
+        \\    };
+        \\}
+        \\const p_fn_noloop = mkNoLoop().p == &@as(u8, 5);
+        \\const p_fn_noloop_deref = mkNoLoop().p.*;
+        \\const p_fn_two_decls = mkNoLoop().p == mkNoLoop().q;
+        \\const p_fn_method = mkNoLoop().get() == &@as(u8, 5);
+        \\const p_fn_other_value = mkNoLoop().p == &@as(u8, 6);
+        \\const p_param = mkParam(5).p == &@as(u8, 5);
+        \\const p_param_other = mkParam(5).p == mkParam(6).p;
+        \\const p_param_same = mkParam(5).p == mkParam(5).p;
+        \\const p_decl_noloop = DeclNoLoop.p == &@as(u8, 5);
+        \\const p_plain_local = plainLocal();
+        \\const p_outer_inner = outerAndInner();
+        \\const p_arr = mkArr().p == &[_]u8{ 1, 2 };
+        \\const p_arr_elem = mkArr().e == &@as(u8, 2);
+        \\const p_struct = mkStruct().p == &Pt{ .x = 1, .y = 2 };
+        \\const p_struct_field = mkStruct().f == &@as(u8, 2);
+        \\const p_var_snapshot = mkVarSnapshot().p == &@as(u8, 5);
+        \\const p_var_copy = mkVarCopy().p == &@as(u8, 6);
+        \\const p_loop0 = loop_types[0].p == &@as(u8, 5);
+        \\const p_loop1 = loop_types[1].p == &@as(u8, 6);
+        \\const p_loop_cross = loop_types[0].p == loop_types[1].p;
+        \\const p_in_eq = mkEq().eq;
+        \\const p_in_ne = mkEq().ne;
+        \\const p_in_self = mkEq().self_eq;
+        \\const p_nested = mkNested().Inner.p == &@as(u8, 5);
+        \\const p_aligned_deref = mkAligned().p.*;
+        \\const p_holder_deref = mkHolder().p.*.*;
+        \\const p_holder_twice = mkHolder().p == mkHolder().p;
+        \\const p_holder_inner = mkHolder().p.* == &@as(u8, 5);
+    , &.{
+        // A captured constant or comptime parameter is a comptime-known value: `&` of it is the
+        // anonymous constant of that value, from a function body, a declaration's initializer,
+        // or a loop iteration
+        .{ "p_fn_noloop", "bool = true" },
+        .{ "p_fn_noloop_deref", "u8 = 5" },
+        .{ "p_fn_two_decls", "bool = true" },
+        .{ "p_fn_method", "bool = true" },
+        .{ "p_fn_other_value", "bool = false" },
+        .{ "p_param", "bool = true" },
+        .{ "p_param_other", "bool = false" },
+        .{ "p_param_same", "bool = true" },
+        .{ "p_decl_noloop", "bool = true" },
+        .{ "p_plain_local", "bool = true" },
+        .{ "p_outer_inner", "bool = true" },
+        .{ "p_arr", "bool = true" },
+        .{ "p_arr_elem", "bool = false" },
+        .{ "p_struct", "bool = true" },
+        .{ "p_struct_field", "bool = false" },
+        .{ "p_var_snapshot", "bool = true" },
+        .{ "p_loop0", "bool = true" },
+        .{ "p_loop1", "bool = true" },
+        .{ "p_loop_cross", "bool = false" },
+        .{ "p_nested", "bool = true" },
+        // Inside the container, every `&` of the capture is the same constant
+        .{ "p_in_eq", "bool = true" },
+        .{ "p_in_ne", "bool = false" },
+        .{ "p_in_self", "bool = true" },
+        // A declaration of the container is not an anonymous constant
+        .{ "p_var_copy", "bool = false" },
+        .{ "p_aligned_deref", "u8 = 5" },
+        // Constants holding pointers are not compared by value, and a pointer a local constant
+        // holds records no place in type inference
+        .{ "p_holder_deref", "u8 = 5" },
+        .{ "p_holder_twice", "bool = true" },
+        .{ "p_holder_inner", "bool" },
+    });
+}
+
+test "comptime evaluation: pointers to anonymous constants keep their identity across calls" {
+    try expectTypes(
+        \\fn retConstPtr() *const u8 {
+        \\    const c: u8 = 5;
+        \\    return &c;
+        \\}
+        \\fn retTempPtr() *const u8 {
+        \\    return &@as(u8, 5);
+        \\}
+        \\const decl_c: u8 = 5;
+        \\fn retDeclPtr() *const u8 {
+        \\    return &decl_c;
+        \\}
+        \\fn retElem() *const u8 {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    return &a[1];
+        \\}
+        \\fn retArr() *const [2]u8 {
+        \\    const a = [_]u8{ 1, 2 };
+        \\    return &a;
+        \\}
+        \\fn retStr() *const [2:0]u8 {
+        \\    const a = "ab".*;
+        \\    return &a;
+        \\}
+        \\fn Named(comptime s: []const u8) type {
+        \\    return struct {
+        \\        const name = s;
+        \\    };
+        \\}
+        \\const p_ret_const = retConstPtr() == &@as(u8, 5);
+        \\const p_ret_temp = retTempPtr() == &@as(u8, 5);
+        \\const p_ret_const_twice = retConstPtr() == retConstPtr();
+        \\const p_ret_const_temp = retConstPtr() == retTempPtr();
+        \\const p_ret_decl = retDeclPtr() == &decl_c;
+        \\const p_ret_decl_temp = retDeclPtr() == &@as(u8, 5);
+        \\const p_ret_decl_const = retDeclPtr() == retConstPtr();
+        \\const p_lit_const = blk: {
+        \\    const c: u8 = 5;
+        \\    break :blk retConstPtr() == &c;
+        \\};
+        \\const p_ret_const_other = retConstPtr() == &@as(u8, 6);
+        \\const p_ret_const_type = @as(*const anyopaque, retConstPtr()) == @as(*const anyopaque, &@as(i8, 5));
+        \\const p_ret_elem = retElem() == &@as(u8, 2);
+        \\const p_ret_elem_twice = retElem() == retElem();
+        \\const p_ret_elem_deref = retElem().*;
+        \\const p_ret_arr = retArr() == &[_]u8{ 1, 2 };
+        \\const p_ret_arr_elem = &retArr()[1] == retElem();
+        \\const p_ret_str_lit = @as([*]const u8, retStr()) == @as([*]const u8, "ab");
+        \\const p_inst_same = Named("ab") == Named(retStr());
+        \\const p_inst_other = Named("ab") == Named("ac");
+    , &.{
+        // A pointer to an anonymous constant returned from a call points to the same constant as
+        // an equal temporary, and not into a declaration
+        .{ "p_ret_const", "bool = true" },
+        .{ "p_ret_temp", "bool = true" },
+        .{ "p_ret_const_twice", "bool = true" },
+        .{ "p_ret_const_temp", "bool = true" },
+        .{ "p_ret_decl", "bool = true" },
+        .{ "p_ret_decl_temp", "bool = false" },
+        .{ "p_ret_decl_const", "bool = false" },
+        .{ "p_lit_const", "bool = true" },
+        .{ "p_ret_const_other", "bool = false" },
+        .{ "p_ret_const_type", "bool = false" },
+        .{ "p_ret_elem", "bool = false" },
+        .{ "p_ret_elem_twice", "bool = true" },
+        .{ "p_ret_elem_deref", "u8 = 2" },
+        .{ "p_ret_arr", "bool = true" },
+        // The element of a call result is not a place here
+        .{ "p_ret_arr_elem", "bool" },
+        // A string literal records no place: compared with it, and as a comptime argument, a
+        // pointer to an equal anonymous constant counts by its data
+        .{ "p_ret_str_lit", "bool = true" },
+        .{ "p_inst_same", "bool = true" },
+        .{ "p_inst_other", "bool = false" },
+    });
+}
+
 test "comptime evaluation: slices of interpreter storage read elements in place" {
     // Guards against copying the whole range when taking an element or the length of a slice:
     // a loop that slices repeatedly (a common pattern in comptime tokenizers) would allocate in
