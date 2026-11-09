@@ -100,6 +100,9 @@ pub const Watcher = struct {
     /// Test hook (null outside tests): the background task stops before its next round until the
     /// pause is released, so that a test can change files before the task gets to them
     test_pause: std.atomic.Value(?*TestPause) = .init(null),
+    /// Test hook (null outside tests): the background task stops before it hands a batch of
+    /// changes to the server (which takes `Server.write_mutex`) until the pause is released
+    test_apply_pause: std.atomic.Value(?*TestPause) = .init(null),
     /// Incremented by the background task whenever it starts watching a directory it did not
     /// watch before, natively or by polling: a scan that started walking before then may have
     /// missed a source file created in that directory before the watch (see `scanned`)
@@ -319,9 +322,9 @@ pub const Watcher = struct {
         if (!w.resync_requested.swap(true, .acq_rel)) w.backend.wake();
     }
 
-    fn testPause(w: *Watcher) void {
+    fn testPause(w: *Watcher, hook: *std.atomic.Value(?*TestPause)) void {
         if (!builtin.is_test) return;
-        const pause = w.test_pause.load(.acquire) orelse return;
+        const pause = hook.load(.acquire) orelse return;
         const io = w.server.io;
         pause.entered.set(io);
         while (!w.stopping.load(.acquire)) {
@@ -335,7 +338,7 @@ pub const Watcher = struct {
         defer w.closeScan();
         defer w.deactivate();
         while (!w.stopping.load(.acquire)) {
-            w.testPause();
+            w.testPause(&w.test_pause);
             const scope = w.server.watchScope();
             // Files the server starts watching may have changed while nobody watched them: they
             // are compared with the disk. At startup, they were all just read.
@@ -842,6 +845,7 @@ pub const Watcher = struct {
     /// Open documents are included: their buffers take precedence, but builds read the disk.
     fn apply(w: *Watcher, a: Allocator, pending: *Pending) Allocator.Error!void {
         const server = w.server;
+        w.testPause(&w.test_apply_pause);
         var events: std.ArrayList(types.FileEvent) = .empty;
         var verified: std.ArrayList(types.FileEvent) = .empty;
         for (pending.paths.keys(), pending.paths.values()) |path, hint| {
