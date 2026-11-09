@@ -2096,6 +2096,53 @@ test "native watching reports changes, creation and removal in watched directori
     try n.drain(a, &events);
 }
 
+test "native watching reports whether directories are newly watched" {
+    if (Native == Unsupported) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "a");
+    try tmp.dir.createDirPath(testing.io, "b");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    const dir_a = try std.fs.path.join(a, &.{ base, "a" });
+    const dir_b = try std.fs.path.join(a, &.{ base, "b" });
+
+    const n = try Native.create(testing.allocator, testing.io);
+    defer n.destroy(testing.allocator);
+    var failed: std.ArrayList([]const u8) = .empty;
+    defer failed.deinit(testing.allocator);
+    try testing.expect(try n.setDirs(testing.allocator, &.{dir_a}, &.{}, &failed));
+    try testing.expect(!try n.setDirs(testing.allocator, &.{dir_a}, &.{}, &failed));
+    try testing.expect(try n.setDirs(testing.allocator, &.{ dir_a, dir_b }, &.{}, &failed));
+    try testing.expectEqual(0, failed.items.len);
+}
+
+// Prevents missing source files created in directories that did not exist when watching started
+test "native watching with subdirectories reports changes in directories created later" {
+    if (!Native.recursive) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+
+    const n = try Native.create(testing.allocator, testing.io);
+    defer n.destroy(testing.allocator);
+    var failed: std.ArrayList([]const u8) = .empty;
+    defer failed.deinit(testing.allocator);
+    try testing.expect(try n.setDirs(testing.allocator, &.{}, &.{dir}, &failed));
+    try testing.expectEqual(0, failed.items.len);
+    // FSEvents starts reporting shortly after the stream starts
+    try testing.io.sleep(.fromMilliseconds(200), .awake);
+
+    try tmp.dir.createDirPath(testing.io, "sub/inner");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "sub/inner/x.zig", .data = "x" });
+    try expectReported(n, a, &.{try std.fs.path.join(a, &.{ dir, "sub", "inner", "x.zig" })});
+}
+
 // Prevents waiting forever for a notification whose APC already ran during an alertable wait
 // elsewhere on the thread
 test "DirNotify: a notification completed outside of waiting ends the next wait at once" {
@@ -2265,6 +2312,32 @@ test "poller: a change before the first check of a tracked file is reported" {
     // Files no longer tracked are forgotten
     _ = try poller.track(testing.io, a, paths[0..1]);
     try testing.expectEqual(1, poller.seen.count());
+}
+
+test "poller: polling directories reports entries created in them" {
+    // `Io.Dir.setTimestamps` is not implemented on Windows
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "d");
+    // An old modification time: a new entry changes it even within the clock's granularity
+    try tmp.dir.setTimestamps(testing.io, "d", .{ .modify_timestamp = .{ .new = .{ .nanoseconds = std.time.ns_per_s * 1_000_000_000 } } });
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    const d = try std.fs.path.join(a, &.{ base, "d" });
+
+    var poller: Poller = .{ .gpa = testing.allocator, .dirs = true };
+    defer poller.deinit();
+    try testing.expect(try poller.track(testing.io, a, &.{d}));
+    try testing.expect(!try poller.track(testing.io, a, &.{d}));
+    var pending: Pending = .{};
+    try poller.poll(testing.io, a, &.{d}, &pending);
+    try testing.expectEqual(0, pending.paths.count());
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "d/new.zig", .data = "" });
+    try poller.poll(testing.io, a, &.{d}, &pending);
+    try testing.expectEqual(Pending.Hint.changed, pending.paths.get(d).?);
 }
 
 // Prevents ignoring a directory renamed, moved or deleted when the notification does not say it is
