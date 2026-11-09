@@ -9013,6 +9013,38 @@ test "member bodies are reused when their source is unchanged" {
     try testing.expect(before.b != after.b);
 }
 
+test "an evicted member body with unchanged source does not invalidate its dependents" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const v1 = "fn a(x: u32) u32 {\n    return x;\n}\nfn b() u32 {\n    return 2;\n}\n";
+    const v2 = "fn a(x: u32) u32 {\n    return x;\n}\nfn b() u32 {\n    return 3;\n}\n";
+    const f = try w.add("/p/main.zig", v1);
+    var owner_a: database.hir.OwnerKey = undefined;
+    {
+        var ctx = w.db.beginRead(testing.allocator);
+        defer ctx.end();
+        const tree = try ctx.get(database.syntax.FileItemTree, f.file);
+        for (tree.items) |it| {
+            const owner: database.hir.OwnerKey = .{ .file = f.file, .item = it.ast_id };
+            if (std.mem.eql(u8, it.name.?, "a")) owner_a = owner;
+            _ = try ctx.get(database.hir.ParamForms, owner);
+        }
+    }
+    const forms_runs = w.db.executions(database.hir.ParamForms);
+    // Capacity 1 with two bodies: the next write transaction evicts both
+    w.db.setLru(database.hir.ItemBody, 1, null);
+    _ = try w.add("/p/main.zig", v2);
+    {
+        var ctx = w.db.beginRead(testing.allocator);
+        defer ctx.end();
+        try testing.expect(ctx.memoized(database.hir.ItemBody, owner_a) == .evicted);
+        _ = try ctx.get(database.hir.ParamForms, owner_a);
+    }
+    // The Body of a is lowered again from the same source: ParamForms(a) is not recomputed
+    try testing.expectEqual(forms_runs, w.db.executions(database.hir.ParamForms));
+}
+
 test "editing a callee body does not invalidate the inference of its callers" {
     // If deciding whether a call is generic depended on the callee's whole Body, editing its
     // function body would make all callers re-infer

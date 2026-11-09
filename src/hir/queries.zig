@@ -102,6 +102,13 @@ pub const ItemBody = struct {
         return a == b or a.eql(b);
     }
 
+    /// What `computeIncremental` reuses a Body by: when the file is edited elsewhere while the
+    /// Body is evicted, the recomputed Body keeps its changed_at, as a Body in memory is reused
+    pub fn fingerprint(v: Value) u128 {
+        const o = Owned.of(v);
+        return @as(u128, o.source_hash) << 64 | @backingInt(o.owner);
+    }
+
     pub fn deinit(v: *Value, gpa: Allocator) void {
         const o = Owned.of(v.*);
         if (o.refs.fetchSub(1, .acq_rel) != 1) return;
