@@ -1470,6 +1470,10 @@ const FsEvents = struct {
     /// Changes received by the callback and not yet taken (accessed only on `queue`; paths are
     /// owned by `gpa`)
     queued: std.ArrayList(Event) = .empty,
+    /// The ID of the event up to which the current stream has reported the changes: where it
+    /// started, then the latest event it delivered (accessed only on `queue` while the stream
+    /// runs)
+    reported: u64 = 0,
     /// Changes received from a replaced stream, already mapped back to the written form with the
     /// roots of that stream (accessed only by the background task; paths are owned by `gpa`)
     carried: std.ArrayList(Event) = .empty,
@@ -1498,6 +1502,7 @@ const FsEvents = struct {
         CFRelease: *const fn (cf: *const anyopaque) callconv(.c) void,
         CFArrayCreate: *const fn (allocator: ?*const anyopaque, values: [*]const ?CFStringRef, num_values: isize, call_backs: ?*const anyopaque) callconv(.c) ?CFArrayRef,
         CFStringCreateWithCString: *const fn (allocator: ?*const anyopaque, c_str: [*:0]const u8, encoding: u32) callconv(.c) ?CFStringRef,
+        FSEventsGetCurrentEventId: *const fn () callconv(.c) u64,
     };
 
     const CFStringRef = *const opaque {};
@@ -1617,41 +1622,57 @@ const FsEvents = struct {
         }
 
         // The changes the old stream still holds back (for its latency) are delivered now and
-        // kept, mapped with the roots they were reported under: the new stream reports only
-        // later changes
+        // kept, mapped with the roots they were reported under
+        const replaced = f.stream != null;
         if (f.stream) |stream| f.sym.FSEventStreamFlushSync(stream);
         f.stopStream();
         var taken = f.takeQueued();
         defer {
-            for (taken.items) |e| gpa.free(e.path);
-            taken.deinit(gpa);
+            for (taken.events.items) |e| gpa.free(e.path);
+            taken.events.deinit(gpa);
         }
-        try f.aliases.carry(gpa, taken.items, &f.carried);
+        try f.aliases.carry(gpa, taken.events.items, &f.carried);
+        // A stream reports the changes after the event it starts at, also those made before the
+        // system service registers it. The new one starts where the old one stopped reporting:
+        // a stopped stream does not report the changes the service had not handed to it yet,
+        // even when flushed, and a stream still reporting the changes before its start has not
+        // reported those after. Without an old stream, it starts at the latest event as of now,
+        // so a change made after this call is reported however long the stream takes to start.
+        const since = if (replaced) taken.reported else f.currentEventId();
         f.clearRoots();
         for (roots.items) |r| try f.roots.append(gpa, try gpa.dupeSentinel(u8, r, 0));
         try f.aliases.set(gpa, f.io, f.roots.items);
         if (f.roots.items.len == 0) return false;
-        f.startStream() catch {
+        f.startStream(since) catch {
             log.warn("cannot start FSEvents stream, checking files on disk periodically instead", .{});
             try failed.appendSlice(gpa, dirs);
             try failed.appendSlice(gpa, trees);
             return false;
         };
-        // The new stream reports only changes from now on
         return true;
     }
 
-    fn startStream(f: *FsEvents) error{ OutOfMemory, StartFailed }!void {
+    /// The ID of the latest event the system service has seen, on any volume; `since_now` when it
+    /// has none (a stream starting at ID 0 would replay the whole history)
+    fn currentEventId(f: *const FsEvents) u64 {
+        const id = f.sym.FSEventsGetCurrentEventId();
+        return if (id == 0) since_now else id;
+    }
+
+    /// Starts a stream for `roots` reporting the changes after event `since` (see `currentEventId`)
+    fn startStream(f: *FsEvents, since: u64) error{ OutOfMemory, StartFailed }!void {
         const s = f.sym;
         f.cf_paths = try f.gpa.alloc(?CFStringRef, f.roots.items.len);
         @memset(f.cf_paths, null);
         for (f.roots.items, f.cf_paths) |r, *p| p.* = s.CFStringCreateWithCString(null, r.ptr, cf_string_encoding_utf8) orelse return error.OutOfMemory;
         f.cf_array = s.CFArrayCreate(null, f.cf_paths.ptr, @intCast(f.cf_paths.len), null) orelse return error.OutOfMemory;
         const ctx: StreamContext = .{ .info = f };
-        const stream = s.FSEventStreamCreate(null, callback, &ctx, f.cf_array.?, since_now, @as(f64, debounce_ms) / 1000.0, .{
+        const stream = s.FSEventStreamCreate(null, callback, &ctx, f.cf_array.?, since, @as(f64, debounce_ms) / 1000.0, .{
             .watch_root = true,
             .file_events = true,
         }) orelse return error.StartFailed;
+        // No callback runs before the stream starts
+        f.reported = since;
         s.FSEventStreamSetDispatchQueue(stream, f.queue);
         if (!s.FSEventStreamStart(stream)) {
             s.FSEventStreamInvalidate(stream);
@@ -1688,11 +1709,13 @@ const FsEvents = struct {
         count: usize,
         paths_ptr: *anyopaque,
         flags_ptr: [*]const EventFlags,
-        _: [*]const u64,
+        ids: [*]const u64,
     ) callconv(.c) void {
         const f: *FsEvents = @ptrCast(@alignCast(info));
         const paths: [*]const [*:0]const u8 = @ptrCast(@alignCast(paths_ptr));
-        for (paths[0..count], flags_ptr[0..count]) |p, fl| {
+        for (paths[0..count], flags_ptr[0..count], ids[0..count]) |p, fl, id| {
+            // Some events (the root changed, a volume mounted) carry no ID
+            f.reported = @max(f.reported, id);
             if (fl.history_done) continue;
             const kind: Event.Kind = if (fl.must_scan_sub_dirs or fl.user_dropped or fl.kernel_dropped)
                 .overflow
@@ -1710,32 +1733,42 @@ const FsEvents = struct {
         _ = f.sem.signal();
     }
 
-    /// Takes the changes received by the callback so far (paths owned by `gpa`)
-    fn takeQueued(f: *FsEvents) std.ArrayList(Event) {
+    const Taken = struct {
+        /// Paths owned by `gpa`
+        events: std.ArrayList(Event),
+        /// See `reported`
+        reported: u64,
+    };
+
+    /// Takes the changes received by the callback so far, with the event the stream has reported
+    /// them up to
+    fn takeQueued(f: *FsEvents) Taken {
         const Take = struct {
             f: *FsEvents,
             taken: std.ArrayList(Event) = .empty,
+            reported: u64 = 0,
             fn run(ctx: ?*anyopaque) callconv(.c) void {
                 const t: *@This() = @ptrCast(@alignCast(ctx));
                 t.taken = t.f.queued;
                 t.f.queued = .empty;
+                t.reported = t.f.reported;
             }
         };
         var take: Take = .{ .f = f };
         dispatch.sync_f(f.queue, &take, Take.run);
-        return take.taken;
+        return .{ .events = take.taken, .reported = take.reported };
     }
 
     fn drain(f: *FsEvents, a: Allocator, out: *std.ArrayList(Event)) Allocator.Error!void {
         var taken = f.takeQueued();
         defer {
-            for (taken.items) |e| f.gpa.free(e.path);
-            taken.deinit(f.gpa);
+            for (taken.events.items) |e| f.gpa.free(e.path);
+            taken.events.deinit(f.gpa);
             for (f.carried.items) |e| f.gpa.free(e.path);
             f.carried.clearRetainingCapacity();
         }
         for (f.carried.items) |e| try out.append(a, .{ .path = try a.dupe(u8, e.path), .kind = e.kind });
-        for (taken.items) |e| try out.append(a, .{ .path = try f.aliases.written(a, e.path), .kind = e.kind });
+        for (taken.events.items) |e| try out.append(a, .{ .path = try f.aliases.written(a, e.path), .kind = e.kind });
     }
 };
 
@@ -2135,8 +2168,6 @@ test "native watching with subdirectories reports changes in directories created
     defer failed.deinit(testing.allocator);
     try testing.expect(try n.setDirs(testing.allocator, &.{}, &.{dir}, &failed));
     try testing.expectEqual(0, failed.items.len);
-    // FSEvents starts reporting shortly after the stream starts
-    try testing.io.sleep(.fromMilliseconds(200), .awake);
 
     try tmp.dir.createDirPath(testing.io, "sub/inner");
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "sub/inner/x.zig", .data = "x" });
@@ -2273,11 +2304,37 @@ test "FSEvents: changes held back by a replaced stream are still reported" {
     var failed: std.ArrayList([]const u8) = .empty;
     defer failed.deinit(testing.allocator);
     _ = try n.setDirs(testing.allocator, &.{dir_a}, &.{}, &failed);
-    // FSEvents starts reporting shortly after the stream starts
-    try testing.io.sleep(.fromMilliseconds(200), .awake);
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/f.zig", .data = "22" });
     // Within the stream's latency
     try testing.io.sleep(.fromMilliseconds(20), .awake);
+    _ = try n.setDirs(testing.allocator, &.{ dir_a, dir_b }, &.{}, &failed);
+    try testing.expectEqual(0, failed.items.len);
+    try expectReported(n, a, &.{try std.fs.path.join(a, &.{ dir_a, "f.zig" })});
+}
+
+// Prevents losing a change the system service had not handed to the stream yet when the stream
+// was replaced
+test "FSEvents: a change made just before the stream is replaced is reported" {
+    if (Native != FsEvents) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "a");
+    try tmp.dir.createDirPath(testing.io, "b");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/f.zig", .data = "1" });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir_a = try std.fs.path.join(a, &.{ dir, "a" });
+    const dir_b = try std.fs.path.join(a, &.{ dir, "b" });
+
+    const n = try Native.create(testing.allocator, testing.io);
+    defer n.destroy(testing.allocator);
+    var failed: std.ArrayList([]const u8) = .empty;
+    defer failed.deinit(testing.allocator);
+    _ = try n.setDirs(testing.allocator, &.{dir_a}, &.{}, &failed);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/f.zig", .data = "22" });
     _ = try n.setDirs(testing.allocator, &.{ dir_a, dir_b }, &.{}, &failed);
     try testing.expectEqual(0, failed.items.len);
     try expectReported(n, a, &.{try std.fs.path.join(a, &.{ dir_a, "f.zig" })});
