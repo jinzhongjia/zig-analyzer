@@ -116,9 +116,10 @@ pub const Watcher = struct {
     /// walking; null when there is none
     scan_epoch: ?u64 = null,
     /// `Server.busyBegin` was called for that scan: the server is not idle until the background
-    /// task has handled it
+    /// task has handled it, or until `closeScan`
     scan_held: bool = false,
-    /// The background task has ended: scans are no longer held for it
+    /// The background task has ended or the server is shutting down (see `closeScan`): scans
+    /// are no longer held
     scan_closed: bool = false,
 
     // ── The following fields are accessed only by the background task ──
@@ -239,6 +240,10 @@ pub const Watcher = struct {
     /// before the watch was neither found nor notified: the server scans again. The server is
     /// busy until the background task has handled this, so that a client waiting for the server
     /// to be idle sees the result of that scan. Called from any thread.
+    ///
+    /// The background task may be waiting for `Server.write_mutex` (see `apply`) when this is
+    /// called, and releases the hold only after it got the mutex: whoever waits for the server
+    /// to be idle while holding that mutex (shutdown) calls `closeScan` first.
     pub fn scanned(w: *Watcher, dirs: []const []const u8, epoch: u64) void {
         const server = w.server;
         {
@@ -296,8 +301,9 @@ pub const Watcher = struct {
         if (held) w.server.busyEnd();
     }
 
-    /// The background task ends: later scans are not held for it
-    fn closeScan(w: *Watcher) void {
+    /// The background task ends, or the server shuts down and nobody waits for a scan's result:
+    /// the scan not handled yet and later scans are not held. Called from any thread.
+    pub fn closeScan(w: *Watcher) void {
         {
             w.scan_mutex.lockUncancelable(w.server.io);
             defer w.scan_mutex.unlock(w.server.io);
