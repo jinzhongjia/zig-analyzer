@@ -8693,6 +8693,160 @@ test "hover on a capture read through a container in the body shows the value of
     }
 }
 
+test "hover in nested inline loops takes an iteration of each enclosing loop" {
+    // Prevents leaving the loop variables of the enclosing loops abstract in the body of an inner
+    // loop. zig 0.17.0 and 0.17.1 analyze that body once per combination of iterations: `direct`
+    // and `via` are u8, u8, u16 and u16, `arr` [1]u8, [2]u8, [1]u16 and [2]u16, `P` starts with
+    // `u8, i32, [1]u8`, `W` u8 and u16, `B` [1]u8, [3]u8, [4]u16 and [6]u16, `L` [1]u8, [1]u16,
+    // [2]u8 and [2]u16.
+    const text =
+        \\pub fn nested() void {
+        \\    inline for (.{ u8, u16 }) |T| {
+        \\        inline for (.{ 1, 2 }) |c| {
+        \\            const direct = T;
+        \\            const N = struct {
+        \\                const t = T;
+        \\            };
+        \\            const via = N.t;
+        \\            const arr = [c]T;
+        \\            _ = .{ direct, via, arr };
+        \\        }
+        \\        const outer = T;
+        \\        _ = outer;
+        \\    }
+        \\}
+        \\pub fn three() void {
+        \\    inline for (.{ u8, u16 }) |T| {
+        \\        inline for (.{ i32, i64 }) |U| {
+        \\            inline for (.{ 1, 2 }) |c| {
+        \\                const P = struct { T, U, [c]u8 };
+        \\                _ = P;
+        \\            }
+        \\        }
+        \\    }
+        \\}
+        \\pub fn prong(x: enum { a, b }) void {
+        \\    inline for (.{ u8, u16 }) |T| {
+        \\        switch (x) {
+        \\            inline else => |v| {
+        \\                const W = T;
+        \\                _ = .{ W, v };
+        \\            },
+        \\        }
+        \\    }
+        \\}
+        \\pub fn counted() void {
+        \\    comptime var acc: usize = 0;
+        \\    inline for (.{ u8, u16 }) |T| {
+        \\        inline for (.{ 1, 2 }) |c| {
+        \\            acc += c;
+        \\            const B = [acc]T;
+        \\            _ = B;
+        \\        }
+        \\    }
+        \\}
+        \\pub fn lengths() void {
+        \\    inline for (.{ 1, 2 }) |n| {
+        \\        inline for (.{ u8, u16 }) |E| {
+        \\            const L = [n]E;
+        \\            _ = L;
+        \\        }
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "direct =", "```zig\nconst direct: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:2 and iteration 1 of the loop at main.zig:3" },
+        .{ "via =", "```zig\nconst via: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:2 and iteration 1 of the loop at main.zig:3" },
+        .{ "arr =", "```zig\nconst arr: type = [1]u8\n```\n\ninferred from iteration 1 of the loop at main.zig:2 and iteration 1 of the loop at main.zig:3" },
+        .{ "outer =", "```zig\nconst outer: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:2" },
+        .{ "P =", "```zig\nconst P: type = struct { u8, i32, [1]u8 }\n```\n\ninferred from iteration 1 of the loop at main.zig:17, iteration 1 of the loop at main.zig:18 and iteration 1 of the loop at main.zig:19" },
+        .{ "W =", "```zig\nconst W: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:27" },
+        .{ "B =", "```zig\nconst B: type = [1]u8\n```\n\ninferred from iteration 1 of the loop at main.zig:38 and iteration 1 of the loop at main.zig:39" },
+        .{ "L =", "```zig\nconst L: type = [1]u8\n```\n\ninferred from iteration 1 of the loop at main.zig:47 and iteration 1 of the loop at main.zig:48" },
+    };
+    for (cases) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+test "hover in an inline loop over the fields of an enclosing loop variable" {
+    // Prevents unrolling the inner loop with the outer loop variable abstract: its list depends on
+    // it. zig 0.17.0 and 0.17.1 give `F` u8, bool and i32.
+    const text =
+        \\const S1 = struct { a: u8, b: bool };
+        \\const S2 = struct { x: i32 };
+        \\pub fn fields() void {
+        \\    inline for (.{ S1, S2 }) |S| {
+        \\        inline for (@typeInfo(S).@"struct".field_types) |F0| {
+        \\            const F = F0;
+        \\            _ = F;
+        \\        }
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    // `@typeInfo(S).@"struct".field_types` is read from `std.builtin.Type`
+    try useRealStd(&w);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "F =").?), &.{}) orelse return error.NoHover;
+    try testing.expectEqualStrings("```zig\nconst F: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:4 and iteration 1 of the loop at main.zig:5", info.text);
+}
+test "references through the loop variable of an enclosing inline loop" {
+    // `T.tag` in the inner loop body is `A.tag` in the first iteration of the outer loop: the
+    // inner body is searched in each combination of iterations, not with `T` abstract
+    const text =
+        \\const A = struct {
+        \\    pub const tag = 1;
+        \\};
+        \\const B = struct {
+        \\    pub const tag = 2;
+        \\};
+        \\pub fn main() void {
+        \\    inline for (.{ A, B }) |T| {
+        \\        inline for (.{ 1, 2 }) |c| {
+        \\            _ = T.tag + c;
+        \\        }
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const fs: [1]FileId = .{file};
+    for ([_][]const u8{ "tag = 1", "tag = 2" }) |decl| {
+        const def = (try definition.defAt(&r, file, @intCast(std.mem.indexOf(u8, text, decl).?))) orelse return error.NoDefinition;
+        const refs = try search.findReferences(&r, def, .{ .scope = &fs });
+        const use = std.mem.indexOf(u8, text, "T.tag").? + 2;
+        for (refs) |ref| {
+            if (ref.start == use) break;
+        } else {
+            std.debug.print("no reference at `T.tag` for `{s}`\n", .{decl});
+            return error.MissingReference;
+        }
+    }
+}
 test "try on a call whose error set depends on an abstract parameter gives the payload type" {
     // When the error set `B.Error` could not be resolved, the whole `Error!Event` used to be
     // unknown, and the result of `try` had no type
