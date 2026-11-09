@@ -840,6 +840,8 @@ fn BackgroundTask(comptime func: anytype) type {
 /// (`Db.WriteOrder.unordered`) runs again on the new state: the text the request refers to has not
 /// changed, so the client has nothing to act on. When a write ordered after the request caused the
 /// interruption, the next read transaction would be stale, and `ContentModified` is answered there.
+/// The caller begins the next read only once that write has taken the lock (see
+/// `Db.waitPendingWrites`): beginning it at once could keep the write waiting.
 fn answerFailure(server: *Server, ctx: *const Db.Ctx, pending: *const Pending, err: anyerror) bool {
     const by_client = pending.cancel.load(.acquire);
     if (err == error.Canceled and !by_client and !ctx.stale and !server.isShuttingDown()) return false;
@@ -854,7 +856,7 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
             defer server.finishRequest(arena, pending);
             pending.sema_start = server.semaUsage();
             server.testGate(method, .before_read, pending);
-            while (!attempt(server, pending, params)) {}
+            while (!attempt(server, pending, params)) server.db.waitPendingWrites();
         }
 
         /// Returns whether the request was answered (see `answerFailure`)
@@ -903,7 +905,7 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             server.testGate(method, .before_read, pending);
             while (true) switch (attempt(server, pending, params, waited_for_projects)) {
                 .answered => return,
-                .again => {},
+                .again => server.db.waitPendingWrites(),
                 // Outside the read transaction: the scan's write waits for read transactions
                 .after_scans => server.waitScans(pending),
             };
@@ -911,7 +913,7 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
 
         const Next = enum {
             answered,
-            /// Run again at once (see `answerFailure`)
+            /// Run again once the pending writes have taken the lock (see `answerFailure`)
             again,
             /// Run again after the scans scheduled so far (see `HandlerError.ScanPending`)
             after_scans,
@@ -1462,6 +1464,9 @@ fn indexOnce(server: *Server, generation: u64) Io.Cancelable!void {
     const Files = struct { symbols: []const Vfs.FileId, project: []const Vfs.FileId };
     const files: Files = while (true) {
         if (server.isShuttingDown()) return;
+        // A canceled read begins again only once the pending writes have the lock (see
+        // `Db.waitPendingWrites`)
+        server.db.waitPendingWrites();
         var ctx = server.db.beginRead(arena_state.allocator());
         defer ctx.end();
         var r: Resolver = .{ .ctx = &ctx, .arena = arena_state.allocator() };
@@ -1500,6 +1505,9 @@ fn indexOnce(server: *Server, generation: u64) Io.Cancelable!void {
     // usable, rather than being left to the first completion
     while (true) {
         if (server.isShuttingDown() or !server.autoImportEnabled()) return;
+        // A canceled read begins again only once the pending writes have the lock (see
+        // `Db.waitPendingWrites`)
+        server.db.waitPendingWrites();
         var ctx = server.db.beginRead(arena_state.allocator());
         defer ctx.end();
         _ = ctx.get(za.ide_db.imports.TestOnlyFiles, {}) catch |err| switch (err) {
@@ -1529,6 +1537,9 @@ fn indexBatches(server: *Server, files: []const Vfs.FileId, title: []const u8, a
         const end = @min(done + index_batch, files.len);
         _ = scratch.reset(.retain_capacity);
         {
+            // A canceled read begins again only once the pending writes have the lock (see
+            // `Db.waitPendingWrites`)
+            server.db.waitPendingWrites();
             var ctx = server.db.beginRead(scratch.allocator());
             defer ctx.end();
             indexFiles(&ctx, files[done..end], auto_import) catch |err| switch (err) {
@@ -1644,6 +1655,9 @@ fn warmImportRoots(server: *Server) Allocator.Error!bool {
     defer seen.deinit(server.gpa);
     while (true) {
         if (server.isShuttingDown() or !server.autoImportEnabled()) return false;
+        // A canceled read begins again only once the pending writes have the lock (see
+        // `Db.waitPendingWrites`)
+        server.db.waitPendingWrites();
         var ctx = server.db.beginRead(scratch.allocator());
         defer ctx.end();
         const graph = (ctx.get(ModuleGraph.Input, {}) catch |err| switch (err) {
@@ -1669,6 +1683,9 @@ fn warmImportRoots(server: *Server) Allocator.Error!bool {
         var found: std.ArrayList(Vfs.FileId) = .empty;
         var canceled = false;
         {
+            // A canceled read begins again only once the pending writes have the lock (see
+            // `Db.waitPendingWrites`)
+            server.db.waitPendingWrites();
             var ctx = server.db.beginRead(scratch.allocator());
             defer ctx.end();
             for (files.items[done..end]) |file| {
@@ -1693,6 +1710,9 @@ fn warmImportRoots(server: *Server) Allocator.Error!bool {
     while (!server.isShuttingDown()) {
         if (!server.autoImportEnabled()) return false;
         _ = scratch.reset(.retain_capacity);
+        // A canceled read begins again only once the pending writes have the lock (see
+        // `Db.waitPendingWrites`)
+        server.db.waitPendingWrites();
         var ctx = server.db.beginRead(scratch.allocator());
         defer ctx.end();
         var canceled = false;

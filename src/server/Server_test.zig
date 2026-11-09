@@ -1239,6 +1239,61 @@ test "a request interrupted by an update the server made on its own is answered,
     try h.notify("exit", {});
 }
 
+test "a request canceled by a write the server made on its own reads again only once that write has the lock" {
+    // Guards against the request beginning its read again at once: the mutex of the lock is not
+    // fair, so a read begun again at once can take the shared lock ahead of the waiting write, be
+    // canceled again, and keep the write waiting for as long as this repeats
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:Untitled-9";
+    const text =
+        \\const alpha_value: u32 = 1;
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    var gate: Server.TestGate = .{ .method = "textDocument/hover", .point = .in_read };
+    h.server.test_gate = &gate;
+    defer h.server.test_gate = null;
+    defer gate.release.set(testing.io);
+    const hover = try h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
+    try gate.entered.wait(testing.io);
+    // A write the server makes on its own (not ordered with the request) has registered and has
+    // not taken the lock yet, as between `Db.beginWriteOf` registering it and locking: the reads
+    // of the held request are canceled while it stays registered
+    const db = &h.server.db;
+    const Write = struct {
+        fn takeLock(d: *@FieldType(Server, "db")) void {
+            _ = d.pending_write.fetchSub(1, .seq_cst);
+            d.io.futexWake(u32, &d.pending_write.raw, std.math.maxInt(u32));
+        }
+    };
+    _ = db.pending_write.fetchAdd(1, .seq_cst);
+    var registered = true;
+    defer if (registered) Write.takeLock(db);
+    gate.entered.reset();
+    gate.release.set(testing.io);
+    // The canceled request either waits for the write or begins its read again, passing the gate
+    while (!gate.entered.isSet() and db.pending_write_waiters.load(.seq_cst) == 0) std.Thread.yield() catch {};
+    try testing.expect(!gate.entered.isSet());
+    registered = false;
+    Write.takeLock(db);
+
+    const response = try h.response(hover);
+    try testing.expect(response.object.get("error") == null);
+    const contents = response.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try testing.expect(std.mem.indexOf(u8, contents, "alpha_value") != null);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "a request interrupted by a later edit is answered with ContentModified" {
     // Guards against a request running again on text the client did not send it for
     const Harness = @import("test_harness.zig").Harness;
