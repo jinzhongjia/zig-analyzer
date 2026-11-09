@@ -539,7 +539,8 @@ fn run(ws: *Workspace) Io.Cancelable!void {
                 const next = if (ws.built) 1 else ws.crash_restarts + 1;
                 ws.mutex.unlock(ws.server.io);
                 if (next > max_crash_restarts) {
-                    log.err("{s}: build system exited unexpectedly: {t} ({?t})", .{ ws.root, err, client.readError() });
+                    // A failure of the maker, shown to the user: not an error of the server
+                    log.warn("{s}: build system exited unexpectedly: {t} ({?t})", .{ ws.root, err, client.readError() });
                     ws.server.showWarning("zig build keeps exiting unexpectedly, compiler diagnostics are unavailable until build.zig is saved");
                     ws.server.abandon(ws);
                 } else {
