@@ -10396,11 +10396,11 @@ test "comptime evaluation: & of a value a container captures points to an anonym
         // A declaration of the container is not an anonymous constant
         .{ "p_var_copy", "bool = false" },
         .{ "p_aligned_deref", "u8 = 5" },
-        // Constants holding pointers are not compared by value, and a pointer a local constant
-        // holds records no place in type inference
+        // Constants holding pointers are not compared by value; the pointer a local constant
+        // holds points to the anonymous constant of the local it was taken from
         .{ "p_holder_deref", "u8 = 5" },
         .{ "p_holder_twice", "bool = true" },
-        .{ "p_holder_inner", "bool" },
+        .{ "p_holder_inner", "bool = true" },
     });
 }
 

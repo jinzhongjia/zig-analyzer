@@ -1379,7 +1379,12 @@ const Inferrer = struct {
             if (l.file != inf.file or l.item != inf.item) return queries.outerLocal(inf.r, l, try queries.memberNamespace(inf.r, inf.file, inf.item), inf.inst);
             const binding = b.binding(l.binding);
             if (binding.kind != .param and !range.contains(binding.range.start)) {
-                return inf.r.ctx.get(queries.LocalValue, .{ .owner = try inf.r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = try inf.iterationInstance() orelse inf.inst });
+                const tv = try inf.r.ctx.get(queries.LocalValue, .{ .owner = try inf.r.ownerKey(l.file, l.item), .target = .{ .binding = l.binding }, .inst = try inf.iterationInstance() orelse inf.inst });
+                // The interpreter reads a constant from the bindings it is given (`eval.exprValue`,
+                // and the anonymous constant `&` of it points to in `eval.addressValue`)
+                const slot = &inf.bindings[@backingInt(l.binding)];
+                if (binding.kind == .local_const and tv.val != null and slot.ty == .unknown) slot.* = tv;
+                return tv;
             }
         };
         return queries.defType(inf.r, def, .{ .file = inf.file, .item = inf.item, .bindings = inf.bindings }, inf.inst);
@@ -3230,8 +3235,9 @@ const Inferrer = struct {
                 };
                 // A pointer to a comptime-known constant (`parseEx(Id, &params, ...)`,
                 // `@field(x, &name)`) is comptime-known: its value points to the constant's value,
-                // and to its place when that is inside a container-level declaration or a value
-                // captured from an enclosing function or declaration
+                // and to its place when that is inside a container-level declaration or an
+                // anonymous constant (a constant local, parameter or capture, including a value
+                // captured from an enclosing function or declaration)
                 if (is_const) if (v.val) |pointee| {
                     if (try inf.mayHavePlace(operand_e))
                         return .{ .ty = ty, .val = try eval.addressValue(inf.r, inf.file, inf.item, inf.body, operand_e, inf.inst, inf.bindings, ty, pointee) };
@@ -3700,10 +3706,12 @@ const Inferrer = struct {
         return placeIsConst(inf.r, inf.file, inf.item, inf.body, inf, e);
     }
 
-    /// Whether place `e` may be inside a container-level declaration or the anonymous constant of
-    /// a captured value, whose place a pointer to it records (`eval.addressValue`): a
-    /// declaration, a member of a type, a local of an enclosing function or declaration that
-    /// this container reads, or a field or element reached from one or through a pointer
+    /// Whether place `e` may be inside a container-level declaration or an anonymous constant,
+    /// whose place a pointer to it records (`eval.addressValue`): a declaration, a member of a
+    /// type, a local (a constant local, a parameter or a capture of this body, which the
+    /// interpreter gives an anonymous constant; `&` of a variable is not a constant pointer and
+    /// does not get here), a local of an enclosing function or declaration that this container
+    /// reads, or a field or element reached from one or through a pointer
     fn mayHavePlace(inf: *Inferrer, e: ExprId) Error!bool {
         const b = inf.body;
         return switch (b.expr(e)) {
@@ -3711,8 +3719,7 @@ const Inferrer = struct {
                 if (inf.ip.key(inf.get(e).ty) == .ptr_type) return true;
                 const def = try inf.r.resolveName(inf.file, inf.item, b, b.expr_scopes[@backingInt(e)], name) orelse return false;
                 return switch (def) {
-                    .item => true,
-                    .local => |l| l.file != inf.file or l.item != inf.item,
+                    .item, .local => true,
                     else => false,
                 };
             },

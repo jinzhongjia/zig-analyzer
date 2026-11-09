@@ -520,9 +520,9 @@ pub fn constPointer(r: *Resolver, ptr_ty: Index, pointee: Index) Error!Index {
 
 /// `&e` where `e` has the comptime-known value `pointee`, under the given bindings: a pointer of
 /// type `ptr_ty` to that value (see `constPointer`), which records its place when `e` is a
-/// container-level declaration, a value captured from an enclosing function or declaration
-/// (`Evaluator.capturePlace`), or a field or element inside one (`InternPool.Key.ptr_base`), as
-/// the interpreter's `&` does
+/// container-level declaration, a constant local, parameter or capture (`Evaluator.localPlace`),
+/// a value captured from an enclosing function or declaration (`Evaluator.capturePlace`), or a
+/// field or element inside one (`InternPool.Key.ptr_base`), as the interpreter's `&` does
 pub fn addressValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, ptr_ty: Index, pointee: Index) Error!Index {
     const scope = if (r.context == null) try queries.enterContext(r, file, inst) else null;
     defer if (scope) |s| s.leave();
