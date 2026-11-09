@@ -437,9 +437,13 @@ fn waitIdleWithin(h: *Harness, seconds: i64) !void {
 
 /// Number of compiles that finished and replaced their results (project builds and single-file
 /// compiles). When something changes during a build, that round's result is discarded and a rebuild
-/// starts immediately; it is not counted.
+/// starts immediately; it is not counted. Nor is the build that only repeats a completed build
+/// after the maker exited (see `Workspace.repeats`): the 0.17 maker can panic right after any
+/// build, and a count must not depend on it.
 fn compiles(h: *Harness) u64 {
-    return h.server.compile_generation.load(.monotonic);
+    // Read first: the server adds a repeated build to it after taking its generation
+    const repeated = h.server.repeated_builds.load(.acquire);
+    return h.server.compile_generation.load(.acquire) - repeated;
 }
 
 /// Number of write transactions of the server
@@ -1513,6 +1517,68 @@ test "a maker that exits during a build or between builds is restarted, and the 
     try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
 
     // Neither exit is reported to the user
+    try testing.expectEqual(0, (try h.notifications("window/showMessage")).len);
+    try expectLiveWorkspaces(&h, 1);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+/// Waits until a restart has replaced the project instance `from` and the server is idle
+fn waitReplaced(h: *Harness, from: *Workspace) !void {
+    for (0..1200) |_| {
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        if (visibleInstance(h) != from) return;
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    return error.Timeout;
+}
+
+// Prevents counting the restart's build after the maker exits as a build a save or change
+// requested: a test that counts builds failed whenever the 0.17 maker panicked right after a build
+test "after the maker exits, the build that repeats the completed one is told apart from requested builds" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&fixture.basic);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const root_uri = try za.base.uri.fromPath(a, project.root);
+    // The client watches: no late notification of the fixture's writes builds again
+    _ = try h.request("initialize", .{
+        .rootUri = root_uri,
+        .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } },
+        .initializationOptions = .{ .files = .{ .watcher = "client" } },
+    });
+    try h.notify("initialized", Empty{});
+    const main_uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
+    try open(&h, main_uri, fixture.basic[1].text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
+    const builds = compiles(&h);
+
+    // The maker exits while idle after a build: the new instance builds once, only repeating it
+    const results = h.server.compile_generation.load(.acquire);
+    const first = visibleInstance(&h);
+    try std.posix.kill(makerPid(&h), .KILL);
+    try waitReplaced(&h, first);
+    try testing.expectEqual(results + 1, h.server.compile_generation.load(.acquire));
+    try testing.expectEqual(builds, compiles(&h));
+    try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
+
+    // A save afterwards is counted
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(builds + 1, compiles(&h));
+
+    // A save while the maker restarts is built by the new instance's first build, which counts
+    const second = visibleInstance(&h);
+    try std.posix.kill(makerPid(&h), .KILL);
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
+    try waitReplaced(&h, second);
+    try testing.expectEqual(builds + 2, compiles(&h));
+    try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
+
     try testing.expectEqual(0, (try h.notifications("window/showMessage")).len);
     try expectLiveWorkspaces(&h, 1);
     _ = try h.request("shutdown", {});
