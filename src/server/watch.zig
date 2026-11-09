@@ -2168,8 +2168,6 @@ test "native watching with subdirectories reports changes in directories created
     defer failed.deinit(testing.allocator);
     try testing.expect(try n.setDirs(testing.allocator, &.{}, &.{dir}, &failed));
     try testing.expectEqual(0, failed.items.len);
-    // FSEvents starts reporting shortly after the stream starts
-    try testing.io.sleep(.fromMilliseconds(200), .awake);
 
     try tmp.dir.createDirPath(testing.io, "sub/inner");
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "sub/inner/x.zig", .data = "x" });
@@ -2306,11 +2304,37 @@ test "FSEvents: changes held back by a replaced stream are still reported" {
     var failed: std.ArrayList([]const u8) = .empty;
     defer failed.deinit(testing.allocator);
     _ = try n.setDirs(testing.allocator, &.{dir_a}, &.{}, &failed);
-    // FSEvents starts reporting shortly after the stream starts
-    try testing.io.sleep(.fromMilliseconds(200), .awake);
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/f.zig", .data = "22" });
     // Within the stream's latency
     try testing.io.sleep(.fromMilliseconds(20), .awake);
+    _ = try n.setDirs(testing.allocator, &.{ dir_a, dir_b }, &.{}, &failed);
+    try testing.expectEqual(0, failed.items.len);
+    try expectReported(n, a, &.{try std.fs.path.join(a, &.{ dir_a, "f.zig" })});
+}
+
+// Prevents losing a change the system service had not handed to the stream yet when the stream
+// was replaced
+test "FSEvents: a change made just before the stream is replaced is reported" {
+    if (Native != FsEvents) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "a");
+    try tmp.dir.createDirPath(testing.io, "b");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/f.zig", .data = "1" });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir_a = try std.fs.path.join(a, &.{ dir, "a" });
+    const dir_b = try std.fs.path.join(a, &.{ dir, "b" });
+
+    const n = try Native.create(testing.allocator, testing.io);
+    defer n.destroy(testing.allocator);
+    var failed: std.ArrayList([]const u8) = .empty;
+    defer failed.deinit(testing.allocator);
+    _ = try n.setDirs(testing.allocator, &.{dir_a}, &.{}, &failed);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/f.zig", .data = "22" });
     _ = try n.setDirs(testing.allocator, &.{ dir_a, dir_b }, &.{}, &failed);
     try testing.expectEqual(0, failed.items.len);
     try expectReported(n, a, &.{try std.fs.path.join(a, &.{ dir_a, "f.zig" })});
