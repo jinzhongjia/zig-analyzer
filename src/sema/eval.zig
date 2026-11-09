@@ -520,9 +520,9 @@ pub fn constPointer(r: *Resolver, ptr_ty: Index, pointee: Index) Error!Index {
 
 /// `&e` where `e` has the comptime-known value `pointee`, under the given bindings: a pointer of
 /// type `ptr_ty` to that value (see `constPointer`), which records its place when `e` is a
-/// container-level declaration, a value captured from an enclosing function or declaration
-/// (`Evaluator.capturePlace`), or a field or element inside one (`InternPool.Key.ptr_base`), as
-/// the interpreter's `&` does
+/// container-level declaration, a constant local, parameter or capture (`Evaluator.localPlace`),
+/// a value captured from an enclosing function or declaration (`Evaluator.capturePlace`), or a
+/// field or element inside one (`InternPool.Key.ptr_base`), as the interpreter's `&` does
 pub fn addressValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, ptr_ty: Index, pointee: Index) Error!Index {
     const scope = if (r.context == null) try queries.enterContext(r, file, inst) else null;
     defer if (scope) |s| s.leave();
@@ -2966,12 +2966,17 @@ const Evaluator = struct {
     /// Comparison `lhs op rhs` of evaluated operands. Matching the compiler, the operands are
     /// coerced to their peer type: an enum literal to the other side's enum (by tag name, never
     /// as a decl literal; a name that is not a tag is a compile error), a comptime number to the
-    /// other side's float type (rounding it). A tagged union compared with a tag keeps the literal
-    /// as it is. Vectors are compared element by element.
+    /// other side's float type (rounding it), a function body to a pointer to the function
+    /// (`functionOperand`). A tagged union compared with a tag keeps the literal as it is. Vectors
+    /// are compared element by element.
     fn compare(ev: *Evaluator, op: SyntaxKind, lhs_in: Val, rhs_in: Val) EvalError!Val {
         const ip = ev.ip;
         var lhs = lhs_in;
         var rhs = rhs_in;
+        if (op == .equal_equal or op == .bang_equal) {
+            if (try ev.functionOperand(lhs, rhs.ty)) |p| lhs = p;
+            if (try ev.functionOperand(rhs, lhs.ty)) |p| rhs = p;
+        }
         if (ev.peerOperand(lhs.ty, rhs.ty)) lhs = try ev.coerce(lhs, rhs.ty);
         if (ev.peerOperand(rhs.ty, lhs.ty)) rhs = try ev.coerce(rhs, lhs.ty);
         // Optionals of different depths are compared at the deeper one, their peer type:
@@ -3828,6 +3833,18 @@ const Evaluator = struct {
         return Val.of(ty, try ev.pointerTo(ty, x, null));
     }
 
+    /// Comparison operand `v` when the other operand has type `other`: a function body compared
+    /// with a pointer to a function has the pointer's peer type, and the compiler coerces the
+    /// body to a pointer to the function's declaration (`analyzeNavRef`), the pointer `&` of the
+    /// function gives (`functionPointer`). Null when `v` is not a function body, or `other` is not
+    /// the type of that pointer: the identity of pointers of other types to a function is not
+    /// tracked.
+    fn functionOperand(ev: *Evaluator, v: Val, other: Index) EvalError!?Val {
+        if (ev.ip.key(v.ty) != .fn_type) return null;
+        if (other != try ev.ip.ptrTo(v.ty, .one, true)) return null;
+        return ev.functionPointer(v);
+    }
+
     /// What a place is resolved for
     const PlaceUse = enum {
         /// An assignment target: storage of this evaluation only
@@ -3898,15 +3915,20 @@ const Evaluator = struct {
     /// interned pointer records (`basePlace`), the place it points to instead (automatic
     /// dereferencing)
     fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId, use: PlaceUse) EvalError!Ref {
-        // A pointer computed by pointer arithmetic (`(p + 1)[0] = x`) or returned by a call
-        // (`std.mem.asBytes(&x)[i] = b`) is not a place: the compiler takes the element pointer
-        // of the value, so the place is the one it points to
+        // A pointer computed by pointer arithmetic (`(p + 1)[0] = x`), returned by a call
+        // (`std.mem.asBytes(&x)[i] = b`) or, for `&`, made by slicing (`&a[1..][0]`) is not a
+        // place: the compiler takes the element pointer of the value, so the place is the one it
+        // points to. For `&`, that includes the place an interned pointer records (`basePlace`),
+        // as for a pointer held by a declaration: `&retArr()[1]` points into the anonymous
+        // constant the returned pointer points to. A slice of data whose place is not known
+        // holds a copy of it, which writes must not reach.
         switch (f.body.expr(e)) {
-            .binary, .call, .builtin_call => {
+            .binary, .call, .builtin_call, .slice => {
+                if (use == .write and f.body.expr(e) == .slice) return error.Abort;
                 const p = try ev.eval(f, e, null);
                 return switch (p.v) {
                     .ref => |r| ev.through(r, p.ty),
-                    else => error.Abort,
+                    else => if (use == .address and ev.ip.key(p.ty) == .ptr_type) try ev.basePlace(p) orelse error.Abort else error.Abort,
                 };
             },
             else => {},
