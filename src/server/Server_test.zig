@@ -4,6 +4,7 @@ const Server = @import("Server.zig");
 const za = @import("../zig_analyzer.zig");
 const transport = za.lsp.transport;
 const FileText = @import("../database.zig").inputs.FileText;
+const Db = @import("../database.zig").Db;
 
 inline fn frame(comptime body: []const u8) []const u8 {
     return comptime std.fmt.comptimePrint("Content-Length: {d}\r\n\r\n{s}", .{ body.len, body });
@@ -268,7 +269,7 @@ test "close: a non-file document is cleared when the result computed on open is 
     var h: Harness = undefined;
     try h.start();
     defer h.finish();
-    var gate: Server.PublishGate = .{};
+    var gate: Server.OnceGate = .{};
     h.server.publish_gate = &gate;
     // Lets the held publish finish when the test fails before releasing it
     defer gate.release.set(testing.io);
@@ -2103,6 +2104,120 @@ test "didChange for a document that is not open changes nothing" {
     for (try h.notifications("textDocument/publishDiagnostics")) |n| {
         try testing.expect(!std.mem.eql(u8, other_uri, n.object.get("params").?.object.get("uri").?.string));
     }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+/// A write transaction that sets nothing: started while the server holds a read transaction, it
+/// waits for the lock until that read transaction ends
+fn waitingWrite(db: *Db) void {
+    db.beginWriteOf(comptime Db.inputSet(&.{FileText}), .unordered);
+    db.endWrite();
+}
+
+/// With the server held at `gate` in a read transaction: starts a write transaction, and releases
+/// the gate once it waits for the lock, so that the server reads on with a write pending. Returns
+/// the writer, which takes the lock once the server's read transaction ends.
+fn releaseWithWriteWaiting(server: *Server, gate: *Server.OnceGate) !std.Thread {
+    const writer = try std.Thread.spawn(.{}, waitingWrite, .{&server.db});
+    while (server.db.pending_write.load(.acquire) == 0) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    gate.release.set(testing.io);
+    return writer;
+}
+
+/// Reports `document_uri` as changed on disk with a write transaction waiting for the lock during
+/// the server's comparison with the known text, then waits until the server is idle
+fn changeWhileWriteWaits(h: anytype, document_uri: []const u8) !void {
+    var gate: Server.OnceGate = .{};
+    h.server.compare_gate = &gate;
+    defer h.server.compare_gate = null;
+    // Lets the held comparison finish when the test fails before releasing it
+    defer gate.release.set(testing.io);
+    try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = document_uri, .type = 2 }} });
+    try gate.entered.wait(testing.io);
+    (try releaseWithWriteWaiting(&h.server, &gate)).join();
+    _ = try h.request("zig-analyzer/waitIdle", {});
+}
+
+// Prevents a comparison with the known text that a write transaction waiting for the lock canceled
+// from counting as a change: a rewrite with the same content was written and republished
+test "an external change compared while a write transaction waits for the lock is compared again" {
+    const Harness = @import("test_harness.zig").Harness;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text = "pub const a = 1;\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "lib.zig", .data = text });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{
+        .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } },
+        .initializationOptions = .{ .files = .{ .watcher = "client" } },
+    });
+    try h.notify("initialized", struct {}{});
+    const path = try std.fs.path.join(a, &.{ root, "lib.zig" });
+    const lib_uri = try za.base.uri.fromPath(a, path);
+    // Closing makes the disk contents the known text
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = lib_uri, .languageId = "zig", .version = 1, .text = text } });
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = lib_uri } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const file = (try h.server.vfs.lookup(path)).?;
+    const writes = h.server.db.writes.load(.monotonic);
+
+    // Rewritten with the same content: the only write transaction is the test's own
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "lib.zig", .data = text });
+    try changeWhileWriteWaits(&h, lib_uri);
+    try testing.expectEqual(writes + 1, h.server.db.writes.load(.monotonic));
+
+    // Really changed: the server writes the new text as well
+    const changed = "pub const a = 2;\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "lib.zig", .data = changed });
+    try changeWhileWriteWaits(&h, lib_uri);
+    try testing.expectEqual(writes + 3, h.server.db.writes.load(.monotonic));
+    {
+        var ctx = h.server.db.beginRead(a);
+        defer ctx.end();
+        try testing.expectEqualStrings(changed, (try ctx.get(FileText, file)).?);
+    }
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+// Prevents a module graph comparison that a write transaction waiting for the lock canceled from
+// counting as a change: the module graph was written again with equal values
+test "a module graph update compared while a write transaction waits for the lock is compared again" {
+    const Harness = @import("test_harness.zig").Harness;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = struct {}{} });
+    try h.notify("initialized", struct {}{});
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // The module graph now equals what another update computes
+    h.server.updateModuleGraph();
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const writes = h.server.db.writes.load(.monotonic);
+
+    var gate: Server.OnceGate = .{};
+    h.server.graph_gate = &gate;
+    defer h.server.graph_gate = null;
+    {
+        const updater = try std.Thread.spawn(.{}, Server.updateModuleGraph, .{&h.server});
+        // Lets the held comparison finish when the test fails before releasing it
+        errdefer {
+            gate.release.set(testing.io);
+            updater.join();
+        }
+        try gate.entered.wait(testing.io);
+        (try releaseWithWriteWaiting(&h.server, &gate)).join();
+        updater.join();
+    }
+    // The only write transaction is the test's own
+    try testing.expectEqual(writes + 1, h.server.db.writes.load(.monotonic));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
