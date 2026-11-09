@@ -32,6 +32,11 @@ pub const Seed = struct {
     offset: u32,
     /// Inferred for this iteration (0-based) of a loop over a list of types
     iteration: ?u32 = null,
+    /// With `iteration`: the iterations of the enclosing loops it is inferred in, outermost first
+    enclosing: []const LoopIteration = &.{},
+
+    /// The `iteration`-th iteration (0-based) of the loop at `offset`
+    pub const LoopIteration = struct { offset: u32, iteration: u32 };
 };
 
 /// Result of inferring member `item` (inside some generic function) under the instance of the first
@@ -58,11 +63,7 @@ pub const Refiner = struct {
     candidates: std.ArrayList(Variant) = .empty,
     loaded: u8 = 0,
     stage_ends: [3]usize = @splat(0),
-    loop_regions: ?[]const LoopRegion = null,
-
-    /// Region inferred per iteration: a `for` loop body, or the body of an `inline` switch prong
-    /// (`prong` is the prong index)
-    const LoopRegion = struct { expr: Body.ExprId, prong: ?u32 = null, range: Body.Range };
+    loop_regions: ?[]const Region = null,
 
     const Variant = struct {
         res: ?*const infer.Result = null,
@@ -125,21 +126,11 @@ pub const Refiner = struct {
         return candidate.presentation;
     }
 
-    fn regions(f: *Refiner) resolve.Error![]const LoopRegion {
+    fn regions(f: *Refiner) resolve.Error![]const Region {
         if (f.loop_regions) |cached| return cached;
-        var out: std.ArrayList(LoopRegion) = .empty;
-        for (f.body.exprs, 0..) |expr, ei| {
-            const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(ei)));
-            switch (expr) {
-                .loop => |loop| if (loop.kind == .@"for") try out.append(f.r.arena, .{ .expr = id, .range = f.body.range(loop.body) }),
-                .@"switch" => |sw| for (sw.prongs, 0..) |prong, pi| {
-                    if (prong.is_inline and prong.capture.len > 0) try out.append(f.r.arena, .{ .expr = id, .prong = @intCast(pi), .range = f.body.range(prong.body) });
-                },
-                else => {},
-            }
-        }
-        f.loop_regions = out.items;
-        return out.items;
+        const out = try allRegions(f.r, f.body);
+        f.loop_regions = out;
+        return out;
     }
 
     fn tryVariant(f: *Refiner, candidate: *Variant, rel: u32, subject: ?Subject, fallback: *?Seed) resolve.Error!?Seed {
@@ -150,6 +141,10 @@ pub const Refiner = struct {
             break :blk inferred;
         };
         if (fits(ip, f.body, res, rel, subject) and candidate.origin != null) return f.presented(candidate);
+        // The compiler analyzes the body of a loop nested in other loops inferred per iteration
+        // once per combination of their iterations: in an iteration of the innermost loop alone,
+        // the captures of the enclosing loops have no value
+        if (try f.nested(candidate, res, rel, subject)) |s| return s;
         // Pick only the innermost heterogeneous loop containing this position; Infer refines the
         // other captures of the same loop along with it.
         var best: ?LoopResults = null;
@@ -203,14 +198,156 @@ pub const Refiner = struct {
         }
         return null;
     }
+
+    /// The first combination of iterations of the regions containing `rel` (see `Combinations`)
+    /// in which the subject is concrete; null when `rel` is not in nested regions.
+    fn nested(f: *Refiner, candidate: *Variant, res: *const infer.Result, rel: u32, subject: ?Subject) resolve.Error!?Seed {
+        var chain: std.ArrayList(Region) = .empty;
+        for (try f.regions()) |region| if (rel >= region.range.start and rel <= region.range.end) try chain.append(f.r.arena, region);
+        if (chain.items.len < 2) return null;
+        std.mem.sort(Region, chain.items, {}, Region.outerFirst);
+        var combos: Combinations = .{ .r = f.r, .owner = f.owner, .body = f.body, .inst = candidate.inst, .chain = chain.items };
+        const Check = struct {
+            f: *Refiner,
+            rel: u32,
+            subject: ?Subject,
+            fn visit(c: @This(), node: *const infer.Result) bool {
+                return fits(c.f.r.ctx.db.env.ip, c.f.body, node, c.rel, c.subject);
+            }
+        };
+        const found = try combos.find(res, Check{ .f = f, .rel = rel, .subject = subject }) orelse return null;
+        return try combos.seed(found, f.node_offset);
+    }
+};
+
+/// Region inferred per iteration: a `for` loop body, or the body of an `inline` switch prong
+/// (`prong` is the prong index)
+const Region = struct {
+    expr: Body.ExprId,
+    prong: ?u32 = null,
+    range: Body.Range,
+
+    /// Enclosing regions first: regions containing the same position are nested
+    fn outerFirst(_: void, a: Region, b: Region) bool {
+        return a.range.end - a.range.start > b.range.end - b.range.start;
+    }
+};
+
+/// One step of a combination: the region at `expr` inferred for one iteration (`seed`)
+const Step = struct { expr: Body.ExprId, seed: infer.LoopSeed };
+
+/// The number of iterations of `region` that are inferred separately in the inference `res`, with
+/// the loop variable that takes them; null when its iterations need no separate inference. As in
+/// `Refiner`, for a loop the first loop variable that needs it is chosen, and Infer refines the
+/// other captures of the same loop along with it.
+fn regionIterations(r: *Resolver, body: *const Body, res: *const infer.Result, region: Region) resolve.Error!?struct { binding: u32, n: u32 } {
+    if (region.prong) |pi| {
+        const sw = body.expr(region.expr).@"switch";
+        const n = try prongIterations(r, body, res, sw, pi) orelse return null;
+        return .{ .binding = @backingInt(sw.prongs[pi].capture[0]), .n = n };
+    }
+    const loop = body.expr(region.expr).loop;
+    for (loop.capture, 0..) |capture, k| {
+        const n = try iterations(r, res, loop, k) orelse continue;
+        return .{ .binding = @backingInt(capture), .n = n };
+    }
+    return null;
+}
+
+/// The combinations of iterations of nested regions inferred per iteration (`chain`, outermost
+/// first) under instance `inst`, as the compiler analyzes them: the body of an inner region once
+/// per iteration of every enclosing one. Starting from an inference, the outermost region whose
+/// iterations it infers separately is inferred for each iteration, and so on inward in each of
+/// those inferences (a loop over a list that depends on an outer loop variable is unrolled only in
+/// an iteration of that loop).
+const Combinations = struct {
+    r: *Resolver,
+    owner: hir.OwnerKey,
+    body: *const Body,
+    inst: ?Index,
+    chain: []const Region,
+    steps: std.ArrayList(Step) = .empty,
+
+    const Combo = struct { res: *const infer.Result, steps: []const Step };
+
+    /// The first inference of a combination, outer iterations first, for which `check.visit`
+    /// holds. A partial combination is taken only when none of its refinements holds: the loop
+    /// variables of the inner loops are abstract in it, and a type built from their values can
+    /// still hold (`[c]u8` is `[_]u8`, whose unknown length depends on no abstract parameter).
+    fn find(c: *Combinations, res: *const infer.Result, check: anytype) resolve.Error!?Combo {
+        return c.findFrom(res, 0, check);
+    }
+
+    fn findFrom(c: *Combinations, res: *const infer.Result, from: usize, check: anytype) resolve.Error!?Combo {
+        for (c.chain[from..], from..) |region, k| {
+            const level = try regionIterations(c.r, c.body, res, region) orelse continue;
+            for (0..level.n) |idx| {
+                const node = try c.push(region, level.binding, @intCast(idx));
+                if (try c.findFrom(node, k + 1, check)) |found| return found;
+                if (check.visit(node)) return .{ .res = node, .steps = try c.r.arena.dupe(Step, c.steps.items) };
+                _ = c.steps.pop();
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /// Every complete combination: no region inside the last one inferred is still inferred as a
+    /// whole loop with differing iterations
+    fn all(c: *Combinations, res: *const infer.Result, out: *std.ArrayList(Combo)) resolve.Error!void {
+        return c.allFrom(res, 0, out);
+    }
+
+    fn allFrom(c: *Combinations, res: *const infer.Result, from: usize, out: *std.ArrayList(Combo)) resolve.Error!void {
+        for (c.chain[from..], from..) |region, k| {
+            const level = try regionIterations(c.r, c.body, res, region) orelse continue;
+            for (0..level.n) |idx| {
+                const node = try c.push(region, level.binding, @intCast(idx));
+                try c.allFrom(node, k + 1, out);
+                _ = c.steps.pop();
+            }
+            return;
+        }
+        if (c.steps.items.len > 0) try out.append(c.r.arena, .{ .res = res, .steps = try c.r.arena.dupe(Step, c.steps.items) });
+    }
+
+    /// Adds the step and infers the combination so far: the seeds of the enclosing regions are
+    /// carried by the instance (see `infer.LoopSeed`)
+    fn push(c: *Combinations, region: Region, binding: u32, index: u32) resolve.Error!*const infer.Result {
+        try c.steps.append(c.r.arena, .{ .expr = region.expr, .seed = .{ .binding = binding, .index = index } });
+        const steps = c.steps.items;
+        var seeds = try c.r.arena.alloc(infer.LoopSeed, steps.len - 1);
+        for (steps[0 .. steps.len - 1], 0..) |s, i| seeds[i] = s.seed;
+        return c.r.ctx.get(queries.Infer, .{
+            .owner = c.owner,
+            .mode = .full,
+            .inst = try infer.iterationInst(c.r.ctx.db.env.ip, c.owner, c.inst, seeds),
+            .loop = steps[steps.len - 1].seed,
+        });
+    }
+
+    /// The seed presenting a combination (positions relative to the member start `node_offset`)
+    fn seed(c: *const Combinations, found: Combo, node_offset: u32) resolve.Error!Seed {
+        const last = found.steps[found.steps.len - 1];
+        const enclosing = try c.r.arena.alloc(Seed.LoopIteration, found.steps.len - 1);
+        for (found.steps[0 .. found.steps.len - 1], 0..) |s, i| enclosing[i] = .{ .offset = node_offset + c.body.range(s.expr).start, .iteration = s.seed.index };
+        return .{
+            .res = found.res,
+            .inst = c.inst,
+            .file = c.owner.file,
+            .offset = node_offset + c.body.range(last.expr).start,
+            .iteration = last.seed.index,
+            .enclosing = enclosing,
+        };
+    }
 };
 
 /// Inference results of member `item` at position `rel` (relative to the member) under every
 /// instance of the generic function containing it (see `allFound`; each instance once, at its first
 /// call site) whose code at `rel` executes, in discovery order. In a region inferred per iteration
-/// (see `iterationResults`), the results of each iteration of the abstract inference `res` and of
-/// every instance. Used where an answer must cover all instances, such as goto, which lists the
-/// target under each of them.
+/// (see `iterationResults`), the results of each combination of iterations of the abstract
+/// inference `res` and of every instance. Used where an answer must cover all instances, such as
+/// goto, which lists the target under each of them.
 pub fn allSeeds(r: *Resolver, file: FileId, item: u32, body: *const Body, res: *const infer.Result, rel: u32) resolve.Error![]const Seed {
     if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return &.{};
     const owner = try r.ownerKey(file, item);
@@ -230,60 +367,52 @@ pub fn allSeeds(r: *Resolver, file: FileId, item: u32, body: *const Body, res: *
         if (instance) |s| if (!inactiveAt(body, s.res, rel)) try out.append(r.arena, s);
         if (inst_res.exprs.len != body.exprs.len) continue;
         const inst = if (instance) |s| s.inst else null;
-        const per = try iterationResults(r, owner, body, inst_res, inst, rel);
-        for (per.results, 0..) |it, idx| {
-            if (inactiveAt(body, it, rel)) continue;
-            try out.append(r.arena, .{ .res = it, .inst = inst, .file = file, .offset = node_offset + per.start, .iteration = @intCast(idx) });
+        const per = try iterationCombinations(r, owner, body, inst_res, inst, rel);
+        for (per.found) |it| {
+            if (inactiveAt(body, it.res, rel)) continue;
+            try out.append(r.arena, try per.combos.seed(it, node_offset));
         }
     }
     return out.items;
 }
 
-/// Per-iteration inference results of a region inferred per iteration
-pub const Iterations = struct {
-    /// Start of the loop or switch (relative to the member)
-    start: u32 = 0,
-    results: []const *const infer.Result = &.{},
-};
+/// The regions inferred per iteration of a member body, in expression order
+fn allRegions(r: *Resolver, body: *const Body) resolve.Error![]const Region {
+    var out: std.ArrayList(Region) = .empty;
+    for (body.exprs, 0..) |expr, ei| {
+        const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(ei)));
+        switch (expr) {
+            .loop => |loop| if (loop.kind == .@"for") try out.append(r.arena, .{ .expr = id, .range = body.range(loop.body) }),
+            .@"switch" => |sw| for (sw.prongs, 0..) |prong, pi| {
+                if (prong.is_inline and prong.capture.len > 0) try out.append(r.arena, .{ .expr = id, .prong = @intCast(pi), .range = body.range(prong.body) });
+            },
+            else => {},
+        }
+    }
+    return out.items;
+}
 
-/// Per-iteration inference results, under instance `inst` (whose result is `res`), of the innermost
-/// region containing `rel` (relative to the member) that is inferred per iteration: a loop whose
-/// loop variable differs per iteration (see `iterations`), or an `inline` switch prong (see
-/// `prongIterations`); empty when there is none. As in `Refiner`, the first loop variable that needs
-/// it is chosen, and Infer refines the other captures of the same loop along with it.
-pub fn iterationResults(r: *Resolver, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, rel: u32) resolve.Error!Iterations {
-    var best: ?struct { expr: Body.ExprId, binding: u32, n: u32 } = null;
-    var best_len: u32 = std.math.maxInt(u32);
-    for (body.exprs, 0..) |expr, ei| switch (expr) {
-        .loop => |loop| if (loop.kind == .@"for") {
-            const range = body.range(loop.body);
-            if (rel < range.start or rel > range.end or range.end - range.start >= best_len) continue;
-            for (loop.capture, 0..) |capture, k| {
-                const n = try iterations(r, res, loop, k) orelse continue;
-                best = .{ .expr = @fromBackingInt(@as(u32, @intCast(ei))), .binding = @backingInt(capture), .n = n };
-                best_len = range.end - range.start;
-                break;
-            }
-        },
-        .@"switch" => |sw| for (sw.prongs, 0..) |prong, pi| {
-            if (!prong.is_inline or prong.capture.len == 0) continue;
-            const range = body.range(prong.body);
-            if (rel < range.start or rel > range.end or range.end - range.start >= best_len) continue;
-            const n = try prongIterations(r, body, res, sw, @intCast(pi)) orelse continue;
-            best = .{ .expr = @fromBackingInt(@as(u32, @intCast(ei))), .binding = @backingInt(prong.capture[0]), .n = n };
-            best_len = range.end - range.start;
-        },
-        else => {},
-    };
-    const b = best orelse return .{};
-    const out = try r.arena.alloc(*const infer.Result, b.n);
-    for (out, 0..) |*o, idx| o.* = try r.ctx.get(queries.Infer, .{
-        .owner = owner,
-        .mode = .full,
-        .inst = inst,
-        .loop = .{ .binding = b.binding, .index = @intCast(idx) },
-    });
-    return .{ .start = body.range(b.expr).start, .results = out };
+const IterationCombinations = struct { combos: Combinations, found: []const Combinations.Combo };
+
+fn iterationCombinations(r: *Resolver, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, rel: u32) resolve.Error!IterationCombinations {
+    var chain: std.ArrayList(Region) = .empty;
+    for (try allRegions(r, body)) |region| if (rel >= region.range.start and rel <= region.range.end) try chain.append(r.arena, region);
+    std.mem.sort(Region, chain.items, {}, Region.outerFirst);
+    var combos: Combinations = .{ .r = r, .owner = owner, .body = body, .inst = inst, .chain = chain.items };
+    var found: std.ArrayList(Combinations.Combo) = .empty;
+    try combos.all(res, &found);
+    return .{ .combos = combos, .found = found.items };
+}
+
+/// Inference results, under instance `inst` (whose result is `res`), of every combination of
+/// iterations of the regions containing `rel` (relative to the member) that are inferred per
+/// iteration (see `Combinations`): loops whose loop variable differs per iteration (see
+/// `iterations`), and `inline` switch prongs (see `prongIterations`); empty when there is none.
+pub fn iterationResults(r: *Resolver, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, rel: u32) resolve.Error![]const *const infer.Result {
+    const per = try iterationCombinations(r, owner, body, res, inst, rel);
+    const out = try r.arena.alloc(*const infer.Result, per.found.len);
+    for (per.found, out) |it, *o| o.* = it.res;
+    return out;
 }
 
 /// Number of per-value inferences for an `inline` switch prong (the `pi`-th of `sw`), when the
