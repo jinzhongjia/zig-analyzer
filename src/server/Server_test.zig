@@ -260,6 +260,40 @@ test "close: non-file documents clear diagnostics on the client URI" {
     }
 }
 
+// Prevents a closed non-file document from keeping the diagnostics of its open text: the result
+// computed on open was sent after the close, and the clearing requested by the close was skipped
+test "close: a non-file document is cleared when the result computed on open is sent after the close" {
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    var gate: Server.PublishGate = .{};
+    h.server.publish_gate = &gate;
+    // Lets the held publish finish when the test fails before releasing it
+    defer gate.release.set(testing.io);
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    const untitled = "untitled:Untitled-1";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = untitled, .languageId = "zig", .version = 1, .text = "fn f() void {\n    var x = 1;\n}\n" } });
+    // The publish started on open has computed its result from the open text and sent nothing
+    try gate.entered.wait(testing.io);
+    try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = untitled } });
+    // Answered after the main loop has handled the close
+    _ = try h.request("zig-analyzer/status", {});
+    gate.release.set(testing.io);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const published = try h.notifications("textDocument/publishDiagnostics");
+    for (published) |n| try testing.expectEqualStrings(untitled, n.object.get("params").?.object.get("uri").?.string);
+    // The result held at the gate, then the clearing requested by the close
+    try testing.expectEqual(2, published.len);
+    try testing.expectEqual(1, published[0].object.get("params").?.object.get("diagnostics").?.array.items.len);
+    try testing.expectEqual(0, published[1].object.get("params").?.object.get("diagnostics").?.array.items.len);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "syntax features end to end" {
     var s: Session = undefined;
     try s.run(frame(
