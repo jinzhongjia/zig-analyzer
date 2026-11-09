@@ -104,7 +104,9 @@ const ContainerNames = struct {
         try w.writeAll(".");
     }
 
-    /// Contents of an anonymous container: layout, kind and fields (only names for enums)
+    /// Contents of an anonymous container: layout, kind and fields. An enum shows what its
+    /// declaration gives it: the tag type of `enum(T)`, the members with the values written for
+    /// them (as evaluated), and `_` when it is non-exhaustive (`enum(u8) { a = 1, b, _ }`).
     fn writeContent(n: ContainerNames, c: InternPool.Container, w: *Io.Writer) Io.Writer.Error!void {
         if (n.anonymous) |seen| seen.* = true;
         const tree = n.r.itemTree(c.file) catch return w.writeAll(@tagName(c.kind));
@@ -112,33 +114,53 @@ const ContainerNames = struct {
             if (x.ast_id == c.ast_id) break i;
         } else return w.writeAll(@tagName(c.kind));
         const x = tree.containers[ci];
+        const ip = n.r.ctx.db.env.ip;
         if (x.layout != .auto) try w.print("{t} ", .{x.layout});
         try w.writeAll(@tagName(c.kind));
         if (x.auto_enum) try w.writeAll("(enum)");
+        if (c.kind == .@"enum") {
+            const tag = eval.writtenTagType(n.r, .{ .file = c.file, .container = @intCast(ci) }, c.inst) catch .unknown;
+            if (tag) |t| {
+                try w.writeAll("(");
+                try ip.print(t, w, n);
+                try w.writeAll(")");
+            }
+        }
         if (n.full) {
             var o = n.outer;
             while (o) |up| : (o = up.parent) if (up.c.file == c.file and up.c.ast_id == c.ast_id) return w.writeAll(" {...}");
         } else if (n.outer != null) return w.writeAll(" {...}");
         const here: Outer = .{ .c = c, .parent = n.outer };
         const inner: ContainerNames = .{ .r = n.r, .outer = &here, .anonymous = n.anonymous, .full = n.full, .max_length = n.max_length, .show_total = n.show_total };
-        const ip = n.r.ctx.db.env.ip;
         try w.writeAll(" {");
         const members = tree.containerMembers(@intCast(ci));
         var total: usize = 0;
         for (members) |m| total += @intFromBool(tree.items[m].kind == .field);
         var count: usize = 0;
-        for (members) |m| {
+        const cut = for (members) |m| {
             const it = tree.items[m];
             if (it.kind != .field) continue;
             try w.writeAll(if (count == 0) " " else ", ");
             count += 1;
-            if (try InternPool.truncateList(n, w, total)) break;
+            if (try InternPool.truncateList(n, w, total)) break true;
             // Tuple fields have no names
             if (it.name) |field| try w.print("{f}", .{std.zig.fmtId(field)});
-            if (c.kind == .@"enum") continue;
+            if (c.kind == .@"enum") {
+                const v = eval.writtenEnumValue(n.r, c.file, m, c.inst) catch .unknown;
+                if (v) |val| {
+                    try w.writeAll(" = ");
+                    try ip.print(val, w, inner);
+                }
+                continue;
+            }
             if (it.name != null) try w.writeAll(": ");
             const tv = queries.defType(n.r, .{ .item = .{ .file = c.file, .item = m } }, null, c.inst) catch TypedValue.unknown;
             try ip.print(tv.ty, w, inner);
+        } else false;
+        // `_` is the last member of a non-exhaustive enum
+        if (x.nonexhaustive and !cut) {
+            try w.writeAll(if (count == 0) " _" else ", _");
+            count += 1;
         }
         try w.writeAll(if (count == 0) "}" else " }");
     }
@@ -442,6 +464,11 @@ const QualifiedNames = struct {
             .simple_value => |s| try q.w.writeAll(if (s == .void) "{}" else @tagName(s)),
             .enum_literal => |n| try q.w.print(".{s}", .{n}),
             .enum_tag => |tag| try q.w.print(".{s}", .{tag.name}),
+            .enum_unnamed => |u| {
+                try q.w.writeAll("@fromBackingInt(");
+                try q.writeValue(u.int);
+                try q.w.writeAll(")");
+            },
             .error_value => |n| try q.w.print("error.{s}", .{n}),
             else => try q.writeType(v),
         }

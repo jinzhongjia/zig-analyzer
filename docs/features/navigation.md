@@ -13,10 +13,13 @@ Hover, inlay hints, and completion details share `render.zig`.
 - A container that is the value of a member is named after the member, also when an `if` / `switch` chooses among several (more readable than the compiler's `S__struct_1`).
 - A `return`ed container is named after the function and its comptime arguments (`List(u8)`), and one named inside a generic instance is qualified as the compiler names it (`Outer(u8).Inner`).
 - Containers without a name in the source are displayed by their contents; a self-reference is `struct {...}`, so expansion always ends.
+- An enum displayed by its contents keeps what its declaration gives it: the tag type of `enum(T)`, the values written for members (as evaluated), and `_` when it is non-exhaustive (`enum(u8) { a = 1, b, _ }`). An enum constructed by `@Enum` shows its tag type and the value of every member.
 
 ## Value display
 
 A declaration is displayed as `const x: T = v`. At a reference, `T` is the reference's own type, not its coerced result type. A tuple or anonymous struct with only comptime fields shows just the value.
+
+A value of a non-exhaustive enum that no member has is shown as the compiler prints it, `@fromBackingInt(15)`; one a member has is that member (`.b`).
 
 - **Hover and completion details** list types in full, without truncation. Values are cut at about 2000 characters (`render.max_value_length`), marked by `…` and the full size.
 - **Layout**: completion details keep a value on one line. Hover breaks a value that does not fit in 80 columns, with each item of a `.{ ... }` list on its own line and broken the same way; lists of atoms such as numbers and strings fill their lines. Types stay on one line.

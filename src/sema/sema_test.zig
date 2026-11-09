@@ -5046,6 +5046,127 @@ test "the _ of a non-exhaustive enum is not a field" {
     });
 }
 
+test "values of non-exhaustive enums that no member has are comptime values" {
+    // Prevents `@enumFromInt` / `@fromBackingInt` giving up on them; expected values are the
+    // results of zig 0.17.0 and 0.17.1, which agree
+    try expectTypes(
+        \\const E = enum(u8) { a = 10, b, c = 20, _ };
+        \\const Neg = enum(i8) { m = -1, _ };
+        \\fn pick(e: E) u8 {
+        \\    return switch (e) {
+        \\        .a => 1,
+        \\        else => 2,
+        \\        _ => 3,
+        \\    };
+        \\}
+        \\fn Gen(comptime e: E) type {
+        \\    return struct {
+        \\        pub const v = e;
+        \\    };
+        \\}
+        \\const unnamed: E = @enumFromInt(15);
+        \\const backed: E = @fromBackingInt(@as(u8, 15));
+        \\const named: E = @fromBackingInt(@as(u8, 11));
+        \\const negative: Neg = @enumFromInt(-100);
+        \\const out_of_range: E = @enumFromInt(300);
+        \\const backing = @backingInt(@as(E, @enumFromInt(15)));
+        \\const from_enum = @intFromEnum(@as(E, @enumFromInt(200)));
+        \\const negative_int = @intFromEnum(@as(Neg, @enumFromInt(-100)));
+        \\const eq = @as(E, @enumFromInt(15)) == @as(E, @enumFromInt(15));
+        \\const ne = @as(E, @enumFromInt(15)) == @as(E, @enumFromInt(16));
+        \\const eq_named = @as(E, @enumFromInt(11)) == E.b;
+        \\const eq_literal = @as(E, @enumFromInt(15)) == .a;
+        \\const list = [_]E{ @enumFromInt(15), .a, @enumFromInt(255) };
+        \\const ptr: *const E = &@as(E, @enumFromInt(15));
+        \\const under = switch (@as(E, @enumFromInt(15))) {
+        \\    .a => 1,
+        \\    .b => 2,
+        \\    .c => 3,
+        \\    _ => 4,
+        \\};
+        \\const under_first = switch (@as(E, @enumFromInt(20))) {
+        \\    _ => 4,
+        \\    .a => 1,
+        \\    .b => 2,
+        \\    .c => 3,
+        \\};
+        \\const under_item = switch (@as(E, @enumFromInt(99))) {
+        \\    .a, .b => 1,
+        \\    .c, _ => 2,
+        \\};
+        \\const else_only = switch (@as(E, @enumFromInt(15))) {
+        \\    .a => 1,
+        \\    else => 2,
+        \\};
+        \\const else_and_under_unnamed = pick(@enumFromInt(15));
+        \\const else_and_under_named = pick(.b);
+        \\const arg = Gen(@enumFromInt(15)).v;
+        \\const name = @typeName(Gen(@enumFromInt(15)));
+    , &.{
+        .{ "unnamed", "E = @fromBackingInt(15)" },
+        .{ "backed", "E = @fromBackingInt(15)" },
+        // A value a member has is that member
+        .{ "named", "E = .b" },
+        .{ "negative", "Neg = @fromBackingInt(-100)" },
+        // A compile error: 300 does not fit the tag type
+        .{ "out_of_range", "E" },
+        .{ "backing", "u8 = 15" },
+        .{ "from_enum", "u8 = 200" },
+        .{ "negative_int", "i8 = -100" },
+        .{ "eq", "bool = true" },
+        .{ "ne", "bool = false" },
+        .{ "eq_named", "bool = true" },
+        .{ "eq_literal", "bool = false" },
+        .{ "list", "[3]E = .{ @fromBackingInt(15), .a, @fromBackingInt(255) }" },
+        .{ "ptr", "*const E = &@fromBackingInt(15)" },
+        // `_` takes the values no member has, wherever it is among the prongs
+        .{ "under", "comptime_int = 4" },
+        .{ "under_first", "comptime_int = 3" },
+        .{ "under_item", "comptime_int = 2" },
+        // Without `_`, `else` takes them
+        .{ "else_only", "comptime_int = 2" },
+        // With both, `else` takes the members not listed and `_` the values no member has
+        .{ "else_and_under_unnamed", "u8 = 3" },
+        .{ "else_and_under_named", "u8 = 2" },
+        .{ "arg", "E = @fromBackingInt(15)" },
+        .{ "name", "*const [29:0]u8 = \"main.Gen(@fromBackingInt(15))\"" },
+    });
+}
+
+test "anonymous enums display their tag type, the values written for members and _" {
+    // Prevents displaying them by member names only (`enum { a }` for `enum(u8) { a, _ }`);
+    // values are as zig 0.17.0 and 0.17.1 evaluate them
+    try expectTypes(
+        \\const exhaustive: enum(u4) { a = 3, b = 5 } = .b;
+        \\const plain: enum { x, y } = .y;
+        \\const open: enum(u8) { a, _ } = .a;
+        \\const open_unnamed: enum(u8) { a, _ } = @enumFromInt(7);
+        \\const partial: enum(u8) { a = 1, b, c = 7 } = .c;
+        \\const evaluated: enum(u8) { a = 1 << 3, b, c = 0x20 } = .b;
+        \\const empty: enum(u8) { _ } = @enumFromInt(3);
+        \\const signed: enum(i8) { a = -1, b, _ } = @enumFromInt(-5);
+        \\const optional: ?enum(u2) { a, b } = .b;
+        \\const reified: @Enum(u8, .nonexhaustive, &.{ "x", "y" }, &.{ 1, 4 }) = .y;
+        \\const reified_unnamed: @Enum(u8, .nonexhaustive, &.{"x"}, &.{1}) = @enumFromInt(9);
+        \\const reified_exhaustive: @Enum(u2, .exhaustive, &.{ "x", "y" }, &.{ 0, 1 }) = .x;
+    , &.{
+        .{ "exhaustive", "enum(u4) { a = 3, b = 5 } = .b" },
+        .{ "plain", "enum { x, y } = .y" },
+        .{ "open", "enum(u8) { a, _ } = .a" },
+        .{ "open_unnamed", "enum(u8) { a, _ } = @fromBackingInt(7)" },
+        // Only the values written are shown, as evaluated
+        .{ "partial", "enum(u8) { a = 1, b, c = 7 } = .c" },
+        .{ "evaluated", "enum(u8) { a = 8, b, c = 32 } = .b" },
+        .{ "empty", "enum(u8) { _ } = @fromBackingInt(3)" },
+        .{ "signed", "enum(i8) { a = -1, b, _ } = @fromBackingInt(-5)" },
+        .{ "optional", "?enum(u2) { a, b } = .b" },
+        // `@Enum` gives every member its value
+        .{ "reified", "enum(u8) { x = 1, y = 4, _ } = .y" },
+        .{ "reified_unnamed", "enum(u8) { x = 1, _ } = @fromBackingInt(9)" },
+        .{ "reified_exhaustive", "enum(u2) { x = 0, y = 1 } = .x" },
+    });
+}
+
 test "@typeInfo lists error names in declaration order" {
     // Prevents listing `error_names` sorted by their bytes; expected values are the results of
     // zig 0.17.0, which sorts only the names in `@typeName`

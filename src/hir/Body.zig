@@ -247,6 +247,12 @@ pub fn nameRefIsEscaped(b: *const Body, id: ExprId) bool {
     return span.end - span.start > b.expr(id).name_ref.len;
 }
 
+/// An unquoted `_`: as a switch prong item it is the `_` prong of a non-exhaustive enum, which
+/// takes the values no member has (`@"_"` is a name)
+pub fn isUnderscore(b: *const Body, id: ExprId) bool {
+    return b.expr(id) == .name_ref and std.mem.eql(u8, b.expr(id).name_ref, "_") and !b.nameRefIsEscaped(id);
+}
+
 /// Unquoted primitive type / primitive value name: built into the language, never resolved to a
 /// declaration with the same name (`@"u32"` can be the name of a declaration)
 pub fn nameRefIsBuiltin(b: *const Body, id: ExprId) bool {

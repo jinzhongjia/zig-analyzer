@@ -800,6 +800,7 @@ const Closure = struct {
             .reified_type => |t| c.importers.contains(t.file) or (if (t.inst) |i| try c.reaches(i) else false) or try c.anyReaches(t.types, &.{}),
             .union_tag_type => |u| c.reaches(u),
             .enum_tag => |e| c.reaches(e.ty),
+            .enum_unnamed => |e| c.reaches(e.ty),
             .fn_value => |f| c.importers.contains(f.file) or (if (f.inst) |i| try c.reaches(i) else false) or try c.reaches(f.ty),
             .aggregate => |a| (try c.reaches(a.ty)) or try c.anyReaches(a.elems, &.{}),
             .bytes => |b| c.reaches(b.ty),
