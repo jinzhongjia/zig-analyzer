@@ -290,7 +290,7 @@ Triggers:
 - `build.zig`, `build.zig.zon`, `zig-analyzer.zon`, or a build script of the project or a dependency package is saved or changes on disk;
 - a configure input declared by `build.zig` changes (the build graph's `path_deps`), as `zig build` repeats configure then;
 - the build configuration changes;
-- the maker crashes: restarted at once, at most 3 times in a row without a completed build, since the crashes it recovers from are races waiting would not avoid;
+- the maker crashes (the 0.17 maker can panic after a build, see [zig-maker-build-request-race.md](zig-maker-build-request-race.md)): restarted at once, at most 3 times in a row without a completed build, since the crashes it recovers from are races waiting would not avoid;
 - the local cache or its `h` directory is deleted or replaced, because the maker writes through handles opened at startup and would otherwise fail silently (checked by inode around each build).
 
 Creating or deleting `build.zig` in a root starts or stops the project.

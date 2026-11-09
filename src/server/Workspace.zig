@@ -533,8 +533,8 @@ fn run(ws: *Workspace) Io.Cancelable!void {
                 configure_exited = true;
                 ws.reportConfigureExit(client);
             } else if (!ws.isStopping()) {
-                // maker crashed (e.g. the 0.17 maker has a race when it receives a new build
-                // request, easily triggered with few cores): restart automatically
+                // maker crashed (the 0.17 maker can panic right after a build, more often with few
+                // cores, see docs/zig-maker-build-request-race.md): restart automatically
                 ws.mutex.lockUncancelable(ws.server.io);
                 const next = if (ws.built) 1 else ws.crash_restarts + 1;
                 ws.mutex.unlock(ws.server.io);
