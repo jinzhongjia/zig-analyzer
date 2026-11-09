@@ -268,7 +268,7 @@ test "close: a non-file document is cleared when the result computed on open is 
     var h: Harness = undefined;
     try h.start();
     defer h.finish();
-    var gate: Server.PublishGate = .{};
+    var gate: Server.OnceGate = .{};
     h.server.publish_gate = &gate;
     // Lets the held publish finish when the test fails before releasing it
     defer gate.release.set(testing.io);

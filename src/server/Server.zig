@@ -69,9 +69,10 @@ test_gate: ?*TestGate = null,
 /// source files keep being created during every walk, so that a scan is always pending; always
 /// false outside tests
 test_rescan: std.atomic.Value(bool) = .init(false),
-/// Test hook: holds a computed diagnostics result before it is sent (see `PublishGate`); always
-/// null outside tests
-publish_gate: ?*PublishGate = null,
+/// Test hook: holds the first diagnostics result that reaches `sendDiagnostics` (its read
+/// transaction has ended, nothing of it has been sent), so that a test can change server state
+/// between computing and sending a publish; always null outside tests
+publish_gate: ?*OnceGate = null,
 /// Test hook: holds the reading task of a project once when the maker's stream has ended, before
 /// the exit is handled (see `Workspace.ExitPause`); always null outside tests
 maker_exit_pause: std.atomic.Value(?*Workspace.ExitPause) = .init(null),
@@ -451,16 +452,15 @@ pub const TestGate = struct {
     }
 };
 
-/// Test hook: the first diagnostics result that reaches `sendDiagnostics` (its read transaction
-/// has ended, nothing of it has been sent) stops there until `release` is set, so that a test can
-/// change server state between computing and sending a publish. Later results pass.
-pub const PublishGate = struct {
-    /// Set when a result stops at the gate
+/// Test hook: the first time the server reaches the point the gate is placed at (`publish_gate`),
+/// it stops there until `release` is set; later times pass
+pub const OnceGate = struct {
+    /// Set when the server stops at the gate
     entered: Io.Event = .unset,
     release: Io.Event = .unset,
     held: std.atomic.Value(bool) = .init(false),
 
-    fn pass(gate: *PublishGate, io: Io) void {
+    fn pass(gate: *OnceGate, io: Io) void {
         if (gate.held.swap(true, .acq_rel)) return;
         gate.entered.set(io);
         gate.release.waitUncancelable(io);
