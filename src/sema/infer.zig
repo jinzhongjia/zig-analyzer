@@ -984,7 +984,9 @@ const Inferrer = struct {
             .null_type, .undefined_type => return .{ .ty = want, .val = tv.val },
             else => {},
         }
-        if (target != want and tv.ty == target) return .{ .ty = want, .val = tv.val };
+        // A value of `T` coerced to `?T` is the payload of a non-null optional (a null `?u8`
+        // coerced to `??u8` is not null)
+        if (target != want and tv.ty == target) return .{ .ty = want, .val = if (tv.val) |v| try value.wrapOptional(ip, want, v) else null };
         // An error coerced to an error union keeps its value, which marks the union as failed; a
         // payload keeps its value coerced to the payload type, which marks the union as successful
         if (tv.val) |v| switch (ip.key(want)) {
@@ -1181,7 +1183,7 @@ const Inferrer = struct {
                     else => .unknown,
                 };
                 // A known non-null optional value is its payload value
-                return .{ .ty = child, .val = if (child != .unknown and inf.condValue(o) == true) o.val else null };
+                return .{ .ty = child, .val = if (child != .unknown and inf.condValue(o) == true) value.optionalPayload(ip, o.val.?) else null };
             },
             .init => |x| {
                 if (x.ty == null) if (expected) |want| try inf.noteExpected(e, want);
@@ -1718,8 +1720,15 @@ const Inferrer = struct {
     /// comptime-known comparison
     fn compare(inf: *Inferrer, op: SyntaxKind, lhs: TypedValue, rhs: TypedValue) Error!?bool {
         const ip = inf.ip;
-        const a = lhs.val orelse return null;
-        const b = rhs.val orelse return null;
+        var a = lhs.val orelse return null;
+        var b = rhs.val orelse return null;
+        // Optionals of different depths are compared at the deeper one, their peer type: a null
+        // `?u8` equals a `??u8` holding it
+        switch (value.deeperOptional(ip, lhs.ty, rhs.ty)) {
+            .lhs => b = try value.coerceValueFrom(ip, b, rhs.ty, lhs.ty) orelse return null,
+            .rhs => a = try value.coerceValueFrom(ip, a, lhs.ty, rhs.ty) orelse return null,
+            .neither => {},
+        }
         if (value.intOf(ip, a)) |x| if (value.intOf(ip, b)) |y| return value.compareInts(ip, op, lhs.ty, rhs.ty, x, y);
         if (ip.key(a) == .float_value or ip.key(b) == .float_value) if (value.floatOf(ip, a)) |x| if (value.floatOf(ip, b)) |y| return order(op, x, y);
         if (lhs.ty == .comptime_int_type or rhs.ty == .comptime_int_type) {
@@ -2711,7 +2720,7 @@ const Inferrer = struct {
         const is_ptr = inf.body.binding(cap).is_ptr;
         if (is_ptr and inf.var_levels.len != 0) if (try inf.comptimeVarPlace(cond_e)) |v| inf.untrackComptimeVar(v);
         // A known non-null optional value is its payload value
-        const val: ?Index = if (!is_ptr and source == .if_then and ip.key(cond) == .optional_type and inf.condValue(cond_tv) == true) cond_tv.val else null;
+        const val: ?Index = if (!is_ptr and source == .if_then and ip.key(cond) == .optional_type and inf.condValue(cond_tv) == true) value.optionalPayload(ip, cond_tv.val.?) else null;
         if (!is_ptr) {
             inf.bindings[@backingInt(cap)] = .{ .ty = t, .val = val };
             return;
@@ -2902,7 +2911,7 @@ const Inferrer = struct {
                 // taken gets only the result type of the whole expression
                 const non_null = inf.condValue(lhs);
                 const rhs = try inf.inferBranch(rhs_e, inf.fallbackType(expected, if (non_null == false) .unknown else child, rhs_e), non_null == true);
-                if (non_null) |n| return if (n) .{ .ty = child, .val = lhs.val } else rhs;
+                if (non_null) |n| return if (n) .{ .ty = child, .val = value.optionalPayload(ip, lhs.val.?) } else rhs;
                 return .{ .ty = try inf.peer(&.{ child, rhs.ty }) };
             },
             .keyword_and, .keyword_or => {
@@ -4567,7 +4576,7 @@ pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args:
                 if (out.* == .unknown) continue;
                 const pt = paramType(f, i) orelse .unknown;
                 if (value.isConcrete(ip, pt)) {
-                    out.* = (try value.coerceValue(ip, out.*, pt)) orelse .unknown;
+                    out.* = (try value.coerceValueFrom(ip, out.*, tv.ty, pt)) orelse .unknown;
                 } else dependent = true;
             },
         }
@@ -4579,7 +4588,7 @@ pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args:
     for (inst_args, 0..) |*out, i| {
         if (g.kinds[i] != .comptime_value or out.* == .unknown or value.isConcrete(ip, paramType(f, i) orelse .unknown)) continue;
         const pt = instParamType(sig, g.body, i) orelse continue;
-        const coerced = (try value.coerceValue(ip, out.*, pt)) orelse .unknown;
+        const coerced = (try value.coerceValueFrom(ip, out.*, if (i < args.len) args[i].ty else .unknown, pt)) orelse .unknown;
         if (coerced != out.*) {
             out.* = coerced;
             changed = true;

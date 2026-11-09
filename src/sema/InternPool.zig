@@ -351,6 +351,11 @@ pub const Key = union(enum) {
     union_value: struct { ty: Index, tag: []const u8, payload: Index },
     /// Single-item pointer to a comptime value
     ptr_value: struct { ty: Index, pointee: Index },
+    /// A non-null value of optional type `ty` whose payload is itself represented as `null_value`
+    /// (or as another `opt_payload`), such as a `??u8` holding a null `?u8`. Every other non-null
+    /// optional is represented by its payload value, and `null_value` is the null of every
+    /// optional type: without this key, such a value would be the same as the null of `ty`.
+    opt_payload: struct { ty: Index, payload: Index },
 
     /// One instantiation of a generic function: the function + the value of each parameter (the
     /// argument value for comptime parameters, unknown when it is not known; the argument type
@@ -1262,6 +1267,8 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("&");
             try ip.print(v.pointee, w, container_name);
         },
+        // Matches the compiler, which prints a non-null optional as its payload
+        .opt_payload => |v| try ip.print(v.payload, w, container_name),
         .instance, .context => try w.writeAll("instance"),
         .opaque_param => |o| try w.writeAll(o.name),
         .runtime => try w.writeAll("_"),

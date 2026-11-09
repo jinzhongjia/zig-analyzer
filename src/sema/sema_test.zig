@@ -1546,6 +1546,262 @@ test "false payloads are not null or failed" {
     });
 }
 
+test "a non-null optional holding a null optional is not null" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 (a `pub const` of each name,
+    // printed with `std.fmt.comptimePrint("{any}", ...)`); a null `?u8` coerced to `??u8` must
+    // not be evaluated as the null of `??u8`
+    try expectTypes(
+        \\fn wrap(x: ?u8) ??u8 {
+        \\    return x;
+        \\}
+        \\fn wrapLocal(x: ?u8) ??u8 {
+        \\    const r: ??u8 = x;
+        \\    return r;
+        \\}
+        \\fn wrapT(comptime T: type, x: T) ?T {
+        \\    return x;
+        \\}
+        \\fn isNullOuter(x: ??u8) bool {
+        \\    return x == null;
+        \\}
+        \\fn optParam(comptime T: type, x: ?T) bool {
+        \\    return x == null;
+        \\}
+        \\fn viaAnytype(x: anytype) bool {
+        \\    const y: ??u8 = x;
+        \\    return y == null;
+        \\}
+        \\fn loopCount(o0: ??u8) u8 {
+        \\    var o = o0;
+        \\    var n: u8 = 0;
+        \\    while (o) |y| {
+        \\        n += 1;
+        \\        if (y == null) o = null else o = @as(?u8, null);
+        \\    }
+        \\    return n;
+        \\}
+        \\const inner_null: ?u8 = null;
+        \\const outer_some_null: ??u8 = inner_null;
+        \\const outer_null: ??u8 = null;
+        \\const S = struct { a: ??u8 = inner_null, b: ??u8 = null };
+        \\const S2 = struct { a: ??u8 };
+        \\const ret_eq = wrap(null) == null;
+        \\const ret_local_eq = wrapLocal(null) == null;
+        \\const as_eq = @as(??u8, inner_null) == null;
+        \\const some_eq = outer_some_null == null;
+        \\const some_ne = outer_some_null != null;
+        \\const outer_eq = outer_null == null;
+        \\const shown = outer_some_null;
+        \\const unwrapped = outer_some_null.?;
+        \\const unwrapped_eq = outer_some_null.? == null;
+        \\const orelse_eq = (outer_some_null orelse @as(?u8, 7)) == null;
+        \\const orelse_outer = (outer_null orelse @as(?u8, 7)).?;
+        \\const if_capture = if (outer_some_null) |y| y == null else false;
+        \\const if_outer = if (outer_null) |_| 1 else 2;
+        \\const while_capture = blk: {
+        \\    var n: u8 = 0;
+        \\    var it: ??u8 = inner_null;
+        \\    while (it) |y| : (it = null) {
+        \\        if (y == null) n += 1;
+        \\    }
+        \\    break :blk n;
+        \\};
+        \\const loop_some_null = loopCount(inner_null);
+        \\const loop_five = loopCount(@as(?u8, 5));
+        \\const loop_null = loopCount(null);
+        \\const arg = isNullOuter(inner_null);
+        \\const arg_lit = isNullOuter(null);
+        \\const generic_ret = wrapT(?u8, inner_null) == null;
+        \\const generic_param = optParam(?u8, inner_null);
+        \\const generic_param_lit = optParam(?u8, null);
+        \\const anytype_arg = viaAnytype(inner_null);
+        \\const anytype_lit = viaAnytype(null);
+        \\const default_a = (S{}).a == null;
+        \\const default_b = (S{}).b == null;
+        \\const init_a = (S2{ .a = inner_null }).a == null;
+        \\const init_lit = (S2{ .a = null }).a == null;
+        \\const elem0 = ([_]??u8{ inner_null, null })[0] == null;
+        \\const elem1 = ([_]??u8{ inner_null, null })[1] == null;
+        \\const triple_inner = blk: {
+        \\    const t: ???u8 = outer_some_null;
+        \\    break :blk t.?.? == null;
+        \\};
+        \\const triple_outer = blk: {
+        \\    const t: ???u8 = outer_some_null;
+        \\    break :blk t == null;
+        \\};
+        \\const mixed_some = outer_some_null == inner_null;
+        \\const mixed_outer = outer_null == inner_null;
+        \\const mixed_rev = inner_null == outer_some_null;
+        \\const ptr_payload = blk: {
+        \\    var o: ??u8 = @as(?u8, 5);
+        \\    if (o) |*p| p.* = null;
+        \\    break :blk o == null;
+        \\};
+        \\const ptr_payload_inner = blk: {
+        \\    var o: ??u8 = @as(?u8, 5);
+        \\    if (o) |*p| p.* = null;
+        \\    break :blk o.? == null;
+        \\};
+        \\const view_payload = blk: {
+        \\    var o: ??u8 = @as(?u8, null);
+        \\    _ = &o;
+        \\    if (o) |*p| {
+        \\        const v: *[1]?u8 = p;
+        \\        break :blk v[0] == null;
+        \\    }
+        \\    break :blk false;
+        \\};
+        \\const view_payload_deref = blk: {
+        \\    var o: ??u8 = @as(?u8, null);
+        \\    _ = &o;
+        \\    if (o) |*p| {
+        \\        const v: *[1]?u8 = p;
+        \\        break :blk v.*[0] == null;
+        \\    }
+        \\    break :blk false;
+        \\};
+        \\const view_payload_write = blk: {
+        \\    var o: ??u8 = @as(?u8, null);
+        \\    if (o) |*p| {
+        \\        const v: *[1]?u8 = p;
+        \\        v[0] = 5;
+        \\    }
+        \\    break :blk o.?.?;
+        \\};
+        \\const assign_unwrap = blk: {
+        \\    var o: ??u8 = @as(?u8, 5);
+        \\    o.? = null;
+        \\    break :blk o == null;
+        \\};
+        \\const eu_payload = blk: {
+        \\    const e: anyerror!??u8 = inner_null;
+        \\    const v = e catch unreachable;
+        \\    break :blk v == null;
+        \\};
+        \\const opt_eu = blk: {
+        \\    const x: anyerror!?u8 = inner_null;
+        \\    const o: ?(anyerror!?u8) = x;
+        \\    break :blk o == null;
+        \\};
+        \\const opt_eu_payload = blk: {
+        \\    const x: anyerror!?u8 = inner_null;
+        \\    const o: ?(anyerror!?u8) = x;
+        \\    const p = o.? catch unreachable;
+        \\    break :blk p == null;
+        \\};
+        \\const ptr_keep = blk: {
+        \\    const a: ?*u8 = null;
+        \\    const b: ?*const u8 = a;
+        \\    break :blk b == null;
+        \\};
+    , &.{
+        .{ "ret_eq", "bool = false" },
+        .{ "ret_local_eq", "bool = false" },
+        .{ "as_eq", "bool = false" },
+        .{ "some_eq", "bool = false" },
+        .{ "some_ne", "bool = true" },
+        .{ "outer_eq", "bool = true" },
+        // Printed as its payload, as the compiler does
+        .{ "shown", "??u8 = null" },
+        .{ "unwrapped", "?u8 = null" },
+        .{ "unwrapped_eq", "bool = true" },
+        .{ "orelse_eq", "bool = true" },
+        .{ "orelse_outer", "u8 = 7" },
+        .{ "if_capture", "bool = true" },
+        .{ "if_outer", "comptime_int = 2" },
+        .{ "while_capture", "u8 = 1" },
+        .{ "loop_some_null", "u8 = 1" },
+        .{ "loop_five", "u8 = 2" },
+        .{ "loop_null", "u8 = 0" },
+        .{ "arg", "bool = false" },
+        .{ "arg_lit", "bool = true" },
+        .{ "generic_ret", "bool = false" },
+        .{ "generic_param", "bool = false" },
+        .{ "generic_param_lit", "bool = true" },
+        .{ "anytype_arg", "bool = false" },
+        .{ "anytype_lit", "bool = true" },
+        .{ "default_a", "bool = false" },
+        .{ "default_b", "bool = true" },
+        .{ "init_a", "bool = false" },
+        .{ "init_lit", "bool = true" },
+        .{ "elem0", "bool = false" },
+        .{ "elem1", "bool = true" },
+        .{ "triple_inner", "bool = true" },
+        .{ "triple_outer", "bool = false" },
+        // Compared at the peer type `??u8`
+        .{ "mixed_some", "bool = true" },
+        .{ "mixed_outer", "bool = false" },
+        .{ "mixed_rev", "bool = true" },
+        .{ "ptr_payload", "bool = false" },
+        .{ "ptr_payload_inner", "bool = true" },
+        // A payload pointer coerced to `*[1]?u8` reads and writes the payload through the view
+        .{ "view_payload", "bool = true" },
+        .{ "view_payload_deref", "bool = true" },
+        .{ "view_payload_write", "u8 = 5" },
+        .{ "assign_unwrap", "bool = false" },
+        .{ "eu_payload", "bool = false" },
+        .{ "opt_eu", "bool = false" },
+        .{ "opt_eu_payload", "bool = true" },
+        // An optional that coerces in memory keeps its null
+        .{ "ptr_keep", "bool = true" },
+    });
+}
+
+test "comptime arguments holding a null optional payload make another instance than null" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1; `Box(inner_null)` must not be
+    // the instance of `Box(null)`
+    try expectTypes(
+        \\fn Box(comptime x: ??u8) type {
+        \\    return struct {
+        \\        pub const v = x;
+        \\    };
+        \\}
+        \\const inner_null: ?u8 = null;
+        \\const distinct = Box(inner_null) == Box(null);
+        \\const some_null = Box(inner_null).v == null;
+        \\const outer_null = Box(null).v == null;
+    , &.{
+        .{ "distinct", "bool = false" },
+        .{ "some_null", "bool = false" },
+        .{ "outer_null", "bool = true" },
+    });
+}
+
+test "a null C pointer coerced to an optional pointer is not null" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1: the compiler represents a null C
+    // pointer as a pointer to address 0, and coercing it to an optional pointer wraps it as the
+    // payload of a non-null optional (`InternPool.getCoerced`)
+    try expectTypes(
+        \\const c_null: [*c]const u8 = null;
+        \\fn takesOpt(o: ?[*]const u8) bool {
+        \\    return o == null;
+        \\}
+        \\const many = blk: {
+        \\    const o: ?[*]const u8 = c_null;
+        \\    break :blk o == null;
+        \\};
+        \\const one = blk: {
+        \\    const o: ?*const u8 = c_null;
+        \\    break :blk o == null;
+        \\};
+        \\const as_many = @as(?[*]const u8, c_null) == null;
+        \\const c_eq = c_null == null;
+        \\const if_taken = blk: {
+        \\    const o: ?[*]const u8 = c_null;
+        \\    break :blk if (o) |_| 1 else 2;
+        \\};
+        \\const param = takesOpt(c_null);
+    , &.{
+        .{ "many", "bool = false" },
+        .{ "one", "bool = false" },
+        .{ "as_many", "bool = false" },
+        .{ "c_eq", "bool = true" },
+        .{ "if_taken", "comptime_int = 1" },
+        .{ "param", "bool = false" },
+    });
+}
+
 test "comptime name builtins produce string literal types" {
     try expectTypes(
         \\const U = union(enum) { a: u8, b: u16 };
