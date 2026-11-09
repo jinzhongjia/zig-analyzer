@@ -1461,6 +1461,55 @@ const RootAliases = struct {
 /// dynamically, with no dependency on the SDK; callbacks run on a serial queue created by this
 /// backend, the received changes are buffered on that queue, and the background task takes them
 /// via `dispatch_sync`.
+/// The IDs of the events a FSEvents stream reports before its HistoryDone event (the changes after
+/// the event it starts at, made before it was registered). FSEvents may report events of this
+/// history again after the HistoryDone event, with the same IDs: an event ID names one change, so
+/// the second report says nothing new. Handled again, the creation of a watch root it reports would
+/// schedule another scan of the workspace.
+const HistoryIds = struct {
+    ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// The largest of `ids`
+    max: u64 = 0,
+    /// The stream is still reporting its history
+    in_history: bool = false,
+
+    /// A stream starts; it reports a history unless it starts at `since_now`
+    fn start(h: *HistoryIds, gpa: Allocator, history: bool) void {
+        h.ids.clearAndFree(gpa);
+        h.max = 0;
+        h.in_history = history;
+    }
+
+    /// The stream has reported its HistoryDone event
+    fn done(h: *HistoryIds) void {
+        h.in_history = false;
+    }
+
+    /// Whether the stream has reported event `id` before; otherwise, during the history, records it
+    fn again(h: *HistoryIds, gpa: Allocator, id: u64) bool {
+        // Some events (the root changed, a volume mounted) carry no ID
+        if (id == 0) return false;
+        if (h.in_history) {
+            // Without memory, the event may be handled twice, which costs a scan at most
+            const gop = h.ids.getOrPut(gpa, id) catch return false;
+            if (gop.found_existing) return true;
+            h.max = @max(h.max, id);
+            return false;
+        }
+        if (h.ids.count() == 0) return false;
+        // Live events arrive in the order of their IDs: after one past the history, none repeats it
+        if (id > h.max) {
+            h.ids.clearAndFree(gpa);
+            return false;
+        }
+        return h.ids.remove(id);
+    }
+
+    fn deinit(h: *HistoryIds, gpa: Allocator) void {
+        h.ids.deinit(gpa);
+    }
+};
+
 const FsEvents = struct {
     const dispatch = std.c.dispatch;
 
@@ -1484,6 +1533,8 @@ const FsEvents = struct {
     /// started, then the latest event it delivered (accessed only on `queue` while the stream
     /// runs)
     reported: u64 = 0,
+    /// The events of the current stream's history (accessed only on `queue` while the stream runs)
+    history: HistoryIds = .{},
     /// Changes received from a replaced stream, already mapped back to the written form with the
     /// roots of that stream (accessed only by the background task; paths are owned by `gpa`)
     carried: std.ArrayList(Event) = .empty,
@@ -1587,6 +1638,7 @@ const FsEvents = struct {
         f.queued.deinit(gpa);
         for (f.carried.items) |e| gpa.free(e.path);
         f.carried.deinit(gpa);
+        f.history.deinit(gpa);
         f.queue.as_object().release();
         f.sem.as_object().release();
         f.lib.close();
@@ -1683,6 +1735,7 @@ const FsEvents = struct {
         }) orelse return error.StartFailed;
         // No callback runs before the stream starts
         f.reported = since;
+        f.history.start(f.gpa, since != since_now);
         s.FSEventStreamSetDispatchQueue(stream, f.queue);
         if (!s.FSEventStreamStart(stream)) {
             s.FSEventStreamInvalidate(stream);
@@ -1726,7 +1779,11 @@ const FsEvents = struct {
         for (paths[0..count], flags_ptr[0..count], ids[0..count]) |p, fl, id| {
             // Some events (the root changed, a volume mounted) carry no ID
             f.reported = @max(f.reported, id);
-            if (fl.history_done) continue;
+            if (fl.history_done) {
+                f.history.done();
+                continue;
+            }
+            if (f.history.again(f.gpa, id)) continue;
             const kind: Event.Kind = if (fl.must_scan_sub_dirs or fl.user_dropped or fl.kernel_dropped)
                 .overflow
             else if (fl.root_changed)
@@ -2352,6 +2409,65 @@ test "FSEvents: a change made just before the stream is replaced is reported" {
 
 // Prevents losing a change made after a file starts being polled but before its first check:
 // the state is recorded when the file joins the polled files, not at the first check
+test "FSEvents history: events of the history reported again after it are recognized" {
+    const gpa = testing.allocator;
+    var h: HistoryIds = .{};
+    defer h.deinit(gpa);
+    h.start(gpa, true);
+    // The history, in no particular order, with an event reported twice in it
+    for ([_]u64{ 325, 343, 334 }) |id| try testing.expect(!h.again(gpa, id));
+    try testing.expect(h.again(gpa, 334));
+    // Events without an ID are never recognized
+    try testing.expect(!h.again(gpa, 0));
+    try testing.expect(!h.again(gpa, 0));
+    h.done();
+    // Live: the history again, and a change between its events that it did not report
+    try testing.expect(h.again(gpa, 325));
+    try testing.expect(!h.again(gpa, 330));
+    try testing.expect(h.again(gpa, 334));
+    try testing.expect(h.again(gpa, 343));
+    // Past the history, nothing is recorded any more
+    try testing.expect(!h.again(gpa, 410));
+    try testing.expectEqual(0, h.ids.count());
+    // A stream starting at `since_now` reports no history
+    h.start(gpa, false);
+    try testing.expect(!h.again(gpa, 500));
+    try testing.expect(!h.again(gpa, 500));
+}
+
+// Prevents a second scan of the workspace: under load, FSEvents reported the creation of the watch
+// root (and of the files in it) before the HistoryDone event and again after it, with the same IDs
+test "FSEvents: events of the history reported again after it are dropped" {
+    if (Native != FsEvents) return error.SkipZigTest;
+    const n = try Native.create(testing.allocator, testing.io);
+    defer n.destroy(testing.allocator);
+    n.history.start(testing.allocator, true);
+    // The order and flags FSEvents used, the last event being a later change to lib.zig
+    var paths = [_][*:0]const u8{ "/p", "/p/lib.zig", "/p/main.zig", "/p", "/p", "/p/main.zig", "/p/lib.zig", "/p/lib.zig" };
+    const raw = [_]u32{ 0x28100, 0x19100, 0x19100, 0x10, 0x28100, 0x19100, 0x19100, 0x19500 };
+    const ids = [_]u64{ 325, 343, 334, 343, 325, 334, 343, 410 };
+    var flags: [raw.len]FsEvents.EventFlags = undefined;
+    for (raw, &flags) |r, *f| f.* = @bitCast(r);
+    FsEvents.callback(undefined, n, paths.len, @ptrCast(&paths), &flags, &ids);
+    var taken = n.takeQueued();
+    defer {
+        for (taken.events.items) |e| testing.allocator.free(e.path);
+        taken.events.deinit(testing.allocator);
+    }
+    const want = [_]Event{
+        .{ .path = "/p", .kind = .dir_created },
+        .{ .path = "/p/lib.zig", .kind = .created },
+        .{ .path = "/p/main.zig", .kind = .created },
+        .{ .path = "/p/lib.zig", .kind = .created },
+    };
+    try testing.expectEqual(want.len, taken.events.items.len);
+    for (want, taken.events.items) |w, e| {
+        try testing.expectEqualStrings(w.path, e.path);
+        try testing.expectEqual(w.kind, e.kind);
+    }
+    try testing.expectEqual(410, taken.reported);
+}
+
 test "poller: a change before the first check of a tracked file is reported" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
