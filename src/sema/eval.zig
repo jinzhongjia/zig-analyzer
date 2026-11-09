@@ -5164,6 +5164,9 @@ const Evaluator = struct {
         // A `*T` → `*[1]T` view points to an array, which does not coerce to a pointer to the
         // field
         if (ref.window != null or ref.as_array or ref.path.len == 0) return error.Abort;
+        // A pointer cast to another pointee type points to reinterpreted bytes of the value its
+        // reinterpreting step views, not to a field of an aggregate
+        if (Ref.lastReinterpret(ref.path)) |k| if (k + 3 == ref.path.len) return error.Abort;
         const parent: Ref = .{ .cell = ref.cell, .path = ref.path[0 .. ref.path.len - 1], .is_const = ref.is_const or parent_ptr.is_const, .immutable = ref.immutable };
         if (value.eqlTypes(ip, (try ev.loadPath(parent)).ty, parent_ty) != true) return error.Abort;
         const at = ref.path[ref.path.len - 1];

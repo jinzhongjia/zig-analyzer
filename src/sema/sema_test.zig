@@ -3145,6 +3145,39 @@ test "comptime @ptrCast of a *T coerced to *[1]T reinterprets the place" {
         .{ "view_cast_back", "u32 = 67305985" },
     });
 }
+test "comptime @fieldParentPtr of a pointer cast to another pointee type" {
+    // A field pointer made by reinterpreting bytes ends in a reinterpreting step, whose byte
+    // offset must not be taken for a field index
+    try expectTypesTargeted(try targetOf("x86_64-linux-musl", null),
+        \\const S = extern struct { a: u32, b: u32 };
+        \\fn fromBytes() u32 {
+        \\    var s: S = .{ .a = 1, .b = 2 };
+        \\    const bytes: *[8]u8 = @ptrCast(&s);
+        \\    const pb: *u32 = @ptrCast(@alignCast(bytes[4..8]));
+        \\    const parent: *S = @fieldParentPtr("b", pb);
+        \\    return parent.a;
+        \\}
+        \\fn fromStart() u32 {
+        \\    var s: S = .{ .a = 1, .b = 2 };
+        \\    const pa: *u32 = @ptrCast(&s);
+        \\    const parent: *S = @fieldParentPtr("a", pa);
+        \\    return parent.b;
+        \\}
+        \\fn throughCastStruct() u32 {
+        \\    var raw: [2]u32 = .{ 1, 2 };
+        \\    const s: *S = @ptrCast(&raw);
+        \\    const parent: *S = @fieldParentPtr("b", &s.b);
+        \\    return parent.a;
+        \\}
+        \\const from_bytes = fromBytes();
+        \\const from_start = fromStart();
+        \\const through_cast_struct = throughCastStruct();
+    , &.{
+        .{ "from_bytes", "u32" },
+        .{ "from_start", "u32" },
+        .{ "through_cast_struct", "u32 = 1" },
+    });
+}
 test "comptime @bitCast and @ptrCast reinterpret into the destination type of their result type" {
     // `@bitCast` strips the error union and the optional of its result type, `@ptrCast` only
     // the error union (the compiler's `resolveDestType`); the result is then wrapped
