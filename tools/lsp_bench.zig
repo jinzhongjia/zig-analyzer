@@ -530,6 +530,11 @@ fn rssMb(gpa: Allocator, io: Io, pid: std.process.Child.Id) !?f64 {
     return @as(f64, @floatFromInt(kb)) / 1024;
 }
 
+/// A memory reading of `rssMb` followed by `unit`, or `unknown` when the reading is missing
+fn mbText(a: Allocator, mb: ?f64, comptime unit: []const u8) ![]const u8 {
+    return if (mb) |v| std.fmt.allocPrint(a, "{d:.0}" ++ unit, .{v}) else "unknown";
+}
+
 /// The memory change between two readings of `rssMb`, or `unknown` when either one is missing
 fn memoryChangeText(a: Allocator, before: ?f64, after: ?f64) ![]const u8 {
     const from = before orelse return "unknown";
@@ -1062,9 +1067,9 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
         // last one full
         const al: ?json.ObjectMap = if (o.get("allocator")) |v| (if (v == .object) v.object else null) else null;
         const vm = commitMb(c.child.id.?);
-        std.debug.print("  {d:>5} {d:>8.0} {d:>8.0} {d:>9} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>9} {d:>9} {d:>6.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7} {d:>7.0} {d:>7.0}  {s}\n", .{
+        std.debug.print("  {d:>5} {s:>8} {d:>8.0} {d:>9} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>8.1} {d:>9} {d:>9} {d:>6.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7.0} {d:>7} {d:>7.0} {d:>7.0}  {s}\n", .{
             round + 1,
-            (try rssMb(c.gpa, io, c.child.id.?)) orelse 0,
+            try mbText(a, try rssMb(c.gpa, io, c.child.id.?), ""),
             mb(o.get("heap_bytes").?.integer),
             @as(u64, @intCast(o.get("intern_pool_items").?.integer)),
             mb(o.get("intern_pool_bytes").?.integer),
@@ -1211,8 +1216,8 @@ fn concurrentTokens(c: *Client, root: []const u8, n: usize, measured: []const []
     const st, _ = try c.request("zig-analyzer/status", {});
     const o = st.object.get("result").?.object;
     const al: ?json.ObjectMap = if (o.get("allocator")) |v| (if (v == .object) v.object else null) else null;
-    std.debug.print("  memory {d:.0} MB, peak {d:.0} MB, heap {d:.0} MB; allocator: small {d:.0} MB, resident {d:.0} MB, slots {d:.0} MB, kept {d:.0} MB, returned {d:.0} MB, large {d:.0} MB; {d} pages returned to the system, {d} taken back\n", .{
-        (try rssMb(c.gpa, io, c.child.id.?)) orelse 0,
+    std.debug.print("  memory {s}, peak {d:.0} MB, heap {d:.0} MB; allocator: small {d:.0} MB, resident {d:.0} MB, slots {d:.0} MB, kept {d:.0} MB, returned {d:.0} MB, large {d:.0} MB; {d} pages returned to the system, {d} taken back\n", .{
+        try mbText(a, try rssMb(c.gpa, io, c.child.id.?), " MB"),
         @as(f64, @floatFromInt(o.get("max_rss_kb").?.integer)) / 1024,
         @as(f64, @floatFromInt(o.get("heap_bytes").?.integer)) / (1024 * 1024),
         allocatorMb(al, "small"),
