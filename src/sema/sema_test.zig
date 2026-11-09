@@ -1915,6 +1915,19 @@ test "@typeName gives the compiler's fully qualified name" {
         \\        const v = x;
         \\    };
         \\}
+        \\fn LoopNamed(comptime n: usize) type {
+        \\    comptime var T: type = void;
+        \\    inline for (0..n) |i| {
+        \\        const L = struct { const v = i; };
+        \\        T = L;
+        \\    }
+        \\    return T;
+        \\}
+        \\fn LoopAnon(comptime n: usize) type {
+        \\    comptime var T: type = void;
+        \\    inline for (0..n) |i| T = struct { const v = i; };
+        \\    return T;
+        \\}
         \\const n_E = @typeName(E);
         \\const n_inner = @typeName(S.Inner);
         \\const n_box = @typeName(Box(u8));
@@ -1938,6 +1951,8 @@ test "@typeName gives the compiler's fully qualified name" {
         \\const n_anon = @typeName(@TypeOf(.{ .a = 1 }));
         \\const n_shared = @typeName(Shared(u8));
         \\const n_plain = @typeName(Out(u8).Plain);
+        \\const n_loop = @typeName(LoopNamed(2));
+        \\const n_loop_anon = @typeName(LoopAnon(2));
         \\const is_list = std.mem.startsWith(u8, @typeName(std.ArrayList(u8)), "array_list.");
         \\const branch = if (is_list) @as(u8, 1) else @as(u16, 2);
         \\const eqname = @intFromBool(std.mem.eql(u8, @typeName(E), "main.E"));
@@ -1980,6 +1995,9 @@ test "@typeName gives the compiler's fully qualified name" {
         .{ "n_anon", "*const [_:0]u8" },
         .{ "n_shared", "*const [_:0]u8" },
         .{ "n_plain", "*const [_:0]u8" },
+        .{ "n_loop_anon", "*const [_:0]u8" },
+        // A local constant in a loop is named after it in every iteration
+        .{ "n_loop", "*const [16:0]u8 = \"main.LoopNamed.L\"" },
         .{ "is_list", "bool = true" },
         .{ "branch", "u8 = 1" },
         .{ "eqname", "u1 = 1" },
@@ -2764,9 +2782,7 @@ test "containers in a type function capture the values its body computed" {
         .{ "nested", "comptime_int = 6" },
         .{ "read_before_return", "comptime_int = 7" },
         .{ "outside_loop", "comptime_int = 2" },
-        // A constant in a loop body has a value per iteration, while the containers of all
-        // iterations share one instance (the compiler gives 4)
-        .{ "per_iteration", "usize" },
+        .{ "per_iteration", "usize = 4" },
         .{ "any_capture", "u8 = 3" },
     });
 }
@@ -2919,9 +2935,270 @@ test "containers in a function capture a comptime var where the body reaches the
         // The identity of a container is its captured values: both capture x = 1
         .{ "same_capture", "bool = true" },
         .{ "other_capture", "bool = false" },
-        // A container in a loop body captures a value per iteration, while the containers of all
-        // iterations share one instance (the compiler gives 3)
-        .{ "in_loop", "comptime_int" },
+        .{ "in_loop", "comptime_int = 3" },
+    });
+}
+
+test "containers in a loop of a type function capture the values of each iteration" {
+    // Prevents the containers of all iterations from sharing one type, which left the locals they
+    // capture without a value and made the types of different iterations compare equal
+    try expectTypes(
+        \\fn LoopCapture(comptime n: usize) type {
+        \\    comptime var T: type = void;
+        \\    inline for (0..n) |i| {
+        \\        T = struct { pub const v = i; };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn LoopConst(comptime n: usize) type {
+        \\    comptime var T: type = void;
+        \\    inline for (0..n) |i| {
+        \\        const c = i * 2;
+        \\        T = struct { pub const v = c; };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn LoopVar(comptime n: usize) type {
+        \\    comptime var x = 0;
+        \\    comptime var T: type = void;
+        \\    inline for (0..n) |_| {
+        \\        x += 1;
+        \\        T = struct { pub const v: comptime_int = x; };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn WhileVar(comptime n: usize) type {
+        \\    comptime var x = 0;
+        \\    comptime var T: type = void;
+        \\    comptime var i = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        x += 2;
+        \\        T = struct { pub const v: comptime_int = x; };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn All(comptime n: usize) [n]type {
+        \\    var ts: [n]type = undefined;
+        \\    inline for (0..n) |i| {
+        \\        ts[i] = struct { pub const v = i; };
+        \\    }
+        \\    return ts;
+        \\}
+        \\fn SameCaptures() [2]type {
+        \\    var ts: [2]type = undefined;
+        \\    inline for (0..2) |i| {
+        \\        const k = 5;
+        \\        ts[i] = struct { pub const v = k; };
+        \\    }
+        \\    return ts;
+        \\}
+        \\fn Nested() type {
+        \\    comptime var T: type = void;
+        \\    inline for (0..2) |i| {
+        \\        inline for (0..3) |j| {
+        \\            T = struct { pub const v = i * 10 + j; };
+        \\        }
+        \\    }
+        \\    return T;
+        \\}
+        \\fn FirstBig(comptime xs: []const u8) type {
+        \\    for (xs) |x| {
+        \\        if (x > 2) return struct { pub const v = x; };
+        \\    }
+        \\    return void;
+        \\}
+        \\fn WithFn(comptime n: usize) type {
+        \\    comptime var T: type = void;
+        \\    inline for (0..n) |i| {
+        \\        T = struct {
+        \\            pub fn get() usize {
+        \\                return i;
+        \\            }
+        \\        };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn Inner(comptime n: usize) type {
+        \\    comptime var T: type = void;
+        \\    inline for (0..n) |i| {
+        \\        T = struct {
+        \\            pub const U = struct { pub const v = i + 100; };
+        \\        };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn LoopThis(comptime n: usize) type {
+        \\    comptime var T: type = void;
+        \\    inline for (0..n) |i| {
+        \\        T = struct {
+        \\            pub const Self = @This();
+        \\            pub const v = i;
+        \\        };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn Fields(comptime n: usize) type {
+        \\    comptime var T: type = void;
+        \\    inline for (0..n) |i| {
+        \\        T = struct { x: [i]u8 };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn Snapshot() type {
+        \\    comptime var arr = [_]u16{ 0, 0 };
+        \\    comptime var T: type = void;
+        \\    inline for (0..2) |i| {
+        \\        arr[i] = 7;
+        \\        const copy = arr;
+        \\        T = struct { pub const v = copy; };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn LocalType() type {
+        \\    comptime var T: type = void;
+        \\    inline for (0..3) |i| {
+        \\        const S = struct { pub const v = i; };
+        \\        T = struct { pub const w = S.v; };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn Plain() usize {
+        \\    inline for (3..6) |i| {
+        \\        const S = struct { pub const v = i; };
+        \\        if (i == 4) return S.v;
+        \\    }
+        \\    unreachable;
+        \\}
+        \\fn Count(comptime n: usize) usize {
+        \\    comptime var total: usize = 0;
+        \\    inline for (0..n) |i| {
+        \\        const S = struct { pub const v = i * i; };
+        \\        total += S.v;
+        \\    }
+        \\    return total;
+        \\}
+        \\fn TypeList(comptime ts: []const type) type {
+        \\    comptime var T: type = struct {};
+        \\    inline for (ts) |t| {
+        \\        const Prev = T;
+        \\        T = struct {
+        \\            pub const Head = t;
+        \\            pub const Tail = Prev;
+        \\        };
+        \\    }
+        \\    return T;
+        \\}
+        \\fn g() void {
+        \\    const loop_capture = LoopCapture(3).v;
+        \\    const loop_const = LoopConst(3).v;
+        \\    const loop_var = LoopVar(3).v;
+        \\    const while_var = WhileVar(3).v;
+        \\    const first = All(3)[0].v;
+        \\    const distinct = All(3)[0] == All(3)[1];
+        \\    const same = All(3)[1] == All(3)[1];
+        \\    const cross_instance = All(3)[1] == All(2)[1];
+        \\    const cross_instance_ne = All(3)[2] == All(2)[1];
+        \\    const same_captures = SameCaptures()[0] == SameCaptures()[1];
+        \\    const nested = Nested().v;
+        \\    const return_in_loop = FirstBig(&.{ 1, 5, 7 }).v;
+        \\    const member_fn = comptime WithFn(3).get();
+        \\    const inner = Inner(2).U.v;
+        \\    const this_same = LoopThis(3) == LoopThis(3).Self;
+        \\    const this_v = LoopThis(3).Self.v;
+        \\    const field_type = @FieldType(Fields(3), "x");
+        \\    const snapshot = Snapshot().v;
+        \\    const local_type = LocalType().w;
+        \\    const plain = comptime Plain();
+        \\    const count = comptime Count(4);
+        \\    const head = TypeList(&.{ u8, u16, u32 }).Head;
+        \\    const tail_head = TypeList(&.{ u8, u16, u32 }).Tail.Tail.Head;
+        \\    const list_eq = TypeList(&.{ u8, u16 }) == TypeList(&.{ u8, u16, u32 }).Tail;
+        \\    _ = .{ loop_capture, loop_const, loop_var, while_var, first, distinct, same, cross_instance, cross_instance_ne, same_captures, nested, return_in_loop, member_fn, inner, this_same, this_v, field_type, snapshot, local_type, plain, count, head, tail_head, list_eq };
+        \\}
+    , &.{
+        .{ "loop_capture", "usize = 2" },
+        .{ "loop_const", "usize = 4" },
+        .{ "loop_var", "comptime_int = 3" },
+        .{ "while_var", "comptime_int = 6" },
+        .{ "first", "usize = 0" },
+        .{ "distinct", "bool = false" },
+        .{ "same", "bool = true" },
+        // The compiler identifies the container by its captured values alone: both capture i = 1
+        .{ "cross_instance", "bool = true" },
+        .{ "cross_instance_ne", "bool = false" },
+        // Iterations that capture equal values define the same type
+        .{ "same_captures", "bool = true" },
+        .{ "nested", "usize = 12" },
+        .{ "return_in_loop", "u8 = 5" },
+        .{ "member_fn", "usize = 2" },
+        .{ "inner", "usize = 101" },
+        .{ "this_same", "bool = true" },
+        .{ "this_v", "usize = 2" },
+        .{ "field_type", "type = [2]u8" },
+        .{ "snapshot", "[2]u16 = .{ 7, 7 }" },
+        .{ "local_type", "usize = 2" },
+        .{ "plain", "usize = 4" },
+        .{ "count", "usize = 14" },
+        .{ "head", "type = u32" },
+        .{ "tail_head", "type = u8" },
+        // Containers of different instances compare by their captured values, including captured
+        // containers of earlier iterations
+        .{ "list_eq", "bool = true" },
+    });
+}
+
+test "the types of captured values compare by their own captures" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1. Prevents comparing the types of
+    // captured values without looking at their captures: a local struct that captures nothing
+    // is the same type in every instance (no result was given), one that captures a parameter
+    // or a loop capture is a different type in each.
+    try expectTypes(
+        \\fn RecEq(comptime n: usize) type {
+        \\    _ = n;
+        \\    const S = struct {
+        \\        a: u8 = 0,
+        \\    };
+        \\    const s: S = .{};
+        \\    return struct {
+        \\        pub const v = s;
+        \\    };
+        \\}
+        \\fn RecNe(comptime n: usize) type {
+        \\    const S = struct {
+        \\        pub const k = n;
+        \\        a: u8 = 0,
+        \\    };
+        \\    const s: S = .{};
+        \\    return struct {
+        \\        pub const v = s;
+        \\    };
+        \\}
+        \\fn LoopRec(comptime n: usize) type {
+        \\    var T: type = void;
+        \\    for (0..2) |i| {
+        \\        const S = struct {
+        \\            pub const k = i * n;
+        \\            a: u8 = 0,
+        \\        };
+        \\        const s: S = .{};
+        \\        T = struct {
+        \\            pub const v = s;
+        \\        };
+        \\    }
+        \\    return T;
+        \\}
+        \\const rec_same = RecEq(1) == RecEq(2);
+        \\const rec_different = RecNe(1) == RecNe(2);
+        \\const rec_k = @TypeOf(RecNe(2).v).k;
+        \\const loop_different = LoopRec(1) == LoopRec(2);
+        \\const loop_last = LoopRec(0) == LoopRec(5);
+    , &.{
+        .{ "rec_same", "bool = true" },
+        .{ "rec_different", "bool = false" },
+        .{ "rec_k", "usize = 2" },
+        .{ "loop_different", "bool = false" },
+        // The last iteration captures k = 0 and k = 5
+        .{ "loop_last", "bool = false" },
     });
 }
 

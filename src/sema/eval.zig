@@ -170,8 +170,8 @@ pub fn localValue(ctx: *Db.Ctx, key: queries.LocalKey) Error!TypedValue {
 /// `runUntil`) and takes the value of local variable `key.binding` when the frame of the function
 /// reaches the expression of container `key.container`, where the compiler's `getCaptures` loads
 /// it. A container in the body, condition or continue expression of a loop is reached once per
-/// iteration, possibly with a different value each time, while the containers of all iterations
-/// share one instance: its captured variables have no value.
+/// iteration, possibly with a different value each time: the value belongs to the instance of the
+/// container of that iteration (`InternPool.Instance.captured`), and there is none here.
 pub fn capturedValue(ctx: *Db.Ctx, key: queries.CaptureKey) Error!TypedValue {
     const body = try ctx.get(hir.ItemBody, key.owner);
     if (@backingInt(key.binding) >= body.bindings.len) return .unknown;
@@ -631,7 +631,9 @@ fn abortToNull(err: EvalError) Error!?TypedValue {
 /// container = definition location + captured values: a container that captures no arguments
 /// is the same type across instances). Captured values are compared as the compiler interns
 /// them: values of different types are different captures even when `==` holds for them
-/// (`@as(u8, 3)` and `@as(u16, 3)`).
+/// (`@as(u8, 3)` and `@as(u16, 3)`). Captured containers, and the types of captured values, are
+/// compared the same way; a container's captured values exist before it, so the comparison
+/// terminates.
 pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
     const ip = r.ctx.db.env.ip;
     if (value.eqlValues(ip, a, b)) |eq| return eq;
@@ -654,8 +656,8 @@ pub fn eqlValues(r: *Resolver, a: Index, b: Index) Error!?bool {
         const tb = try queries.outerLocal(r, local, ns, ib);
         const va = ta.val orelse return null;
         const vb = tb.val orelse return null;
-        const same_value = value.eqlValues(ip, va, vb);
-        const same_type = value.eqlTypes(ip, ta.ty, tb.ty);
+        const same_value = try eqlValues(r, va, vb);
+        const same_type = try eqlValues(r, ta.ty, tb.ty);
         if (same_value == false or same_type == false) return false;
         if (same_value == null or same_type == null) unknown = true;
     }
@@ -1043,6 +1045,9 @@ const Evaluator = struct {
     cell_decls: std.AutoHashMapUnmanaged(*const Val, DeclKey) = .empty,
     /// Anonymous constants of constant bindings, by the binding's slot (see `constantCell`)
     constant_cells: std.AutoHashMapUnmanaged(*const Val, ConstantCell) = .empty,
+    /// The locals each container defined in a loop of a function body captures (see
+    /// `loopCaptures`), by container
+    loop_captures: std.AutoHashMapUnmanaged(Namespace, []const Body.BindingId) = .empty,
 
     fn deinit(ev: *Evaluator) void {
         if (!ev.owns_calls) return;
@@ -1761,7 +1766,7 @@ const Evaluator = struct {
                 const ns = try ev.containerAt(f, e) orelse return error.Abort;
                 if (ev.stop) |s| if (s.frame == f and s.container == ns.container) try ev.take(f, s);
                 if (c.arg) |arg| _ = try ev.eval(f, arg, null);
-                return Val.ofType(try queries.containerType(ev.r, ns, f.inst));
+                return Val.ofType(try queries.containerType(ev.r, ns, try ev.containerInst(f, ns, e)));
             },
             .fn_type => |ft| {
                 const params = try ev.a.alloc(Index, ft.params.len);
@@ -1823,6 +1828,54 @@ const Evaluator = struct {
             else => |x| return x,
         };
         return ev.freeze(v);
+    }
+
+    /// The instance of container `ns`, whose expression `e` frame `f` evaluates: the instance of
+    /// the function, and for a container in a loop of the function that captures locals of the
+    /// function other than parameters, that instance with the values those locals have here
+    /// (`InternPool.Instance.captured`). The compiler analyzes the container's definition again
+    /// in every iteration and gives each set of captured values its own type (`getCaptures`).
+    fn containerInst(ev: *Evaluator, f: *const Frame, ns: Namespace, e: ExprId) EvalError!?Index {
+        const inst = f.inst orelse return null;
+        const locals = try ev.loopCaptures(f, ns, e);
+        if (locals.len == 0) return inst;
+        var key = switch (ev.ip.key(inst)) {
+            .instance => |k| k,
+            else => return inst,
+        };
+        const tree = try ev.r.itemTree(f.file);
+        if (key.file != f.file or key.decl != tree.items[f.item].ast_id or key.captured.len != 0) return inst;
+        const captured = try ev.a.alloc(InternPool.CapturedLocal, locals.len);
+        for (locals, captured) |b, *c| {
+            const v = f.slots[@backingInt(b)];
+            const val = ev.freeze(v) catch |err| switch (err) {
+                error.Abort => null,
+                else => |x| return x,
+            };
+            c.* = .{ .binding = @backingInt(b), .ty = v.ty, .val = val orelse .unknown };
+        }
+        key.captured = captured;
+        return try ev.ip.get(.{ .instance = key });
+    }
+
+    /// The locals of the function of frame `f` other than parameters that container `ns` (with
+    /// expression `e`) captures, sorted by binding, when the container is in the body, the
+    /// condition, or the continue expression of a loop of the function; empty otherwise.
+    /// Parameters are recorded in the instance of the function.
+    fn loopCaptures(ev: *Evaluator, f: *const Frame, ns: Namespace, e: ExprId) EvalError![]const Body.BindingId {
+        if (ev.loop_captures.get(ns)) |locals| return locals;
+        var out: std.ArrayList(Body.BindingId) = .empty;
+        if (repeats(f.body, f.body.range(e).start)) for (try captures(ev.r, ns)) |cap| {
+            if (cap.item != f.item or f.body.binding(cap.binding).kind == .param) continue;
+            try out.append(ev.a, cap.binding);
+        };
+        std.mem.sort(Body.BindingId, out.items, {}, struct {
+            fn lt(_: void, a: Body.BindingId, b: Body.BindingId) bool {
+                return @backingInt(a) < @backingInt(b);
+            }
+        }.lt);
+        try ev.loop_captures.put(ev.a, ns, out.items);
+        return out.items;
     }
 
     fn nameRef(ev: *Evaluator, f: *Frame, e: ExprId, name: []const u8) EvalError!Val {
