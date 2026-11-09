@@ -3093,10 +3093,19 @@ const Evaluator = struct {
     }
 
     /// Two pointers into the same storage cell: the same location when they take the same path
-    /// and start at the same element; paths that part at some level reach different elements
+    /// and start at the same element; paths that part at an element index reach different
+    /// elements. A reinterpreting step views the memory at a byte offset, so where paths part
+    /// at one, the locations may still coincide.
     fn samePlace(x: Ref, y: Ref) ?bool {
-        const n = @min(x.path.len, y.path.len);
-        if (!std.mem.eql(u32, x.path[0..n], y.path[0..n])) return false;
+        var i: usize = 0;
+        while (i < x.path.len and i < y.path.len) {
+            const step = x.path[i] == Ref.reinterpret or y.path[i] == Ref.reinterpret;
+            const len: usize = if (step) 3 else 1;
+            const a = x.path[i..@min(i + len, x.path.len)];
+            const b = y.path[i..@min(i + len, y.path.len)];
+            if (!std.mem.eql(u32, a, b)) return if (step) null else false;
+            i += len;
+        }
         if (x.path.len != y.path.len) return null;
         const xs = if (x.window) |w| w.start else 0;
         const ys = if (y.window) |w| w.start else 0;

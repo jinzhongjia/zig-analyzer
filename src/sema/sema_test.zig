@@ -3240,6 +3240,60 @@ test "comptime @fieldParentPtr of a pointer cast to another pointee type" {
         .{ "through_cast_struct", "u32 = 1" },
     });
 }
+test "comptime comparison of pointers cast to another pointee type" {
+    // A pointer that reaches a place through a reinterpreting step is not known to be unequal
+    // to one that reaches the same memory through element indices. zig 0.17.0 and 0.17.1 give
+    // false, true, true, true, false, true; the last four depend on the byte offsets of the steps.
+    try expectTypesTargeted(try targetOf("x86_64-linux-musl", null),
+        \\const S = extern struct { a: u32, b: u32 };
+        \\fn afterStepNe() bool {
+        \\    var raw: [2]u32 = .{ 1, 2 };
+        \\    const s: *S = @ptrCast(&raw);
+        \\    return &s.a == &s.b;
+        \\}
+        \\fn afterStepEq() bool {
+        \\    var raw: [2]u32 = .{ 1, 2 };
+        \\    const s: *S = @ptrCast(&raw);
+        \\    const t: *S = @ptrCast(&raw);
+        \\    return &s.b == &t.b;
+        \\}
+        \\fn stepVsIndex() bool {
+        \\    var raw: [2]u32 = .{ 1, 2 };
+        \\    const s: *S = @ptrCast(&raw);
+        \\    return &s.b == &raw[1];
+        \\}
+        \\fn bytesVsField() bool {
+        \\    var s: S = .{ .a = 1, .b = 2 };
+        \\    const bytes: *[8]u8 = @ptrCast(&s);
+        \\    const pb: *u32 = @ptrCast(@alignCast(bytes[4..8]));
+        \\    return pb == &s.b;
+        \\}
+        \\fn bytesVsOtherField() bool {
+        \\    var s: S = .{ .a = 1, .b = 2 };
+        \\    const bytes: *[8]u8 = @ptrCast(&s);
+        \\    const pb: *u32 = @ptrCast(@alignCast(bytes[0..4]));
+        \\    return pb == &s.b;
+        \\}
+        \\fn castVsFirst() bool {
+        \\    var s: S = .{ .a = 1, .b = 2 };
+        \\    const pa: *u32 = @ptrCast(&s);
+        \\    return pa == &s.a;
+        \\}
+        \\const after_step_ne = afterStepNe();
+        \\const after_step_eq = afterStepEq();
+        \\const step_vs_index = stepVsIndex();
+        \\const bytes_vs_field = bytesVsField();
+        \\const bytes_vs_other_field = bytesVsOtherField();
+        \\const cast_vs_first = castVsFirst();
+    , &.{
+        .{ "after_step_ne", "bool = false" },
+        .{ "after_step_eq", "bool = true" },
+        .{ "step_vs_index", "bool" },
+        .{ "bytes_vs_field", "bool" },
+        .{ "bytes_vs_other_field", "bool" },
+        .{ "cast_vs_first", "bool" },
+    });
+}
 test "comptime @bitCast and @ptrCast reinterpret into the destination type of their result type" {
     // `@bitCast` strips the error union and the optional of its result type, `@ptrCast` only
     // the error union (the compiler's `resolveDestType`); the result is then wrapped
