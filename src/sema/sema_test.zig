@@ -1911,6 +1911,11 @@ test "@typeName gives the compiler's fully qualified name" {
         \\        const k = .{ n, b, e, o, l, x };
         \\    };
         \\}
+        \\fn Any(x: anytype) type {
+        \\    return struct {
+        \\        const v = x;
+        \\    };
+        \\}
         \\const n_E = @typeName(E);
         \\const n_inner = @typeName(S.Inner);
         \\const n_box = @typeName(Box(u8));
@@ -1919,6 +1924,9 @@ test "@typeName gives the compiler's fully qualified name" {
         \\const n_in = @typeName(Out(u8).In);
         \\const n_g = @typeName(Out(u8).G(u16));
         \\const n_gen = @typeName(Gen(3, true, .b, 5, .q, null));
+        \\const n_any = @typeName(Any(@as(u8, 3)));
+        \\const n_any_type = @typeName(Any(u8));
+        \\const n_any_opt = @typeName(Any(@as(?u8, 3)));
         \\const n_list = @typeName(std.ArrayList(u8));
         \\const n_alloc = @typeName(std.mem.Allocator);
         \\const n_std = @typeName(std);
@@ -1955,6 +1963,10 @@ test "@typeName gives the compiler's fully qualified name" {
         .{ "n_in", "*const [15:0]u8 = \"main.Out(u8).In\"" },
         .{ "n_g", "*const [19:0]u8 = \"main.Out(u8).G(u16)\"" },
         .{ "n_gen", "*const [29:0]u8 = \"main.Gen(3,true,.b,5,.q,null)\"" },
+        // A type function records the values of anytype arguments, which its name shows
+        .{ "n_any", "*const [11:0]u8 = \"main.Any(3)\"" },
+        .{ "n_any_type", "*const [12:0]u8 = \"main.Any(u8)\"" },
+        .{ "n_any_opt", "*const [11:0]u8 = \"main.Any(3)\"" },
         .{ "n_list", "*const [27:0]u8 = \"array_list.Aligned(u8,null)\"" },
         .{ "n_alloc", "*const [13:0]u8 = \"mem.Allocator\"" },
         .{ "n_std", "*const [3:0]u8 = \"std\"" },
@@ -2498,18 +2510,115 @@ test "instances of the same container compare by their captured values" {
         \\}
         \\fn Capture(comptime T: type) type { return struct { x: T }; }
         \\fn Id(comptime n: usize) type { return struct { pub const N = n; }; }
+        \\fn AnyId(comptime x: anytype) type { return struct { pub const v = x; }; }
         \\fn g() void {
         \\    const nc = if (NoCapture(u8) == NoCapture(u16)) @as(u8, 1) else @as(u8, 2);
         \\    const cap = if (Capture(u8) == Capture(u16)) @as(u8, 1) else @as(u8, 2);
         \\    const id = if (Id(@sizeOf(u8)) == Id(@sizeOf(u64))) @as(u8, 1) else @as(u8, 2);
         \\    const same = if (Capture(u8) == Capture(u8)) @as(u8, 1) else @as(u8, 2);
-        \\    _ = .{ nc, cap, id, same };
+        \\    const typed = if (AnyId(@as(u8, 3)) == AnyId(@as(u16, 3))) @as(u8, 1) else @as(u8, 2);
+        \\    const same_any = if (AnyId(@as(u8, 3)) == AnyId(@as(u8, 3))) @as(u8, 1) else @as(u8, 2);
+        \\    _ = .{ nc, cap, id, same, typed, same_any };
         \\}
     , &.{
         .{ "nc", "u8 = 1" },
         .{ "cap", "u8 = 2" },
         .{ "id", "u8 = 2" },
         .{ "same", "u8 = 1" },
+        // Captured values of different types are different captures, although `==` holds for
+        // them (zig 0.17.0 and 0.17.1 give 2)
+        .{ "typed", "u8 = 2" },
+        .{ "same_any", "u8 = 1" },
+    });
+}
+
+test "calls of a type function with different anytype argument values are different instances" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1: a call returning `type` executes
+    // at comptime and is memoized by the argument values, anytype ones included. Prevents calls
+    // with different values of the same type from sharing one instance, which made
+    // `AnyCap(@as(u8, 3)) == AnyCap(@as(u8, 4))` true and left `AnyCap(@as(u8, 3)).v` unknown.
+    try expectTypes(
+        \\fn AnyCap(x: anytype) type {
+        \\    return struct {
+        \\        pub const v = x;
+        \\    };
+        \\}
+        \\fn NoCap(x: anytype) type {
+        \\    _ = x;
+        \\    return struct {};
+        \\}
+        \\fn TypeCap(x: anytype) type {
+        \\    return struct {
+        \\        pub const T = @TypeOf(x);
+        \\    };
+        \\}
+        \\fn Mixed(comptime T: type, x: anytype) type {
+        \\    return struct {
+        \\        pub const v: T = x;
+        \\    };
+        \\}
+        \\fn AnyLocal(x: anytype) type {
+        \\    const y = x + 1;
+        \\    return struct {
+        \\        pub const v = y;
+        \\    };
+        \\}
+        \\const same_type = AnyCap(@as(u8, 3)) == AnyCap(@as(u8, 4));
+        \\const same_value = AnyCap(@as(u8, 3)) == AnyCap(@as(u8, 3));
+        \\const other_type = AnyCap(@as(u8, 3)) == AnyCap(@as(u16, 3));
+        \\const direct = AnyCap(@as(u8, 3)).v;
+        \\const no_capture = NoCap(@as(u8, 3)) == NoCap(@as(u8, 4));
+        \\const type_capture = TypeCap(@as(u8, 3)) == TypeCap(@as(u8, 4));
+        \\const captured_type = TypeCap(@as(u8, 3)).T;
+        \\const mixed = Mixed(u16, @as(u8, 7)).v;
+        \\const mixed_eq = Mixed(u16, @as(u8, 7)) == Mixed(u16, @as(u8, 8));
+        \\const elem = AnyCap([_]u8{ 5, 6 }).v[1];
+        \\const arr_eq = AnyCap([_]u8{ 5, 6 }) == AnyCap([_]u8{ 5, 7 });
+        \\const ty = AnyCap(u8).v;
+        \\const ty_eq = AnyCap(u8) == AnyCap(u16);
+        \\const int = AnyCap(5).v;
+        \\const int_eq = AnyCap(5) == AnyCap(6);
+        \\const optional = AnyCap(@as(?u8, 3)) == AnyCap(@as(u8, 3));
+        \\const opt_value = AnyCap(@as(?u8, 3)).v;
+        \\const opt_type = TypeCap(@as(?u8, 3)).T;
+        \\const null_types = AnyCap(@as(?u8, null)) == AnyCap(@as(?u16, null));
+        \\const null_type = TypeCap(@as(?u16, null)).T;
+        \\const eu_value = AnyCap(@as(error{Bad}!u8, 3)).v;
+        \\const eu_eq = AnyCap(@as(error{Bad}!u8, 3)) == AnyCap(@as(u8, 3));
+        \\const err_type = TypeCap(@as(error{Bad}!u8, error.Bad)).T;
+        \\const local = AnyLocal(@as(u8, 3)).v;
+        \\const local_eq = AnyLocal(@as(u8, 3)) == AnyLocal(@as(u8, 4));
+    , &.{
+        .{ "same_type", "bool = false" },
+        .{ "same_value", "bool = true" },
+        .{ "other_type", "bool = false" },
+        .{ "direct", "u8 = 3" },
+        // A container that captures nothing is the same type in every instance
+        .{ "no_capture", "bool = true" },
+        // Capturing the parameter captures its value, even when only its type is used
+        .{ "type_capture", "bool = false" },
+        .{ "captured_type", "type = u8" },
+        .{ "mixed", "u16 = 7" },
+        .{ "mixed_eq", "bool = false" },
+        .{ "elem", "u8 = 6" },
+        .{ "arr_eq", "bool = false" },
+        .{ "ty", "type = u8" },
+        .{ "ty_eq", "bool = false" },
+        .{ "int", "comptime_int = 5" },
+        .{ "int_eq", "bool = false" },
+        // The instance records the argument type: values of optional and error union types are
+        // represented by their payloads, and `null` is the same value whatever its type
+        .{ "optional", "bool = false" },
+        .{ "opt_value", "?u8 = 3" },
+        .{ "opt_type", "type = ?u8" },
+        .{ "null_types", "bool = false" },
+        .{ "null_type", "type = ?u16" },
+        .{ "eu_value", "error{Bad}!u8 = 3" },
+        .{ "eu_eq", "bool = false" },
+        .{ "err_type", "type = error{Bad}!u8" },
+        // A local constant computed from the argument value and captured by a container
+        .{ "local", "u8 = 4" },
+        .{ "local_eq", "bool = false" },
     });
 }
 
@@ -2626,8 +2735,7 @@ test "containers in a type function capture the values its body computed" {
         // A constant in a loop body has a value per iteration, while the containers of all
         // iterations share one instance (the compiler gives 4)
         .{ "per_iteration", "usize" },
-        // The instance records only the type of an anytype argument (the compiler gives 3)
-        .{ "any_capture", "u8" },
+        .{ "any_capture", "u8 = 3" },
     });
 }
 
