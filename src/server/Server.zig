@@ -1433,15 +1433,21 @@ fn scanOnce(server: *Server) Allocator.Error!void {
         }
     }.lt);
     // A write transaction cancels in-flight requests: write only when the files differ. Scans run
-    // one at a time, so nobody else changes the input after the comparison.
-    const unchanged = blk: {
-        var ctx = server.db.beginRead(a);
-        defer ctx.end();
-        const current = ctx.get(WorkspaceFiles, {}) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Canceled => break :blk false,
+    // one at a time, so nobody else changes the input after the comparison. A comparison canceled
+    // by a write transaction (an edit) tells nothing about the files: it is made again once that
+    // write has taken the lock (see `Db.waitPendingWrites`)
+    const unchanged = while (true) {
+        const same: ?bool = blk: {
+            var ctx = server.db.beginRead(a);
+            defer ctx.end();
+            const current = ctx.get(WorkspaceFiles, {}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Canceled => break :blk null,
+            };
+            break :blk std.mem.eql(Vfs.FileId, current, files);
         };
-        break :blk std.mem.eql(Vfs.FileId, current, files);
+        if (same) |s| break s;
+        server.db.waitPendingWrites();
     };
     if (unchanged) return;
     {
