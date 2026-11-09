@@ -509,6 +509,9 @@ fn printQueryTable(c: *Client) !void {
     std.debug.print("queries (whole run):\n{s}", .{out.written()});
 }
 
+/// Resident memory of the process in MB, or null when it cannot be read: `ps` cannot run or its
+/// output does not parse (on Windows, the working set query fails). Callers print a missing
+/// reading as unknown or leave it out.
 fn rssMb(gpa: Allocator, io: Io, pid: std.process.Child.Id) !?f64 {
     // On Windows, Child.Id is a process HANDLE and there is no ps: read the working set of the
     // process directly
@@ -525,6 +528,13 @@ fn rssMb(gpa: Allocator, io: Io, pid: std.process.Child.Id) !?f64 {
     defer gpa.free(r.stderr);
     const kb = std.fmt.parseInt(u64, std.mem.trim(u8, r.stdout, " \n"), 10) catch return null;
     return @as(f64, @floatFromInt(kb)) / 1024;
+}
+
+/// The memory change between two readings of `rssMb`, or `unknown` when either one is missing
+fn memoryChangeText(a: Allocator, before: ?f64, after: ?f64) ![]const u8 {
+    const from = before orelse return "unknown";
+    const to = after orelse return "unknown";
+    return std.fmt.allocPrint(a, "{d:.0} → {d:.0} MB", .{ from, to });
 }
 
 /// Resident memory in transparent huge pages (`AnonHugePages` of /proc/<pid>/smaps_rollup; Linux)
@@ -1602,7 +1612,7 @@ pub fn main(init: std.process.Init) !u8 {
                 cold_max = @max(cold_max, t);
                 if (verbose and t > 20) {
                     const after = try rssMb(gpa, io, c.child.id.?);
-                    std.debug.print("    slow {s} {d}:{d} {d:.1}ms memory {d:.0} → {d:.0} MB  `{s}`\n", .{ method["textDocument/".len..], p.line + 1, p.character + 1, t, before.?, after.?, lineText(text, p.line) });
+                    std.debug.print("    slow {s} {d}:{d} {d:.1}ms memory {s}  `{s}`\n", .{ method["textDocument/".len..], p.line + 1, p.character + 1, t, try memoryChangeText(a, before, after), lineText(text, p.line) });
                     const counts_after = try queryCounts(&c);
                     for (counts_after, counts_before.?) |x, y| if (x.n != y.n) std.debug.print("      {s}: +{d}\n", .{ x.name, x.n - y.n });
                 }
