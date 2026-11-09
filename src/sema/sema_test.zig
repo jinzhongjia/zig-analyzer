@@ -4878,6 +4878,100 @@ test "dereferencing a comptime-known slice in a function body" {
     });
 }
 
+test "slices and many-item pointers unwrapped from a comptime-known optional or error union read their elements" {
+    // Prevents reading the elements of a slice returned in an optional as values without a type
+    // (no value at container level) and `.*` of it as the element type (`u16 = .{ 1, 2 }`)
+    try expectTypes(
+        \\fn optU16() ?[]const u16 {
+        \\    const arr: [2]u16 = .{ 1, 2 };
+        \\    return &arr;
+        \\}
+        \\fn optU16Loop() ?[]const u16 {
+        \\    var arr: [2]u16 = undefined;
+        \\    var i: usize = 0;
+        \\    while (i < 2) : (i += 1) arr[i] = @intCast(i + 1);
+        \\    const frozen = arr;
+        \\    return &frozen;
+        \\}
+        \\fn optArr3() ?[]const [3]u8 {
+        \\    const arr: [1][3]u8 = .{.{ 1, 2, 3 }};
+        \\    return &arr;
+        \\}
+        \\fn optU8() ?[]const u8 {
+        \\    const arr: [2]u8 = .{ 1, 2 };
+        \\    return &arr;
+        \\}
+        \\fn errU16() error{X}![]const u16 {
+        \\    const arr: [2]u16 = .{ 1, 2 };
+        \\    return &arr;
+        \\}
+        \\fn optMany() ?[*]const u16 {
+        \\    const arr: [2]u16 = .{ 1, 2 };
+        \\    return &arr;
+        \\}
+        \\fn optArrPtr() ?*const [2]u16 {
+        \\    const arr: [2]u16 = .{ 1, 2 };
+        \\    return &arr;
+        \\}
+        \\fn optSent() ?[:0]const u16 {
+        \\    const arr: [2:0]u16 = .{ 1, 2 };
+        \\    return &arr;
+        \\}
+        \\fn optI8() ?[]const i8 {
+        \\    const arr: [2]i8 = .{ -1, -2 };
+        \\    return &arr;
+        \\}
+        \\fn viaLocal() u16 {
+        \\    const s = optU16().?;
+        \\    return s[1];
+        \\}
+        \\const noloop = optU16().?[1];
+        \\const loop = optU16Loop().?[1];
+        \\const arr3 = optArr3().?[0];
+        \\const bytes = optU8().?[0];
+        \\const len = optU16().?.len;
+        \\const d: ?[]const u16 = optU16();
+        \\const via_decl = d.?[1];
+        \\const via_catch = (errU16() catch unreachable)[1];
+        \\const via_fn = viaLocal();
+        \\const via_ptr = optU16().?.ptr[1];
+        \\const resliced = optU16().?[0..2][1];
+        \\const many = optMany().?[1];
+        \\const arr_ptr = optArrPtr().?[1];
+        \\const arr_ptr_ptr = optArrPtr().?.ptr[1];
+        \\const sent_last = optSent().?[2];
+        \\const signed = optI8().?[1];
+        \\const via_if = if (optU16()) |s| s[1] else 0;
+        \\const sum = optU16().?[1] + 1;
+        \\const wrapped = optI8().?[1] -% 127;
+        \\const deref = optU16().?.*;
+        \\const deref_ptr = &optU16().?.*;
+        \\const deref_ptr_elem = (&optU16().?.*)[1];
+    , &.{
+        .{ "noloop", "u16 = 2" },
+        .{ "loop", "u16 = 2" },
+        .{ "arr3", "[3]u8 = \"\\x01\\x02\\x03\"" },
+        .{ "bytes", "u8 = 1" },
+        .{ "len", "usize = 2" },
+        .{ "via_decl", "u16 = 2" },
+        .{ "via_catch", "u16 = 2" },
+        .{ "via_fn", "u16 = 2" },
+        .{ "via_ptr", "u16 = 2" },
+        .{ "resliced", "u16 = 2" },
+        .{ "many", "u16 = 2" },
+        .{ "arr_ptr", "u16 = 2" },
+        .{ "arr_ptr_ptr", "u16 = 2" },
+        .{ "sent_last", "u16 = 0" },
+        .{ "signed", "i8 = -2" },
+        .{ "via_if", "u16 = 2" },
+        .{ "sum", "u16 = 3" },
+        .{ "wrapped", "i8 = 127" },
+        .{ "deref", "[2]u16 = .{ 1, 2 }" },
+        .{ "deref_ptr", "*const [2]u16 = &.{ 1, 2 }" },
+        .{ "deref_ptr_elem", "u16 = 2" },
+    });
+}
+
 test "concatenation follows the compiler" {
     try expectTypes(
         \\fn f() void {
