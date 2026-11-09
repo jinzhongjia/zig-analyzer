@@ -462,13 +462,15 @@ pub const Instance = struct {
     /// known), parallel to `args`, with `runtime` at the other parameters; empty when the function
     /// has no such parameter. `comptime x: anytype` parameters are recorded by value, and so are
     /// all anytype parameters of a function returning a comptime-only type: every call of such a
-    /// function executes at comptime, and the compiler memoizes it by the argument values, so
-    /// calls with different values of the same type are different instances and the containers
-    /// defined in the body capture those values. Such a parameter takes the type of the argument,
-    /// which a value does not always give back: a value of an optional or error union type is
-    /// represented by its payload, `null` and `undefined` are the same value whatever their type,
-    /// an error value does not record its error set. The compiler records the argument as a value
-    /// of its type, so arguments of different types are different instances.
+    /// function executes at comptime, and the compiler memoizes it by the argument values, so calls
+    /// with different values of the same type are different instances and the containers defined in
+    /// the body capture those values. An anytype parameter whose argument type is comptime-only
+    /// (such as `comptime_int` or `type`) is recorded by value as well, because the compiler makes
+    /// it comptime for that argument. Such a parameter takes the type of the argument, which a
+    /// value does not always give back: a value of an optional or error union type is represented
+    /// by its payload, `null` and `undefined` are the same value whatever their type, an error
+    /// value does not record its error set. The compiler records the argument as a value of its
+    /// type, so arguments of different types are different instances.
     arg_types: []const Index = &.{},
     parent: ?Index = null,
     /// The values a container defined in a loop of member `decl` (in its body, condition, or

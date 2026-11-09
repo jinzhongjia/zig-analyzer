@@ -4624,7 +4624,9 @@ fn literalFieldValue(ip: *InternPool, t: Index, name: []const u8) ?Index {
 
 /// `comptime_anytype` (`comptime x: anytype`, or any anytype parameter of a function returning a
 /// comptime-only type) records the argument value in the instance, and its type in
-/// `InternPool.Instance.arg_types`; `anytype_type` records the argument type
+/// `InternPool.Instance.arg_types`; `anytype_type` records the argument type, or, when the
+/// argument type is comptime-only, the argument value and type as `comptime_anytype` does (see
+/// `instanceOf`)
 pub const ParamKind = enum { runtime, comptime_value, comptime_anytype, anytype_type };
 
 /// A callee that needs instantiation: it has comptime parameters (including implicit ones of
@@ -4679,24 +4681,31 @@ pub fn genericCallee(r: *Resolver, scratch: Allocator, callee: TypedValue, f: Fn
 /// the parameter types: when a parameter type depends on other parameters (`comptime n: T`), an
 /// instance is first built with the uncoerced arguments to evaluate the parameter types, then
 /// the arguments are coerced, so `Box(u8, 3)` and `Box(u8, @as(u8, 3))` are the same instance.
+/// An anytype parameter is comptime when the argument type is comptime-only, as in the compiler
+/// (`param_is_comptime = declared_comptime or arg_ty.comptimeOnly(zcu)` in `analyzeCall`): the
+/// instance records such an argument by value, with its type in `InternPool.Instance.arg_types`,
+/// so `arrOf(3)` and `arrOf(4)` are different instances and the parameter has its value in the
+/// signature and the body.
 pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args: []const TypedValue) Error!Index {
     const ip = r.ctx.db.env.ip;
     const inst_args = try scratch.alloc(Index, g.body.params.len);
-    const arg_types: []Index = for (g.kinds) |k| {
-        if (k == .comptime_anytype) break try scratch.alloc(Index, inst_args.len);
-    } else &.{};
-    @memset(arg_types, .runtime);
+    var arg_types: []Index = &.{};
     var dependent = false;
     for (inst_args, 0..) |*out, i| {
         const tv: TypedValue = if (i < args.len) args[i] else .unknown;
         switch (g.kinds[i]) {
             .runtime => out.* = .runtime,
-            .anytype_type => out.* = tv.ty,
+            .anytype_type => {
+                out.* = tv.ty;
+                if (!try anytypeByValue(r, tv)) continue;
+                out.* = tv.val.?;
+                arg_types = try recordArgType(scratch, arg_types, inst_args.len, i, tv.ty);
+            },
             // As in the compiler, the argument is a value of its type: values of different types
             // can have the same representation (`@as(?u8, 3)` and `@as(u8, 3)`)
             .comptime_anytype => {
                 out.* = tv.val orelse .unknown;
-                arg_types[i] = tv.ty;
+                arg_types = try recordArgType(scratch, arg_types, inst_args.len, i, tv.ty);
             },
             .comptime_value => {
                 out.* = tv.val orelse .unknown;
@@ -4723,6 +4732,28 @@ pub fn instanceOf(r: *Resolver, scratch: Allocator, g: Generic, f: FnType, args:
     }
     if (changed) inst = try ip.get(.{ .instance = .{ .file = g.owner.file, .decl = g.owner.item, .args = inst_args, .arg_types = arg_types, .parent = g.parent } });
     return inst;
+}
+
+/// Whether the argument `tv` of an anytype parameter is recorded by value: its type is
+/// comptime-only and its value is known. An argument whose value is not known keeps its type (the
+/// compiler requires the value and reports an error without it). Most anytype arguments are
+/// runtime values, which have no value here and need no comptime-only check.
+fn anytypeByValue(r: *Resolver, tv: TypedValue) Error!bool {
+    const v = tv.val orelse return false;
+    if (v == .unknown or v == .runtime or tv.ty == .unknown) return false;
+    return eval.isComptimeOnly(r, tv.ty);
+}
+
+/// `arg_types` of an instance with `n` parameters (allocated on first use, `runtime` for the
+/// parameters not recorded by value) with the type `ty` of the argument of parameter `i`
+fn recordArgType(scratch: Allocator, arg_types: []Index, n: usize, i: usize, ty: Index) Error![]Index {
+    const out = if (arg_types.len != 0) arg_types else blk: {
+        const a = try scratch.alloc(Index, n);
+        @memset(a, .runtime);
+        break :blk a;
+    };
+    out[i] = ty;
+    return out;
 }
 
 /// When the instance is used for the member `owner` it belongs to: a chain of iteration instances

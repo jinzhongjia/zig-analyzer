@@ -571,6 +571,76 @@ test "comptime anytype arguments of different types are different instances" {
     });
 }
 
+test "anytype arguments of comptime-only types are recorded by value" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1: an anytype parameter is comptime
+    // when the argument type is comptime-only, so the instance records the argument value, which
+    // the signature reads. Recording such arguments by type only gave `[_]u8` for
+    // `@TypeOf(arrOf(3))` and made `Any(5) == Any(6)` true.
+    try expectTypes(
+        \\fn arrOf(x: anytype) [x]u8 { return undefined; }
+        \\fn Wrap(comptime T: type) type { return struct { t: T }; }
+        \\fn wrapOf(x: anytype) Wrap(x) { return undefined; }
+        \\const E = enum { a, b, c };
+        \\fn tagArr(x: anytype) [@intFromEnum(@as(E, x))]u8 { return undefined; }
+        \\fn nullArr(x: anytype) [if (x == null) 1 else 2]u8 { return undefined; }
+        \\fn three() usize { return 3; }
+        \\fn four() usize { return 4; }
+        \\fn callArr(f: anytype) [f()]u8 { return undefined; }
+        \\fn mix(a: anytype, n: anytype) [n]@TypeOf(a) { return undefined; }
+        \\fn dep(n: anytype, y: [n]u8) [n]u8 { return y; }
+        \\const V = struct {
+        \\    pub fn get(_: V, n: anytype) [n]u8 { return undefined; }
+        \\};
+        \\const v: V = .{};
+        \\inline fn inlineArr(x: anytype) [x]u8 { return undefined; }
+        \\fn outer() usize { return @sizeOf(@TypeOf(arrOf(3))); }
+        \\fn Any(x: anytype) type { return struct { pub const val = x; }; }
+        \\fn optArr(x: anytype) [if (x.? == u8) 1 else 2]u8 { return undefined; }
+        \\const int_arg = @TypeOf(arrOf(3));
+        \\const distinct = @TypeOf(arrOf(3)) == @TypeOf(arrOf(4));
+        \\const type_arg = @TypeOf(wrapOf(u8));
+        \\const literal_arg = @TypeOf(tagArr(.c));
+        \\const null_arg = @TypeOf(nullArr(null));
+        \\const fn_three = @TypeOf(callArr(three));
+        \\const fn_four = @TypeOf(callArr(four));
+        \\const mixed = @TypeOf(mix(@as(u16, 1), 2));
+        \\const dependent = @TypeOf(dep(2, .{ 1, 2 }));
+        \\const method = @TypeOf(v.get(3));
+        \\const inline_arg = @TypeOf(inlineArr(3));
+        \\const nested = outer();
+        \\const name_int = @typeName(Any(3));
+        \\const name_type = @typeName(Any(u8));
+        \\const name_literal = @typeName(Any(.c));
+        \\const int_eq = Any(5) == Any(6);
+        \\const type_eq = Any(u8) == Any(u16);
+        \\const captured = Any(5).val;
+        \\const opt_arg = @TypeOf(optArr(@as(?type, u16)));
+    , &.{
+        .{ "int_arg", "type = [3]u8" },
+        .{ "distinct", "bool = false" },
+        .{ "type_arg", "type = Wrap(u8)" },
+        .{ "literal_arg", "type = [2]u8" },
+        .{ "null_arg", "type = [1]u8" },
+        .{ "fn_three", "type = [3]u8" },
+        .{ "fn_four", "type = [4]u8" },
+        // A comptime-known argument of a runtime type stays recorded by type
+        .{ "mixed", "type = [2]u16" },
+        .{ "dependent", "type = [2]u8" },
+        .{ "method", "type = [3]u8" },
+        .{ "inline_arg", "type = [3]u8" },
+        .{ "nested", "usize = 3" },
+        .{ "name_int", "*const [11:0]u8 = \"main.Any(3)\"" },
+        .{ "name_type", "*const [12:0]u8 = \"main.Any(u8)\"" },
+        .{ "name_literal", "*const [12:0]u8 = \"main.Any(.c)\"" },
+        .{ "int_eq", "bool = false" },
+        .{ "type_eq", "bool = false" },
+        .{ "captured", "comptime_int = 5" },
+        // A non-null optional value is represented by its payload: the instance records the
+        // argument type with it, so `x.?` is the payload
+        .{ "opt_arg", "type = [2]u8" },
+    });
+}
+
 test "functions with an inferred error set are evaluated in constants" {
     // The inferred error set of the running function must be the one in the function's type,
     // otherwise the computed value of the initializer is discarded.
@@ -9239,6 +9309,104 @@ test "comptime evaluation: anytype and comptime parameters write through pointer
         .{ "w_ptr_ptr", "u32 = 9" },
         .{ "w_alias_const", "u32 = 7" },
         .{ "w_alias_field", "u32 = 7" },
+    });
+}
+
+test "comptime evaluation: writes through pointers next to anytype arguments recorded by value" {
+    // Prevents the arguments of comptime-only types, which the instance records by value, from
+    // making a call that writes through a pointer argument reuse an earlier result; expected
+    // values are the results of zig 0.17.0 and 0.17.1
+    try expectTypes(
+        \\fn incAny(p: anytype) void {
+        \\    p.* += 1;
+        \\}
+        \\fn setTypeAny(p: anytype) void {
+        \\    p.* = u16;
+        \\}
+        \\fn addN(p: anytype, n: anytype) void {
+        \\    p.* += n;
+        \\}
+        \\fn incTuple(t: anytype) void {
+        \\    t[0].* += 1;
+        \\}
+        \\fn setTo(p: anytype, v: anytype) void {
+        \\    p.* = v;
+        \\}
+        \\fn retAny(p: anytype, n: anytype) @TypeOf(p) {
+        \\    p.* += n;
+        \\    return p;
+        \\}
+        \\const w_ct_int = blk: {
+        \\    var x: comptime_int = 1;
+        \\    incAny(&x);
+        \\    incAny(&x);
+        \\    break :blk x;
+        \\};
+        \\const w_type = blk: {
+        \\    var t: type = u8;
+        \\    setTypeAny(&t);
+        \\    break :blk t;
+        \\};
+        \\const w_mixed = blk: {
+        \\    var x: u32 = 1;
+        \\    addN(&x, 2);
+        \\    addN(&x, 3);
+        \\    break :blk x;
+        \\};
+        \\const w_mixed_ct = blk: {
+        \\    var x: comptime_int = 1;
+        \\    addN(&x, 2);
+        \\    addN(&x, 3);
+        \\    break :blk x;
+        \\};
+        \\const w_same_twice = blk: {
+        \\    var x: comptime_int = 10;
+        \\    addN(&x, 5);
+        \\    addN(&x, 5);
+        \\    break :blk x;
+        \\};
+        \\const w_tuple = blk: {
+        \\    var x: comptime_int = 1;
+        \\    incTuple(.{&x});
+        \\    incTuple(.{&x});
+        \\    break :blk x;
+        \\};
+        \\const w_set_type = blk: {
+        \\    var x: type = void;
+        \\    setTo(&x, [2]u8);
+        \\    break :blk x;
+        \\};
+        \\const w_set_int = blk: {
+        \\    var x: comptime_int = 0;
+        \\    setTo(&x, 7);
+        \\    setTo(&x, 8);
+        \\    break :blk x;
+        \\};
+        \\const w_ret = blk: {
+        \\    var x: comptime_int = 1;
+        \\    const q = retAny(&x, 4);
+        \\    q.* += 10;
+        \\    break :blk x;
+        \\};
+        \\const w_loop = blk: {
+        \\    var x: comptime_int = 0;
+        \\    for (0..4) |i| addN(&x, i + 1);
+        \\    break :blk x;
+        \\};
+    , &.{
+        // Pointers to variables of comptime-only types, directly and inside a tuple
+        .{ "w_ct_int", "comptime_int = 3" },
+        .{ "w_type", "type = u16" },
+        .{ "w_tuple", "comptime_int = 3" },
+        // A pointer next to a comptime_int or type argument, with different and equal values
+        .{ "w_mixed", "u32 = 6" },
+        .{ "w_mixed_ct", "comptime_int = 6" },
+        .{ "w_same_twice", "comptime_int = 20" },
+        .{ "w_set_type", "type = [2]u8" },
+        .{ "w_set_int", "comptime_int = 8" },
+        // A returned pointer, and a comptime_int argument that changes per iteration
+        .{ "w_ret", "comptime_int = 15" },
+        .{ "w_loop", "comptime_int = 10" },
     });
 }
 
