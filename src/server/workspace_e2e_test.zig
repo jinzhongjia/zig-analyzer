@@ -474,11 +474,11 @@ fn holdVisibleInstance(h: *Harness) *Workspace {
 /// Whether the only project was restarted because its maker crashed since `since` was its visible
 /// instance. The Zig 0.17 maker can panic right after a build, also after `waitIdle` has returned
 /// (see docs/zig-maker-build-request-race.md): the new instance then loads, configures and builds
-/// the project once more, so the write transactions, builds and publishes counted since then are
-/// not only the server's response to what the test did. The new instance is registered before it
-/// does any of that (see `Server.restartWorkspace`): checked after counting, this sees every
-/// restart the counts include. A restart for any other reason returns false, and the counts then
-/// show it.
+/// the project once more. `compiles` leaves out that build, but the write transactions and
+/// publishes counted since then are not only the server's response to what the test did. The new
+/// instance is registered before it does any of that (see `Server.restartWorkspace`): checked
+/// after counting, this sees every restart the counts include. A restart for any other reason
+/// returns false, and the counts then show it.
 fn restartedAfterCrash(h: *Harness, since: *const Workspace) bool {
     h.server.workspaces_mutex.lockUncancelable(testing.io);
     defer h.server.workspaces_mutex.unlock(testing.io);
