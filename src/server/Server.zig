@@ -69,6 +69,9 @@ test_gate: ?*TestGate = null,
 /// source files keep being created during every walk, so that a scan is always pending; always
 /// false outside tests
 test_rescan: std.atomic.Value(bool) = .init(false),
+/// Test hook: holds a computed diagnostics result before it is sent (see `PublishGate`); always
+/// null outside tests
+publish_gate: ?*PublishGate = null,
 
 /// Background tasks: reading projects' build system protocol, publishing diagnostics. Several
 /// threads submit tasks to it, and `Io.Group` does not allow submitting during an await, so it
@@ -428,6 +431,22 @@ pub const TestGate = struct {
             gate.release.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }) catch continue;
             return;
         }
+    }
+};
+
+/// Test hook: the first diagnostics result that reaches `sendDiagnostics` (its read transaction
+/// has ended, nothing of it has been sent) stops there until `release` is set, so that a test can
+/// change server state between computing and sending a publish. Later results pass.
+pub const PublishGate = struct {
+    /// Set when a result stops at the gate
+    entered: Io.Event = .unset,
+    release: Io.Event = .unset,
+    held: std.atomic.Value(bool) = .init(false),
+
+    fn pass(gate: *PublishGate, io: Io) void {
+        if (gate.held.swap(true, .acq_rel)) return;
+        gate.entered.set(io);
+        gate.release.waitUncancelable(io);
     }
 };
 
@@ -4620,6 +4639,7 @@ fn liveReady(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) !bool {
 /// `clear`: sent even when empty for a file that is not showing diagnostics; `always`: sent even
 /// when it is the same as the last result sent for the file.
 fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagnosticsParams, clear: bool, always: bool, seq: u64) void {
+    if (@import("builtin").is_test) if (server.publish_gate) |gate| gate.pass(server.io);
     const bytes = jsonrpc.notification(server.gpa, "textDocument/publishDiagnostics", params) catch return log.err("out of memory while building notification", .{});
     var sent = false;
     defer if (!sent) server.gpa.free(bytes);
