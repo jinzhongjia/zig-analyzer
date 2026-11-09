@@ -21,6 +21,10 @@
 //! directories are created or deleted, or notifications are lost. Source files created in watched
 //! directories that are not files of interest yet, and directories created or deleted, make the
 //! server scan the root directories for source files again (see `Server.scheduleScan`).
+//! A file becomes of interest when it is interned, and the server may read it before this task
+//! watches it: once it is watched, its known text is compared with the disk, so a change in
+//! between is not lost. A file still being read then is compared once the read is done: what
+//! the read gets is not known before.
 //!
 //! Polling (periodically checking size and modification time) is only the last resort: when
 //! native notifications are unavailable (other platforms, initialization failure), or some
@@ -50,6 +54,9 @@ const max_debounce_ms = 500;
 /// When polling, the wait between two checks is at least this many times the duration of one
 /// check: with many files the interval grows, so polling takes no more than about 5% of the time
 const min_idle_factor = 20;
+/// A file being read from disk when it was to be compared with the disk is compared again after
+/// this long
+const reverify_ms = 10;
 
 /// One change reported by native notifications
 const Event = struct {
@@ -82,6 +89,9 @@ pub const Watcher = struct {
     /// interned, roots were added or removed)
     resync_requested: std.atomic.Value(bool) = .init(true),
     stopping: std.atomic.Value(bool) = .init(false),
+    /// Test hook (null outside tests): the background task stops before its next round until the
+    /// pause is released, so that a test can change files before the task gets to them
+    test_pause: std.atomic.Value(?*TestPause) = .init(null),
 
     // ── The following fields are accessed only by the background task ──
     /// What is being watched (see `Server.WatchScope`); `.none` while not watching
@@ -114,9 +124,19 @@ pub const Watcher = struct {
     /// Duration of the last poll (see `min_idle_factor`)
     poll_ns: i96 = 0,
     next_poll: ?Io.Timestamp = null,
+    /// Files to compare with the disk again: they were being read from disk when compared (see
+    /// `Server.ChangeSource`); allocated by `gpa`
+    reverify: std.ArrayList([]u8) = .empty,
 
     /// Ids of the requests sent by `registerClientGlobs` start with this
     pub const registration_prefix = "zig-analyzer/didChangeWatchedFiles/";
+
+    /// See `test_pause`
+    pub const TestPause = struct {
+        /// Set when the background task has stopped
+        entered: Io.Event = .unset,
+        release: Io.Event = .unset,
+    };
 
     /// Created on the main loop, so later `wake` / `stop` calls are not lost. Falls back to polling
     /// when native notifications are unavailable.
@@ -152,6 +172,8 @@ pub const Watcher = struct {
         w.entry_dirs.deinit(w.gpa);
         w.state_arena.deinit();
         w.poller.deinit();
+        w.clearReverify();
+        w.reverify.deinit(w.gpa);
         w.gpa.destroy(w);
     }
 
@@ -175,10 +197,22 @@ pub const Watcher = struct {
         if (!w.resync_requested.swap(true, .acq_rel)) w.backend.wake();
     }
 
+    fn testPause(w: *Watcher) void {
+        if (!builtin.is_test) return;
+        const pause = w.test_pause.load(.acquire) orelse return;
+        const io = w.server.io;
+        pause.entered.set(io);
+        while (!w.stopping.load(.acquire)) {
+            pause.release.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }) catch continue;
+            return;
+        }
+    }
+
     /// Background task: ends when the server shuts down
     pub fn run(w: *Watcher) Io.Cancelable!void {
         defer w.deactivate();
         while (!w.stopping.load(.acquire)) {
+            w.testPause();
             const scope = w.server.watchScope();
             // Files the server starts watching may have changed while nobody watched them: they
             // are compared with the disk. At startup, they were all just read.
@@ -287,11 +321,13 @@ pub const Watcher = struct {
             if (pending.paths.count() != 0) return w.apply(a, &pending);
         }
 
-        // Wait for notifications; when some files need polling, wait at most until the next poll
-        const timeout_ns: ?u64 = if (w.next_poll) |at| blk: {
+        // Wait for notifications; when some files need polling or comparing again, wait at most
+        // until then
+        var timeout_ns: ?u64 = if (w.next_poll) |at| blk: {
             const left = Io.Clock.awake.now(io).durationTo(at).nanoseconds;
             break :blk if (left <= 0) 0 else @intCast(left);
         } else null;
+        if (w.reverify.items.len != 0) timeout_ns = @min(timeout_ns orelse std.math.maxInt(u64), reverify_ms * std.time.ns_per_ms);
         w.backend.wait(timeout_ns);
         if (w.stopping.load(.acquire)) return;
 
@@ -316,6 +352,8 @@ pub const Watcher = struct {
             w.poll_ns = start.durationTo(Io.Clock.awake.now(io)).nanoseconds;
             w.schedulePoll();
         };
+        for (w.reverify.items) |path| try pending.add(a, path, .verify);
+        w.clearReverify();
 
         // First add watches for newly appeared directories, then read the state of the files:
         // every later change will be notified
@@ -340,6 +378,12 @@ pub const Watcher = struct {
         _ = w.state_arena.reset(.retain_capacity);
         w.poller.reset();
         w.next_poll = null;
+        w.clearReverify();
+    }
+
+    fn clearReverify(w: *Watcher) void {
+        for (w.reverify.items) |path| w.gpa.free(path);
+        w.reverify.clearRetainingCapacity();
     }
 
     /// Identity key: consistent with Vfs file identity; lowercased on a case-insensitive volume
@@ -354,7 +398,8 @@ pub const Watcher = struct {
     /// Recomputes the files of interest and the watched directories for `scope`; with
     /// `.outside_roots`, also registers the client's additional file watchers. Files of interest
     /// that already exist in directories that did not exist before but have appeared now are
-    /// recorded in `pending`.
+    /// recorded in `pending`, and so are the files that were not of interest before, to be
+    /// compared with the disk.
     fn resync(w: *Watcher, a: Allocator, scope: Server.WatchScope, pending: *Pending) Allocator.Error!void {
         const server = w.server;
         const gpa = w.gpa;
@@ -456,6 +501,13 @@ pub const Watcher = struct {
                 const dir_key = std.fs.path.dirname(k) orelse continue;
                 if (appeared.contains(dir_key)) try pending.add(a, path, .created);
             };
+        }
+        // Files that were not of interest before: the server may have read them before they were
+        // watched (they are interned and read first, and recomputing the watched directories
+        // follows in this task), and a change in between was not notified. Now that later changes
+        // are notified or polled, their known text is compared with the disk.
+        for (files.keys(), files.values()) |k, path| {
+            if (!w.files.contains(k) and !entry_dirs.contains(k)) try pending.add(a, path, .verify);
         }
 
         w.spellings.reset(gpa);
@@ -583,10 +635,16 @@ pub const Watcher = struct {
             const kind: types.FileChangeType = if (!exists) .Deleted else if (hint == .created) .Created else .Changed;
             try (if (hint == .verify) &verified else &events).append(a, .{ .uri = try uri.fromPath(a, path), .type = kind });
         }
-        if (verified.items.len != 0) server.applyWatchedChanges(a, verified.items, .verified);
+        if (verified.items.len != 0) for (server.applyWatchedChanges(a, verified.items, .verified)) |path| {
+            const owned = try w.gpa.dupe(u8, path);
+            w.reverify.append(w.gpa, owned) catch |err| {
+                w.gpa.free(owned);
+                return err;
+            };
+        };
         if (events.items.len == 0) return;
         log.debug("{d} file(s) changed on disk", .{events.items.len});
-        server.applyWatchedChanges(a, events.items, .notified);
+        _ = server.applyWatchedChanges(a, events.items, .notified);
     }
 };
 

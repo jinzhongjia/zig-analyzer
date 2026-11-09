@@ -8,6 +8,7 @@ const fixture = za.project.fixture;
 const Harness = @import("test_harness.zig").Harness;
 const Server = @import("Server.zig");
 const Workspace = @import("Workspace.zig");
+const watch = @import("watch.zig");
 
 const Empty = struct {};
 
@@ -1647,6 +1648,50 @@ test "with a client that registers file watchers, the server watches the files o
 
         // Rewritten outside the editor, and the client sends no notification
         try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "libs/util.zig"), .data = "// one\n// two\npub fn helper() void {}\n" });
+        try waitWatched(&h, GotoLine{ .uri = main_uri, .text = main_text, .needle = "util.help", .want = 2 });
+
+        _ = try h.request("shutdown", {});
+        try h.notify("exit", {});
+    }
+}
+
+// Prevents losing a change made after the server read a file and before the background task
+// watched it: files are interned and read first, and watched once the task gets to them
+test "the server watches files on disk: a change between the first read of a file and its watch is reported" {
+    const main_text = "const util = @import(\"../libs/util.zig\");\npub fn main() void {\n    util.helper();\n}\n";
+    // With file watchers registered by the client, the server watches the files outside the
+    // workspace folders; otherwise all files
+    inline for (.{ true, false }) |client_watches| {
+        var project = try fixture.Project.create(&.{
+            .{ .path = "app/main.zig", .text = main_text },
+            .{ .path = "libs/util.zig", .text = "pub fn helper() void {}\n" },
+        });
+        defer project.deinit();
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const a = h.arena.allocator();
+        const app_uri = try za.base.uri.fromPath(a, try project.path(a, "app"));
+        const capabilities = if (client_watches) .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true, .relativePatternSupport = true } } } else Empty{};
+        _ = try h.request("initialize", .{ .rootUri = app_uri, .workspaceFolders = &.{.{ .uri = app_uri, .name = "app" }}, .capabilities = capabilities });
+        try h.notify("initialized", Empty{});
+        _ = try h.request("zig-analyzer/waitIdle", {});
+
+        // The background task stops before it gets to the files interned from here on
+        const watcher = h.server.watcher.?;
+        var pause: watch.Watcher.TestPause = .{};
+        watcher.test_pause.store(&pause, .release);
+        watcher.requestResync();
+        pause.entered.waitUncancelable(testing.io);
+        const main_uri = try za.base.uri.fromPath(a, try project.path(a, "app/main.zig"));
+        try open(&h, main_uri, main_text);
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        try testing.expectEqual(0, try gotoLine(&h, main_uri, main_text, "util.help"));
+
+        // Rewritten outside the editor while not watched yet, and the client sends no notification
+        try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "libs/util.zig"), .data = "// one\n// two\npub fn helper() void {}\n" });
+        watcher.test_pause.store(null, .release);
+        pause.release.set(testing.io);
         try waitWatched(&h, GotoLine{ .uri = main_uri, .text = main_text, .needle = "util.help", .want = 2 });
 
         _ = try h.request("shutdown", {});

@@ -353,7 +353,7 @@ On `exit` and end of input, in-flight reads are canceled rather than awaited (`s
 
 ### External changes
 
-The server registers `workspace/didChangeWatchedFiles` when the client supports it. With `files.watcher = auto`, it watches every file itself when the client cannot register or rejects the registration, and otherwise only files outside the workspace folders, which clients do not watch. `server` always watches on the server, and `client` never does. Clients report folder changes by the folder's path only, so such an event applies to every known file under it. When the server takes over watching, it compares known files with the disk once.
+The server registers `workspace/didChangeWatchedFiles` when the client supports it. With `files.watcher = auto`, it watches every file itself when the client cannot register or rejects the registration, and otherwise only files outside the workspace folders, which clients do not watch. `server` always watches on the server, and `client` never does. Clients report folder changes by the folder's path only, so such an event applies to every known file under it. When the server takes over watching, it compares known files with the disk once. It does the same for each file it starts watching: a file is interned and read before the server watches it, and a change in between is not notified. Only files with a known text are read for the comparison, and a file still being read is compared once the read is done.
 
 Files of interest are interned files, configure inputs, and root build files, excluding dependency libraries. Open documents are included: buffers win over disk, but builds read the disk.
 
