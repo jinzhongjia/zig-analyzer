@@ -4385,18 +4385,27 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, always: bool, gene
         server.docs_mutex.unlock(server.io);
         if (!wanted) return;
     }
-    // Retry when canceled by a write transaction: a publish triggered by a build result must not be
-    // lost because of an unrelated edit
-    var attempt: usize = 0;
-    while (attempt < 100) : (attempt += 1) {
+    // Retry when canceled by a write transaction, however often: a publish triggered by a build
+    // result or a file deleted on disk must not be lost because of unrelated edits. Before
+    // retrying, wait for the write transaction to take the lock (see `Db.waitPendingWrites`);
+    // retrying at once could keep it waiting.
+    while (true) {
         if (generation) |g| if (server.editGeneration(file) != g) return;
-        server.prepareLive(file);
+        const prepared = server.prepareLive(file);
         _ = arena_state.reset(.retain_capacity);
         const arena = arena_state.allocator();
         var ctx = server.db.beginRead(arena);
         // Another edit came in after preparing: prepare again outside the lock instead of running
-        // AstGen inside the read transaction (while typing, AstGen may be slower than keystrokes)
-        const ready = server.liveReady(&ctx, file) catch false;
+        // AstGen inside the read transaction (while typing, AstGen may be slower than keystrokes).
+        // When preparing failed, the query runs AstGen itself.
+        const ready = !prepared or (server.liveReady(&ctx, file) catch |err| switch (err) {
+            error.Canceled => {
+                ctx.end();
+                server.db.waitPendingWrites();
+                continue;
+            },
+            error.OutOfMemory => true,
+        });
         if (!ready) {
             ctx.end();
             continue;
@@ -4407,14 +4416,20 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, always: bool, gene
         const params = server.computeDiagnostics(&ctx, arena, file) catch |err| {
             ctx.end();
             switch (err) {
-                error.Canceled => continue,
+                error.Canceled => {
+                    server.db.waitPendingWrites();
+                    continue;
+                },
                 error.OutOfMemory => return log.err("out of memory while computing diagnostics", .{}),
             }
         };
         // If the computation swallowed `Canceled`, the result is incomplete: retry as well
         const canceled = if (ctx.checkCanceled()) |_| false else |_| true;
         ctx.end();
-        if (canceled) continue;
+        if (canceled) {
+            server.db.waitPendingWrites();
+            continue;
+        }
         server.sendDiagnostics(file, params, clear, always, seq);
         return;
     }
@@ -4423,26 +4438,41 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, always: bool, gene
 /// Runs AstGen on the file's current text outside any read transaction (see `live.Prepared`):
 /// AstGen does not check for cancellation, so if it ran inside a read transaction, write
 /// transactions would have to wait for it to finish. A read transaction is held briefly, only to
-/// read the text. Any failure just falls back to computing in the query.
-fn prepareLive(server: *Server, file: Vfs.FileId) void {
-    if (!server.liveEligible(file)) return;
+/// read the text. Returns false when preparing failed: the query then computes the live
+/// diagnostics itself (a publish waiting for a preparation that keeps failing would never finish).
+/// A read canceled by a write transaction is not a failure: it returns true once the write
+/// transaction has the lock, and the caller reads again.
+fn prepareLive(server: *Server, file: Vfs.FileId) bool {
+    if (!server.liveEligible(file)) return true;
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const text, const backend = blk: {
+    const Read = struct { text: []const u8, backend: live.Backend };
+    const read: ?Read = blk: {
         var ctx = server.db.beginRead(a);
         defer ctx.end();
-        const backend: live.Backend = switch (ctx.get(live.LiveBackend, {}) catch return) {
+        const backend: live.Backend = switch (ctx.get(live.LiveBackend, {}) catch |err| switch (err) {
+            error.Canceled => break :blk null,
+            error.OutOfMemory => return false,
+        }) {
             .in_process => .in_process,
-            .subprocess => |exe| .{ .subprocess = a.dupe(u8, exe) catch return },
+            .subprocess => |exe| .{ .subprocess = a.dupe(u8, exe) catch return false },
         };
-        const t = (ctx.get(FileText, file) catch return) orelse return;
-        break :blk .{ a.dupe(u8, t) catch return, backend };
+        const t = (ctx.get(FileText, file) catch |err| switch (err) {
+            error.Canceled => break :blk null,
+            error.OutOfMemory => return false,
+        }) orelse return true;
+        break :blk .{ .text = a.dupe(u8, t) catch return false, .backend = backend };
+    };
+    const r = read orelse {
+        server.db.waitPendingWrites();
+        return true;
     };
     const mode = live.modeOf(server.vfs.path(file));
-    if (!server.live_prepared.claim(server.io, file, live.Prepared.hash(text, mode, backend))) return;
-    const result = live.checkWith(server.gpa, server.io, backend, text, mode) catch return;
-    server.live_prepared.put(server.io, file, text, mode, backend, result) catch {};
+    if (!server.live_prepared.claim(server.io, file, live.Prepared.hash(r.text, mode, r.backend))) return true;
+    const result = live.checkWith(server.gpa, server.io, r.backend, r.text, mode) catch return false;
+    server.live_prepared.put(server.io, file, r.text, mode, r.backend, result) catch return false;
+    return true;
 }
 
 /// The live diagnostics of the current text have already been prepared outside a read transaction
@@ -4630,6 +4660,49 @@ test "publishFiles: requests for a file being published coalesce into one more r
     const computed = server.publish_seq.load(.monotonic) - before;
     try std.testing.expect(computed >= 1 and computed <= 2);
     try std.testing.expectEqual(0, server.publish_files.count());
+}
+
+// Prevents a publish from giving up after a fixed number of attempts interrupted by write
+// transactions: the clearing of a file deleted on disk and closed was lost, and its compile errors
+// stayed published
+test "publishFiles: a publish interrupted by write transactions again and again still sends its result" {
+    const gpa = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, gpa, &writer);
+    defer server.deinit();
+    const native = @import("../util/test_path.zig").native;
+    const file = try server.vfs.intern(native("/tmp/zig-analyzer-publish-interrupted.zig"));
+    {
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        try server.db.set(FileText, file, try gpa.dupe(u8, "fn f() void {\n    var x = 1;\n}\n"), .low);
+    }
+    server.publishFiles(&.{file}, true);
+    // Write transactions follow each other for a while, canceling the reads the publish begins
+    // meanwhile
+    const t0 = Io.Clock.awake.now(server.io);
+    var writes: usize = 0;
+    while (writes < 1000 or t0.durationTo(Io.Clock.awake.now(server.io)).nanoseconds < 200 * std.time.ns_per_ms) : (writes += 1) {
+        server.db.beginWrite();
+        server.db.endWrite();
+    }
+    server.waitIdle();
+    var reader: Io.Reader = .fixed(out.written());
+    var diagnostics: std.ArrayList(usize) = .empty;
+    defer diagnostics.deinit(gpa);
+    while (transport.readMessage(&reader, gpa)) |body| {
+        defer gpa.free(body);
+        const msg = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+        defer msg.deinit();
+        const method = msg.value.object.get("method") orelse continue;
+        if (!std.mem.eql(u8, method.string, "textDocument/publishDiagnostics")) continue;
+        try diagnostics.append(gpa, msg.value.object.get("params").?.object.get("diagnostics").?.array.items.len);
+    } else |err| if (err != error.EndOfStream) return err;
+    try std.testing.expectEqual(1, diagnostics.items.len);
+    try std.testing.expect(diagnostics.items[0] > 0);
 }
 
 // Prevents ignoring a build.zig created or saved through another spelling of a root directory on a

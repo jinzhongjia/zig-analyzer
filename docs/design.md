@@ -85,6 +85,7 @@ Each thread keeps an active query stack; a cycle calls the query's `cycleFallbac
 ### Cancellation
 
 - `pending_write` counts write transactions waiting for the exclusive lock. While it is nonzero, read queries return `error.Canceled` on entry to `get`, canceled computations write no memos, and read requests stop (see "Read requests"). A write transaction decrements it only after acquiring the lock, so overlapping writes do not clear each other's registration.
+- `waitPendingWrites` waits until `pending_write` is zero; a read that begins afterwards sees the changes of the writes that were waiting. Diagnostic publishing calls it before beginning a canceled read again: the lock's mutex is not fair, so a read that begins again at once can take the shared lock ahead of the waiting write, be canceled again, and keep the write waiting for as long as it retries.
 - A write may declare the inputs it changes (`beginWriteOf`), and a read the inputs its results may depend on (`Mark`): a write cancels only the reads it may affect, and the others finish first.
 
 ### Concurrent reads
@@ -337,6 +338,7 @@ Reads run concurrently on snapshots and are canceled by `$/cancelRequest` and wr
 Edit-triggered publishing is debounced per file; live diagnostics are computed outside read transactions. During a compile the previous results are kept, then replaced atomically; compile results are immutable and reference counted.
 
 - The queue coalesces by file, and a file being computed is published once more after it finishes.
+- A publish interrupted by write transactions runs again until its result is sent, however often it is interrupted; it waits for each write to take the lock first (`waitPendingWrites`). When preparing the live diagnostics fails, the query computes them instead of the publish waiting for a preparation.
 - A file's diagnostics may depend on other files' text, so other open files are recomputed when a document is edited, opened, or closed or a file changes on disk, and sent only when they differ.
 - Edit-triggered publishes bypass the queue: each takes an increasing sequence number before reading state, and only results no older than the last sent are sent.
 

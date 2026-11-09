@@ -1221,6 +1221,52 @@ test "cancellation: a writer taking the lock keeps the request of the writer que
     try testing.expectEqual(0, d.pending_write.load(.acquire));
 }
 
+test "cancellation: a read begun after waitPendingWrites reads the changes of the writes that were pending" {
+    // Guards against a read canceled by a pending write beginning again ahead of that write: the
+    // mutex of the lock is not fair, so retrying at once could keep the write waiting
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 7, .low);
+    // Returns at once when no write transaction is pending
+    d.waitPendingWrites();
+    const Writer = struct {
+        fn run(dd: *Db, result: *?Allocator.Error!void) void {
+            dd.beginWrite();
+            defer dd.endWrite();
+            result.* = dd.set(Number, 1, 70, .low);
+        }
+    };
+    var result: ?Allocator.Error!void = null;
+    // A write transaction holds the lock, so the second one waits for the mutex of the lock. When
+    // the first one ends, the woken writer competes for that mutex with the reads begun meanwhile
+    d.beginWrite();
+    const thread = std.Thread.spawn(.{}, Writer.run, .{ &d, &result }) catch |err| {
+        d.endWrite();
+        return err;
+    };
+    while (d.pending_write.load(.acquire) != 1) std.Thread.yield() catch {};
+    d.endWrite();
+    // Read until a read is not canceled, waiting for the pending write after each canceled one
+    var canceled: usize = 0;
+    const after = while (true) {
+        var ctx = d.beginRead(testing.allocator);
+        const value = ctx.get(Plus, 1);
+        ctx.end();
+        if (value) |_| {} else |err| if (err == error.Canceled) {
+            canceled += 1;
+            d.waitPendingWrites();
+            continue;
+        }
+        break value;
+    };
+    thread.join();
+    try result.?;
+    // Plus is Number / 10 + 1: 1 before the write, 8 after
+    try testing.expectEqual(8, try after);
+    // Only a read begun before the write took the lock is canceled
+    try testing.expect(canceled <= 1);
+}
+
 test "cancellation: result of a compute that swallowed Canceled is not memoized" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
