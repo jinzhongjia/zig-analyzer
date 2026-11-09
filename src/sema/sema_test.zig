@@ -7380,6 +7380,254 @@ test "comptime evaluation: std.sort and std.mem.sortUnstable sort in place" {
         .{ "s_pdq_median", "u32 = 32588" },
     });
 }
+test "comptime evaluation: pointer identity of declarations, functions and temporaries" {
+    try expectTypes(
+        \\const arr = [_]u8{ 1, 2, 3, 4 };
+        \\const arr2 = [_]u8{ 1, 2, 3, 4 };
+        \\const gp: [*]const u8 = &arr;
+        \\const word = [_]u8{ 'a', 'b', 'c' };
+        \\const word_z = [_:0]u8{ 'a', 'b', 'c' };
+        \\const S = struct {
+        \\    a: u32,
+        \\    b: u32,
+        \\    const table = [_]u8{ 7, 8 };
+        \\    const Self = @This();
+        \\    fn get(self: *const S) u32 {
+        \\        return self.a;
+        \\    }
+        \\};
+        \\const s = S{ .a = 1, .b = 1 };
+        \\const s2 = S{ .a = 1, .b = 1 };
+        \\var gv: u32 = 0;
+        \\fn foo() void {}
+        \\fn bar() void {}
+        \\const foo_alias = foo;
+        \\const fp: *const fn () void = &foo;
+        \\const ch: u8 = 'a';
+        \\const gview: *const [1][4]u8 = &arr;
+        \\fn eql(a: []const u8, b: []const u8) bool {
+        \\    if (a.len != b.len) return false;
+        \\    if (a.len == 0 or a.ptr == b.ptr) return true;
+        \\    for (a, b) |x, y| if (x != y) return false;
+        \\    return true;
+        \\}
+        \\fn gpAddr() bool {
+        \\    return gp == @as([*]const u8, &arr);
+        \\}
+        \\fn addrAddr() bool {
+        \\    return @as([*]const u8, &arr) == @as([*]const u8, &arr);
+        \\}
+        \\fn twoDecls() bool {
+        \\    return &arr == &arr2;
+        \\}
+        \\fn field() bool {
+        \\    return &s.a == &s.a;
+        \\}
+        \\fn fieldOther() bool {
+        \\    return &s.a == &s.b;
+        \\}
+        \\fn fieldOtherDecl() bool {
+        \\    return &s.a == &s2.a;
+        \\}
+        \\fn elem() bool {
+        \\    return &arr[1] == &arr[1];
+        \\}
+        \\fn elemOther() bool {
+        \\    return &arr[1] == &arr[2];
+        \\}
+        \\fn member() bool {
+        \\    return &S.table == &S.table;
+        \\}
+        \\fn memberThis() bool {
+        \\    return &S.Self.table == &S.table;
+        \\}
+        \\fn memberOther() bool {
+        \\    return @as([*]const u8, &S.table) == @as([*]const u8, &arr);
+        \\}
+        \\fn variable() bool {
+        \\    return &gv == &gv;
+        \\}
+        \\fn method() u32 {
+        \\    return s.get();
+        \\}
+        \\fn func() bool {
+        \\    return &foo == &foo;
+        \\}
+        \\fn funcAlias() bool {
+        \\    return &foo == &foo_alias;
+        \\}
+        \\fn funcStored() bool {
+        \\    return fp == &foo;
+        \\}
+        \\fn funcOther() bool {
+        \\    return &foo == &bar;
+        \\}
+        \\fn temp() bool {
+        \\    return &[_]u8{ 1, 2, 3 } == &[_]u8{ 1, 2, 3 };
+        \\}
+        \\fn tempOther() bool {
+        \\    return &[_]u8{ 1, 2, 3 } == &[_]u8{ 1, 2, 4 };
+        \\}
+        \\fn tempDecl() bool {
+        \\    return &[_]u8{ 1, 2, 3, 4 } == &arr;
+        \\}
+        \\fn tempInt() bool {
+        \\    return &@as(u32, 5) == &@as(u32, 5);
+        \\}
+        \\fn eqlWord() bool {
+        \\    return eql(&word, "abc");
+        \\}
+        \\fn eqlWordOther() bool {
+        \\    return eql(&word, "abd");
+        \\}
+        \\fn eqlDecls() bool {
+        \\    return eql(&arr, &arr2);
+        \\}
+        \\fn eqlSlice() bool {
+        \\    return eql(&arr, gp[0..4]);
+        \\}
+        \\fn wordLit() bool {
+        \\    return @as([*]const u8, &word) == @as([*]const u8, "abc");
+        \\}
+        \\fn wordzLit() bool {
+        \\    return @as([*]const u8, &word_z) == @as([*]const u8, "abc");
+        \\}
+        \\fn localDecl() bool {
+        \\    var a = [_]u8{ 1, 2, 3, 4 };
+        \\    _ = &a;
+        \\    return &a == &arr;
+        \\}
+        \\fn localTemp() bool {
+        \\    const a = [_]u8{ 1, 2, 3 };
+        \\    return &a == &[_]u8{ 1, 2, 3 };
+        \\}
+        \\fn localTempOther() bool {
+        \\    const a = [_]u8{ 1, 2, 3 };
+        \\    return &a == &[_]u8{ 1, 2, 4 };
+        \\}
+        \\fn derefAddr() bool {
+        \\    const p = &arr;
+        \\    return &p.* == p;
+        \\}
+        \\fn viewSame() bool {
+        \\    return @as(*const [1]u8, &ch) == @as(*const [1]u8, &ch);
+        \\}
+        \\fn viewElem() bool {
+        \\    const v: *const [1]u8 = &ch;
+        \\    return &v[0] == &ch;
+        \\}
+        \\fn viewInterned() bool {
+        \\    return @as(*const [1][4]u8, &arr) == gview;
+        \\}
+        \\fn viewLit() bool {
+        \\    return @as([*]const u8, @as(*const [1]u8, &ch)) == @as([*]const u8, "a");
+        \\}
+        \\fn eqlView() bool {
+        \\    return eql(@as(*const [1]u8, &ch), "a");
+        \\}
+        \\fn eqlViewOther() bool {
+        \\    return eql(@as(*const [1]u8, &ch), "b");
+        \\}
+        \\const p_gp_addr = gp == @as([*]const u8, &arr);
+        \\const p_addr_addr = @as([*]const u8, &arr) == @as([*]const u8, &arr);
+        \\const p_eql_addr = eql(&word, "abc");
+        \\const p_eql_other = eql(&word, "abd");
+        \\const r_gp_addr = gpAddr();
+        \\const r_addr_addr = addrAddr();
+        \\const r_two_decls = twoDecls();
+        \\const r_field = field();
+        \\const r_field_other = fieldOther();
+        \\const r_field_decl = fieldOtherDecl();
+        \\const r_elem = elem();
+        \\const r_elem_other = elemOther();
+        \\const r_member = member();
+        \\const r_member_this = memberThis();
+        \\const r_member_other = memberOther();
+        \\const r_var = variable();
+        \\const r_method = method();
+        \\const r_fn = func();
+        \\const r_fn_alias = funcAlias();
+        \\const r_fn_stored = funcStored();
+        \\const r_fn_other = funcOther();
+        \\const r_temp = temp();
+        \\const r_temp_other = tempOther();
+        \\const r_temp_decl = tempDecl();
+        \\const r_temp_int = tempInt();
+        \\const r_eql_word = eqlWord();
+        \\const r_eql_word_other = eqlWordOther();
+        \\const r_eql_decls = eqlDecls();
+        \\const r_eql_slice = eqlSlice();
+        \\const r_word_lit = wordLit();
+        \\const r_wordz_lit = wordzLit();
+        \\const r_local_decl = localDecl();
+        \\const r_local_temp = localTemp();
+        \\const r_local_temp_other = localTempOther();
+        \\const r_deref = derefAddr();
+        \\const r_view_same = viewSame();
+        \\const r_view_elem = viewElem();
+        \\const r_view_interned = viewInterned();
+        \\const r_view_lit = viewLit();
+        \\const r_eql_view = eqlView();
+        \\const r_eql_view_other = eqlViewOther();
+    , &.{
+        // `&` of a declaration points to the declaration, as the pointer stored in `gp` does;
+        // an interned pointer keeps no identity, so equal data gives no value instead of `false`
+        .{ "p_gp_addr", "bool" },
+        .{ "p_addr_addr", "bool = true" },
+        .{ "p_eql_addr", "bool = true" },
+        .{ "p_eql_other", "bool = false" },
+        .{ "r_gp_addr", "bool" },
+        .{ "r_addr_addr", "bool = true" },
+        // Distinct declarations with equal values
+        .{ "r_two_decls", "bool = false" },
+        // Fields and elements of a declaration, and declarations reached through a type
+        .{ "r_field", "bool = true" },
+        .{ "r_field_other", "bool = false" },
+        .{ "r_field_decl", "bool = false" },
+        .{ "r_elem", "bool = true" },
+        .{ "r_elem_other", "bool = false" },
+        .{ "r_member", "bool = true" },
+        .{ "r_member_this", "bool = true" },
+        .{ "r_member_other", "bool = false" },
+        .{ "r_var", "bool = true" },
+        // A method receives the address of the declaration it is called on
+        .{ "r_method", "u32 = 1" },
+        // A function is the identity of pointers to it, whichever constant names it
+        .{ "r_fn", "bool = true" },
+        .{ "r_fn_alias", "bool = true" },
+        .{ "r_fn_stored", "bool = true" },
+        .{ "r_fn_other", "bool = false" },
+        // Temporaries are the same constant for equal values of the same type
+        .{ "r_temp", "bool = true" },
+        .{ "r_temp_other", "bool = false" },
+        .{ "r_temp_decl", "bool = false" },
+        .{ "r_temp_int", "bool = true" },
+        // The fast path of `std.mem.eql` compares the pointers of equal data
+        .{ "r_eql_word", "bool = true" },
+        .{ "r_eql_word_other", "bool = false" },
+        .{ "r_eql_decls", "bool = true" },
+        .{ "r_eql_slice", "bool = true" },
+        // A string literal carries its sentinel, for which `word` has no room
+        .{ "r_word_lit", "bool = false" },
+        .{ "r_wordz_lit", "bool" },
+        // A local variable is storage of its own; a constant local may be the same constant
+        // as an equal temporary
+        .{ "r_local_decl", "bool = false" },
+        .{ "r_local_temp", "bool" },
+        .{ "r_local_temp_other", "bool = false" },
+        // `&p.*` is `p`
+        .{ "r_deref", "bool = true" },
+        // A `*T` → `*[1]T` view of a declaration points to the declaration, its only element
+        // being the place: an interned pointer is compared with that one element (equal data
+        // gives no value, as for `gp`; a literal's sentinel has no room after it)
+        .{ "r_view_same", "bool = true" },
+        .{ "r_view_elem", "bool = true" },
+        .{ "r_view_interned", "bool" },
+        .{ "r_view_lit", "bool = false" },
+        .{ "r_eql_view", "bool = true" },
+        .{ "r_eql_view_other", "bool = false" },
+    });
+}
 
 test "comptime evaluation: slices of interpreter storage read elements in place" {
     // Guards against copying the whole range when taking an element or the length of a slice:
