@@ -19,6 +19,12 @@ In a file already formatted with `zig fmt`, the edit is laid out by `zig fmt`, s
 - **Order**: `std` / `builtin` / `root`, dependency modules, then files, with a blank line between groups. `imports.derived` and `imports.sort` set the style and can be shared through `zig-analyzer.zon`. Comparisons use rustfmt's version sort, as rust-analyzer does.
 - **When offered**: always when requested through `context.only`, which keybindings and organize on save use; in menus, only when the range intersects a block. It is not offered when already organized, and applying it twice changes nothing.
 
+## Fix all (`source.fixAll`)
+
+Applies, across the whole file, the fixes that need no decision: `var` to `const` and deleting pointless discards. Returned only when requested through `context.only` (the range is ignored), which on-save actions and keybindings use, and not offered when there is nothing to fix.
+
+LSP excludes fixes that suppress errors or are unsafe, so these remain individual quick fixes: fixes of unused names (discards, removing or renaming captures and parameters), and the `undefined` / `@panic("TODO")` placeholders for missing fields and prongs.
+
 ## Removing unused parameters (`ide/remove_param.zig`)
 
 Offered on AstGen's `unused function parameter`, besides the preferred discard, for functions with a body in the user's code. Not offered for `export` / `extern` or variadic functions, or receivers of methods.

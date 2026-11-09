@@ -219,6 +219,87 @@ test "use 'const' for locals that are never mutated" {
     }
 }
 
+/// Applies `source.fixAll` to `source`; "no action" when it is not offered
+fn applyFixAll(source: []const u8) ![]const u8 {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", source);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const action = try code_actions.fixAll(&r, added.file) orelse return testing.allocator.dupe(u8, "no action");
+    try testing.expectEqual(code_actions.Action.Kind.source_fix_all, action.kind);
+    const edits = try w.arena.allocator().dupe(code_actions.Edit, action.edits);
+    std.mem.sort(code_actions.Edit, edits, {}, struct {
+        fn lessThan(_: void, a: code_actions.Edit, b: code_actions.Edit) bool {
+            return a.start < b.start;
+        }
+    }.lessThan);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var pos: u32 = 0;
+    for (edits) |e| {
+        try out.appendSlice(testing.allocator, source[pos..e.start]);
+        try out.appendSlice(testing.allocator, e.text);
+        pos = e.end;
+    }
+    try out.appendSlice(testing.allocator, source[pos..]);
+    return out.toOwnedSlice(testing.allocator);
+}
+
+test "fix all applies const and pointless discard fixes across the file" {
+    const got = try applyFixAll(
+        \\fn f() u32 {
+        \\    var x: u32 = 1;
+        \\    _ = x;
+        \\    return x;
+        \\}
+        \\fn g(a: u32) u32 {
+        \\    comptime var c: u32 = 2;
+        \\    _ = a;
+        \\    var d: u32 = c;
+        \\    d += a;
+        \\    return d;
+        \\}
+        \\
+    );
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(
+        \\fn f() u32 {
+        \\    const x: u32 = 1;
+        \\    return x;
+        \\}
+        \\fn g(a: u32) u32 {
+        \\    const c: u32 = comptime 2;
+        \\    var d: u32 = c;
+        \\    d += a;
+        \\    return d;
+        \\}
+        \\
+    , got);
+    try expectAstCheckClean(got);
+}
+
+test "fix all leaves fixes that suppress errors or add placeholders alone" {
+    for ([_][]const u8{
+        // Clean file
+        "fn f() u32 {\n    return 1;\n}\n",
+        // Unused names: every fix hides that the name is not used
+        "fn f(a: u32) void {\n    const x = 1;\n}\n",
+        "fn f(o: ?u32) void {\n    if (o) |v| {}\n}\n",
+        // Placeholders: `undefined` and `@panic("TODO")` need user input
+        "const S = struct { a: u32 };\nfn f() S {\n    return .{};\n}\n",
+        "const E = enum { a, b };\nfn f(e: E) void {\n    switch (e) {\n        .a => {},\n    }\n}\n",
+        // AstGen does not run with syntax errors
+        "fn f() u32 {\n    var x: u32 = 1;\n    return x\n}\n",
+    }) |source| {
+        const got = try applyFixAll(source);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("no action", got);
+    }
+}
+
 test "remove unused captures or rename them to _" {
     const cases = [_]struct { []const u8, []const u8, []const u8 }{
         // Optional if / while: the condition is compared with null

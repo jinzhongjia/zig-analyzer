@@ -15,7 +15,7 @@
 //!
 //! Refactors: extract the selected expression into a local constant, and convert losslessly
 //! between ordinary and multiline string literals. Source actions: organize imports (see
-//! `ide_db/organize_imports.zig`).
+//! `ide_db/organize_imports.zig`) and fix all (see `fixAll`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -49,8 +49,11 @@ pub const Action = struct {
     /// diagnostic has several fixes, only one of them is preferred
     preferred: bool = true,
 
-    pub const Kind = enum { quickfix, refactor_extract, refactor_rewrite, source_organize_imports };
+    pub const Kind = enum { quickfix, refactor_extract, refactor_rewrite, source_organize_imports, source_fix_all };
 };
+
+const never_mutated_message = "local variable is never mutated";
+const pointless_discard_prefix = "pointless discard of ";
 
 /// Quick fixes available in the range `[start, end]`
 pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Error![]const Action {
@@ -59,14 +62,14 @@ pub fn codeActions(r: *Resolver, file: FileId, start: u32, end: u32) resolve.Err
     const check = try r.ctx.get(database.live.AstCheck, file);
     for (check.items) |d| {
         if (d.end < start or d.start > end) continue;
-        if (std.mem.eql(u8, d.message, "local variable is never mutated")) {
+        if (std.mem.eql(u8, d.message, never_mutated_message)) {
             const edits = try useConst(r, file, text, d.start) orelse continue;
             try out.append(r.arena, .{ .title = "use 'const'", .edits = edits, .diagnostic = .{ .start = d.start, .end = d.end, .message = d.message } });
             continue;
         }
         const edit = if (std.mem.startsWith(u8, d.message, "unused ") and !std.mem.endsWith(u8, d.message, " label"))
             try discard(r, file, text, d.start)
-        else if (std.mem.startsWith(u8, d.message, "pointless discard of "))
+        else if (std.mem.startsWith(u8, d.message, pointless_discard_prefix))
             removeDiscard(text, d.start)
         else
             null;
@@ -116,6 +119,25 @@ pub fn organizeImports(r: *Resolver, file: FileId, start: u32, end: u32, opts: o
     const edits = try r.arena.alloc(Edit, result.edits.len);
     for (result.edits, edits) |e, *out| out.* = .{ .start = e.start, .end = e.end, .text = e.text };
     return .{ .title = "Organize imports", .kind = .source_organize_imports, .edits = edits };
+}
+
+/// Applies every fix in the file that leaves nothing to decide (`source.fixAll`): `var` to `const`
+/// and deleting pointless discards. LSP excludes fixes that suppress errors or are unsafe, so fixes
+/// of unused names (each one hides that a name is not used) and placeholders for missing prongs and
+/// fields are left out. Not offered when there is nothing to fix.
+pub fn fixAll(r: *Resolver, file: FileId) resolve.Error!?Action {
+    const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
+    const check = try r.ctx.get(database.live.AstCheck, file);
+    var edits: std.ArrayList(Edit) = .empty;
+    for (check.items) |d| {
+        if (std.mem.eql(u8, d.message, never_mutated_message)) {
+            if (try useConst(r, file, text, d.start)) |e| try edits.appendSlice(r.arena, e);
+        } else if (std.mem.startsWith(u8, d.message, pointless_discard_prefix)) {
+            if (removeDiscard(text, d.start)) |e| try edits.append(r.arena, e);
+        }
+    }
+    if (edits.items.len == 0) return null;
+    return .{ .title = "Fix all auto-fixable problems", .kind = .source_fix_all, .edits = edits.items };
 }
 
 /// Replaces only complete string literals; the multiline form is decoded token by token, so that

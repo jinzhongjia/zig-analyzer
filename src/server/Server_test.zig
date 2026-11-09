@@ -1773,6 +1773,56 @@ test "organize imports is offered with the cursor in an import block or when req
     try h.notify("exit", {});
 }
 
+test "fix all is returned only when requested and ignores the range" {
+    const Harness = @import("test_harness.zig").Harness;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const init = try h.request("initialize", .{
+        .capabilities = .{ .textDocument = .{ .codeAction = .{ .codeActionLiteralSupport = .{ .codeActionKind = .{ .valueSet = &[_][]const u8{ "quickfix", "source.fixAll" } } } } } },
+    });
+    const kinds = init.object.get("result").?.object.get("capabilities").?.object.get("codeActionProvider").?.object.get("codeActionKinds").?.array.items;
+    const advertised = for (kinds) |k| {
+        if (std.mem.eql(u8, k.string, "source.fixAll")) break true;
+    } else false;
+    try testing.expect(advertised);
+    const uri = "untitled:fix-all.zig";
+    const text =
+        \\fn f() u32 {
+        \\    var x: u32 = 1;
+        \\    return x;
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const actions = struct {
+        fn get(hh: *Harness, only: ?[]const []const u8) ![]const std.json.Value {
+            const pos = .{ .line = 3, .character = 0 };
+            const resp = try hh.request("textDocument/codeAction", .{
+                .textDocument = .{ .uri = "untitled:fix-all.zig" },
+                .range = .{ .start = pos, .end = pos },
+                .context = .{ .diagnostics = &[_]std.json.Value{}, .only = only },
+            });
+            var out: std.ArrayList(std.json.Value) = .empty;
+            for (resp.object.get("result").?.array.items) |a| {
+                if (std.mem.eql(u8, a.object.get("kind").?.string, "source.fixAll")) try out.append(hh.arena.allocator(), a);
+            }
+            return out.items;
+        }
+    }.get;
+    try testing.expectEqual(0, (try actions(&h, null)).len);
+    try testing.expectEqual(0, (try actions(&h, &.{"quickfix"})).len);
+    try testing.expectEqual(1, (try actions(&h, &.{"source"})).len);
+    const requested = try actions(&h, &.{"source.fixAll"});
+    try testing.expectEqual(1, requested.len);
+    const edits = requested[0].object.get("edit").?.object.get("changes").?.object.get(uri).?.array.items;
+    try testing.expectEqual(1, edits.len);
+    try testing.expectEqualStrings("const", edits[0].object.get("newText").?.string);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "workspace symbol returns at most workspace_symbol.limit best matches, all of them with 0" {
     const Harness = @import("test_harness.zig").Harness;
     var h: Harness = undefined;

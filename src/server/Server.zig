@@ -5832,7 +5832,7 @@ fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams)
             .workspace = .{ .workspaceFolders = .{ .supported = true, .changeNotifications = .{ .boolean = true } } },
             // Every action carries an edit, which only `CodeAction` literals can hold
             .codeActionProvider = if (server.code_action_literals) .{ .CodeActionOptions = .{
-                .codeActionKinds = &.{ types.CodeActionKind.QuickFix, types.CodeActionKind.RefactorExtract, types.CodeActionKind.RefactorRewrite, types.CodeActionKind.SourceOrganizeImports },
+                .codeActionKinds = &.{ types.CodeActionKind.QuickFix, types.CodeActionKind.RefactorExtract, types.CodeActionKind.RefactorRewrite, types.CodeActionKind.SourceOrganizeImports, types.CodeActionKind.SourceFixAll },
                 .resolveProvider = true,
             } } else .{ .boolean = false },
             .semanticTokensProvider = .{ .SemanticTokensOptions = .{
@@ -6776,6 +6776,10 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
     if (wantsKind(only, types.CodeActionKind.SourceOrganizeImports)) {
         if (try ide.code_actions.organizeImports(r, file, start, end, import_options, only != null)) |a| try actions.append(arena, a);
     }
+    // Applies to the whole file regardless of the range, so it is left out of the unfiltered menu
+    if (only != null and wantsKind(only, types.CodeActionKind.SourceFixAll)) {
+        if (try ide.code_actions.fixAll(r, file)) |a| try actions.append(arena, a);
+    }
     const lines = try offsets.LineIndex.init(arena, text);
     const doc_uri = try server.uriFor(arena, file);
     const Item = @typeInfo(@typeInfo(types.ResultType("textDocument/codeAction")).optional.child).pointer.child;
@@ -6786,6 +6790,7 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
             .refactor_extract => types.CodeActionKind.RefactorExtract,
             .refactor_rewrite => types.CodeActionKind.RefactorRewrite,
             .source_organize_imports => types.CodeActionKind.SourceOrganizeImports,
+            .source_fix_all => types.CodeActionKind.SourceFixAll,
         };
         if (!wantsKind(only, kind)) continue;
         const edits = try arena.alloc(types.TextEdit, a.edits.len);
