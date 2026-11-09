@@ -98,6 +98,7 @@ pub const Db = engine.Engine(*const Env, &.{
     ide_db.imports.BindingNames,
     ide_db.seed.Callers,
     ide_db.seed.AllInstances,
+    ide_db.seed.GenericCallers,
     ide_db.seed.RootCallers,
     ide_db.seed.CallsIn,
     @import("ide_db/search.zig").ProjectImporters,
