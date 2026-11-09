@@ -4673,8 +4673,10 @@ fn sendDiagnostics(server: *Server, file: Vfs.FileId, params: types.PublishDiagn
             continue;
         });
     }
-    // The clearing for the virtual document has been sent: its URI is no longer needed
-    if (isVirtual(server.vfs.path(file))) {
+    // The clearing for the closed virtual document has been sent: its URI is no longer needed. A
+    // result computed before the close and sent after it clears nothing, and the clearing that the
+    // close requested still needs the URI
+    if (params.diagnostics.len == 0 and isVirtual(server.vfs.path(file))) {
         server.docs_mutex.lockUncancelable(server.io);
         defer server.docs_mutex.unlock(server.io);
         if (!server.open_docs.contains(file)) if (server.last_uris.fetchSwapRemove(file)) |kv| server.gpa.free(kv.value);
