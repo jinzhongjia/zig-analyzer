@@ -108,8 +108,10 @@ single_compiles: za.project.bsp.SingleFileCompiles = .{},
 /// Sequence number of the last compile result taken (shared by project builds and single-file
 /// compiles; see `nextCompileGeneration`)
 compile_generation: std.atomic.Value(u64) = .init(0),
-/// Builds requested for saves and changes on disk (`requestBuild`, `deferChanges`), counted before
-/// a project instance handles them, so that a request an instance being replaced drops counts too
+/// Builds requested for saves and changes on disk (`requestBuild`, counted before a project
+/// instance handles the request, so that one an instance being replaced drops counts too), and
+/// changes notified during a build that its completion found to differ on disk (see
+/// `Workspace.deferChanges`)
 build_requests: std.atomic.Value(u64) = .init(0),
 /// Compile results that only repeated a completed build after the maker exited (see
 /// `Workspace.repeats`): tests leave them out when they count builds
@@ -4027,11 +4029,13 @@ fn didChangeWorkspaceFolders(server: *Server, arena: Allocator, params: types.Di
 /// set and compiler diagnostics stay in effect, and build requests are forwarded to the new
 /// instance (see `requestBuild`).
 pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) void {
-    // The maker exited while idle after a completed build: the new instance's first build repeats
-    // that build unless another is requested meanwhile (see `Workspace.repeats`)
+    // The maker exited while idle after a completed build, or before the first result of an
+    // instance that was to repeat one: the new instance's first build repeats that build unless
+    // another is requested meanwhile (see `Workspace.repeats`)
     const repeats: ?u64 = if (crash_restarts == 0) null else blk: {
         ws.mutex.lockUncancelable(server.io);
         defer ws.mutex.unlock(server.io);
+        if (ws.repeats) |r| break :blk r;
         break :blk if (ws.built and !ws.building) ws.requests_built else null;
     };
     // Stopping ends this instance's load before the new instance is known
@@ -4190,7 +4194,6 @@ pub fn requestBuild(server: *Server, ws: *Workspace) void {
 /// current instance is in the middle of a build, it decides whether to rebuild for them when the
 /// build completes (see `Workspace.deferChanges`) and this returns true
 pub fn deferChanges(server: *Server, ws: *Workspace, files: []const Vfs.FileId) bool {
-    _ = server.build_requests.fetchAdd(1, .acq_rel);
     const target = blk: {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);

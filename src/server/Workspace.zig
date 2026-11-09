@@ -115,13 +115,16 @@ result_generation: u64 = 0,
 result_at_ms: i64 = 0,
 /// FileId → entry in `result`
 result_files: std.AutoArrayHashMapUnmanaged(FileId, *const compiler.FileResult) = .empty,
-/// `Server.build_requests` when `result` was stored: the requests it covers (one arriving during
-/// the build starts another round)
+/// `Server.build_requests` when the current build was sent: the requests its result covers (one
+/// arriving during the build discards the result or starts another round, see `rebuild`)
+requests_sent: u64 = 0,
+/// `requests_sent` of the build whose result was stored last
 requests_built: u64 = 0,
 /// This instance replaces one whose maker exited while idle after a completed build (the 0.17
 /// maker can panic right after a build, see docs/zig-maker-build-request-race.md): the
-/// `requests_built` of that instance. While no build has been requested since, the first build of
-/// this instance only repeats that one, and is counted in `Server.repeated_builds`.
+/// `requests_built` of that instance, or its own `repeats` when it exited before storing a
+/// result. When no build has been requested since, the first result of this instance only
+/// repeats that build, and is counted in `Server.repeated_builds`.
 repeats: ?u64 = null,
 building: bool = false,
 /// At least one build has completed (used to decide whether crashes are "consecutive")
@@ -366,6 +369,8 @@ pub fn requestBuild(ws: *Workspace) void {
             };
             return;
         }
+        // The empty result below covers the requests made so far
+        ws.requests_sent = ws.server.build_requests.load(.acquire);
         break :blk false;
     };
     if (replaced) {
@@ -417,6 +422,7 @@ fn sendBuild(ws: *Workspace, client: *bsp.Client, model: *const ProjectModel, st
     defer closure.deinit(ws.gpa);
     ws.build_total = @intCast(closure.count());
     ws.build_done = 0;
+    ws.requests_sent = ws.server.build_requests.load(.acquire);
     try client.buildSteps(steps);
 }
 
@@ -814,6 +820,8 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             defer changed.deinit(ws.gpa);
             // The steps that may write the files are done (see `deferChanges`)
             const differs = ws.server.changedSinceBuilt(changed.keys()) catch return;
+            // A change to build for, counted like a requested build (see `Server.build_requests`)
+            if (differs) _ = ws.server.build_requests.fetchAdd(1, .acq_rel);
             ws.mutex.lockUncancelable(io);
             const rebuild = ws.rebuild or differs;
             ws.rebuild = false;
@@ -913,7 +921,10 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 }
                 ws.mutex.unlock(io);
                 defer late.deinit(ws.gpa);
-                if (ws.server.changedSinceBuilt(late.keys()) catch true) again = true;
+                if (ws.server.changedSinceBuilt(late.keys()) catch true) {
+                    _ = ws.server.build_requests.fetchAdd(1, .acq_rel);
+                    again = true;
+                }
             }
             // More files were saved while the result was being published: `requestBuild` only
             // recorded `rebuild` then, so the next round starts here. Start the new build before
@@ -1045,12 +1056,14 @@ fn storeResult(ws: *Workspace, target: *Workspace) Allocator.Error!void {
         target.result_files.deinit(ws.gpa);
         target.result = result;
         target.result_generation = ws.server.nextCompileGeneration();
-        const requests = ws.server.build_requests.load(.acquire);
-        if (target.repeats) |r| {
-            if (r == requests) _ = ws.server.repeated_builds.fetchAdd(1, .acq_rel);
-            target.repeats = null;
+        // A result stored into the old instance is that of a failed configuration, not a build
+        if (target == ws) {
+            if (ws.repeats) |r| {
+                if (r == ws.requests_sent) _ = ws.server.repeated_builds.fetchAdd(1, .acq_rel);
+                ws.repeats = null;
+            }
+            ws.requests_built = ws.requests_sent;
         }
-        target.requests_built = requests;
         target.result_at_ms = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
         target.result_files = files;
     }
