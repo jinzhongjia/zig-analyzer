@@ -3683,6 +3683,121 @@ test "loop containers of a container-level initializer compare their captures by
     });
 }
 
+test "containers in a container-level initializer capture the values its evaluation computed" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1. Prevents a container defined in a
+    // comptime initializer from reading a captured local through inference alone, which does not
+    // execute the loop that computes it: the field type stayed `[len]u8`.
+    try expectTypes(
+        \\const b_loop = blk: {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    const len = n;
+        \\    const S = struct { a: [len]u8 };
+        \\    break :blk S{ .a = @splat(5) };
+        \\};
+        \\pub const p_b_loop = @TypeOf(b_loop.a);
+        \\
+        \\const b_type = blk: {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    const len = n;
+        \\    break :blk struct { a: [len]u8 };
+        \\};
+        \\pub const p_b_type = @TypeOf(@as(b_type, undefined).a);
+        \\
+        \\const b_known = blk: {
+        \\    const len: usize = 3;
+        \\    break :blk struct { a: [len]u8 };
+        \\};
+        \\pub const p_b_known = @TypeOf(@as(b_known, undefined).a);
+        \\
+        \\fn inFn() type {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    const len = n;
+        \\    return struct { a: [len]u8 };
+        \\}
+        \\pub const p_in_fn = @TypeOf(@as(inFn(), undefined).a);
+        \\
+        \\const b_var = blk: {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    break :blk struct { a: [n]u8 };
+        \\};
+        \\pub const p_b_var = @TypeOf(@as(b_var, undefined).a);
+        \\
+        \\const b_annotated: type = blk: {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    const len = n;
+        \\    break :blk struct { a: [len]u8 };
+        \\};
+        \\pub const p_b_annotated = @TypeOf(@as(b_annotated, undefined).a);
+        \\
+        \\var g_var = blk: {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    const len = n;
+        \\    const S = struct { a: [len]u8 };
+        \\    break :blk S{ .a = @splat(5) };
+        \\};
+        \\pub const p_g_var = @TypeOf(g_var.a);
+        \\
+        \\const WithDefault = struct {
+        \\    t: type = blk: {
+        \\        var n: usize = 0;
+        \\        for (0..3) |_| n += 1;
+        \\        const len = n;
+        \\        break :blk struct { a: [len]u8 };
+        \\    },
+        \\};
+        \\pub const p_field_default = @TypeOf(@as((WithDefault{}).t, undefined).a);
+        \\
+        \\fn Gen(comptime k: usize) type {
+        \\    return struct {
+        \\        const inner = blk: {
+        \\            var n: usize = 0;
+        \\            for (0..k) |_| n += 1;
+        \\            const len = n;
+        \\            break :blk struct { a: [len]u8 };
+        \\        };
+        \\        pub const T = @TypeOf(@as(inner, undefined).a);
+        \\    };
+        \\}
+        \\pub const p_gen = Gen(4).T;
+        \\
+        \\const b_mixed = blk: {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    const len = n;
+        \\    var types: [2]type = undefined;
+        \\    for (0..2) |i| types[i] = struct { a: [len + i]u8 };
+        \\    break :blk types;
+        \\};
+        \\pub const p_b_mixed = @TypeOf(@as(b_mixed[1], undefined).a);
+        \\
+        \\comptime {
+        \\    var n: usize = 0;
+        \\    for (0..3) |_| n += 1;
+        \\    const len = n;
+        \\    const S = struct { a: [len]u8 };
+        \\    const in_comptime = @TypeOf(@as(S, undefined).a);
+        \\    if (in_comptime != [3]u8) @compileError("comptime block");
+        \\}
+    , &.{
+        .{ "p_b_loop", "type = [3]u8" },
+        .{ "p_b_type", "type = [3]u8" },
+        .{ "p_b_known", "type = [3]u8" },
+        .{ "p_in_fn", "type = [3]u8" },
+        .{ "p_b_var", "type = [3]u8" },
+        .{ "p_b_annotated", "type = [3]u8" },
+        .{ "p_g_var", "type = [3]u8" },
+        .{ "p_field_default", "type = [3]u8" },
+        .{ "p_gen", "type = [4]u8" },
+        .{ "p_b_mixed", "type = [4]u8" },
+        .{ "in_comptime", "type = [3]u8" },
+    });
+}
 test "inferred error sets from function bodies" {
     try expectTypes(
         \\fn wrap(x: anytype) !@TypeOf(x) { return x; }

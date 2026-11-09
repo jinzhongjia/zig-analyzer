@@ -147,10 +147,11 @@ pub fn compute(ctx: *Db.Ctx, key: CallKey) Error!TypedValue {
     return ev.toTyped(result) catch |err| giveUp(err);
 }
 
-/// Computation of `LocalEval`: executes function `key.owner` in its instance `key.inst`, with the
-/// argument values the instance records, and stops once the frame of the function defines local
-/// constant `key.target` (see `runUntil`). Only a constant defined at most once per call (outside
-/// the bodies, conditions and continue expressions of loops) has one value per instance.
+/// Computation of `LocalEval`: executes member `key.owner` (a function in its instance
+/// `key.inst`, with the argument values the instance records, or a comptime initializer in the
+/// instance context `key.inst`) and stops once the frame of the member defines local constant
+/// `key.target` (see `runUntil`). Only a constant defined at most once per execution (outside the
+/// bodies, conditions and continue expressions of loops) has one value per instance.
 pub fn localValue(ctx: *Db.Ctx, key: queries.LocalKey) Error!TypedValue {
     const binding = switch (key.target) {
         .binding => |b| b,
@@ -167,8 +168,8 @@ pub fn localValue(ctx: *Db.Ctx, key: queries.LocalKey) Error!TypedValue {
     return runUntil(&r, &scratch, key.owner, key.inst, body, &stop);
 }
 
-/// Computation of `CapturedVar`: executes function `key.owner` in its instance `key.inst` (see
-/// `runUntil`) and takes the value of local variable `key.binding` when the frame of the function
+/// Computation of `CapturedVar`: executes member `key.owner` in instance `key.inst` (see
+/// `runUntil`) and takes the value of local variable `key.binding` when the frame of the member
 /// reaches the expression of container `key.container`, where the compiler's `getCaptures` loads
 /// it. A container in the body, condition or continue expression of a loop is reached once per
 /// iteration, possibly with a different value each time: the value belongs to the instance of the
@@ -186,15 +187,26 @@ pub fn capturedValue(ctx: *Db.Ctx, key: queries.CaptureKey) Error!TypedValue {
     return runUntil(&r, &scratch, key.owner, key.inst, body, &stop);
 }
 
-/// Executes function `owner` (with body `body`) in its instance `inst`, with the argument values
-/// the instance records, until it reaches `stop`, and returns the value taken there. A local
-/// defined outside the loops of the body has the same value in every iteration of a loop
-/// inferred per iteration, so an iteration instance stands for the instance of its function. The
-/// call sites that produce the instance are not known, so the backward branch quota is the
-/// default one (`@setEvalBranchQuota` in the function raises it as usual).
+/// Executes member `owner` (with body `body`) until it reaches `stop`, and returns the value
+/// taken there. A function runs in its instance `inst`, with the argument values the instance
+/// records. A local defined outside the loops of the body has the same value in every iteration
+/// of a loop inferred per iteration, so an iteration instance stands for the instance of its
+/// function. The call sites that produce the instance are not known, so the backward branch quota
+/// is the default one (`@setEvalBranchQuota` in the function raises it as usual). The other
+/// members with locals are evaluated at comptime by the compiler (see `runInitializerUntil`); a
+/// test body runs at runtime and has no value here.
 fn runUntil(r: *Resolver, scratch: *std.heap.ArenaAllocator, owner: hir.OwnerKey, key_inst: ?Index, body: *const Body, stop: *Stop) Error!TypedValue {
     const ctx = r.ctx;
     const ip = ctx.db.env.ip;
+    const tree = try r.itemTree(owner.file);
+    const item: u32 = for (tree.items, 0..) |it, i| {
+        if (it.ast_id == owner.item) break @intCast(i);
+    } else return .unknown;
+    switch (tree.items[item].kind) {
+        .@"fn" => {},
+        .@"const", .@"var", .field, .@"comptime" => return runInitializerUntil(r, scratch, owner, item, key_inst, body, stop),
+        .@"test", .zon => return .unknown,
+    }
     var run = key_inst orelse return .unknown;
     var inst = switch (ip.key(run)) {
         .instance => |i| i,
@@ -220,6 +232,34 @@ fn runUntil(r: *Resolver, scratch: *std.heap.ArenaAllocator, owner: hir.OwnerKey
         v.* = if (x == .unknown or x == .runtime or type_only) .unknown else Val.of(value.typeOfValue(ip, x), x);
     }
     _ = ev.runFunction(owner, run, vals) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => {},
+        error.Canceled => return error.Canceled,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    return stop.value orelse .unknown;
+}
+
+/// `runUntil` for the initializer of container-level declaration `owner` (index `item`), a
+/// field's default value, or a container-level comptime block: the compiler evaluates them at
+/// comptime (`Zcu.PerThread.analyzeNavVal`; `Sema.resolveInlineBody` for a field's default
+/// value), and a container they define captures the values its locals have in that evaluation
+/// (`Sema.getCaptures`). The member has no instance of its own, so the body runs in the instance
+/// context `inst` of the member, as `ownerValue` runs it, with the type annotation (the field
+/// type for a default value) as its result type.
+fn runInitializerUntil(r: *Resolver, scratch: *std.heap.ArenaAllocator, owner: hir.OwnerKey, item: u32, inst: ?Index, body: *const Body, stop: *Stop) Error!TypedValue {
+    const main = body.value orelse return .unknown;
+    const scope = try queries.enterContext(r, owner.file, inst);
+    defer scope.leave();
+    const want: ?Index = if (body.type_expr) |t| blk: {
+        const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst });
+        if (res.exprs.len == 0) return .unknown;
+        break :blk res.exprs[@backingInt(t)].asType() orelse .unknown;
+    } else null;
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = scratch.allocator(), .arena = scratch, .stop = stop };
+    defer ev.deinit();
+    var frame = try ev.newFrame(owner.file, item, body, inst);
+    stop.frame = &frame;
+    _ = ev.eval(&frame, main, want) catch |err| switch (err) {
         error.Abort, error.Break, error.Continue, error.Return => {},
         error.Canceled => return error.Canceled,
         error.OutOfMemory => return error.OutOfMemory,
@@ -991,16 +1031,17 @@ const Label = struct {
 
 pub const Field = struct { name: []const u8, ty: Index, item: ?u32 = null };
 
-/// Where `runUntil` stops the evaluation: once the frame of the function it executes defines
-/// local constant `binding` (`localValue`), or once that frame reaches the expression of
-/// `container` (`capturedValue`)
+/// Where `runUntil` stops the evaluation: once the frame of the member it executes defines local
+/// constant `binding` (`localValue`), or once that frame reaches the expression of `container`
+/// (`capturedValue`)
 const Stop = struct {
     /// The local whose value is taken
     binding: Body.BindingId,
-    /// A container defined in the body of the function (an index into `ItemTree.containers`):
+    /// A container defined in the body of the member (an index into `ItemTree.containers`):
     /// the value of `binding` is taken where the frame evaluates its expression
     container: ?u32 = null,
-    /// The frame of the function `runUntil` executes (the first frame `runFunction` creates)
+    /// The frame of the member `runUntil` executes (for a function, the first frame
+    /// `runFunction` creates)
     frame: ?*const Frame = null,
     /// The value taken; every later step then aborts
     value: ?TypedValue = null,
