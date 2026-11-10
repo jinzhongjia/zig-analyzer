@@ -1,0 +1,13 @@
+id = "zig-analyzer"
+name = "zig-analyzer"
+description = "The zig-analyzer language server for Zig and ZON files."
+version = "0.0.1"
+schema_version = 1
+authors = ["jinzhongjia"]
+repository = "https://github.com/jinzhongjia/zig-analyzer"
+
+# The Zig language (tree-sitter grammar, highlighting, `.zig` and `.zon` files) comes from the Zig
+# extension; this extension only adds the language server.
+[language_servers.zig-analyzer]
+name = "zig-analyzer"
+languages = ["Zig"]
