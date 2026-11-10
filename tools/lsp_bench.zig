@@ -51,7 +51,9 @@
 //!   `instanceHover`); the files on the command line only load the project, and the phases
 //!   above do not run. `BENCH_INSTANCE_HOVER_DIRS=<dir>,...` samples only the files under these
 //!   directories (relative to the project root); `BENCH_INSTANCE_HOVER_OUT=<path>` writes the
-//!   result at each name, tab-separated, to compare builds name by name
+//!   result at each name, tab-separated, to compare builds name by name;
+//!   `BENCH_INSTANCE_HOVER_TOKENS=1` requests semantic tokens for each file before its hovers
+//!   (with `BENCH_INSTANCE_HOVER_OUT`, their time per file goes to `<path>.tokens`)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -1221,10 +1223,12 @@ fn hoverLength(result: json.Value) usize {
 /// project is loaded by opening `first`. Three passes run over the same names; in each, a
 /// file is opened and the server idle before its names are requested, then it is closed:
 /// hover (the first request at each name), definition (more than one target means the name has
-/// different declarations under different instances), and hover again. No semantic tokens are
-/// requested, as an editor would on opening a file: their last stage computes the instances of
-/// generic functions, which the first hover would then find already computed.
-fn instanceHover(c: *Client, root: []const u8, first: []const u8, n: usize, dirs: ?[]const u8, out_path: ?[]const u8) !void {
+/// different declarations under different instances), and hover again. With `tokens`, the first
+/// pass requests semantic tokens for each file and waits for the server to be idle before the
+/// hovers, as an editor with semantic highlighting does on opening a file: their last stage
+/// computes the instances of generic functions, which the first hover then finds computed.
+/// Without it, the first hover computes them itself.
+fn instanceHover(c: *Client, root: []const u8, first: []const u8, n: usize, dirs: ?[]const u8, out_path: ?[]const u8, tokens: bool) !void {
     const a = c.arena.allocator();
     const io = c.io;
     {
@@ -1278,6 +1282,9 @@ fn instanceHover(c: *Client, root: []const u8, first: []const u8, n: usize, dirs
     }
     std.debug.print("instance hover: {d} names in {d} files, sampled from {d} names in {d} files\n", .{ count, sampled_files, total, files.items.len });
     var max_rss: ?f64 = null;
+    var tokens_ms: f64 = 0;
+    // Semantic tokens time of each file, in the order the files are opened
+    var file_tokens: std.ArrayList(struct { file: usize, time: f64 }) = .empty;
     for ([_][]const u8{ "textDocument/hover", "textDocument/definition", "textDocument/hover" }, 0..) |method, pass| {
         const t_pass = Io.Clock.awake.now(io);
         var i: usize = 0;
@@ -1285,6 +1292,14 @@ fn instanceHover(c: *Client, root: []const u8, first: []const u8, n: usize, dirs
             const f = files.items[picked[i].file];
             try c.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = f.uri, .languageId = "zig", .version = 1, .text = f.text } });
             _ = try c.request("zig-analyzer/waitIdle", {});
+            if (pass == 0 and tokens) {
+                const t_tokens = Io.Clock.awake.now(io);
+                _ = try c.request("textDocument/semanticTokens/full", .{ .textDocument = .{ .uri = f.uri } });
+                _ = try c.request("zig-analyzer/waitIdle", {});
+                const time = ms(io, t_tokens);
+                tokens_ms += time;
+                try file_tokens.append(a, .{ .file = picked[i].file, .time = time });
+            }
             const file = picked[i].file;
             while (i < picked.len and picked[i].file == file) : (i += 1) {
                 const s = &picked[i];
@@ -1311,6 +1326,7 @@ fn instanceHover(c: *Client, root: []const u8, first: []const u8, n: usize, dirs
         }
         const rss = try rssMb(c.gpa, io, c.child.id.?);
         std.debug.print("  pass {d} ({s}) {d:.1}s, memory {s}\n", .{ pass + 1, method["textDocument/".len..], ms(io, t_pass) / 1000, try mbText(a, rss, " MB") });
+        if (pass == 0 and tokens) std.debug.print("  semantic tokens before the hovers {d:.1}s (not in the hover times)\n", .{tokens_ms / 1000});
         if (verbose) try c.phase(method);
     }
     var several: std.ArrayList(Sample) = .empty;
@@ -1362,6 +1378,13 @@ fn instanceHover(c: *Client, root: []const u8, first: []const u8, n: usize, dirs
         try w.writeAll("file\tline\tcolumn\thover_ms\tagain_ms\tdefinition_ms\ttargets\tlength\n");
         for (picked) |s| try w.print("{s}\t{d}\t{d}\t{d:.3}\t{d:.3}\t{d:.3}\t{d}\t{d}\n", .{ files.items[s.file].rel, s.pos.line + 1, s.pos.character + 1, s.hover, s.again, s.definition, s.targets, s.len });
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = out.written() });
+        if (tokens) {
+            var tokens_out: std.Io.Writer.Allocating = .init(a);
+            const tw = &tokens_out.writer;
+            try tw.writeAll("file\ttokens_ms\n");
+            for (file_tokens.items) |x| try tw.print("{s}\t{d:.3}\n", .{ files.items[x.file].rel, x.time });
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}.tokens", .{p}), .data = tokens_out.written() });
+        }
     }
 }
 
@@ -1768,7 +1791,7 @@ pub fn main(init: std.process.Init) !u8 {
     try sampleInitialize(gpa, io, args[1], root_uri);
 
     const instance_hover = init.environ_map.get("BENCH_INSTANCE_HOVER");
-    if (instance_hover) |v| try instanceHover(&c, root, args[3], std.fmt.parseInt(usize, v, 10) catch 2000, init.environ_map.get("BENCH_INSTANCE_HOVER_DIRS"), init.environ_map.get("BENCH_INSTANCE_HOVER_OUT"));
+    if (instance_hover) |v| try instanceHover(&c, root, args[3], std.fmt.parseInt(usize, v, 10) catch 2000, init.environ_map.get("BENCH_INSTANCE_HOVER_DIRS"), init.environ_map.get("BENCH_INSTANCE_HOVER_OUT"), init.environ_map.get("BENCH_INSTANCE_HOVER_TOKENS") != null);
     for (args[3..], 0..) |rel, file_index| {
         if (instance_hover != null) break;
         const path = try std.fs.path.join(a, &.{ root, rel });
