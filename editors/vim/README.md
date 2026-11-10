@@ -26,6 +26,8 @@ See `:help zig_analyzer`.
 
 ## Test
 
+The smoke test opens a copy of `editors/test-project` and needs Zig 0.17 in `PATH`:
+
 ```sh
 ZIG_ANALYZER=/path/to/zig-analyzer ZA_CLIENT=yegappan ZA_CLIENT_DIR=/path/to/yegappan-lsp \
   ZA_RESULT=/tmp/result.txt vim -N -u NONE -i NONE --not-a-term -S test/smoke.vim; cat /tmp/result.txt
