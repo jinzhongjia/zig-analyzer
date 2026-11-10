@@ -382,6 +382,16 @@ pub fn symbolReferences(r: *Resolver, symbol: Symbol, opts: Options) resolve.Err
     }
 }
 
+/// The references of all `symbols` (see `symbolReferences`), sorted by file and position, each
+/// position once: a member name in a generic function can refer to a different declaration under
+/// each instance (see `definition.symbolsAt`), and the uses of those declarations overlap
+pub fn symbolsReferences(r: *Resolver, symbols: []const Symbol, opts: Options) resolve.Error![]Reference {
+    if (symbols.len == 1) return symbolReferences(r, symbols[0], opts);
+    var out: std.ArrayList(Reference) = .empty;
+    for (symbols) |symbol| try out.appendSlice(r.arena, try symbolReferences(r, symbol, opts));
+    return sortUnique(out.items);
+}
+
 /// References to a label: the label itself and the `break :l` / `continue :l` that target it,
 /// sorted by position
 pub fn labelReferences(r: *Resolver, label: Label) resolve.Error![]Reference {

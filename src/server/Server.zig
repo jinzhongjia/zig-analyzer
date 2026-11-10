@@ -6463,11 +6463,12 @@ fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     return user.items;
 }
 
-/// The symbol at the cursor (see `definition.symbolAt`)
-fn symbolAtPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position) !?struct { symbol: za.ide_db.search.Symbol, file: Vfs.FileId } {
+/// The symbols at the cursor (see `definition.symbolsAt`); null when there is none
+fn symbolsAtPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position) !?struct { symbols: []const za.ide_db.search.Symbol, file: Vfs.FileId } {
     const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
-    const symbol = try ide.definition.symbolAt(r, at.file, at.offset) orelse return null;
-    return .{ .symbol = symbol, .file = at.file };
+    const symbols = try ide.definition.symbolsAt(r, at.file, at.offset);
+    if (symbols.len == 0) return null;
+    return .{ .symbols = symbols, .file = at.file };
 }
 
 /// Why the references of `symbol` cannot all be found now (see `scopeIncomplete`); null also when
@@ -6504,9 +6505,9 @@ const RangeMapper = struct {
 };
 
 fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!Outcome(types.ResultType("textDocument/references")) {
-    const found = try server.symbolAtPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
-    if (try server.scopeIncompleteFor(r, found.symbol)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot find all references: {s}", .{reason}) };
-    const refs = try za.ide_db.search.symbolReferences(r, found.symbol, .{ .scope = try server.searchScope(r) });
+    const found = try server.symbolsAtPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
+    for (found.symbols) |symbol| if (try server.scopeIncompleteFor(r, symbol)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot find all references: {s}", .{reason}) };
+    const refs = try za.ide_db.search.symbolsReferences(r, found.symbols, .{ .scope = try server.searchScope(r) });
     var out: std.ArrayList(types.Location) = .empty;
     var m: RangeMapper = .{ .server = server, .r = r };
     for (refs) |ref| {
@@ -6519,8 +6520,8 @@ fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.Ref
 /// Occurrences of the symbol at the cursor in the same file: declarations and the targets of
 /// assignments are written to (`Write`), other uses read it (`Read`)
 fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentHighlightParams) HandlerError!types.ResultType("textDocument/documentHighlight") {
-    const found = try server.symbolAtPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
-    const refs = try za.ide_db.search.symbolReferences(r, found.symbol, .{ .scope = &.{}, .only_file = found.file });
+    const found = try server.symbolsAtPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
+    const refs = try za.ide_db.search.symbolsReferences(r, found.symbols, .{ .scope = &.{}, .only_file = found.file });
     const out = try arena.alloc(types.DocumentHighlight, refs.len);
     var m: RangeMapper = .{ .server = server, .r = r };
     for (refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl or ref.is_write) .Write else .Read };
