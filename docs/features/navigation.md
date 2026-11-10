@@ -6,6 +6,17 @@ Goto definition, goto declaration, goto type definition, hover, and signature he
 
 The lookup searches `error{ ... }` declarations, preferring one whose members equal the expected error set, then one that is part of it, then any containing the name. It searches the current file, then files reachable via `@import`, and memoizes each file's sets (`ErrorSets`).
 
+## Generic function bodies
+
+A generic function body is inferred with the instance of a call site, and hover names the call (`inferred from the call at main.zig:4`). This includes an enum literal or an initializer field whose result type is a parameter (`return .empty` and `.{ .len = 3 }` in a function returning `T`), which name a declaration or field only under an instance.
+
+A member name can refer to a different declaration under each instance. Goto lists the declaration under the selected instance first, then the one under every other instance; find references and document highlight cover all of them. Hover shows the declaration under the selected instance, followed by the others, each once and in goto order, as set by `hover.instances`:
+
+- `"list"` (default): one line per other declaration, with its signature (without the value), its location, and the call that selects it.
+- `"full"`: the complete hover of each other declaration (code, value, call, documentation), separated by rules.
+
+A name that refers to the same declaration under every instance is shown as before. Finding the other declarations infers the body under every instance; its cost is described under Hover in generic function bodies in `docs/perf.md`.
+
 ## Type display
 
 Hover, inlay hints, and completion details share `render.zig`.
