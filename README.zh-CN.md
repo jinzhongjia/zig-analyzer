@@ -17,9 +17,16 @@
 - **结构**：折叠范围和选择范围。
 - **命名检查**（需手动开启）：依据 Zig 风格指南的 [Names](https://ziglang.org/documentation/0.17.1/#Names) 一节给出提示，并提供安全的重命名修复。
 
-## Neovim 配置
+## 编辑器支持
 
-Neovim 0.12+：
+| 编辑器 | 集成方式 |
+| --- | --- |
+| VS Code | 扩展，见 [`editors/vscode`](editors/vscode) |
+| Zed | 扩展，见 [`editors/zed`](editors/zed)（需同时安装 Zig 扩展） |
+| Neovim 0.12+ | 插件，见 [`editors/nvim`](editors/nvim) |
+| Vim | 插件，见 [`editors/vim`](editors/vim)，支持 yegappan/lsp 和 vim-lsp |
+
+不使用 Neovim 插件时，Neovim 0.12+ 只需：
 
 ```lua
 vim.lsp.config('zig_analyzer', {
