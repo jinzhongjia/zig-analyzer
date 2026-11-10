@@ -83,6 +83,24 @@ Completion after `.` has p50 2.0-2.6 ms. An expected type changes the latency on
 
 On `Sema.zig`, edit → diagnostics p50 is 170 ms (169 ms when disabled), codeAction p50 is 3.8 ms, and resolving a local fix takes 68 ms. On ZLS, zigimg, and Cubyz, codeAction p50 is 1.0-1.5 ms, resolving a fix p50 12-19 ms, and the slowest cross-file one 128 ms.
 
+### Hover in generic function bodies
+
+`BENCH_INSTANCE_HOVER=2000` on the Zig 0.17.0 compiler (`src` and `lib/std`, ReleaseSafe, project loaded) samples 2000 of the 37908 names in generic function bodies whose declaration can depend on the instance, in 276 files. Each file is opened and its names hovered, then goto is requested at every name, then hover again. "Instance only" is hover without the other instances; `"list"` is the default of `hover.instances`. Each configuration is one run, on macOS (arm64, 18 cores) and in a Linux container (arm64, 8 CPUs); Windows is not measured.
+
+| | Instance only | `"list"` | `"full"` |
+|---|---|---|---|
+| macOS, first hover total | 67.1 s | 305.5 s | 307.9 s |
+| macOS, first hover p95 | 8.7 ms | 81.7 ms | 82.2 ms |
+| macOS, hover again p95 | 2.4 ms | 3.3 ms | 3.3 ms |
+| macOS, goto afterwards total | 248.3 s | 9.2 s | 9.4 s |
+| macOS, semantic tokens first: first hover total | 5.2 s | 124.2 s | — |
+| macOS, semantic tokens first: semantic tokens total | 627.7 s | 631.6 s | — |
+| Linux, first hover total | 78.4 s | 332.5 s | — |
+| Linux, first hover p95 | 12.8 ms | 154.2 ms | — |
+| Linux, goto afterwards total | 259.4 s | 13.0 s | — |
+
+The added time is the inference of each body under every instance, which goto also performs: after the hovers, goto at the same names takes 4-7% of its time with instance-only hover. The time concentrates in a few names. Per name, the difference has p50 0 ms; 2.4% of names take more than 1 s longer (1.1% with semantic tokens first), 80% of the added time comes from 1-2% of the names, and the slowest takes 9.5-11.8 s longer. With semantic tokens requested first, as an editor does on open, whose last stage also covers every instance, 124 s is added in total, and the semantic tokens take the same time. `"full"` costs as much as `"list"`, since both find the same declarations. The peak resident memory of the server between files is about 3.4 GB in every configuration on macOS (not measured on Linux).
+
 ## Known gaps
 
 - **Edit → diagnostics on very large files**: on `Sema.zig`, most of the time goes to reparsing (about 54 ms) and the official AstGen (about 48 ms), about 85 ms with the default configuration; with `diagnostics.inactive_code` enabled, the whole file must also be inferred to compute the inactive code ranges.

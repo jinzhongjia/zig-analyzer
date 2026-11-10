@@ -133,6 +133,19 @@ fn importedMemberDefs(r: *Resolver, file: FileId, offset: u32) resolve.Error![]c
 /// when the abstract inference does not determine it; empty otherwise. Each instance of a generic
 /// function is analyzed separately, and the same name can refer to a different declaration in each.
 fn instanceDefs(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Def {
+    const all = try instanceDefsAt(r, file, offset);
+    const out = try r.arena.alloc(Def, all.len);
+    for (all, out) |x, *d| d.* = x.def;
+    return out;
+}
+
+/// A definition that a member name refers to under one instance of the generic function containing
+/// it, with the name's position under that instance (`at.seeded` is the instance)
+pub const InstanceDef = struct { def: Def, at: context.At };
+
+/// The definitions of `instanceDefs`, each with its instance, in the order of `context.allSeeded`;
+/// a definition appears once for each instance that refers to it
+pub fn instanceDefsAt(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const InstanceDef {
     const tok = try tokenAt(r, file, offset) orelse return &.{};
     if (tok.kind != .identifier) return &.{};
     const a = try context.at(r, file, tok.offset, false) orelse return &.{};
@@ -155,9 +168,10 @@ fn instanceDefs(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const D
         else => return &.{},
     };
     if (memberAt(a, e, field) != null) return &.{};
-    var out: std.ArrayList(Def) = .empty;
+    var out: std.ArrayList(InstanceDef) = .empty;
     for (try context.allSeeded(r, a)) |v| {
-        try out.append(r.arena, try context.defOfKey(r, memberAt(v, e, field) orelse continue) orelse continue);
+        const def = try context.defOfKey(r, memberAt(v, e, field) orelse continue) orelse continue;
+        try out.append(r.arena, .{ .def = def, .at = v });
     }
     return out.items;
 }

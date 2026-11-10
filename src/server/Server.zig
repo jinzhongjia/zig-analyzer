@@ -6350,7 +6350,7 @@ fn hover(server: *Server, r: *Resolver, arena: Allocator, params: types.HoverPar
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
     // Checked before computing: a load that ends during the computation cancels this read
     const incomplete = server.projectsPending();
-    const info = try ide.hover.hover(r, at.file, at.offset, try server.rootsAlloc(arena)) orelse return null;
+    const info = try ide.hover.hover(r, at.file, at.offset, try server.rootsAlloc(arena), server.config.hover_instances) orelse return null;
     const lines = try offsets.LineIndex.init(arena, at.text);
     const text = if (!incomplete) info.text else try std.mem.concat(arena, u8, &.{ info.text, if (server.hover_markdown) "\n\n---\n\n_" ++ hover_loading_note ++ "_" else "\n\n" ++ hover_loading_note });
     return .{

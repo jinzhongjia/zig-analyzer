@@ -12,6 +12,7 @@
 //!                        "builtin_parameters": true, "exclude_single_argument": true, "hide_redundant_param_names": true,
 //!                        "max_length": 25 },
 //!       "semantic_tokens": { "mode": "full", "global_var": false },
+//!       "hover": { "instances": "list" },
 //!       "imports": { "derived": "with_import", "sort": "path" },
 //!       "completion": { "auto_import": true, "max_auto_imports": 128, "snippets": true, "argument_placeholders": true },
 //!       "sema": { "callsite_seeding": true, "wait_for_project": false },
@@ -39,6 +40,7 @@ const std = @import("std");
 const json = std.json;
 const Allocator = std.mem.Allocator;
 const ImportOptions = @import("../ide_db/organize_imports.zig").Options;
+const HoverInstances = @import("../ide/hover.zig").Instances;
 const syntax_queries = @import("../syntax/queries.zig");
 const syntax_ast = @import("../syntax/ast.zig");
 
@@ -98,6 +100,9 @@ semantic_tokens_mode: SemanticTokensMode = .full,
 /// Semantic highlighting: declarations of and references to container-level `var`s carry the
 /// `global` modifier
 semantic_tokens_global_var: bool = false,
+/// Hover in a generic function body: how the declarations that a member name refers to under the
+/// other instances are shown, when they differ from the one shown
+hover_instances: HoverInstances = .list,
 /// Placement of derived declarations (`const Allocator = std.mem.Allocator;`) in the import
 /// block: both organize imports and auto-import follow it
 imports_derived: ImportOptions.Derived = .with_import,
@@ -250,6 +255,7 @@ const settings = [_]Setting{
     .{ .section = "inlay_hints", .key = "max_length", .field = "inlay_max_length" },
     .{ .section = "semantic_tokens", .key = "mode", .field = "semantic_tokens_mode" },
     .{ .section = "semantic_tokens", .key = "global_var", .field = "semantic_tokens_global_var" },
+    .{ .section = "hover", .key = "instances", .field = "hover_instances" },
     .{ .section = "imports", .key = "derived", .field = "imports_derived" },
     .{ .section = "imports", .key = "sort", .field = "imports_sort" },
     .{ .section = "completion", .key = "auto_import", .field = "completion_auto_import" },
@@ -662,6 +668,13 @@ test "parse: nested fields, optional wrapper" {
     defer partial.deinit(testing.allocator);
     try testing.expect(partial.semantic_tokens_mode == .partial and partial.semantic_tokens_global_var);
     try testing.expectEqual(0, partial.warnings.len);
+    try testing.expectEqual(HoverInstances.list, empty.hover_instances);
+    var full_hover = try parseText(
+        \\{"hover": {"instances": "full"}}
+    );
+    defer full_hover.deinit(testing.allocator);
+    try testing.expectEqual(HoverInstances.full, full_hover.hover_instances);
+    try testing.expectEqual(0, full_hover.warnings.len);
 
     try testing.expect(empty.completion_snippets and empty.completion_argument_placeholders);
     var no_snippets = try parseText(

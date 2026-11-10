@@ -113,6 +113,16 @@
     //       .global_var = false,
     //   },
 
+    // Hover (editor only):
+    //   .hover = .{
+    //       // In a generic function body, a member name can refer to a different declaration
+    //       // under each instance (each set of comptime arguments at the call sites). Hover shows
+    //       // the declaration under one instance; the others follow it:
+    //       // .list: one line each, with its type, location, and the call it comes from.
+    //       // .full: the complete hover of each (signature, value, documentation).
+    //       .instances = .list,
+    //   },
+
     // Completion (editor only):
     //   .completion = .{
     //       // In name completion, also offer reachable declarations and modules that are not

@@ -46,6 +46,14 @@
 //! - `BENCH_SESSION=<rounds>`: a long session, to watch memory growth
 //! - `BENCH_CONCURRENT=<n>`: throughput: open the n largest files of the project at once and
 //!   request their semantic tokens without waiting for the answers (see `concurrentTokens`)
+//! - `BENCH_INSTANCE_HOVER=<n>`: hover at n names after `.` in the bodies of generic functions,
+//!   where a name can refer to a different declaration under each instance (see
+//!   `instanceHover`); the files on the command line only load the project, and the phases
+//!   above do not run. `BENCH_INSTANCE_HOVER_DIRS=<dir>,...` samples only the files under these
+//!   directories (relative to the project root); `BENCH_INSTANCE_HOVER_OUT=<path>` writes the
+//!   result at each name, tab-separated, to compare builds name by name;
+//!   `BENCH_INSTANCE_HOVER_TOKENS=1` requests semantic tokens for each file before its hovers
+//!   (with `BENCH_INSTANCE_HOVER_OUT`, their time per file goes to `<path>.tokens`)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -1146,6 +1154,241 @@ fn longSession(c: *Client, root: []const u8, rounds: usize) !void {
 }
 
 /// Throughput (BENCH_CONCURRENT=<n>): opens the n largest files of the project (other than the
+/// Byte ranges of the bodies of functions with a `comptime`, `anytype`, or `type` parameter;
+/// functions nested in such a body are inside its range
+fn genericBodies(a: Allocator, tree: *const std.zig.Ast) ![]const [2]u32 {
+    var out: std.ArrayList([2]u32) = .empty;
+    for (0..tree.nodes.len) |i| {
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(i));
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        var buf: [1]std.zig.Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buf, node) orelse continue;
+        var params = proto.iterate(tree);
+        const generic = while (params.next()) |p| {
+            if (p.anytype_ellipsis3) |t| if (tree.tokenTag(t) == .keyword_anytype) break true;
+            if (p.comptime_noalias) |t| if (tree.tokenTag(t) == .keyword_comptime) break true;
+            if (p.type_expr) |t| if (tree.nodeTag(t) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(t)), "type")) break true;
+        } else false;
+        if (!generic) continue;
+        const body = tree.nodeData(node).node_and_node[1];
+        try out.append(a, .{ tree.tokenStart(tree.firstToken(body)), tree.tokenStart(tree.lastToken(body)) });
+    }
+    return out.items;
+}
+
+/// Offsets of the names after `.` in the bodies of generic functions: members, enum and decl
+/// literals, and field names of initializers, whose declaration can depend on the instance
+fn instanceNames(a: Allocator, gpa: Allocator, text: [:0]const u8) ![]const u32 {
+    var tree = try std.zig.Ast.parse(gpa, text, .{});
+    defer tree.deinit(gpa);
+    const bodies = try genericBodies(a, &tree);
+    var out: std.ArrayList(u32) = .empty;
+    if (bodies.len == 0) return out.items;
+    const tags = tree.tokens.items(.tag);
+    for (tags, 0..) |t, i| {
+        if (t != .identifier or i == 0 or tags[i - 1] != .period) continue;
+        const start = tree.tokenStart(@intCast(i));
+        for (bodies) |r| if (start > r[0] and start < r[1]) {
+            try out.append(a, start);
+            break;
+        };
+    }
+    return out.items;
+}
+
+/// Whether the relative path `rel` is under the directory `dir` (either separator)
+fn underDir(rel: []const u8, dir: []const u8) bool {
+    if (rel.len <= dir.len) return false;
+    for (dir, rel[0..dir.len]) |x, y| {
+        const sep_x = x == '/' or x == '\\';
+        const sep_y = y == '/' or y == '\\';
+        if (x != y and !(sep_x and sep_y)) return false;
+    }
+    return rel[dir.len] == '/' or rel[dir.len] == '\\';
+}
+
+/// Length of the text of a hover result (0 for null)
+fn hoverLength(result: json.Value) usize {
+    if (result != .object) return 0;
+    return switch (result.object.get("contents") orelse return 0) {
+        .object => |o| if (o.get("value")) |v| (if (v == .string) v.string.len else 0) else 0,
+        .string => |s| s.len,
+        else => 0,
+    };
+}
+
+/// Hover where a name can refer to a different declaration under each instance of the generic
+/// function containing it (BENCH_INSTANCE_HOVER=<n>): samples n names after `.` in the bodies
+/// of generic functions (`instanceNames`), evenly over the project's files in path order. The
+/// project is loaded by opening `first`. Three passes run over the same names; in each, a
+/// file is opened and the server idle before its names are requested, then it is closed:
+/// hover (the first request at each name), definition (more than one target means the name has
+/// different declarations under different instances), and hover again. With `tokens`, the first
+/// pass requests semantic tokens for each file and waits for the server to be idle before the
+/// hovers, as an editor with semantic highlighting does on opening a file: their last stage
+/// computes the instances of generic functions, which the first hover then finds computed.
+/// Without it, the first hover computes them itself.
+fn instanceHover(c: *Client, root: []const u8, first: []const u8, n: usize, dirs: ?[]const u8, out_path: ?[]const u8, tokens: bool) !void {
+    const a = c.arena.allocator();
+    const io = c.io;
+    {
+        const path = try std.fs.path.join(a, &.{ root, first });
+        const text = try Io.Dir.cwd().readFileAllocOptions(io, path, a, .unlimited, .of(u8), 0);
+        const uri = try za.base.uri.fromPath(a, path);
+        const t0 = Io.Clock.awake.now(io);
+        try c.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+        _ = try c.request("zig-analyzer/waitIdle", {});
+        std.debug.print("  open {s} → project idle {d:.1}ms\n", .{ first, ms(io, t0) });
+        try c.notify("textDocument/didClose", .{ .textDocument = .{ .uri = uri } });
+    }
+    const File = struct { rel: []const u8, uri: []const u8, text: [:0]const u8, offsets: []const u32 };
+    var files: std.ArrayList(File) = .empty;
+    var total: usize = 0;
+    for (try projectFiles(c, root)) |path| {
+        const rel = path[root.len + 1 ..];
+        if (dirs) |d| {
+            var it = std.mem.splitScalar(u8, d, ',');
+            const inside = while (it.next()) |dir| {
+                if (underDir(rel, dir)) break true;
+            } else false;
+            if (!inside) continue;
+        }
+        const text = try Io.Dir.cwd().readFileAllocOptions(io, path, a, .unlimited, .of(u8), 0);
+        const offsets = try instanceNames(a, c.gpa, text);
+        if (offsets.len == 0) continue;
+        try files.append(a, .{ .rel = rel, .uri = try za.base.uri.fromPath(a, path), .text = text, .offsets = offsets });
+        total += offsets.len;
+    }
+    const Sample = struct { file: usize, pos: Position, hover: f64 = 0, again: f64 = 0, definition: f64 = 0, targets: usize = 0, len: usize = 0 };
+    const count = @min(n, total);
+    const picked = try a.alloc(Sample, count);
+    {
+        var file: usize = 0;
+        // Names in the files before `file`
+        var before: usize = 0;
+        for (picked, 0..) |*s, i| {
+            const k = i * total / count;
+            while (k >= before + files.items[file].offsets.len) {
+                before += files.items[file].offsets.len;
+                file += 1;
+            }
+            const f = files.items[file];
+            s.* = .{ .file = file, .pos = positionOf(f.text, f.offsets[k - before]) };
+        }
+    }
+    var sampled_files: usize = 0;
+    for (picked, 0..) |s, i| {
+        if (i == 0 or picked[i - 1].file != s.file) sampled_files += 1;
+    }
+    std.debug.print("instance hover: {d} names in {d} files, sampled from {d} names in {d} files\n", .{ count, sampled_files, total, files.items.len });
+    var max_rss: ?f64 = null;
+    var tokens_ms: f64 = 0;
+    // Semantic tokens time of each file, in the order the files are opened
+    var file_tokens: std.ArrayList(struct { file: usize, time: f64 }) = .empty;
+    for ([_][]const u8{ "textDocument/hover", "textDocument/definition", "textDocument/hover" }, 0..) |method, pass| {
+        const t_pass = Io.Clock.awake.now(io);
+        var i: usize = 0;
+        while (i < picked.len) {
+            const f = files.items[picked[i].file];
+            try c.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = f.uri, .languageId = "zig", .version = 1, .text = f.text } });
+            _ = try c.request("zig-analyzer/waitIdle", {});
+            if (pass == 0 and tokens) {
+                const t_tokens = Io.Clock.awake.now(io);
+                _ = try c.request("textDocument/semanticTokens/full", .{ .textDocument = .{ .uri = f.uri } });
+                _ = try c.request("zig-analyzer/waitIdle", {});
+                const time = ms(io, t_tokens);
+                tokens_ms += time;
+                try file_tokens.append(a, .{ .file = picked[i].file, .time = time });
+            }
+            const file = picked[i].file;
+            while (i < picked.len and picked[i].file == file) : (i += 1) {
+                const s = &picked[i];
+                const resp, const t = try c.request(method, .{ .textDocument = .{ .uri = f.uri }, .position = s.pos });
+                const result = resp.object.get("result") orelse .null;
+                switch (pass) {
+                    0 => {
+                        s.hover = t;
+                        s.len = hoverLength(result);
+                    },
+                    1 => {
+                        s.definition = t;
+                        s.targets = switch (result) {
+                            .array => |arr| arr.items.len,
+                            .object => 1,
+                            else => 0,
+                        };
+                    },
+                    else => s.again = t,
+                }
+            }
+            try c.notify("textDocument/didClose", .{ .textDocument = .{ .uri = f.uri } });
+            if (try rssMb(c.gpa, io, c.child.id.?)) |mb| max_rss = @max(max_rss orelse mb, mb);
+        }
+        const rss = try rssMb(c.gpa, io, c.child.id.?);
+        std.debug.print("  pass {d} ({s}) {d:.1}s, memory {s}\n", .{ pass + 1, method["textDocument/".len..], ms(io, t_pass) / 1000, try mbText(a, rss, " MB") });
+        if (pass == 0 and tokens) std.debug.print("  semantic tokens before the hovers {d:.1}s (not in the hover times)\n", .{tokens_ms / 1000});
+        if (verbose) try c.phase(method);
+    }
+    var several: std.ArrayList(Sample) = .empty;
+    for (picked) |s| if (s.targets > 1) try several.append(a, s);
+    const Column = enum { hover, again, definition, len };
+    const values = struct {
+        fn of(al: Allocator, list: []const Sample, comptime col: Column) ![]f64 {
+            const out = try al.alloc(f64, list.len);
+            for (list, out) |s, *o| o.* = switch (col) {
+                .hover => s.hover,
+                .again => s.again,
+                .definition => s.definition,
+                .len => @floatFromInt(s.len),
+            };
+            return out;
+        }
+    }.of;
+    var hover_total: f64 = 0;
+    for (picked) |s| hover_total += s.hover;
+    std.debug.print("  names with several targets: {d}/{d}\n", .{ several.items.len, count });
+    std.debug.print("  first hover total {d:.0}ms\n", .{hover_total});
+    Stats.print("hover", try values(a, picked, .hover));
+    Stats.print("hover again", try values(a, picked, .again));
+    Stats.print("definition", try values(a, picked, .definition));
+    Stats.print("hover (sev.)", try values(a, several.items, .hover));
+    Stats.print("again (sev.)", try values(a, several.items, .again));
+    inline for (.{ .{ "all", picked }, .{ "several targets", several.items } }) |group| {
+        const lens = try values(a, group[1], .len);
+        if (lens.len > 0) {
+            std.mem.sort(f64, lens, {}, std.sort.asc(f64));
+            std.debug.print("  hover length ({s}): p50 {d:.0} p95 {d:.0} max {d:.0} bytes\n", .{ group[0], Stats.at(lens, 0.5), Stats.at(lens, 0.95), lens[lens.len - 1] });
+        }
+    }
+    std.debug.print("  peak memory between files {s}\n", .{try mbText(a, max_rss, " MB")});
+    const by_time = try a.dupe(Sample, picked);
+    std.mem.sort(Sample, by_time, {}, struct {
+        fn gt(_: void, x: Sample, y: Sample) bool {
+            return x.hover > y.hover;
+        }
+    }.gt);
+    std.debug.print("  slowest first hovers:\n", .{});
+    for (by_time[0..@min(10, by_time.len)]) |s| {
+        const f = files.items[s.file];
+        std.debug.print("    {d:>8.1}ms {s}:{d}:{d} targets {d}  `{s}`\n", .{ s.hover, f.rel, s.pos.line + 1, s.pos.character + 1, s.targets, lineText(f.text, s.pos.line) });
+    }
+    if (out_path) |p| {
+        var out: std.Io.Writer.Allocating = .init(a);
+        const w = &out.writer;
+        try w.writeAll("file\tline\tcolumn\thover_ms\tagain_ms\tdefinition_ms\ttargets\tlength\n");
+        for (picked) |s| try w.print("{s}\t{d}\t{d}\t{d:.3}\t{d:.3}\t{d:.3}\t{d}\t{d}\n", .{ files.items[s.file].rel, s.pos.line + 1, s.pos.character + 1, s.hover, s.again, s.definition, s.targets, s.len });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = out.written() });
+        if (tokens) {
+            var tokens_out: std.Io.Writer.Allocating = .init(a);
+            const tw = &tokens_out.writer;
+            try tw.writeAll("file\ttokens_ms\n");
+            for (file_tokens.items) |x| try tw.print("{s}\t{d:.3}\n", .{ files.items[x.file].rel, x.time });
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}.tokens", .{p}), .data = tokens_out.written() });
+        }
+    }
+}
+
+/// Throughput (BENCH_CONCURRENT=<n>): opens the n largest files of the project (other than the
 /// measured ones) and requests their full semantic tokens right away, as an editor restoring n
 /// tabs does, without waiting for the answers; reports the time from the first open to the last
 /// answer, then until background work is done, the latency of each request, and the memory
@@ -1547,7 +1790,10 @@ pub fn main(init: std.process.Init) !u8 {
     try c.notify("initialized", struct {}{});
     try sampleInitialize(gpa, io, args[1], root_uri);
 
+    const instance_hover = init.environ_map.get("BENCH_INSTANCE_HOVER");
+    if (instance_hover) |v| try instanceHover(&c, root, args[3], std.fmt.parseInt(usize, v, 10) catch 2000, init.environ_map.get("BENCH_INSTANCE_HOVER_DIRS"), init.environ_map.get("BENCH_INSTANCE_HOVER_OUT"), init.environ_map.get("BENCH_INSTANCE_HOVER_TOKENS") != null);
     for (args[3..], 0..) |rel, file_index| {
+        if (instance_hover != null) break;
         const path = try std.fs.path.join(a, &.{ root, rel });
         const text = try Io.Dir.cwd().readFileAllocOptions(io, path, a, .unlimited, .of(u8), 0);
         const uri = try za.base.uri.fromPath(a, path);
