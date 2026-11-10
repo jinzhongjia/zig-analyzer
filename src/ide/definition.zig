@@ -1031,6 +1031,22 @@ pub fn symbolAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?search.S
     return zonFieldAt(r, file, offset);
 }
 
+/// What references and document highlight work on at the cursor: the symbol of `symbolAt`,
+/// followed by the declarations a member name in a generic function refers to under the other
+/// instances of the function (see `instanceDefs`), each once. These are the declarations goto
+/// lists: the uses of each instance's declaration are references of the name. Rename works on
+/// `symbolAt` alone and is refused when a use also refers to another declaration.
+pub fn symbolsAt(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const search.Symbol {
+    var out: std.ArrayList(search.Symbol) = .empty;
+    if (try symbolAt(r, file, offset)) |s| try out.append(r.arena, s);
+    for (try instanceDefs(r, file, offset)) |def| {
+        for (out.items) |s| {
+            if (s == .def and std.meta.eql(s.def, def)) break;
+        } else try out.append(r.arena, .{ .def = def });
+    }
+    return out.items;
+}
+
 fn target(r: *Resolver, def: Def) resolve.Error!?Target {
     const loc = try r.location(def) orelse return null;
     return .{ .file = loc.file, .start = loc.start, .end = loc.end };

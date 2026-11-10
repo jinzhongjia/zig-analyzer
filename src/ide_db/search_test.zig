@@ -65,13 +65,15 @@ fn refs(w: *World, fs: Files, file: FileId, offset: u32, only_file: ?FileId) ![]
     return symbolRefs(w, file, offset, .{ .scope = &.{ fs.main, fs.lib, fs.other }, .only_file = only_file });
 }
 
-/// References of the symbol at `offset` (see `refs`)
+/// References of the symbols at `offset`, as the server finds them (see `refs` and
+/// `definition.symbolsAt`)
 fn symbolRefs(w: *World, file: FileId, offset: u32, opts: search.Options) ![]const u8 {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
-    const symbol = try definition.symbolAt(&r, file, offset) orelse return "null";
-    const list = try search.symbolReferences(&r, symbol, opts);
+    const symbols = try definition.symbolsAt(&r, file, offset);
+    if (symbols.len == 0) return "null";
+    const list = try search.symbolsReferences(&r, symbols, opts);
     var out: std.ArrayList(u8) = .empty;
     for (list, 0..) |ref, i| {
         const text = (try ctx.get(database.syntax.SourceText, ref.file)).text;
@@ -109,6 +111,59 @@ test "find references" {
     }
     // Search in a single file only (document highlight)
     try testing.expectEqualStrings("lib:3:add* lib:7:add", try refs(&w, fs, fs.lib, at(lib_src, "add", 0), fs.lib));
+}
+
+test "references of a member name in a generic function cover the declaration under every instance" {
+    // Prevents references from listing only the declaration under the first call-site instance
+    const generic =
+        \\fn Fs(comptime assets: type) type {
+        \\    return struct {
+        \\        pub fn count() usize {
+        \\            return assets.files.len;
+        \\        }
+        \\        pub fn response() usize {
+        \\            if (comptime !@hasDecl(assets, "responses")) @compileError("no responses");
+        \\            return assets.files.len + assets.responses.len;
+        \\        }
+        \\    };
+        \\}
+        \\const Generated = struct {
+        \\    pub const files = [_][]const u8{"a"};
+        \\    pub const responses = [_][]const u8{"r"};
+        \\};
+        \\
+    ;
+    for ([_][]const u8{
+        \\test {
+        \\    _ = Fs(Generated).count() + Fs(Generated).response();
+        \\    _ = Fs(struct {
+        \\        pub const files = [_][]const u8{ "b", "c" };
+        \\    }).count();
+        \\}
+        \\
+        ,
+        \\test {
+        \\    _ = Fs(struct {
+        \\        pub const files = [_][]const u8{ "b", "c" };
+        \\    }).count();
+        \\    _ = Fs(Generated).count() + Fs(Generated).response();
+        \\}
+        \\
+    }, [_][]const u8{ "fs:19:files*", "fs:18:files*" }) |calls, anon_files| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const src = try std.mem.concat(w.arena.allocator(), u8, &.{ generic, calls });
+        const file = (try w.add("/p/fs.zig", src)).file;
+        const scope = [_]FileId{file};
+        const opts: search.Options = .{ .scope = &scope };
+        const all = try std.fmt.allocPrint(w.arena.allocator(), "fs:4:files fs:8:files fs:13:files* {s}", .{anon_files});
+        // Without the guard, `assets.files` is the `files` of either instance
+        try testing.expectEqualStrings(all, try symbolRefs(&w, file, at(src, "files", 0), opts));
+        try testing.expectEqualStrings(all, try symbolRefs(&w, file, at(src, "files", 0), .{ .scope = &.{}, .only_file = file }));
+        // The guard fires before the second use under the anonymous struct: only `Generated.files`
+        try testing.expectEqualStrings("fs:4:files fs:8:files fs:13:files*", try symbolRefs(&w, file, at(src, "files", 1), opts));
+    }
 }
 
 test "references to standard library declarations from project files" {

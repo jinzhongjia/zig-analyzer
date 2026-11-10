@@ -296,6 +296,11 @@ test "rename refuses when a generic reference also refers to other declarations"
     // Find references still includes it
     const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = uri }, .position = position(text, "x"), .context = .{ .includeDeclaration = true } });
     try testing.expectEqual(3, refs.object.get("result").?.array.items.len);
+    // From `p.x` itself, references and document highlight cover the field of either instance
+    const from_use = try h.request("textDocument/references", .{ .textDocument = .{ .uri = uri }, .position = position(text, "x;"), .context = .{ .includeDeclaration = true } });
+    try testing.expectEqual(5, from_use.object.get("result").?.array.items.len);
+    const highlights = try h.request("textDocument/documentHighlight", .{ .textDocument = .{ .uri = uri }, .position = position(text, "x;") });
+    try testing.expectEqual(5, highlights.object.get("result").?.array.items.len);
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
