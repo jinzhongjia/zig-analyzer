@@ -54,3 +54,7 @@ zig build test-all                # run all tests, including those that run the 
 ```
 
 Options are listed in [`zig-analyzer.default.zon`](zig-analyzer.default.zon). The design is described in [`docs/design.md`](docs/design.md).
+
+## License
+
+[MIT](LICENSE)
