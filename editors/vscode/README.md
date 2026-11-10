@@ -12,9 +12,10 @@ for `.zig` and `.zon` files.
 
 ## The Zig extension and ZLS
 
-The Zig extension (`ziglang.vscode-zig`) also starts ZLS for Zig files. When it is installed,
-this extension offers to set `zig.zls.enabled` to `off`, so that only one language server answers.
-Its other features (the Zig toolchain management, tasks, and debugging) keep working.
+If the Zig extension (`ziglang.vscode-zig`) is installed, it starts its own language server, ZLS,
+for Zig files, and you would get results from both servers. This extension offers to turn ZLS off
+(`zig.zls.enabled: "off"`). Only ZLS is turned off: the Zig extension's other features, such as
+installing Zig, build tasks, and run and debug, keep working.
 
 ## Settings
 
