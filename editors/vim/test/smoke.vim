@@ -36,6 +36,14 @@ function! s:wait(cond, ms) abort
   return eval(a:cond)
 endfunction
 
+call s:check(zig_analyzer#backend() ==# s:client, 'registered with ' . zig_analyzer#backend())
+" Without a client every request would only time out: stop, with the messages (such as errors
+" loading the client) in the results
+if zig_analyzer#backend() !=# s:client
+  call writefile(s:results + split(execute('messages'), "\n"), $ZA_RESULT)
+  cquit!
+endif
+
 let s:dir = resolve(tempname())
 call mkdir(s:dir, 'p')
 call system('cp -R ' . shellescape(s:root . '/../test-project') . '/. ' . shellescape(s:dir))
@@ -90,7 +98,6 @@ endfunction
 call s:open('src/main.zig')
 let s:main = bufnr('%')
 call s:check(&filetype ==# 'zig', 'filetype is zig')
-call s:check(zig_analyzer#backend() ==# s:client, 'registered with ' . zig_analyzer#backend())
 call s:check(s:idle(), 'server running')
 
 let s:doc = {'uri': s:uri('src/main.zig')}
@@ -237,6 +244,9 @@ let s:restarted = s:wait('!empty(s:server_pids()) && s:server_pids() != s:pids_b
 call s:check(s:restarted, ':ZigAnalyzer restart')
 
 call add(s:results, s:failures == 0 ? 'all checks passed' : s:failures . ' checks failed')
+if s:failures > 0
+  call extend(s:results, split(execute('messages'), "\n"))
+endif
 call writefile(s:results, $ZA_RESULT)
 call delete(s:dir, 'rf')
 execute s:failures == 0 ? 'qa!' : 'cquit!'
