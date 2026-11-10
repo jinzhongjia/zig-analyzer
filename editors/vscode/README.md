@@ -46,8 +46,9 @@ Click the `zig-analyzer` status bar item, or run from the command palette:
 npm install
 npm run typecheck
 npm run check-settings   # package.json settings match src/server/Config.zig
-npm test                 # smoke test; ZIG_ANALYZER=<server> VSCODE_EXECUTABLE=<code> are optional
+npm test                 # smoke test on editors/test-project; ZIG_ANALYZER=<server> VSCODE_EXECUTABLE=<code> are optional
 npm run package          # build zig-analyzer-<version>.vsix
 ```
 
-On Linux without a display, run the test with `xvfb-run -a npm test`.
+The smoke test needs Zig 0.17 in `PATH`. On Linux without a display, run it with
+`xvfb-run -a npm test`.
