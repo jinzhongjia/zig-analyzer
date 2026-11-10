@@ -69,7 +69,7 @@ test "hover shows signature, type and doc" {
         .{ "init(1", 0, "```zig\npub fn init(x: i32, y: i32) Point\n```" },
     };
     for (cases) |c| {
-        const info = try hover.hover(&r, file, offsetOf(c[0], c[1]), &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, file, offsetOf(c[0], c[1]), &.{}, .list) orelse return error.NoHover;
         testing.expectEqualStrings(c[2], info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
@@ -88,7 +88,7 @@ fn importedDocs(source: []const u8, label: []const u8) ![2][]const u8 {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const at = f.cursor.?;
-    const info = try hover.hover(&r, at.file, at.offset - 1, &.{}) orelse return error.NoHover;
+    const info = try hover.hover(&r, at.file, at.offset - 1, &.{}, .list) orelse return error.NoHover;
     const item = for ((try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items) |it| {
         if (std.mem.eql(u8, it.label, label)) break it;
     } else return error.NoItem;
@@ -208,7 +208,7 @@ test "hover on field names in initializers shows the field" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const name = "```zig\nname: []const u8\n```\n\nName of the thing.";
-    const control = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "name, generic").?), &.{})).?;
+    const control = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "name, generic").?), &.{}, .list)).?;
     try testing.expectEqualStrings(name, control.text);
     const cases = [_]struct { []const u8, []const u8 }{
         .{ "name = \"a\"", name },
@@ -225,7 +225,7 @@ test "hover on field names in initializers shows the field" {
         .{ "first = undefined", "```zig\nfirst: T\n```" },
     };
     for (cases) |c| {
-        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{})) orelse {
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list)) orelse {
             std.debug.print("no hover at `{s}`\n", .{c[0]});
             return error.NoHover;
         };
@@ -258,7 +258,7 @@ test "hover on field names of build.zig option structs" {
         .{ "root_source_file", "```zig\nroot_source_file: ?LazyPath\n```\n\nThis could either be a generated file" },
     };
     for (cases) |c| {
-        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{})) orelse {
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list)) orelse {
             std.debug.print("no hover at `{s}`\n", .{c[0]});
             return error.NoHover;
         };
@@ -326,7 +326,7 @@ test "decltest identifier is a reference to the declaration" {
     try testing.expectEqual(file, t.file);
     try testing.expect(std.mem.startsWith(u8, text[t.start..], "helper(x: u32)"));
 
-    const info = (try hover.hover(&r, file, test_name, &.{})) orelse return error.NoHover;
+    const info = (try hover.hover(&r, file, test_name, &.{}, .list)) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nfn helper(x: u32) u32\n```", info.text);
 
     const fn_name: u32 = @intCast(std.mem.indexOf(u8, text, "fn helper").? + "fn ".len);
@@ -400,9 +400,9 @@ test "completion and hover quote names that shadow primitives or are not identif
     };
     for (saw) |ok| try testing.expect(ok);
 
-    const local = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, clean, "_ = @\"a b\"").? + 6), &.{})).?;
+    const local = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, clean, "_ = @\"a b\"").? + 6), &.{}, .list)).?;
     try testing.expectEqualStrings("```zig\nconst @\"a b\": u8\n```", local.text);
-    const param = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, clean, "return @\"i32\"").? + 8), &.{})).?;
+    const param = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, clean, "return @\"i32\"").? + 8), &.{}, .list)).?;
     try testing.expectEqualStrings("```zig\n@\"i32\": u8\n```", param.text);
 }
 
@@ -668,7 +668,7 @@ test "hover and signature help drop comments from multi-line function prototypes
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "add(1, 2)").?), &.{}) orelse return error.NoHover;
+    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "add(1, 2)").?), &.{}, .list) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nfn add(a: u32, b: u32) callconv(.c) u32\n```", info.text);
     const s = try signature_help.signatureHelp(&r, file, @intCast(std.mem.indexOf(u8, text, "2);").?)) orelse return error.NoSignature;
     try testing.expectEqualStrings("fn add(a: u32, b: u32) callconv(.c) u32", s.label);
@@ -2156,9 +2156,9 @@ test "hover names a reified type after the constant it initializes" {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const param = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "k, Kind").?), &.{})).?;
+    const param = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "k, Kind").?), &.{}, .list)).?;
     try testing.expectEqualStrings("```zig\nk: Kind\n```", param.text);
-    const member = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "beta }").?), &.{})).?;
+    const member = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "beta }").?), &.{}, .list)).?;
     try testing.expect(std.mem.indexOf(u8, member.text, "enum {") == null);
 }
 
@@ -2254,7 +2254,7 @@ test "imported zon files are values with member completion and hover" {
         .{ "name }", "*const [6:0]u8 = \"origin\"" },
     };
     for (hovers) |c| {
-        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list) orelse return error.NoHover;
         testing.expectEqualStrings(try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}\n```", .{c[1]}), info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
@@ -2402,7 +2402,7 @@ test "zon imports with a result type take the result type" {
         .{ "port =", "const port: u16" },
     };
     for (hovers) |c| {
-        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list) orelse return error.NoHover;
         testing.expectEqualStrings(try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}\n```", .{c[1]}), info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
@@ -2798,14 +2798,14 @@ test "zig-analyzer.zon settings have the descriptions of the default settings" {
     };
     for (cases) |c| {
         const offset: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).?);
-        const info = try hover.hover(&r, file, offset, &.{});
+        const info = try hover.hover(&r, file, offset, &.{}, .list);
         const got = if (info) |i| i.text else "";
         if (c[1]) |want| {
             testing.expect(std.mem.startsWith(u8, got, want)) catch |err| {
                 std.debug.print("hover at `{s}`: {s}\n", .{ c[0], got });
                 return err;
             };
-            if (try hover.hover(&r, other, offset, &.{})) |i| try testing.expect(!std.mem.startsWith(u8, i.text, want));
+            if (try hover.hover(&r, other, offset, &.{}, .list)) |i| try testing.expect(!std.mem.startsWith(u8, i.text, want));
         } else {
             testing.expect(std.mem.indexOf(u8, got, "\n\nDefault") == null and !std.mem.startsWith(u8, got, "How")) catch |err| {
                 std.debug.print("hover at `{s}`: {s}\n", .{ c[0], got });
@@ -2813,7 +2813,7 @@ test "zig-analyzer.zon settings have the descriptions of the default settings" {
             };
         }
     }
-    const with_default = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "sort").?), &.{})).?.text;
+    const with_default = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "sort").?), &.{}, .list)).?.text;
     try testing.expect(std.mem.indexOf(u8, with_default, "\n\nDefault: `.path`\n\nExample:\n\n```zig\n.sort = .name,\n```") != null);
 }
 
@@ -2950,8 +2950,8 @@ test "build.zig.zon fields have the official documentation" {
     };
     for (cases) |c| {
         const offset: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).?);
-        const info = try hover.hover(&r, file, offset, &.{});
-        const other = try hover.hover(&r, cfg, offset, &.{});
+        const info = try hover.hover(&r, file, offset, &.{}, .list);
+        const other = try hover.hover(&r, cfg, offset, &.{}, .list);
         const got = if (info) |i| i.text else "";
         if (c[1]) |want| {
             testing.expect(std.mem.startsWith(u8, got, want)) catch |err| {
@@ -3180,7 +3180,7 @@ test "hover in generic bodies does not seed an array length no instance determin
         .{ "t: T", "```zig\nconst t: u8 = undefined\n```\n\ninferred from the call at main.zig:10" },
     };
     for (cases) |c| {
-        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list) orelse return error.NoHover;
         testing.expectEqualStrings(c[1], info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
@@ -3219,7 +3219,7 @@ test "hover in generic bodies is inferred from a call site" {
         .{ "bigger =", "```zig\nconst bigger: u32\n```\n\ninferred from the call at main.zig:14" },
     };
     for (cases) |c| {
-        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list) orelse return error.NoHover;
         testing.expectEqualStrings(c[1], info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
@@ -3263,7 +3263,7 @@ test "hover on @This() in generic bodies is inferred from a call site like the w
         .{ "q:", "```zig\nconst q: Pair(u8, u16)\n```\n\ninferred from the call at main.zig:14" },
     };
     for (cases) |c| {
-        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list) orelse return error.NoHover;
         testing.expectEqualStrings(c[1], info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
@@ -3376,7 +3376,7 @@ test "hover in generic functions passed as a value with an argument tuple" {
         .{ "y =", "```zig\nconst y: u16\n```\n\ninferred from the call at main.zig:7" },
     };
     for (cases) |c| {
-        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list) orelse return error.NoHover;
         testing.expectEqualStrings(c[1], info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
@@ -3411,7 +3411,7 @@ test "hover in generic bodies called only from other generic functions" {
     var r = resolver(&w, &ctx);
     // `over` is called only in the generic `run`: the concrete type comes through the call-site
     // instance of `run`
-    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "v =").?), &.{}) orelse return error.NoHover;
+    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "v =").?), &.{}, .list) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst v: Px\n```\n\ninferred from the call at main.zig:8", info.text);
 }
 
@@ -3444,7 +3444,7 @@ test "hover in generic bodies through two levels of generic callers" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     // `leaf` <- generic `mid` <- generic `run` <- concrete call
-    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "v =").?), &.{}) orelse return error.NoHover;
+    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "v =").?), &.{}, .list) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst v: Px\n```\n\ninferred from the call at main.zig:7", info.text);
 }
 
@@ -3471,7 +3471,7 @@ test "hover in generic bodies is inferred from a call site in another file" {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const info = try hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "bigger =").?), &.{}) orelse return error.NoHover;
+    const info = try hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "bigger =").?), &.{}, .list) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst bigger: i64\n```\n\ninferred from the call at main.zig:3", info.text);
 }
 
@@ -3510,7 +3510,7 @@ test "hover in generic bodies takes the same call site whatever order the files 
         var ctx = w.db.beginRead(w.arena.allocator());
         defer ctx.end();
         var r = resolver(&w, &ctx);
-        const info = try hover.hover(&r, util, @intCast(std.mem.indexOf(u8, util_text, "head =").?), &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, util, @intCast(std.mem.indexOf(u8, util_text, "head =").?), &.{}, .list) orelse return error.NoHover;
         out.* = try testing.allocator.dupe(u8, info.text);
     }
     defer for (results) |t| testing.allocator.free(t);
@@ -3542,7 +3542,7 @@ test "hover in generic bodies: call sites through aliases" {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const info = try hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "bigger =").?), &.{}) orelse return error.NoHover;
+    const info = try hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "bigger =").?), &.{}, .list) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst bigger: u16\n```\n\ninferred from the call at main.zig:3", info.text);
 }
 
@@ -4408,9 +4408,9 @@ test "goto and hover on error values: the expected error set picks the declarati
     try testing.expectEqual(lib, missing.file);
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, lib_text, "Missing").?)), missing.start);
 
-    const info = (try hover.hover(&r, file, at("Foo;") + 1, &.{})).?;
+    const info = (try hover.hover(&r, file, at("Foo;") + 1, &.{}, .list)).?;
     try testing.expectEqualStrings("```zig\nerror.Foo: error{Bar,Foo}\n```\n\nthe foo error", info.text);
-    const plain = (try hover.hover(&r, file, at("Baz;") + 1, &.{})).?;
+    const plain = (try hover.hover(&r, file, at("Baz;") + 1, &.{}, .list)).?;
     try testing.expectEqualStrings("```zig\nerror.Baz\n```", plain.text);
 }
 
@@ -4461,7 +4461,7 @@ test "goto and hover on quoted error names" {
         try testing.expectEqual(decl_at + @as(u32, @intCast(c[2].len)), t.end);
     }
     // hover includes the docs for the escaped name
-    const info = (try hover.hover(&r, file, at("error.Escaped") + @as(u32, "error.".len), &.{})).?;
+    const info = (try hover.hover(&r, file, at("error.Escaped") + @as(u32, "error.".len), &.{}, .list)).?;
     try testing.expect(std.mem.endsWith(u8, info.text, "escaped doc"));
 }
 
@@ -4576,7 +4576,7 @@ test "names in the alignment of destructuring targets are references" {
         const use: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).?);
         const t = try definition.definition(&r, file, use) orelse return error.NoTarget;
         try testing.expect(std.mem.startsWith(u8, text[t.start..], c[1]));
-        _ = try hover.hover(&r, file, use, &.{}) orelse return error.NoHover;
+        _ = try hover.hover(&r, file, use, &.{}, .list) orelse return error.NoHover;
         const def = try definition.defAt(&r, file, @intCast(std.mem.indexOf(u8, text, c[1]).?)) orelse return error.NoDefinition;
         const refs = try search.findReferences(&r, def, .{ .scope = &.{file} });
         try testing.expectEqual(2, refs.len);
@@ -4773,6 +4773,155 @@ test "goto in generic functions lists the targets under every instance" {
     }
 }
 
+test "hover in generic bodies follows the declarations under the other instances" {
+    // Prevents hover from showing only the declaration under one instance where goto lists the
+    // declarations under the others
+    const text =
+        \\const A = struct {
+        \\    /// The files of A
+        \\    pub const files = [_][]const u8{"a.txt"};
+        \\    pub const empty: A = .{};
+        \\    len: u32 = 1,
+        \\};
+        \\const B = struct {
+        \\    /// The files of B
+        \\    pub const files = [_][]const u8{ "b.txt", "c.txt" };
+        \\    pub const empty: B = .{};
+        \\    len: u16 = 2,
+        \\};
+        \\fn count(comptime T: type) usize {
+        \\    return T.files.len;
+        \\}
+        \\fn make(comptime T: type) T {
+        \\    return .{ .len = 3 };
+        \\}
+        \\fn none(comptime T: type) T {
+        \\    return .empty;
+        \\}
+        \\fn same(comptime T: type) usize {
+        \\    return @sizeOf(T) + A.files.len;
+        \\}
+        \\test {
+        \\    _ = count(A);
+        \\    _ = count(B);
+        \\    _ = count(A);
+        \\    _ = make(A);
+        \\    _ = make(B);
+        \\    _ = none(A);
+        \\    _ = none(B);
+        \\    _ = same(A);
+        \\    _ = same(B);
+        \\}
+        \\const E1 = enum { alpha, beta };
+        \\const E2 = enum { gamma, alpha };
+        \\fn pick(comptime E: type) E {
+        \\    return .alpha;
+        \\}
+        \\test {
+        \\    _ = pick(E1);
+        \\    _ = pick(E2);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_]struct { []const u8, hover.Instances, []const u8 }{
+        .{
+            "files.len;\n}\nfn make", .list,
+            \\```zig
+            \\const files: [1][]const u8 = .{ "a.txt" }
+            \\```
+            \\
+            \\inferred from the call at main.zig:26
+            \\
+            \\The files of A
+            \\
+            \\Under other instances:
+            \\
+            \\- `const files: [2][]const u8` at main.zig:9, inferred from the call at main.zig:27
+        },
+        .{
+            "files.len;\n}\nfn make", .full,
+            \\```zig
+            \\const files: [1][]const u8 = .{ "a.txt" }
+            \\```
+            \\
+            \\inferred from the call at main.zig:26
+            \\
+            \\The files of A
+            \\
+            \\---
+            \\
+            \\```zig
+            \\const files: [2][]const u8 = .{ "b.txt", "c.txt" }
+            \\```
+            \\
+            \\inferred from the call at main.zig:27
+            \\
+            \\The files of B
+        },
+        .{
+            "len = 3", .list,
+            \\```zig
+            \\len: u32
+            \\```
+            \\
+            \\inferred from the call at main.zig:29
+            \\
+            \\Under other instances:
+            \\
+            \\- `len: u16` at main.zig:11, inferred from the call at main.zig:30
+        },
+        .{
+            "empty;\n}", .list,
+            \\```zig
+            \\const empty: A = .{ .len = 1 }
+            \\```
+            \\
+            \\inferred from the call at main.zig:31
+            \\
+            \\Under other instances:
+            \\
+            \\- `const empty: B` at main.zig:10, inferred from the call at main.zig:32
+        },
+        .{
+            "alpha;\n}", .list,
+            \\```zig
+            \\alpha: E1 = .alpha
+            \\```
+            \\
+            \\inferred from the call at main.zig:42
+            \\
+            \\Under other instances:
+            \\
+            \\- `alpha: E2` at main.zig:37, inferred from the call at main.zig:43
+        },
+        // The same declaration under every instance: nothing follows
+        .{
+            "files.len;\n}\ntest", .list,
+            \\```zig
+            \\const files: [1][]const u8 = .{ "a.txt" }
+            \\```
+            \\
+            \\The files of A
+        },
+    }) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, c[1]) orelse {
+            std.debug.print("no hover at `{s}` ({t})\n", .{ c[0], c[1] });
+            return error.NoHover;
+        };
+        testing.expectEqualStrings(c[2], info.text) catch |err| {
+            std.debug.print("hover at `{s}` ({t})\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+}
+
 test "hover in generic bodies on names whose result type is a parameter" {
     // Prevents a null hover on `.len` in `.{ .len = 3 }` and `@EnumLiteral()` for `.empty` returned as `T`, while goto resolves both
     const text =
@@ -4810,7 +4959,7 @@ test "hover in generic bodies on names whose result type is a parameter" {
         .{ "empty;", "```zig\nconst empty: A = .{ .len = 1 }\n```\n\ninferred from the call at main.zig:18\n\nThe empty A" },
         .{ "alpha;", "```zig\nalpha: E = .alpha\n```\n\ninferred from the call at main.zig:19" },
     }) |c| {
-        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{})) orelse {
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list)) orelse {
             std.debug.print("no hover at `{s}`\n", .{c[0]});
             return error.NoHover;
         };
@@ -4900,7 +5049,7 @@ test "goto, hover and symbols on the types of unnamed extern parameters" {
     }
     try testing.expectEqual(null, try definition.definition(&r, file, at("c_int) void")));
     try testing.expectEqual(null, try definition.symbolAt(&r, file, at("c_int) void")));
-    const info = (try hover.hover(&r, file, at("Foo, *const"), &.{})) orelse return error.NoHover;
+    const info = (try hover.hover(&r, file, at("Foo, *const"), &.{}, .list)) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst Foo = struct\n```", info.text);
 }
 
@@ -5284,7 +5433,7 @@ test "hover shows tuples whose fields are all comptime by value and does not tru
         .{ "name_len =", "const name_len: usize = 315" },
     };
     for (cases) |c| {
-        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{})).?;
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list)).?;
         testing.expectEqualStrings(try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}\n```", .{c[1]}), info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
@@ -5318,7 +5467,7 @@ test "hover writes the void value inside aggregates and union values as {}" {
         .{ "tup =", "const tup = .{ {}, true }" },
     };
     for (cases) |c| {
-        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{})).?;
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list)).?;
         testing.expectEqualStrings(try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}\n```", .{c[1]}), info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
@@ -5357,7 +5506,7 @@ test "hover shows comptime-known bool, null, undefined and void values" {
         .{ "b = false", "var b: bool" },
     };
     for (cases) |c| {
-        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{})).?;
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list)).?;
         testing.expectEqualStrings(try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}\n```", .{c[1]}), info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
@@ -5392,10 +5541,10 @@ test "hover and completion details bound large comptime values and mark the cut"
     // The value of `@embedFile` is shown as the call, with the file and its size
     const blob_code = std.fmt.comptimePrint("*const [1048576:0]u8 = @embedFile(\"assets/blob.bin\")\n```\n\nEmbedded file `assets{c}blob.bin`: 1048576 bytes", .{std.fs.path.sep});
     for ([_][]const u8{ "blob =", "blob.len" }) |needle| {
-        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, needle).?), roots)).?;
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, needle).?), roots, .list)).?;
         try testing.expectEqualStrings("```zig\nconst blob: " ++ blob_code, info.text);
     }
-    const call = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "embedFile").?), roots)).?.text;
+    const call = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "embedFile").?), roots, .list)).?.text;
     try testing.expect(std.mem.endsWith(u8, call, "Inferred result:\n\n```zig\n" ++ blob_code));
     // `completionItem/resolve` of an auto-import candidate: `blob` is the first member
     try testing.expectEqualStrings(
@@ -5404,16 +5553,16 @@ test "hover and completion details bound large comptime values and mark the cut"
     );
 
     // A value computed from the content is cut, with the total
-    const head = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "head =").?), roots)).?.text;
+    const head = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "head =").?), roots, .list)).?.text;
     try testing.expect(head.len < 4096);
     try testing.expect(std.mem.startsWith(u8, head, "```zig\nconst head: *const [4096]u8 = \"\\x00\\xef\\xde"));
     try testing.expect(std.mem.endsWith(u8, head, "…\" (4096 bytes total)\n```"));
-    const table = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "table:").?), roots)).?.text;
+    const table = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "table:").?), roots, .list)).?.text;
     try testing.expect(table.len < 4096);
     try testing.expect(std.mem.startsWith(u8, table, "```zig\nconst table: [3000]u16 = .{\n    7, 7, "));
     try testing.expect(std.mem.endsWith(u8, table, ",\n    … (3000 total)\n}\n```"));
     // Values within the limit are shown in full
-    const small = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "small =").?), roots)).?.text;
+    const small = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "small =").?), roots, .list)).?.text;
     try testing.expectEqualStrings("```zig\nconst small: *const [4:0]u8 = \"fits\"\n```", small);
 }
 
@@ -5473,7 +5622,7 @@ test "hover breaks values too wide for one line, completion details keep them on
         },
     };
     for (cases) |c| {
-        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{})).?;
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list)).?;
         try testing.expectEqualStrings(try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}\n```", .{c[1]}), info.text);
     }
 
@@ -5530,39 +5679,39 @@ test "hover shows the file and size of @embedFile values, and the content of sho
 
     // Text: the content follows, in a fence longer than its backtick runs
     const notes_hover = "```zig\nconst notes: *const [31:0]u8 = @embedFile(\"notes.txt\")\n```\n\nEmbedded file `notes.txt`: 31 bytes\n\n````text\n" ++ notes ++ "````";
-    try testing.expectEqualStrings(notes_hover, (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "notes =").?), roots)).?.text);
+    try testing.expectEqualStrings(notes_hover, (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "notes =").?), roots, .list)).?.text);
     // From another file, relative to the workspace folder
-    try testing.expectEqualStrings(notes_hover, (try hover.hover(&r, other, @intCast(std.mem.indexOf(u8, other_text, "notes.len").?), roots)).?.text);
+    try testing.expectEqualStrings(notes_hover, (try hover.hover(&r, other, @intCast(std.mem.indexOf(u8, other_text, "notes.len").?), roots, .list)).?.text);
     // Outside the workspace folders, the absolute path
-    const outside = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "notes =").?), &.{})).?.text;
+    const outside = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "notes =").?), &.{}, .list)).?.text;
     try testing.expect(std.mem.indexOf(u8, outside, "Embedded file `" ++ comptime test_path.native("/p/notes.txt") ++ "`: 31 bytes") != null);
     // The type annotation is kept
     try testing.expectEqualStrings(
         "```zig\nconst typed: []const u8 = @embedFile(\"notes.txt\")\n```\n\nEmbedded file `notes.txt`: 31 bytes\n\n````text\n" ++ notes ++ "````",
-        (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "typed:").?), roots)).?.text,
+        (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "typed:").?), roots, .list)).?.text,
     );
     // Binary content and text over the limit are not shown
     const bin_hover = "```zig\nconst bin: *const [4:0]u8 = @embedFile(\"small.bin\")\n```\n\nEmbedded file `small.bin`: 4 bytes";
-    try testing.expectEqualStrings(bin_hover, (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "bin =").?), roots)).?.text);
+    try testing.expectEqualStrings(bin_hover, (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "bin =").?), roots, .list)).?.text);
     try testing.expectEqualStrings(
         "```zig\nconst long: *const [2001:0]u8 = @embedFile(\"long.txt\")\n```\n\nEmbedded file `long.txt`: 2001 bytes",
-        (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "long =").?), roots)).?.text,
+        (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "long =").?), roots, .list)).?.text,
     );
     try testing.expectEqualStrings(
         try std.fmt.allocPrint(arena, "```zig\nconst wide: *const [4000:0]u8 = @embedFile(\"wide.txt\")\n```\n\nEmbedded file `wide.txt`: 4000 bytes\n\n```text\n{s}\n```", .{wide}),
-        (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "wide =").?), roots)).?.text,
+        (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "wide =").?), roots, .list)).?.text,
     );
     // A path known at comptime, and a local constant
     try testing.expectEqualStrings(
         "```zig\nconst by_name: *const [4:0]u8 = @embedFile(\"small.bin\")\n```\n\nEmbedded file `small.bin`: 4 bytes",
-        (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "by_name =").?), roots)).?.text,
+        (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "by_name =").?), roots, .list)).?.text,
     );
     try testing.expectEqualStrings(
         "```zig\nconst local: *const [4:0]u8 = @embedFile(\"small.bin\")\n```\n\nEmbedded file `small.bin`: 4 bytes",
-        (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "local.len").?), roots)).?.text,
+        (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "local.len").?), roots, .list)).?.text,
     );
     // A file that does not exist has no value
-    try testing.expectEqualStrings("```zig\nconst missing: unknown\n```", (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "missing =").?), roots)).?.text);
+    try testing.expectEqualStrings("```zig\nconst missing: unknown\n```", (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "missing =").?), roots, .list)).?.text);
 
     // Completion details show the call without the content
     const tree = try r.itemTree(file);
@@ -5619,7 +5768,7 @@ test "hover on a constant aliasing a container shows the aliased type" {
         .{ "Self) u8", "const Self: type = Holder" },
     };
     for (cases) |c| {
-        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{})).?;
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list)).?;
         const expected = try std.fmt.allocPrint(w.arena.allocator(), "```zig\n{s}{s}", .{ c[1], if (std.mem.indexOfScalar(u8, c[1], '`') == null) "\n```" else "" });
         testing.expectEqualStrings(expected, info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
@@ -5695,7 +5844,7 @@ test "anonymous containers are shown by content, and their type hints only when 
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "i = s.inner").?), &.{})).?;
+    const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "i = s.inner").?), &.{}, .list)).?;
     try testing.expectEqualStrings("```zig\nconst i: packed struct { x: u8 }\n```", info.text);
 }
 
@@ -5856,7 +6005,7 @@ test "callsite seeding can be switched off" {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "bigger =").?), &.{}) orelse return error.NoHover;
+    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "bigger =").?), &.{}, .list) orelse return error.NoHover;
     // Not inferred from a call-site instance: shows the abstract type, without "inferred from"
     try testing.expectEqualStrings("```zig\nconst bigger: T\n```", info.text);
 }
@@ -6208,9 +6357,9 @@ test "via a comptime type parameter dispatch uses the real caller instance" {
     const at_x: u32 = @intCast(std.mem.indexOf(u8, text, "        x.hello").? + "        ".len);
     const at_hello: u32 = @intCast(std.mem.indexOf(u8, text, "        x.hello").? + "        x.".len);
 
-    const x = (try hover.hover(&r, file, at_x, &.{})) orelse return error.NoHover;
+    const x = (try hover.hover(&r, file, at_x, &.{}, .list)) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nx: Foo\n```\n\ninferred from the call at main.zig:18", x.text);
-    const hello = (try hover.hover(&r, file, at_hello, &.{})) orelse return error.NoHover;
+    const hello = (try hover.hover(&r, file, at_hello, &.{}, .list)) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nfn hello(_: Foo) void\n```\n\ninferred from the call at main.zig:18", hello.text);
     const t = (try definition.definition(&r, file, at_hello)) orelse return error.NoTarget;
     try testing.expect(std.mem.startsWith(u8, text[t.start..], "hello(_: Foo)"));
@@ -6254,9 +6403,9 @@ test "via a comptime type parameter dispatch without a real instance stays abstr
     const at_x: u32 = @intCast(std.mem.indexOf(u8, text, "        x.hello").? + "        ".len);
     const at_hello: u32 = at_x + @as(u32, @intCast("x.".len));
 
-    const x = (try hover.hover(&r, file, at_x, &.{})) orelse return error.NoHover;
+    const x = (try hover.hover(&r, file, at_x, &.{}, .list)) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nx: unknown\n```", x.text);
-    try testing.expect(try hover.hover(&r, file, at_hello, &.{}) == null);
+    try testing.expect(try hover.hover(&r, file, at_hello, &.{}, .list) == null);
     try testing.expect(try definition.definition(&r, file, at_hello) == null);
 }
 
@@ -6350,7 +6499,7 @@ test "inside an inline for over a list of types, features use one iteration" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const plain = try std.mem.replaceOwned(u8, w.arena.allocator(), text, "<|>", "");
-    const info = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, plain, "v = ").?), &.{})) orelse return error.NoHover;
+    const info = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, plain, "v = ").?), &.{}, .list)) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst v: u32\n```\n\ninferred from iteration 1 of the loop at main.zig:13", info.text);
 }
 
@@ -7260,7 +7409,7 @@ test "hover and definition combine alternate callsites with reflected loop itera
             defer ctx.end();
             var r = resolver(&w, &ctx);
             const at: u32 = @intCast(std.mem.indexOf(u8, updated, ".deinit()").? + 1);
-            const info = try hover.hover(&r, file, at, &.{}) orelse return error.NoHover;
+            const info = try hover.hover(&r, file, at, &.{}, .list) orelse return error.NoHover;
             try testing.expect(std.mem.indexOf(u8, info.text, "pub fn deinit(_: *@This()) void") != null);
             const loop_at = std.mem.indexOf(u8, updated, "inline for").?;
             const loop_line = std.mem.count(u8, updated[0..loop_at], "\n") + 1;
@@ -7294,7 +7443,7 @@ test "builtin hover combines official documentation and inferred values" {
         var ctx = w.db.beginRead(w.arena.allocator());
         defer ctx.end();
         var r = resolver(&w, &ctx);
-        const info = try hover.hover(&r, added.file, added.cursor, &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, added.file, added.cursor, &.{}, .list) orelse return error.NoHover;
         try testing.expect(std.mem.indexOf(u8, info.text, case.signature) != null);
         try testing.expect(std.mem.indexOf(u8, info.text, "https://ziglang.org/documentation/0.17.1/") != null);
         if (case.value) |value| try testing.expect(std.mem.indexOf(u8, info.text, value) != null);
@@ -7326,7 +7475,7 @@ test "builtin documentation names the version of the user's zig" {
         var r = resolver(&w, &ctx);
         var docs: std.ArrayList([]const u8) = .empty;
         const a = w.arena.allocator();
-        try docs.append(a, (try hover.hover(&r, hovered.file, hovered.cursor, &.{}) orelse return error.NoHover).text);
+        try docs.append(a, (try hover.hover(&r, hovered.file, hovered.cursor, &.{}, .list) orelse return error.NoHover).text);
         try docs.append(a, (try signature.signatureHelp(&r, called.file, called.cursor) orelse return error.NoSignature).doc.?);
         for ((try completion.complete(&r, completed.file, completed.cursor, .{ .auto_import = false })).items) |item| {
             if (std.mem.eql(u8, item.label, "@sizeOf")) try docs.append(a, item.doc.?);
@@ -7420,7 +7569,7 @@ test "builtin metadata excludes strings comments unknown names and escaped ident
         var ctx = w.db.beginRead(w.arena.allocator());
         defer ctx.end();
         var r = resolver(&w, &ctx);
-        if (try hover.hover(&r, added.file, added.cursor, &.{})) |info|
+        if (try hover.hover(&r, added.file, added.cursor, &.{}, .list)) |info|
             try testing.expect(std.mem.indexOf(u8, info.text, "https://ziglang.org/documentation/") == null);
         try testing.expect((try signature_help.signatureHelp(&r, added.file, added.cursor)) == null);
         if (i != 0) for ((try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items) |item|
@@ -7452,7 +7601,7 @@ test "builtin hover source gaps and argument names remain distinct" {
         var ctx = w.db.beginRead(w.arena.allocator());
         defer ctx.end();
         var r = resolver(&w, &ctx);
-        const info = try hover.hover(&r, added.file, added.cursor, &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, added.file, added.cursor, &.{}, .list) orelse return error.NoHover;
         if (case.gap) {
             try testing.expect(std.mem.indexOf(u8, info.text, "0.17.1") != null);
             try testing.expect(std.mem.indexOf(u8, info.text, "@Frame(") == null);
@@ -8712,7 +8861,7 @@ test "an iteration that leaves the loop before a declaration is not used for it"
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const info = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, text, "F =").?), &.{})) orelse return error.NoHover;
+    const info = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, text, "F =").?), &.{}, .list)) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst F: type = u8\n```\n\ninferred from iteration 2 of the loop at main.zig:4", info.text);
 }
 
@@ -8759,7 +8908,7 @@ test "hover on a capture read through a container in the body shows the value of
         .{ "p_payload =", "```zig\nconst p_payload: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:14" },
     };
     for (cases) |c| {
-        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list) orelse return error.NoHover;
         testing.expectEqualStrings(c[1], info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
@@ -8847,7 +8996,7 @@ test "hover in nested inline loops takes an iteration of each enclosing loop" {
         .{ "L =", "```zig\nconst L: type = [1]u8\n```\n\ninferred from iteration 1 of the loop at main.zig:47 and iteration 1 of the loop at main.zig:48" },
     };
     for (cases) |c| {
-        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list) orelse return error.NoHover;
         testing.expectEqualStrings(c[1], info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
@@ -8879,7 +9028,7 @@ test "hover in an inline loop over the fields of an enclosing loop variable" {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "F =").?), &.{}) orelse return error.NoHover;
+    const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "F =").?), &.{}, .list) orelse return error.NoHover;
     try testing.expectEqualStrings("```zig\nconst F: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:4 and iteration 1 of the loop at main.zig:5", info.text);
 }
 test "references through the loop variable of an enclosing inline loop" {
@@ -9120,7 +9269,7 @@ test "hover never treats the initializer as the missing type of a declaration" {
         defer ctx.end();
         var r = resolver(&w, &ctx);
         const offset: u32 = @intCast(std.mem.lastIndexOf(u8, text, c[0]).?);
-        const info = try hover.hover(&r, added.file, offset, &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, added.file, offset, &.{}, .list) orelse return error.NoHover;
         try testing.expectEqualStrings(c[1], info.text);
     }
 }
@@ -9322,14 +9471,14 @@ test "hover on a reference in a coercing context shows its own type" {
         .{ "null)", "```zig\n?u8 = null\n```" },
     };
     for (cases) |c| {
-        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list) orelse return error.NoHover;
         testing.expectEqualStrings(c[1], info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
         };
     }
     // A cast takes its result type without the optional
-    const cast = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "@intCast").?), &.{}) orelse return error.NoHover;
+    const cast = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "@intCast").?), &.{}, .list) orelse return error.NoHover;
     try testing.expect(std.mem.endsWith(u8, cast.text, "Inferred result:\n\n```zig\nu16\n```"));
 }
 
@@ -9385,7 +9534,7 @@ test "captures of inline prongs on tagged unions take the payload of each item" 
         .{ "y = e.x", "```zig\nconst y: u8\n```\n\ninferred from iteration 1 of the loop at main.zig:25" },
     };
     for (cases) |c| {
-        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}) orelse return error.NoHover;
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list) orelse return error.NoHover;
         testing.expectEqualStrings(c[1], info.text) catch |err| {
             std.debug.print("hover at `{s}`\n", .{c[0]});
             return err;
