@@ -30,7 +30,7 @@ Rename and naming fixes return only a reason and location, with no edit, when:
 
 - a reference cannot be confirmed (ambiguous in a generic function, a member access of unknown type, incomplete instances, a file with syntax errors that mentions the name);
 - the new name conflicts (a member of the same container, shadowing, a newly ambiguous reference, or any new AstGen error in the declaration's file);
-- a container member's name appears as a string literal in a file that can access it (`@field`, `@hasDecl`, serialization keys).
+- a container member's name appears as a string literal in a file that can access it (`@field`, `@hasDecl`, serialization keys). Test names (`test "name" {}`) do not count: they only describe the test.
 
 ## Labels and error names
 
