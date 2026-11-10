@@ -96,8 +96,13 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, 
     }
 
     // A generic function body has no concrete instance: infer with a call-site instance
+    const ip = r.ctx.db.env.ip;
+    // An enum literal whose expected type contains parameters (`return .empty` in a function
+    // returning `T`) names a declaration or tag only under an instance
+    const instance_literal = def == null and expr_id != null and b.expr(expr_id.?) == .enum_literal and
+        if (a.literalExpected(expr_id.?)) |t| seed.wanted(ip, .{ .ty = t }) else false;
     var seeded_from: ?seed.Seed = null;
-    if ((binding_id != null or expr_id != null) and seed.wanted(r.ctx.db.env.ip, tv)) {
+    if ((binding_id != null or expr_id != null) and (instance_literal or seed.wanted(ip, tv))) {
         const subject: seed.Subject = if (binding_id) |id| .{ .binding = id } else .{ .expr = expr_id.? };
         const rel = tok.offset - a.node.offset;
         var refiner = try seed.Refiner.init(r, file, a.item, a.node.offset, b, a.res);
@@ -107,9 +112,15 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, 
                 (if (@backingInt(id) < res.bindings.len) res.bindings[@backingInt(id)] else .unknown)
             else
                 res.uncoercedValue(expr_id.?);
-            if (!seed.wanted(r.ctx.db.env.ip, better)) {
+            if (!seed.wanted(ip, better)) {
                 tv = better;
                 seeded_from = s;
+                if (instance_literal) {
+                    const i = @backingInt(expr_id.?);
+                    if (i < res.members.len) if (res.members[i]) |key| {
+                        def = try context.defOfKey(r, key);
+                    };
+                }
             }
         }
     }
@@ -128,24 +139,30 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, 
     w.print("```zig\n{s}\n```", .{code}) catch return error.OutOfMemory;
     if (embed) |e| writeEmbedded(w, r.ctx.db.env.vfs.shownPath(roots, r.ctx.db.env.vfs.path(e.file)), e.text) catch return error.OutOfMemory;
     if (seeded_from) |s| {
-        const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, s.file)).text;
-        const line = std.mem.count(u8, text[0..@min(s.offset, text.len)], "\n") + 1;
-        const where = std.fs.path.basename(r.ctx.db.env.vfs.path(s.file));
-        if (s.iteration) |n| {
-            // Nested loops: the iteration of each, outermost first
-            w.writeAll("\n\ninferred from ") catch return error.OutOfMemory;
-            for (s.enclosing, 0..) |outer, i| {
-                const outer_line = std.mem.count(u8, text[0..@min(outer.offset, text.len)], "\n") + 1;
-                const sep = if (i + 1 < s.enclosing.len) ", " else " and ";
-                w.print("iteration {d} of the loop at {s}:{d}{s}", .{ outer.iteration + 1, where, outer_line, sep }) catch return error.OutOfMemory;
-            }
-            w.print("iteration {d} of the loop at {s}:{d}", .{ n + 1, where, line }) catch return error.OutOfMemory;
-        } else w.print("\n\ninferred from the call at {s}:{d}", .{ where, line }) catch return error.OutOfMemory;
+        w.writeAll("\n\ninferred from ") catch return error.OutOfMemory;
+        try writeSource(w, r, s);
     }
     if (def) |d| if (try context.docOf(r, d, tv)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
     return .{ .text = out.written(), .start = tok.offset, .end = tok.offset + @as(u32, @intCast(tok.text.len)) };
 }
 
+/// Where the instance `s` comes from: `the call at file.zig:12`, or the iteration of each loop
+/// containing the position, outermost first
+fn writeSource(w: *std.Io.Writer, r: *Resolver, s: seed.Seed) resolve.Error!void {
+    const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, s.file)).text;
+    const line = std.mem.count(u8, text[0..@min(s.offset, text.len)], "\n") + 1;
+    const where = std.fs.path.basename(r.ctx.db.env.vfs.path(s.file));
+    const n = s.iteration orelse {
+        w.print("the call at {s}:{d}", .{ where, line }) catch return error.OutOfMemory;
+        return;
+    };
+    for (s.enclosing, 0..) |outer, i| {
+        const outer_line = std.mem.count(u8, text[0..@min(outer.offset, text.len)], "\n") + 1;
+        const sep = if (i + 1 < s.enclosing.len) ", " else " and ";
+        w.print("iteration {d} of the loop at {s}:{d}{s}", .{ outer.iteration + 1, where, outer_line, sep }) catch return error.OutOfMemory;
+    }
+    w.print("iteration {d} of the loop at {s}:{d}", .{ n + 1, where, line }) catch return error.OutOfMemory;
+}
 /// The file a value comes from with `@embedFile` and its size; its content when it is text of at
 /// most `render.max_value_length` characters
 fn writeEmbedded(w: *std.Io.Writer, path: []const u8, content: []const u8) std.Io.Writer.Error!void {
@@ -194,17 +211,45 @@ fn initFieldHover(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.Expr
     const k = for (fields, 0..) |f, k| {
         if (f.name != null and rel >= f.name_range.start and rel < f.name_range.end) break k;
     } else return null;
-    const t = a.initType(e) orelse return null;
-    if (t == .unknown) return null;
-    const field = try infer.initField(r, t, try queries.namespaceOfType(r, t), k, fields[k].name);
+    var field = try initFieldAt(r, a, e, k);
+    // The result type is a parameter (`.{ .len = 3 }` returned as `T`): the field exists only
+    // under an instance. A result type that names the field (`Pair(T)`) keeps its type in terms
+    // of the parameters.
+    var from: ?seed.Seed = null;
+    if (field.member == null) if (a.seeded) |s| {
+        const under = try initFieldAt(r, instanceOnly(a), e, k);
+        if (under.member != null) {
+            field = under;
+            from = s;
+        }
+    };
     const def = try context.defOfKey(r, field.member orelse return null) orelse return null;
     var out: std.Io.Writer.Allocating = .init(r.arena);
     const w = &out.writer;
     w.print("```zig\n{s}\n```", .{try context.signature(r, def, .{ .ty = field.ty orelse .unknown }, .multi_line)}) catch return error.OutOfMemory;
+    if (from) |s| {
+        w.writeAll("\n\ninferred from ") catch return error.OutOfMemory;
+        try writeSource(w, r, s);
+    }
     if (try context.doc(r, def)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
     return .{ .text = out.written(), .start = tok.offset, .end = tok.range().end };
 }
 
+/// The field that the `k`-th field name of the initializer `e` names at `a`, with its type
+fn initFieldAt(r: *Resolver, a: context.At, e: Body.ExprId, k: usize) resolve.Error!infer.InitField {
+    const t = a.initType(e) orelse return .{};
+    if (t == .unknown) return .{};
+    return infer.initField(r, t, try queries.namespaceOfType(r, t), k, a.body.expr(e).init.fields[k].name);
+}
+/// `a` with only the inference result of its instance (`a.seeded`), not the abstract one
+fn instanceOnly(a: context.At) context.At {
+    var x = a;
+    if (a.seeded) |s| {
+        x.res = s.res;
+        x.seeded = null;
+    }
+    return x;
+}
 /// `error.Foo`: the error name and the expected error set, plus its documentation when the
 /// current file declares it
 fn errorValue(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.ExprId, name: []const u8) resolve.Error!?Info {

@@ -4773,6 +4773,53 @@ test "goto in generic functions lists the targets under every instance" {
     }
 }
 
+test "hover in generic bodies on names whose result type is a parameter" {
+    // Prevents a null hover on `.len` in `.{ .len = 3 }` and `@EnumLiteral()` for `.empty` returned as `T`, while goto resolves both
+    const text =
+        \\const A = struct {
+        \\    /// The empty A
+        \\    pub const empty: A = .{};
+        \\    len: u32 = 1,
+        \\};
+        \\const E = enum { alpha, beta };
+        \\fn make(comptime T: type) T {
+        \\    return .{ .len = 3 };
+        \\}
+        \\fn none(comptime T: type) T {
+        \\    return .empty;
+        \\}
+        \\fn pick(comptime T: type) T {
+        \\    return .alpha;
+        \\}
+        \\test {
+        \\    _ = make(A);
+        \\    _ = none(A);
+        \\    _ = pick(E);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "len = 3", "```zig\nlen: u32\n```\n\ninferred from the call at main.zig:17" },
+        .{ "empty;", "```zig\nconst empty: A = .{ .len = 1 }\n```\n\ninferred from the call at main.zig:18\n\nThe empty A" },
+        .{ "alpha;", "```zig\nalpha: E = .alpha\n```\n\ninferred from the call at main.zig:19" },
+    }) |c| {
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{})) orelse {
+            std.debug.print("no hover at `{s}`\n", .{c[0]});
+            return error.NoHover;
+        };
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
 test "type definition of fields typed by the parameter of a generic container" {
     // Prevents an empty result on `self.items` when only the type of `self` was seeded
     const text =
