@@ -17,9 +17,16 @@ A language server (LSP) for Zig, built on an incremental query engine.
 - **Structure**: folding ranges and selection ranges.
 - **Naming checks** (opt-in): hints based on the [Names](https://ziglang.org/documentation/0.17.1/#Names) section of the Zig style guide, with safe rename fixes.
 
-## Neovim setup
+## Editor support
 
-Neovim 0.12+:
+| Editor | Integration |
+| --- | --- |
+| VS Code | Extension in [`editors/vscode`](editors/vscode) |
+| Zed | Extension in [`editors/zed`](editors/zed) (with the Zig extension) |
+| Neovim 0.12+ | Plugin in [`editors/nvim`](editors/nvim) |
+| Vim | Plugin in [`editors/vim`](editors/vim), for yegappan/lsp or vim-lsp |
+
+Without the Neovim plugin, Neovim 0.12+ needs only:
 
 ```lua
 vim.lsp.config('zig_analyzer', {

@@ -1,0 +1,538 @@
+{
+  "name": "zig-analyzer",
+  "displayName": "zig-analyzer",
+  "description": "Zig language support through the zig-analyzer language server",
+  "version": "0.0.1",
+  "publisher": "jinzhongjia",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jinzhongjia/zig-analyzer"
+  },
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Formatters",
+    "Linters"
+  ],
+  "keywords": [
+    "zig",
+    "zon",
+    "lsp"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "workspaceContains:build.zig"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "zig",
+        "aliases": [
+          "Zig",
+          "zig"
+        ],
+        "extensions": [
+          ".zig",
+          ".zon"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "zig",
+        "scopeName": "source.zig",
+        "path": "./syntaxes/zig.tmLanguage.json"
+      }
+    ],
+    "semanticTokenModifiers": [
+      {
+        "id": "global",
+        "description": "Container-level `var` declarations and their references"
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "zig",
+        "scopes": {
+          "variable.global": [
+            "variable.other.global.zig"
+          ],
+          "namespace": [
+            "entity.name.namespace.zig"
+          ],
+          "struct": [
+            "entity.name.type.struct.zig"
+          ],
+          "enumMember": [
+            "variable.other.enummember.zig"
+          ],
+          "typeParameter": [
+            "entity.name.type.parameter.zig"
+          ]
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "zig-analyzer.restartServer",
+        "title": "Restart Server",
+        "category": "zig-analyzer"
+      },
+      {
+        "command": "zig-analyzer.reloadWorkspace",
+        "title": "Reload Workspace (rerun build.zig)",
+        "category": "zig-analyzer"
+      },
+      {
+        "command": "zig-analyzer.showStatus",
+        "title": "Show Server Status",
+        "category": "zig-analyzer"
+      },
+      {
+        "command": "zig-analyzer.showFileStatus",
+        "title": "Show File Status",
+        "category": "zig-analyzer"
+      },
+      {
+        "command": "zig-analyzer.showSyntaxTree",
+        "title": "Show Syntax Tree",
+        "category": "zig-analyzer"
+      },
+      {
+        "command": "zig-analyzer.showModuleGraph",
+        "title": "Show Module Graph",
+        "category": "zig-analyzer"
+      },
+      {
+        "command": "zig-analyzer.showOutput",
+        "title": "Show Output",
+        "category": "zig-analyzer"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "zig-analyzer.showFileStatus",
+          "when": "editorLangId == zig"
+        },
+        {
+          "command": "zig-analyzer.showSyntaxTree",
+          "when": "editorLangId == zig"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "zig-analyzer",
+      "properties": {
+        "zig-analyzer.server.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Path to the `zig-analyzer` executable. Empty: looked up in `PATH`. A leading `~/` is the home directory. Takes effect after restarting the server."
+        },
+        "zig-analyzer.server.extraEnv": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "scope": "machine-overridable",
+          "markdownDescription": "Extra environment variables of the server process. Takes effect after restarting the server."
+        },
+        "zig-analyzer.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "markdownDescription": "Log the messages between VS Code and the server to the `zig-analyzer` output channel."
+        },
+        "zig-analyzer.zig.path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "scope": "machine-overridable",
+          "markdownDescription": "Path to the `zig` executable. Default: looked up in `PATH`. It must be Zig 0.17.0 or 0.17.1; otherwise projects with `build.zig` are not loaded. Takes effect after restarting the server."
+        },
+        "zig-analyzer.zig.lib_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "scope": "machine-overridable",
+          "markdownDescription": "Zig lib directory, which must contain `std/std.zig`; overrides what `zig env` reports. The standard library is read from it, and zig runs with `ZIG_LIB_DIR` set to it."
+        },
+        "zig-analyzer.zig.global_cache_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "scope": "machine-overridable",
+          "markdownDescription": "Existing global cache directory; overrides what `zig env` reports. zig runs with `ZIG_GLOBAL_CACHE_DIR` set to it."
+        },
+        "zig-analyzer.zig.builtin_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "scope": "machine-overridable",
+          "markdownDescription": "`@import(\"builtin\")` of files outside any project. Default: generated for the native target. Modules of a project always use the one of their build settings."
+        },
+        "zig-analyzer.build.enable": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Load projects through the build system protocol (`zig build --listen=-`); off handles every file in single-file mode."
+        },
+        "zig-analyzer.build.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Extra arguments passed to `zig build`, such as `-Dtarget=aarch64-linux`."
+        },
+        "zig-analyzer.diagnostics.steps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Build steps for compiler diagnostics. Empty: `check` if the project has it, otherwise the default step."
+        },
+        "zig-analyzer.diagnostics.compiler": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Run the compiler on save for diagnostics; off gives only live diagnostics (syntax and AstGen) while typing."
+        },
+        "zig-analyzer.diagnostics.inactive_code": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Mark code that is not compiled in the current build configuration (branches comptime knows are not taken) as inactive."
+        },
+        "zig-analyzer.diagnostics.debounce_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 50,
+          "markdownDescription": "Milliseconds without edits before live diagnostics are computed; 0 for no delay."
+        },
+        "zig-analyzer.inlay_hints.types": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Inferred types of local variables without a type annotation."
+        },
+        "zig-analyzer.inlay_hints.field_types": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Field types after the field names in initializers that have a result type (`.{ .x: i32 = 1 }`)."
+        },
+        "zig-analyzer.inlay_hints.anonymous_containers": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Also show type hints whose type has an anonymous container, which is shown by its content."
+        },
+        "zig-analyzer.inlay_hints.parameters": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Parameter names at call arguments."
+        },
+        "zig-analyzer.inlay_hints.builtin_parameters": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Parameter names at builtin call arguments (`@memcpy(dest: a, source: b)`), for builtins whose arguments do not show what they are. Needs `#zig-analyzer.inlay_hints.parameters#`."
+        },
+        "zig-analyzer.inlay_hints.exclude_single_argument": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "No parameter names for calls with a single argument (including builtins and method calls like `list.append(item)`)."
+        },
+        "zig-analyzer.inlay_hints.hide_redundant_param_names": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Hide the parameter name when the argument already has that name: a variable or a field access ending in it, also behind `&`, `.*`, `.?` and `try`."
+        },
+        "zig-analyzer.inlay_hints.max_length": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 25,
+          "markdownDescription": "Type hints longer than this many characters end with `…` instead of their remaining fields or arguments. 0 never truncates."
+        },
+        "zig-analyzer.semantic_tokens.mode": {
+          "type": "string",
+          "enum": [
+            "full",
+            "partial"
+          ],
+          "enumDescriptions": [
+            "Every token.",
+            "Only tokens whose class needs name resolution and types; keywords, comments, literals, operators, labels and built-in names are left to the syntax highlighting."
+          ],
+          "default": "full",
+          "markdownDescription": "Which tokens semantic highlighting sends."
+        },
+        "zig-analyzer.semantic_tokens.global_var": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Mark container-level `var` declarations and their references with the `global` modifier."
+        },
+        "zig-analyzer.hover.instances": {
+          "type": "string",
+          "enum": [
+            "list",
+            "full"
+          ],
+          "enumDescriptions": [
+            "One line for each other instance, with its type, location, and the call it comes from.",
+            "The complete hover of each other instance (signature, value, documentation)."
+          ],
+          "default": "list",
+          "markdownDescription": "In a generic function body, how hover shows the declarations a member name refers to under the other instances."
+        },
+        "zig-analyzer.completion.auto_import": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "In name completion, also offer reachable declarations and modules that are not imported yet, adding the import when one is accepted, and members of visible namespaces matched by their whole path (`memeql` -> `std.mem.eql`)."
+        },
+        "zig-analyzer.completion.max_auto_imports": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 128,
+          "markdownDescription": "At most this many candidates besides the names in scope per completion (the list is marked incomplete and refreshed as you type); 0 never limits."
+        },
+        "zig-analyzer.completion.snippets": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Functions and builtins complete as calls, and common snippets are offered where a statement or a declaration starts."
+        },
+        "zig-analyzer.completion.argument_placeholders": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Call snippets get a placeholder for each argument; off inserts only the parentheses, with the cursor between them."
+        },
+        "zig-analyzer.imports.derived": {
+          "type": "string",
+          "enum": [
+            "with_import",
+            "separate"
+          ],
+          "enumDescriptions": [
+            "Right after the import they come from.",
+            "In a last group of their own."
+          ],
+          "default": "with_import",
+          "markdownDescription": "Where declarations derived from an import (`const Allocator = std.mem.Allocator;`) go, in \"Organize imports\" and auto-import."
+        },
+        "zig-analyzer.imports.sort": {
+          "type": "string",
+          "enum": [
+            "path",
+            "name"
+          ],
+          "enumDescriptions": [
+            "By what is imported: module name, file path with nearer files first, the full access path of derived declarations.",
+            "By declaration name."
+          ],
+          "default": "path",
+          "markdownDescription": "Order of imports within a group."
+        },
+        "zig-analyzer.sema.callsite_seeding": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Inside generic functions with no concrete types, infer with the instances from call sites (hover, completion, inlay hints, ...)."
+        },
+        "zig-analyzer.sema.wait_for_project": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Requests that use name resolution and types wait until the projects have loaded, so that every answer is complete. Off answers at once with what is known so far."
+        },
+        "zig-analyzer.sema.max_intern_pool_mb": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 64,
+          "markdownDescription": "Discard all cached type information when the intern pool exceeds this many MB and twice the most that one request has added; it is recomputed on demand. 0 never discards."
+        },
+        "zig-analyzer.cache.capacity": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 64,
+          "markdownDescription": "Syntax trees kept in memory. 0 keeps all."
+        },
+        "zig-analyzer.cache.queries": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "Per query: how many values (`count`) and how many MB (`mb`) are kept, taking precedence over `#zig-analyzer.cache.capacity#`. 0 removes the limit.",
+          "properties": {
+            "ParseFile": {
+              "$ref": "#/definitions/cacheLimit"
+            },
+            "FileAstIdMap": {
+              "$ref": "#/definitions/cacheLimit"
+            },
+            "FileItemTree": {
+              "$ref": "#/definitions/cacheLimit"
+            },
+            "ItemBody": {
+              "$ref": "#/definitions/cacheLimit"
+            },
+            "Infer": {
+              "$ref": "#/definitions/cacheLimit"
+            },
+            "Exports": {
+              "$ref": "#/definitions/cacheLimit"
+            }
+          },
+          "additionalProperties": false,
+          "definitions": {
+            "cacheLimit": {
+              "type": "object",
+              "properties": {
+                "count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "mb": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "zig-analyzer.workspace_symbol.dependencies": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Also list symbols from dependencies (fetched packages, generated files, opened std files)."
+        },
+        "zig-analyzer.workspace_symbol.limit": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 256,
+          "markdownDescription": "At most this many symbols per query (the best matches are kept); 0 never limits."
+        },
+        "zig-analyzer.naming.enable": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Hint names that do not follow the Names section of the Zig style guide, with rename fixes. Only open files of your own code are checked."
+        },
+        "zig-analyzer.naming.ignore": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Names the naming check skips; `*` matches any sequence of characters (`SDL_*`)."
+        },
+        "zig-analyzer.naming.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Files the naming check skips: `/`-separated paths relative to the workspace root; `*` matches any sequence of characters, including `/`."
+        },
+        "zig-analyzer.naming.rules": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "Turn individual naming rules on or off; each matches the diagnostic code `naming.<rule>`.",
+          "properties": {
+            "type": {
+              "type": "boolean",
+              "description": "Types and type aliases: TitleCase."
+            },
+            "type_function": {
+              "type": "boolean",
+              "description": "Callables that return `type`: TitleCase."
+            },
+            "function": {
+              "type": "boolean",
+              "description": "Other callables: camelCase."
+            },
+            "namespace": {
+              "type": "boolean",
+              "description": "Namespaces (files with no top-level fields): snake_case."
+            },
+            "value": {
+              "type": "boolean",
+              "description": "Other values: snake_case."
+            },
+            "field": {
+              "type": "boolean",
+              "description": "Fields and enum members, by the type of the field."
+            }
+          },
+          "additionalProperties": false
+        },
+        "zig-analyzer.files.watcher": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "client",
+            "server"
+          ],
+          "enumDescriptions": [
+            "The server watches files when the editor cannot register file watchers.",
+            "Only the editor's notifications.",
+            "Always the server (the editor's notifications are still handled)."
+          ],
+          "default": "auto",
+          "markdownDescription": "Who detects changes on disk."
+        },
+        "zig-analyzer.log.level": {
+          "type": "string",
+          "enum": [
+            "err",
+            "warn",
+            "info",
+            "debug"
+          ],
+          "default": "info",
+          "markdownDescription": "Server log level. Logs appear in the `zig-analyzer` output channel."
+        },
+        "zig-analyzer.log.file": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "scope": "machine-overridable",
+          "markdownDescription": "Also append server logs to this file."
+        },
+        "zig-analyzer.log.slow_request_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 100,
+          "markdownDescription": "Log a breakdown of the queries for requests slower than this many milliseconds; 0 turns it off."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node20 --sourcemap",
+    "typecheck": "tsc --noEmit",
+    "check-settings": "node scripts/check-settings.mjs",
+    "test": "npm run build && tsc -p test && node out-test/test/run.js",
+    "package": "npm run build -- --minify && vsce package --no-dependencies --skip-license",
+    "vscode:prepublish": "npm run build -- --minify"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "~1.91.0",
+    "@vscode/test-electron": "^2.4.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}
