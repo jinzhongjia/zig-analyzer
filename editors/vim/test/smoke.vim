@@ -98,6 +98,10 @@ endfunction
 call s:open('src/main.zig')
 let s:main = bufnr('%')
 call s:check(&filetype ==# 'zig', 'filetype is zig')
+if &filetype !=# 'zig'
+  call writefile(s:results + split(execute('messages'), "\n"), $ZA_RESULT)
+  cquit!
+endif
 call s:check(s:idle(), 'server running')
 
 let s:doc = {'uri': s:uri('src/main.zig')}
