@@ -1,0 +1,58 @@
+name: Mirror editor plugins
+
+# The Neovim and Vim plugins are developed in editors/nvim and editors/vim, and published as
+# repositories of their own, so that plugin managers install them by name. Each push to main that
+# changes them pushes the history of the directory (`git subtree split`) to the mirror repository.
+# The mirrors are read-only: their history is only ever extended by this workflow.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - editors/nvim/**
+      - editors/vim/**
+      - .github/workflows/mirror.yml
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Mirror ${{ matrix.dir }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dir: editors/nvim
+            repo: jinzhongjia/zig-analyzer.nvim
+            secret: NVIM_MIRROR_DEPLOY_KEY
+          - dir: editors/vim
+            repo: jinzhongjia/zig-analyzer.vim
+            secret: VIM_MIRROR_DEPLOY_KEY
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Push the history of ${{ matrix.dir }} to ${{ matrix.repo }}
+        # A deploy key with write access to the mirror repository only
+        env:
+          DEPLOY_KEY: ${{ secrets[matrix.secret] }}
+        run: |
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::The secret ${{ matrix.secret }} (a deploy key of ${{ matrix.repo }} with write access) is not set"
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/mirror_key
+          chmod 600 ~/.ssh/mirror_key
+          # GitHub's published host key
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND='ssh -i ~/.ssh/mirror_key -o IdentitiesOnly=yes'
+          git subtree split --prefix="${{ matrix.dir }}" -b mirror
+          # Not forced: the split of a directory only grows, so a rejected push means the mirror
+          # was changed by hand
+          git push "git@github.com:${{ matrix.repo }}.git" mirror:main

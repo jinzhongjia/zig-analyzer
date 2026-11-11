@@ -23,8 +23,8 @@ A language server (LSP) for Zig, built on an incremental query engine.
 | --- | --- |
 | VS Code | Extension in [`editors/vscode`](editors/vscode) |
 | Zed | Extension in [`editors/zed`](editors/zed) (with the Zig extension) |
-| Neovim 0.12+ | Plugin in [`editors/nvim`](editors/nvim) |
-| Vim | Plugin in [`editors/vim`](editors/vim), for yegappan/lsp or vim-lsp |
+| Neovim 0.12+ | Plugin [zig-analyzer.nvim](https://github.com/jinzhongjia/zig-analyzer.nvim), developed in [`editors/nvim`](editors/nvim) |
+| Vim | Plugin [zig-analyzer.vim](https://github.com/jinzhongjia/zig-analyzer.vim), developed in [`editors/vim`](editors/vim), for yegappan/lsp or vim-lsp |
 
 Without the Neovim plugin, Neovim 0.12+ needs only:
 

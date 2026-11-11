@@ -23,8 +23,8 @@
 | --- | --- |
 | VS Code | 扩展，见 [`editors/vscode`](editors/vscode) |
 | Zed | 扩展，见 [`editors/zed`](editors/zed)（需同时安装 Zig 扩展） |
-| Neovim 0.12+ | 插件，见 [`editors/nvim`](editors/nvim) |
-| Vim | 插件，见 [`editors/vim`](editors/vim)，支持 yegappan/lsp 和 vim-lsp |
+| Neovim 0.12+ | 插件 [zig-analyzer.nvim](https://github.com/jinzhongjia/zig-analyzer.nvim)，在 [`editors/nvim`](editors/nvim) 中开发 |
+| Vim | 插件 [zig-analyzer.vim](https://github.com/jinzhongjia/zig-analyzer.vim)，在 [`editors/vim`](editors/vim) 中开发，支持 yegappan/lsp 和 vim-lsp |
 
 不使用 Neovim 插件时，Neovim 0.12+ 只需：
 
