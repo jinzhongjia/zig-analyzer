@@ -38,19 +38,16 @@ features, a patch bump otherwise. Propose the version with the reason and let th
 
 Check the tag does not exist yet: `git tag -l vX.Y.Z` and `git ls-remote --tags origin vX.Y.Z`.
 
-## 3. Verify locally
+## 3. Verify
 
-GitHub Actions may not run the CI; do not rely on it. On this machine:
+The CI run of the commit to release must have passed on every platform:
 
 ```sh
-zig fmt --check src tools build.zig
-zig build gen && git diff --exit-code    # generated code is up to date
-zig build test-all
-zig build test-all -Doptimize=ReleaseSafe
-zig build check -Dtarget=x86_64-windows
+gh run list --workflow ci.yml --branch main --commit "$(git rev-parse main)"
 ```
 
-Stop on any failure and report it; a release is never cut over failing tests.
+Stop on any failure and report it; a release is never cut over failing tests. The version bump
+in the next step changes only `build.zig.zon`, so it needs no new run.
 
 ## 4. Bump the version
 
@@ -109,7 +106,7 @@ gh run list --workflow release.yml --limit 1
 gh run watch <run id> --exit-status
 ```
 
-If no run starts within a few minutes (Actions disabled, billing), tell the user; the tag is pushed
+If no run starts within a few minutes, tell the user; the tag is pushed
 but there is no release yet. Do not build and upload the release by hand unless the user asks.
 
 When it succeeds, check the release:
