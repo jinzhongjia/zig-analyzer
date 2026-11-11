@@ -127,6 +127,20 @@ for the archive and `SHA256SUMS`), the provenance (`gh attestation verify <archi
 jinzhongjia/zig-analyzer`), and the checksum (`shasum -a 256 -c SHA256SUMS --ignore-missing`), then
 extract and check that `zig-analyzer --version` prints `X.Y.Z`.
 
+## Pre-releases
+
+A release candidate `vX.Y.Z-rc.N` goes through the same steps with the version `X.Y.Z-rc.N`
+everywhere (`build.zig.zon`, `tools/changelog.sh X.Y.Z-rc.N`, the tag). The workflow publishes it
+as a pre-release, so it does not become the latest release.
+
+- Its changelog section counts from the last final release, not from the previous candidate, so
+  each candidate lists everything users get compared with the last final release.
+- Fixes found in a candidate are merged to `main` as usual and released as the next candidate
+  (`rc.N+1`); a published candidate is never moved.
+- The final `X.Y.Z` is a new release commit: `tools/changelog.sh X.Y.Z` replaces the sections of
+  its candidates with one section since the last final release, and `build.zig.zon` drops the
+  suffix. The candidates' GitHub releases stay as they are.
+
 ## 8. When something fails
 
 Until the release is published nothing is public but the tag, and a tag can be deleted only by an

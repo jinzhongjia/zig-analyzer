@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Adds the section of a new version to CHANGELOG.md, from the pull requests merged into HEAD since
-# the last release tag.
+# the last release that is not a pre-release.
 #
 # Usage: tools/changelog.sh <version>    (e.g. 0.2.0 or 0.2.0-rc.1, without the `v`)
 #
@@ -8,6 +8,10 @@
 # `breaking`, `enhancement`, `bug`, `performance`; one with `internal` is left out, and one with none
 # of these goes under "Other changes". The titles are the starting point: edit the lines into
 # user-facing text before committing. Needs git and an authenticated gh.
+#
+# Pre-releases count from the last final release too, so the section of `0.2.0-rc.2` repeats what
+# `0.2.0-rc.1` listed. A final version replaces the sections of its pre-releases (`0.2.0-rc.N`):
+# its own section lists everything since the previous final release.
 set -euo pipefail
 
 if [ $# -ne 1 ]; then
@@ -24,8 +28,8 @@ if grep -qF "## [$version](" "$file"; then
   exit 1
 fi
 
-# The previous release; without one, the whole history
-if prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null); then
+# The previous final release; without one, the whole history
+if prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude 'v*-*' HEAD 2>/dev/null); then
   range="$prev..HEAD"
 else
   range=HEAD
@@ -55,11 +59,17 @@ for pair in "Breaking changes:$breaking" "Features:$features" "Fixes:$fixes" "Pe
   if [ -n "$items" ]; then section+=$'\n'"### $heading"$'\n\n'"$items"; fi
 done
 
-# The new section goes before the first version section, after the introduction
+# The new section goes before the first version section, after the introduction; a final version
+# drops the sections of its pre-releases
+case "$version" in
+  *-*) drop='' ;;
+  *) drop="## [$version-" ;;
+esac
 tmp=$(mktemp)
-SECTION=$section awk '
+SECTION=$section DROP=$drop awk '
+  /^## \[/ { skip = ENVIRON["DROP"] != "" && index($0, ENVIRON["DROP"]) == 1 }
   !done && /^## \[/ { print ENVIRON["SECTION"]; done = 1 }
-  { print }
+  !skip { print }
   END { if (!done) { print ""; print ENVIRON["SECTION"] } }
 ' "$file" > "$tmp"
 mv "$tmp" "$file"
