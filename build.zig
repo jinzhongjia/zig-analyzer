@@ -162,6 +162,21 @@ pub fn build(b: *std.Build) void {
     bench_run.addPassthruArgs();
     b.step("bench", "Measure LSP latencies against a project (see tools/lsp_bench.zig)").dependOn(&bench_run.step);
 
+    // Smoke test of a released executable:
+    // zig build release-smoke -- <zig-analyzer> <project root> [<expected version>]
+    const release_smoke = b.addExecutable(.{
+        .name = "release-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/release_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zig_analyzer", .module = mod }},
+        }),
+    });
+    const release_smoke_run = b.addRunArtifact(release_smoke);
+    release_smoke_run.addPassthruArgs();
+    b.step("release-smoke", "Check a released executable over LSP (see tools/release_smoke.zig)").dependOn(&release_smoke_run.step);
+
     // Test runner: the runner bundled with Zig, with stack trace recording enabled for the testing
     // allocator (so that leaks can be located under ReleaseSafe too), unwound with frame pointers
     // on aarch64 Darwin (see tools/patch_test_runner.zig)
@@ -179,7 +194,7 @@ pub fn build(b: *std.Build) void {
 
     // check also compiles every tool: CI runs only some of them, and a tool that nothing compiles
     // stops compiling unnoticed when the analyzer's interfaces change
-    for ([_]*std.Build.Step.Compile{ check_imports, gen_lsp, gen_builtins, gen_manifest, corpus, sema_corpus, bench, patch_runner }) |tool| check.dependOn(&tool.step);
+    for ([_]*std.Build.Step.Compile{ check_imports, gen_lsp, gen_builtins, gen_manifest, corpus, sema_corpus, bench, release_smoke, patch_runner }) |tool| check.dependOn(&tool.step);
 
     // Tests that depend on a real zig (build system protocol, single-file compilation, end-to-end)
     // run only in test-all and test-stress: under `zig build test` zig is not found (see
