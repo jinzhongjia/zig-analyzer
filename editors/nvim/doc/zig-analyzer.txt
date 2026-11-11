@@ -10,29 +10,18 @@ Configures the zig-analyzer language server with |vim.lsp.config()| and adds
 ==============================================================================
 INSTALLATION                                  *zig-analyzer-installation*
 
-The plugin is the `editors/nvim` directory of the repository: install the
-repository and add that directory to 'runtimepath'.
-
 With |vim.pack|:
 >lua
-    vim.pack.add({ 'https://github.com/jinzhongjia/zig-analyzer' }, {
-      load = function(plugin)
-        vim.opt.runtimepath:append(plugin.path .. '/editors/nvim')
-      end,
-    })
+    vim.pack.add({ 'https://github.com/jinzhongjia/zig-analyzer.nvim' })
     require('zig-analyzer').setup()
 <
 With lazy.nvim:
 >lua
-    {
-      'jinzhongjia/zig-analyzer',
-      ft = 'zig',
-      config = function(plugin)
-        vim.opt.runtimepath:append(plugin.dir .. '/editors/nvim')
-        require('zig-analyzer').setup()
-      end,
-    }
+    { 'jinzhongjia/zig-analyzer.nvim', ft = 'zig', opts = {} }
 <
+The plugin is developed in `editors/nvim` of jinzhongjia/zig-analyzer, which
+jinzhongjia/zig-analyzer.nvim mirrors.
+
 ==============================================================================
 SETUP                                                *zig-analyzer-setup*
 

@@ -15,15 +15,13 @@ The server is registered with the first one that is loaded. Requires
 ==============================================================================
 INSTALLATION                                    *zig_analyzer-installation*
 
-The plugin is the `editors/vim` directory of the repository; install it with
-one of the LSP clients. With vim-plug:
+Install it with one of the LSP clients. With vim-plug:
 >vim
     Plug 'yegappan/lsp'
-    Plug 'jinzhongjia/zig-analyzer', { 'rtp': 'editors/vim' }
+    Plug 'jinzhongjia/zig-analyzer.vim'
 <
-Vundle and dein.vim take the same `rtp` option. With Vim packages, clone the
-repository under `pack/*/opt/` and link its `editors/vim` directory into
-`pack/*/start/` (see README.md in the plugin directory).
+The plugin is developed in `editors/vim` of jinzhongjia/zig-analyzer, which
+jinzhongjia/zig-analyzer.vim mirrors.
 
 ==============================================================================
 OPTIONS                                              *zig_analyzer-options*
