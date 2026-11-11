@@ -18,6 +18,7 @@ const resolve = @import("../names/resolve.zig");
 const Resolver = resolve.Resolver;
 const Def = resolve.Def;
 const ItemTree = @import("../syntax/ItemTree.zig");
+const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
@@ -166,7 +167,8 @@ pub fn errorNameConflict(r: *Resolver, file: FileId, scope: []const FileId, old:
 
 /// First occurrence of the name as a string literal: reflection (`@field(x, "name")`,
 /// `@hasDecl(T, "name")`) and serialization refer to names by string, and renaming cannot update
-/// these strings
+/// these strings. Test names (`test "name" {}`) do not count: they describe the test, and no code
+/// can look a declaration up through them
 pub fn stringReference(r: *Resolver, files: []const FileId, name: []const u8) resolve.Error!?Problem {
     const quoted = try std.fmt.allocPrint(r.arena, "\"{s}\"", .{name});
     for (files) |f| {
@@ -177,6 +179,7 @@ pub fn stringReference(r: *Resolver, files: []const FileId, name: []const u8) re
             const root = (try r.ctx.get(database.syntax.ParseFile, f)).rootNode();
             const tok = root.tokenAtOffset(@intCast(pos)) orelse continue;
             if (tok.kind != .string_literal or tok.offset != pos or tok.text.len != quoted.len) continue;
+            if (isTestName(root, tok.offset)) continue;
             return .{
                 .file = f,
                 .offset = @intCast(pos),
@@ -185,6 +188,25 @@ pub fn stringReference(r: *Resolver, files: []const FileId, name: []const u8) re
         }
     }
     return null;
+}
+
+/// Whether the token at `offset` is a direct child of a test declaration, that is, its name
+fn isTestName(root: SyntaxNode, offset: u32) bool {
+    var node = root;
+    outer: while (true) {
+        var it = node.children();
+        while (it.next()) |e| {
+            if (!e.range().contains(offset)) continue;
+            switch (e) {
+                .token => return node.kind() == .test_decl,
+                .node => |c| {
+                    node = c;
+                    continue :outer;
+                },
+            }
+        }
+        return false;
+    }
 }
 
 /// Declarations of the root source file that the standard library of Zig 0.17.1 looks up by name

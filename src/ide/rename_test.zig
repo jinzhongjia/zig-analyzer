@@ -163,6 +163,37 @@ test "rename: names referenced by string literals" {
     try testing.expectEqual(null, try rename.stringReference(&r, &.{file}, "other"));
 }
 
+test "rename: test names are not string references" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\pub fn area(x: u32) u32 {
+        \\    return x * x;
+        \\}
+        \\const S = struct {
+        \\    test "area" {}
+        \\};
+        \\test "area" {
+        \\    _ = area(3);
+        \\    _ = "side";
+        \\}
+        \\test "side" {}
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    const a = w.arena.allocator();
+    var ctx = w.db.beginRead(a);
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = a };
+    // A rename of `area` once failed because of the test names, top-level and nested
+    try testing.expectEqual(null, try rename.stringReference(&r, &.{file}, "area"));
+    // Other string literals inside a test body still count
+    const p = (try rename.stringReference(&r, &.{file}, "side")).?;
+    const got = try format(text, p);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("9:9 `side` appears in a string literal, which may refer to it by name (as `@field` and serialization do) and would not be updated", got);
+}
+
 test "rename: declarations the standard library looks up in the root source file" {
     var w: World = undefined;
     try w.init();
