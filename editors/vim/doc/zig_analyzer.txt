@@ -13,6 +13,19 @@ The server is registered with the first one that is loaded. Requires
 `zig-analyzer` in PATH, and Zig 0.17.0 or 0.17.1.
 
 ==============================================================================
+INSTALLATION                                    *zig_analyzer-installation*
+
+The plugin is the `editors/vim` directory of the repository; install it with
+one of the LSP clients. With vim-plug:
+>vim
+    Plug 'yegappan/lsp'
+    Plug 'jinzhongjia/zig-analyzer', { 'rtp': 'editors/vim' }
+<
+Vundle and dein.vim take the same `rtp` option. With Vim packages, clone the
+repository under `pack/*/opt/` and link its `editors/vim` directory into
+`pack/*/start/` (see README.md in the plugin directory).
+
+==============================================================================
 OPTIONS                                              *zig_analyzer-options*
 
 *g:zig_analyzer_cmd*        The server command, a List or a String.
