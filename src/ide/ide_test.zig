@@ -1725,6 +1725,70 @@ test "goto declaration of enum literals passed to anytype parameters that the ca
     }
 }
 
+test "goto declaration of enum and struct literals in the arguments of type-constructing builtins" {
+    // The arguments got no result type, so their literals had no target
+    const text =
+        \\const I = @Int(.unsigned, 8);
+        \\const P = @Pointer(.one, .{ .@"const" = true }, u8, null);
+        \\const S = @Struct(.auto, null, &.{"a"}, &.{u8}, &.{.{ .@"comptime" = false }});
+        \\const U = @Union(.@"extern", null, &.{"x"}, &.{u32}, &.{.{}});
+        \\const E = @Enum(u8, .exhaustive, &.{"a"}, &.{0});
+        \\const F = @Fn(&.{u8}, &.{.{ .@"noalias" = false }}, void, .{ .@"callconv" = .auto });
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try useRealStd(&w);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    // Cursor text, then the target: its name and the declaration it is a member of
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "unsigned, 8", "unsigned", "Signedness" },
+        .{ "one, .{", "one", "Size" },
+        .{ "const\" = true", "@\"const\"", "Attributes" },
+        .{ "auto, null", "auto", "ContainerLayout" },
+        .{ "comptime\" = false", "@\"comptime\"", "FieldAttributes" },
+        .{ "extern\", null", "@\"extern\"", "ContainerLayout" },
+        .{ "exhaustive, &", "exhaustive", "Mode" },
+        .{ "noalias\" = false", "@\"noalias\"", "ParamAttributes" },
+        .{ "callconv\" = .auto", "@\"callconv\"", "Attributes" },
+        .{ "auto });", "auto", "CallingConvention" },
+    };
+    for (cases, 0..) |c, i| {
+        const at = std.mem.indexOf(u8, text, c[0]).?;
+        const t = try definition.declaration(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        try testing.expect(std.mem.endsWith(u8, w.vfs.path(t.file), "lang.zig"));
+        const target_text = (try ctx.get(database.syntax.SourceText, t.file)).text;
+        testing.expectEqualStrings(c[1], target_text[t.start..t.end]) catch |err| {
+            std.debug.print("case {d}\n", .{i});
+            return err;
+        };
+        // The container: declared on the target's line (`pub const Mode = enum { a, b };`), or
+        // the nearest line above that is indented less than the target
+        var line_start = std.mem.lastIndexOfScalar(u8, target_text[0..t.start], '\n').? + 1;
+        const indent = t.start - line_start;
+        const same_line = std.mem.trimStart(u8, target_text[line_start..t.start], " ");
+        const header = if (std.mem.startsWith(u8, same_line, "pub const ")) same_line else while (line_start > 0) {
+            const prev = if (std.mem.lastIndexOfScalar(u8, target_text[0 .. line_start - 1], '\n')) |n| n + 1 else 0;
+            const line = target_text[prev .. line_start - 1];
+            line_start = prev;
+            const trimmed = std.mem.trimStart(u8, line, " ");
+            if (trimmed.len != 0 and line.len - trimmed.len < indent) break trimmed;
+        } else unreachable;
+        testing.expect(std.mem.startsWith(u8, header, "pub const ") and std.mem.startsWith(u8, header["pub const ".len..], c[2]) and header["pub const ".len + c[2].len] == ' ') catch |err| {
+            std.debug.print("case {d}: container `{s}`\n", .{ i, header });
+            std.debug.print("case {d}\n", .{i});
+            return err;
+        };
+    }
+}
+
 test "goto declaration of switch prong literals on a member of a loop's type" {
     // In merged inference the type of the literal at the cursor is `@Type(.enum_literal)`: it used
     // to be treated as an already known type instead of being inferred per iteration, and had no

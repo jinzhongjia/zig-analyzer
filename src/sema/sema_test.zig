@@ -4825,6 +4825,31 @@ test "orelse and catch on comptime-known operands take only the evaluated side" 
     });
 }
 
+test "orelse, .? and if / while captures of a C pointer are the C pointer itself" {
+    // Expected values are the results of zig 0.17.1 (`@compileLog` of `@TypeOf` each declaration);
+    // the unwrapped C pointer was inferred as unknown, so fields through `.*` did not resolve
+    try expectTypes(
+        \\const S = extern struct { x: u8 };
+        \\fn probe(p: [*c]S, w: [*c]const S) void {
+        \\    const a = p orelse return;
+        \\    const b = p.?;
+        \\    if (w) |wc| {
+        \\        const wy = wc.*.x;
+        \\        _ = .{ wc, wy };
+        \\    }
+        \\    var it = p;
+        \\    while (it) |d| : (it = null) _ = d;
+        \\    _ = .{ a, b };
+        \\}
+    , &.{
+        .{ "a", "[*c]S" },
+        .{ "b", "[*c]S" },
+        .{ "wc", "[*c]const S" },
+        .{ "wy", "u8" },
+        .{ "d", "[*c]S" },
+    });
+}
+
 test "catch and orelse on operands evaluated at comptime take the type of the side that is taken" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (`@TypeOf` and `{any}` of each
     // declaration, printed by a `zig test` runner). The handler gets the result type of the whole
