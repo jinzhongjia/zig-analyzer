@@ -1025,7 +1025,7 @@ fn save(h: *Harness, path: []const u8, file_uri: []const u8, version: i64, text:
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = file_uri } });
 }
 
-test "modules outside the build root: never compiled alone, saving them rebuilds the project, renamable" {
+test "modules outside the build root: never compiled alone, saving them rebuilds the project, only own-file names renamable" {
     var project = try fixture.Project.create(&outside_root);
     defer project.deinit();
     var h: Harness = undefined;
@@ -1052,10 +1052,20 @@ test "modules outside the build root: never compiled alone, saving them rebuilds
     try expectDiagnostics(try h.diagnostics(), "dep.zig", &.{"3:11 zig: expected type 'u32'"});
     try testing.expect(countTitles(try progressTitles(&h), "zig build check") > builds);
 
-    // User code outside the root directory that belongs to the project can be renamed
-    const prepared = try h.request("textDocument/prepareRename", .{ .textDocument = .{ .uri = dep_uri }, .position = .{ .line = 1, .character = 8 } });
-    try testing.expect(prepared.object.get("error") == null);
-    try testing.expect(prepared.object.get("result").? != .null);
+    // Outside the workspace folders, a module of the project is still not only the project's: its
+    // other users are unknown, so only what its own file alone refers to can be renamed. Prevents
+    // renaming `pub fn value` for this project while breaking the module's other users.
+    {
+        const prepared = try h.request("textDocument/prepareRename", .{ .textDocument = .{ .uri = dep_uri }, .position = .{ .line = 0, .character = 6 } });
+        try testing.expect(prepared.object.get("error") == null);
+        try testing.expect(prepared.object.get("result").? != .null);
+    }
+    {
+        const prepared = try h.request("textDocument/prepareRename", .{ .textDocument = .{ .uri = dep_uri }, .position = .{ .line = 1, .character = 8 } });
+        try testing.expectEqualStrings("cannot rename a public declaration or field of a file outside the workspace folders: the files that use it are not known", prepared.object.get("error").?.object.get("message").?.string);
+        const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = dep_uri }, .position = .{ .line = 1, .character = 8 }, .newName = "amount" });
+        try testing.expect(renamed.object.get("error") != null);
+    }
 
     // After the fix, again save only dep.zig: the error is cleared
     try save(&h, dep_path, dep_uri, 3, dep_good);
