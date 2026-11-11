@@ -2044,7 +2044,19 @@ pub fn main(init: std.process.Init) !u8 {
                         const done = c.builds_done;
                         const t0 = Io.Clock.awake.now(io);
                         try c.notify("textDocument/didSave", .{ .textDocument = doc });
-                        while (c.builds_done == done) _ = try c.next();
+                        // A build that completes before the client answers its progress create
+                        // sends no progress at all (see src/server/progress.zig), so the build's
+                        // end is also detected by idle: the save starts the build before the
+                        // server handles the request
+                        const idle_id = c.next_id;
+                        c.next_id += 1;
+                        try c.send(.{ .jsonrpc = "2.0", .id = idle_id, .method = "zig-analyzer/waitIdle" });
+                        while (c.builds_done == done) {
+                            const msg = try c.next();
+                            if (msg.object.get("method") != null) continue;
+                            const got = msg.object.get("id") orelse continue;
+                            if (got == .integer and got.integer == idle_id) break;
+                        }
                         out.* = ms(io, t0);
                         if (verbose) std.debug.print("    save: {s}\n", .{c.build_message});
                         if (round == 0 and content.ptr == bad.ptr) {
