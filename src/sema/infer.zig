@@ -1263,10 +1263,7 @@ const Inferrer = struct {
             },
             .unwrap_optional => |x| {
                 const o = try inf.infer(x, null);
-                const child: Index = switch (ip.key(o.ty)) {
-                    .optional_type => |c| c,
-                    else => .unknown,
-                };
+                const child = unwrappedType(ip, o.ty);
                 // A known non-null optional value is its payload value
                 return .{ .ty = child, .val = if (child != .unknown and inf.condValue(o) == true) value.optionalPayload(ip, o.val.?) else null };
             },
@@ -2824,7 +2821,7 @@ const Inferrer = struct {
         const ip = inf.ip;
         const cond = cond_tv.ty;
         const t: Index = switch (ip.key(cond)) {
-            .optional_type => |c| if (source == .if_then) c else .unknown,
+            .optional_type, .ptr_type => if (source == .if_then) unwrappedType(ip, cond) else .unknown,
             .error_union_type => |eu| if (source == .if_then) eu.payload else eu.err,
             else => .unknown,
         };
@@ -3015,10 +3012,7 @@ const Inferrer = struct {
         switch (op) {
             .keyword_orelse => {
                 const lhs = try inf.comptimeOperand(lhs_e, try inf.infer(lhs_e, null));
-                const child: Index = switch (ip.key(lhs.ty)) {
-                    .optional_type => |c| c,
-                    else => .unknown,
-                };
+                const child = unwrappedType(ip, lhs.ty);
                 // When comptime-known, only one side is evaluated, and a right-hand side that is
                 // taken gets only the result type of the whole expression
                 const non_null = inf.condValue(lhs);
@@ -4485,6 +4479,17 @@ fn optionalChild(ip: *InternPool, t: Index) Index {
     return switch (ip.key(t)) {
         .optional_type => |c| c,
         else => t,
+    };
+}
+
+/// The type of the payload of `t` unwrapped by `.?`, `orelse`, or an if / while capture: the child
+/// of an optional, and a C pointer itself (as in the compiler, `ptr.?` of a `[*c]T` is a
+/// `[*c]T`); unknown for other types
+fn unwrappedType(ip: *InternPool, t: Index) Index {
+    return switch (ip.key(t)) {
+        .optional_type => |c| c,
+        .ptr_type => |p| if (p.size == .c) t else .unknown,
+        else => .unknown,
     };
 }
 
