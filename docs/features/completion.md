@@ -50,7 +50,7 @@ Controlled by `completion.snippets` (on by default), used only with `completionI
 - **Calls**: functions and builtins complete as calls (`add(${1:a}, ${2:b})`), skipping the receiver of a method called through a value. With `completion.argument_placeholders` off, only the parentheses are inserted.
 - **Name only**: where `(` already follows the cursor, where the position expects a function value, and in declaration positions. A function value is expected by `&f`, the callee of `@call`, typed positions whose type is a function or pointer to one, and `anytype` parameters that the callee calls or forwards, followed through every call of the chain (`std.Thread.spawn`).
 - **Statements and declarations**: keyword snippets at the start of statements and container members; those depending on `std` are offered only when `std` is the standard library.
-- **Ranges** are converted within the cursor's line (`offsets.Line`), because building a whole-file line table is slower than completion itself. With `insertReplaceSupport`, items carry both ranges.
+- **Ranges** are converted within the cursor's line (`offsets.Line`), and ranges outside it with the file's cached line table (`LineStarts`). With `insertReplaceSupport`, items carry both ranges.
 - **Cost**: the response is larger, and client latency is about 2-3 times that without snippets on large member lists.
 
 ## completionItem/resolve
