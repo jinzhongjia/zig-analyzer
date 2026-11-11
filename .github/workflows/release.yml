@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       # checkout leaves the tag lightweight; fetch the annotated tag object, whose message is the
@@ -50,10 +50,10 @@ jobs:
     timeout-minutes: 30
     steps:
       # The full history and tags: without the tag, the executable prints a development version
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
           cache-key: release-${{ matrix.target }}-${{ matrix.optimize }}
@@ -76,7 +76,7 @@ jobs:
             *) tar -czf "$name.tar.gz" "$name" ;;
           esac
           rm -r "$name"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.target }}-${{ matrix.optimize }}
           path: dist/*
@@ -88,10 +88,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Fetch the annotated tag
         run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
           cache-key: minizign
@@ -102,7 +102,7 @@ jobs:
           git -C "$RUNNER_TEMP/minizign" checkout -q FETCH_HEAD
           (cd "$RUNNER_TEMP/minizign" && zig build -Doptimize=ReleaseSafe)
           echo "$RUNNER_TEMP/minizign/zig-out/bin" >> "$GITHUB_PATH"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true

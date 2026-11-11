@@ -24,8 +24,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ matrix.zig }}
           cache-key: test-${{ matrix.optimize }}
@@ -42,8 +42,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ matrix.zig }}
           cache-key: build
@@ -62,8 +62,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ matrix.zig }}
           cache-key: corpus
@@ -75,8 +75,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: zig fmt
@@ -93,8 +93,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
       # Use ReleaseSafe: Debug builds on Linux x86_64 use the self-hosted backend by default, which
@@ -110,15 +110,15 @@ jobs:
     env:
       ZIG_ANALYZER: ${{ github.workspace }}/zig-out/bin/zig-analyzer
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
           cache-key: editors
       # The smoke tests open editors/test-project, which the server loads with the zig in PATH
       - name: Build the server
         run: zig build
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -142,7 +142,7 @@ jobs:
           XDG_STATE_HOME="$RUNNER_TEMP/nvim-state" "$RUNNER_TEMP/nvim-linux-x86_64/bin/nvim" --headless --clean -u NONE -l editors/nvim/test/smoke.lua
       # yegappan/lsp needs a newer Vim than Ubuntu's (9.1.0016): build the version the tests were
       # written with
-      - uses: rhysd/action-setup-vim@v1
+      - uses: rhysd/action-setup-vim@febef33995d6649302e9d88dda81e071b68f16a7 # v1.6.1
         id: vim
         with:
           version: v9.2.1178
