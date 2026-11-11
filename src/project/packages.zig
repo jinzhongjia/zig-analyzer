@@ -101,6 +101,17 @@ pub fn discover(gpa: Allocator, io: Io, build_root: []const u8, pkg_dir: []const
     return .{ .arena = arena_state.state, .list = packages };
 }
 
+/// The directories of the dependencies that the build.zig.zon text `text` of the package in
+/// `package_root` gives by `.path`, resolved against `package_root` (allocated by `a`); nothing
+/// when it does not parse. `gpa` holds the parse while it runs.
+pub fn pathDependencies(a: Allocator, gpa: Allocator, package_root: []const u8, text: [:0]const u8) Allocator.Error![]const []const u8 {
+    var it = try Dependencies.init(gpa, text);
+    defer it.deinit(gpa);
+    var out: std.ArrayList([]const u8) = .empty;
+    while (it.next()) |d| if (d.path) |p| try out.append(a, try std.fs.path.resolveAlloc(a, &.{ package_root, p }));
+    return out.items;
+}
+
 /// The entries of `.dependencies` in a build.zig.zon; nothing when it does not parse
 const Dependencies = struct {
     ast: std.zig.Ast,
@@ -225,4 +236,28 @@ test packageDir {
     try testing.expectEqualStrings(native("/p/pkgs"), try packageDir(a, root, &.{}, "pkgs"));
     try testing.expectEqualStrings(native("/sys"), try packageDir(a, root, &.{ "--system", native("/sys") }, null));
     try testing.expectEqualStrings(native("/q"), try packageDir(a, root, &.{ "--system", native("/sys"), "--pkg-dir", "../q" }, null));
+}
+
+test pathDependencies {
+    const native = @import("../util/test_path.zig").native;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = native("/repo/examples/hello");
+    const deps = try pathDependencies(a, testing.allocator, root,
+        \\.{
+        \\    .name = .hello,
+        \\    .dependencies = .{
+        \\        .lib = .{ .path = "../../" },
+        \\        .fetched = .{ .url = "https://example.com/x.tar.gz", .hash = "x-0.0.0-AAAA" },
+        \\        .sibling = .{ .path = "../todo" },
+        \\    },
+        \\}
+    );
+    try testing.expectEqual(2, deps.len);
+    try testing.expectEqualStrings(native("/repo"), deps[0]);
+    try testing.expectEqualStrings(native("/repo/examples/todo"), deps[1]);
+    // A build.zig.zon that does not parse gives nothing
+    try testing.expectEqual(0, (try pathDependencies(a, testing.allocator, root, ".{ .dependencies = .{ .lib = .{ .path = \"..\" }")).len);
+    try testing.expectEqual(0, (try pathDependencies(a, testing.allocator, root, ".{ .name = .hello }")).len);
 }
