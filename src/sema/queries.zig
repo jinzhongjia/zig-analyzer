@@ -437,7 +437,7 @@ pub const ErrorSetOf = struct {
 
 /// Whether `range` lies in a branch that is inactive at comptime or after a noreturn statement
 /// (see `Infer.Result.inactive` / `dead_spans`)
-fn isInactive(body: *const Body, res: *const infer.Result, range: Body.Range) bool {
+pub fn isInactive(body: *const Body, res: *const infer.Result, range: Body.Range) bool {
     for (res.inactive) |e| {
         const r = body.range(e);
         if (range.start >= r.start and range.end <= r.end) return true;

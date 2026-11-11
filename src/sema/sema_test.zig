@@ -4825,6 +4825,43 @@ test "orelse and catch on comptime-known operands take only the evaluated side" 
     });
 }
 
+test "a break out of an inline for takes its type in the iterations that reach it" {
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const Msg = struct { name: []const u8, message: []const u8 };
+        \\fn helpMsg(comptime O: type, comptime n: usize) ?[n]Msg {
+        \\    _ = O;
+        \\    return null;
+        \\}
+        \\const O = struct { cmd: union(enum) { a: void, b: void } };
+        \\fn printHelp() void {
+        \\    const msgs = if (@hasField(O, "cmd")) blk: {
+        \\        const s = @typeInfo(O).@"struct";
+        \\        inline for (s.field_names, s.field_types) |name, ft| {
+        \\            if (comptime std.mem.eql(u8, name, "cmd")) {
+        \\                const u = @typeInfo(ft).@"union";
+        \\                break :blk helpMsg(ft, u.field_names.len);
+        \\            }
+        \\        }
+        \\    } else null;
+        \\    if (msgs) |m| for (m) |w| {
+        \\        _ = w;
+        \\    };
+        \\    const pick = blk: {
+        \\        inline for (1..4) |i| {
+        \\            if (comptime i == 2) break :blk [i]u8;
+        \\        }
+        \\    };
+        \\    _ = pick;
+        \\}
+    , &.{
+        .{ "msgs", "?[2]Msg" },
+        .{ "m", "[2]Msg" },
+        .{ "w", "Msg" },
+        .{ "pick", "type = [2]u8" },
+    });
+}
+
 test "orelse, .? and if / while captures of a C pointer are the C pointer itself" {
     // Expected values are the results of zig 0.17.1 (`@compileLog` of `@TypeOf` each declaration);
     // the unwrapped C pointer was inferred as unknown, so fields through `.*` did not resolve
