@@ -13,6 +13,28 @@ function M.setup(opts)
   end
   vim.lsp.config(name, opts)
   vim.lsp.enable(name)
+  M.create_command()
+end
+
+--- Defines `:ZigAnalyzer`. `plugin/zig-analyzer.lua` calls it at startup; `setup()` calls it too,
+--- for plugin managers that load the plugin after startup or add only `lua/` to 'runtimepath'
+function M.create_command()
+  vim.api.nvim_create_user_command('ZigAnalyzer', function(args)
+    local f = M.commands[args.fargs[1] or '']
+    if not f then
+      vim.notify('ZigAnalyzer: unknown subcommand ' .. (args.fargs[1] or '(none)'), vim.log.levels.ERROR)
+      return
+    end
+    f()
+  end, {
+    nargs = 1,
+    desc = 'zig-analyzer commands',
+    complete = function(lead)
+      local names = vim.tbl_keys(M.commands)
+      table.sort(names)
+      return vim.tbl_filter(function(n) return vim.startswith(n, lead) end, names)
+    end,
+  })
 end
 
 --- The zig-analyzer client of the current buffer, or else any running one
