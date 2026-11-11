@@ -61,6 +61,14 @@ minisign -Vm zig-analyzer-<version>-<target>-ReleaseSafe.tar.gz -p minisign.pub
 minizign -V -p minisign.pub -m zig-analyzer-<version>-<target>-ReleaseSafe.tar.gz
 ```
 
+Each archive also has a build provenance attestation, which shows that the release workflow of this repository built it from the tagged commit:
+
+```sh
+gh attestation verify zig-analyzer-<version>-<target>-ReleaseSafe.tar.gz --repo jinzhongjia/zig-analyzer
+```
+
+Versions with a suffix (`0.2.0-rc.1`) are pre-releases. Changes between versions are listed in [`CHANGELOG.md`](CHANGELOG.md).
+
 ## Development
 
 Requires Zig **0.17.0** or **0.17.1**.
