@@ -6,10 +6,12 @@ description: Release a new version of the zig-analyzer server (version bump, loc
 # Release zig-analyzer
 
 A release is an annotated tag `vX.Y.Z` on `main`. Pushing it runs `.github/workflows/release.yml`,
-which checks the tag, cross-compiles ReleaseSafe executables for x86_64 / aarch64 × Linux / macOS /
-Windows, and publishes a GitHub release with the archives, `SHA256SUMS`, and the tag message as
-the notes. The editor extensions in `editors/` are versioned and published separately; a release
-does not touch them.
+which checks the tag, cross-compiles ReleaseSafe and ReleaseFast executables for x86_64 / aarch64 ×
+Linux / macOS / Windows, signs the archives and `SHA256SUMS` with minizign, and publishes a GitHub
+release with them, their `.minisig` signatures, and the tag message as the notes. Signing needs the
+repository secrets `MINISIGN_SECRET_KEY` (the secret key file) and `MINISIGN_PASSWORD`, matching
+`minisign.pub`. The editor extensions in `editors/` are versioned and published separately; a
+release does not touch them.
 
 Ask the user before each step that is visible to others: pushing to `main`, pushing the tag, and
 deleting a tag or release.
@@ -112,12 +114,13 @@ but there is no release yet. Do not build and upload the release by hand unless 
 When it succeeds, check the release:
 
 ```sh
-gh release view vX.Y.Z    # 6 archives (.tar.gz, .zip for Windows) and SHA256SUMS
-gh release download vX.Y.Z -p '*-<this machine>.tar.gz' -p SHA256SUMS -D <empty temporary dir>
+gh release view vX.Y.Z    # 12 archives (.tar.gz, .zip for Windows), SHA256SUMS, and a .minisig for each
+gh release download vX.Y.Z -p '*-<this machine>-ReleaseSafe.tar.gz*' -p 'SHA256SUMS*' -D <empty temporary dir>
 ```
 
-In that directory, verify the checksum (`shasum -a 256 -c SHA256SUMS --ignore-missing`), extract,
-and check that `zig-analyzer --version` prints `X.Y.Z`.
+In that directory, verify the signatures against `minisign.pub` (`minisign -Vm <file> -p minisign.pub`
+for the archive and `SHA256SUMS`), the checksum (`shasum -a 256 -c SHA256SUMS --ignore-missing`),
+extract, and check that `zig-analyzer --version` prints `X.Y.Z`.
 
 ## 8. When something fails
 

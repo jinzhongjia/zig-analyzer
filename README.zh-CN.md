@@ -43,6 +43,24 @@ vim.lsp.config('zig_analyzer', {
 vim.lsp.enable('zig_analyzer')
 ```
 
+## 安装
+
+每个 [release](https://github.com/jinzhongjia/zig-analyzer/releases) 都为每个平台（Linux、macOS、Windows 的 x86_64 和 aarch64）提供两种构建：
+
+| 构建 | 用途 |
+| --- | --- |
+| `ReleaseSafe` | 推荐。保留安全检查：出现 bug 时服务器停止并在日志里留下栈回溯，而不是给出错误结果，编辑器会重启它。报告崩溃时请附上日志。 |
+| `ReleaseFast` | 关闭安全检查，稍快。出现 bug 时可能给出错误结果，或没有栈回溯地崩溃。 |
+
+把 `zig-analyzer`（Windows 上是 `zig-analyzer.exe`）放进 `PATH`，或在编辑器插件里配置它的路径。
+
+压缩包和 `SHA256SUMS` 用 [minisign](https://jedisct1.github.io/minisign/) 签名。用 [`minisign.pub`](minisign.pub) 里的公钥，以 `minisign` 或 [`minizign`](https://github.com/jedisct1/zig-minisign) 验证：
+
+```sh
+minisign -Vm zig-analyzer-<version>-<target>-ReleaseSafe.tar.gz -p minisign.pub
+minizign -V -p minisign.pub -m zig-analyzer-<version>-<target>-ReleaseSafe.tar.gz
+```
+
 ## 开发
 
 需要 Zig **0.17.0** 或 **0.17.1**。

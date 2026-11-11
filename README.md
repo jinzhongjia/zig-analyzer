@@ -43,6 +43,24 @@ vim.lsp.config('zig_analyzer', {
 vim.lsp.enable('zig_analyzer')
 ```
 
+## Installation
+
+Each [release](https://github.com/jinzhongjia/zig-analyzer/releases) has an archive per platform (x86_64 and aarch64 on Linux, macOS, and Windows) in two builds:
+
+| Build | Use |
+| --- | --- |
+| `ReleaseSafe` | Recommended. Safety checks stay on: a bug stops the server with a stack trace in the log instead of producing wrong results, and the editor restarts it. Include the log when reporting a crash. |
+| `ReleaseFast` | Safety checks off, somewhat faster. A bug may produce wrong results or crash without a trace. |
+
+Put `zig-analyzer` (`zig-analyzer.exe` on Windows) in `PATH`, or point the editor integration at it.
+
+The archives and `SHA256SUMS` are signed with [minisign](https://jedisct1.github.io/minisign/). Verify with the public key in [`minisign.pub`](minisign.pub), using `minisign` or [`minizign`](https://github.com/jedisct1/zig-minisign):
+
+```sh
+minisign -Vm zig-analyzer-<version>-<target>-ReleaseSafe.tar.gz -p minisign.pub
+minizign -V -p minisign.pub -m zig-analyzer-<version>-<target>-ReleaseSafe.tar.gz
+```
+
 ## Development
 
 Requires Zig **0.17.0** or **0.17.1**.
