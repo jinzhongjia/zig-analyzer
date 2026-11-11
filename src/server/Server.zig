@@ -5304,7 +5304,9 @@ const OtherFiles = struct {
         const loaded: ?[]const u8 = if (file) |f| (self.ctx.get(FileText, f) catch null) orelse null else null;
         const text = loaded orelse Io.Dir.cwd().readFileAlloc(self.server.io, path, arena, .limited(Vfs.max_file_size)) catch return null;
         const u = if (file) |f| self.server.uriFor(arena, f) catch return null else uri.fromPath(arena, path) catch return null;
-        return .{ .uri = u, .text = text };
+        // With `FileText`, the `SourceText` is that text, whose line table is cached
+        const line_starts: ?[]const u32 = if (loaded != null) self.ctx.get(syntax_q.LineStarts, file.?) catch null else null;
+        return .{ .uri = u, .text = text, .line_starts = line_starts };
     }
 
     /// Takes `fr` from the compile result `build` (called while holding the lock that protects
@@ -5392,9 +5394,11 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     defer other.release();
     const fr = try server.compilerResult(arena, file, &other);
     const current = text orelse if (fr) |r| r.base_text else "";
+    // With `FileText`, the `SourceText` is that text, whose line table is cached
+    const lines = if (text != null) try sourceLines(ctx, file) else try offsets.LineIndex.init(arena, current);
     var diags = try compiler.merge(arena, .{
         .text = current,
-        .lines = try offsets.LineIndex.init(arena, current),
+        .lines = lines,
         .encoding = server.encoding,
         .uri = document_uri,
         .live = live_result,
@@ -5402,15 +5406,15 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
         .other_file = OtherFiles.get,
         .other_ctx = &other,
     });
-    if (text) |t| if (server.wantsInactiveCode(file)) {
-        diags = try server.appendInactiveCode(ctx, arena, file, t, diags);
+    if (text != null) if (server.wantsInactiveCode(file)) {
+        diags = try server.appendInactiveCode(ctx, arena, file, lines, diags);
     };
     if (text) |t| if (try server.namingFor(arena, file, t)) |settings| {
-        diags = try server.appendNaming(ctx, arena, file, t, settings, diags);
+        diags = try server.appendNaming(ctx, arena, file, lines, settings, diags);
     };
-    if (text) |t| diags = try server.appendUnloadedProjectHint(arena, file, t, diags);
-    if (text) |t| if (is_zon and std.mem.eql(u8, std.fs.path.basename(server.vfs.path(file)), Config.project_file)) {
-        diags = try server.appendProjectConfigProblems(arena, t, diags);
+    if (text != null) diags = try server.appendUnloadedProjectHint(arena, file, lines, diags);
+    if (text != null) if (is_zon and std.mem.eql(u8, std.fs.path.basename(server.vfs.path(file)), Config.project_file)) {
+        diags = try server.appendProjectConfigProblems(arena, lines, diags);
     };
     return .{ .uri = document_uri, .diagnostics = diags };
 }
@@ -5499,11 +5503,11 @@ test "computeDiagnostics: notes of combined results keep the coordinates of thei
 }
 
 /// The problems `zig-analyzer.zon` has beyond its syntax, which is reported as for any `.zon` file
-fn appendProjectConfigProblems(server: *Server, arena: Allocator, text: []const u8, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+fn appendProjectConfigProblems(server: *Server, arena: Allocator, lines: offsets.LineIndex, diags: []const types.Diagnostic) ![]const types.Diagnostic {
     if (diags.len > 0) return diags;
+    const text = lines.text;
     const problems = try Config.projectProblems(server.gpa, arena, text);
     const out = try arena.alloc(types.Diagnostic, problems.len);
-    const lines = try offsets.LineIndex.init(arena, text);
     for (problems, out) |p, *o| {
         const start: u32 = @min(p.start orelse 0, @as(u32, @intCast(text.len)));
         var end = start;
@@ -5524,17 +5528,17 @@ fn appendProjectConfigProblems(server: *Server, arena: Allocator, text: []const 
 /// belong to no crate, it is a Hint marking only the first few characters of the file. No hint
 /// before startup finishes or while projects are loading for the first time: the file may later
 /// show up in a project's module graph (modules added by path).
-fn appendUnloadedProjectHint(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const u8, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+fn appendUnloadedProjectHint(server: *Server, arena: Allocator, file: Vfs.FileId, lines: offsets.LineIndex, diags: []const types.Diagnostic) ![]const types.Diagnostic {
     const path = server.vfs.path(file);
     if (!server.isOpen(path) or !server.startup_done.load(.acquire) or server.projectsLoading()) return diags;
     if (server.fileContext(file) != .unloaded_project) return diags;
     const dir = server.projectDirOf(path) orelse return diags;
+    const text = lines.text;
     var end: usize = 0;
     var chars: usize = 0;
     while (chars < 3 and end < text.len and text[end] != '\n' and text[end] != '\r') : (chars += 1) {
         end += std.unicode.utf8ByteSequenceLength(text[end]) catch 1;
     }
-    const lines = try offsets.LineIndex.init(arena, text);
     const out = try arena.alloc(types.Diagnostic, diags.len + 1);
     @memcpy(out[0..diags.len], diags);
     out[diags.len] = .{
@@ -5561,11 +5565,10 @@ fn wantsInactiveCode(server: *Server, file: Vfs.FileId) bool {
 
 /// Code that is not compiled under the current build configuration (branches known at comptime not
 /// to execute): hints tagged `Unnecessary`, which editors show faded
-fn appendInactiveCode(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, text: []const u8, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+fn appendInactiveCode(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, lines: offsets.LineIndex, diags: []const types.Diagnostic) ![]const types.Diagnostic {
     var r: Resolver = .{ .ctx = ctx, .arena = arena };
     const ranges = try za.ide.inactive.ranges(&r, file);
     if (ranges.len == 0) return diags;
-    const lines = try offsets.LineIndex.init(arena, text);
     const out = try arena.alloc(types.Diagnostic, diags.len + ranges.len);
     @memcpy(out[0..diags.len], diags);
     var n = diags.len;
@@ -5574,7 +5577,7 @@ fn appendInactiveCode(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
         // errors (AstGen checks every branch, and a file can be compiled in several
         // configurations): no hint is published where it overlaps a compiler diagnostic, so that
         // the same code is not both an error and inactive
-        if (conflictsWithCompilerError(diags, text, server.encoding, x)) continue;
+        if (conflictsWithCompilerError(diags, lines, server.encoding, x)) continue;
         out[n] = .{
             .range = lines.range(x.start, x.end, server.encoding),
             .severity = .Hint,
@@ -5587,12 +5590,12 @@ fn appendInactiveCode(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     return out[0..n];
 }
 
-fn conflictsWithCompilerError(diags: []const types.Diagnostic, text: []const u8, enc: offsets.Encoding, range: za.ide.inactive.Range) bool {
+fn conflictsWithCompilerError(diags: []const types.Diagnostic, lines: offsets.LineIndex, enc: offsets.Encoding, range: za.ide.inactive.Range) bool {
     for (diags) |d| {
         const source = d.source orelse continue;
         if (!std.mem.eql(u8, source, "zig")) continue;
-        const start: u32 = @intCast(offsets.positionToOffset(text, d.range.start, enc));
-        const end: u32 = @intCast(offsets.positionToOffset(text, d.range.end, enc));
+        const start: u32 = @intCast(lines.offsetOf(d.range.start, enc));
+        const end: u32 = @intCast(lines.offsetOf(d.range.end, enc));
         if (range.start < end and start < range.end) return true;
     }
     return false;
@@ -5721,11 +5724,10 @@ fn rootsAlloc(server: *Server, arena: Allocator) Allocator.Error![]const []const
 
 /// Names that violate the naming conventions (see `naming`): low-severity hints with code
 /// `naming.<rule>` and a link to the official rules
-fn appendNaming(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, text: []const u8, settings: NamingSettings, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+fn appendNaming(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, lines: offsets.LineIndex, settings: NamingSettings, diags: []const types.Diagnostic) ![]const types.Diagnostic {
     var r: Resolver = .{ .ctx = ctx, .arena = arena };
     const found = try ide.naming.findings(&r, file, null);
     if (found.len == 0) return diags;
-    const lines = try offsets.LineIndex.init(arena, text);
     const guide_url = ide.naming.guideUrl(try ctx.get(database.syntax.SyntaxDialect, {}));
     var out: std.ArrayList(types.Diagnostic) = .empty;
     try out.appendSlice(arena, diags);
@@ -5754,16 +5756,23 @@ fn lookupFile(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs
 
 /// Converts a range in a request to byte offsets; a range
 /// whose start and end are reversed is treated as swapped
-fn rangeOffsets(server: *const Server, text: []const u8, range: types.Range) struct { u32, u32 } {
-    const a: u32 = @intCast(offsets.positionToOffset(text, range.start, server.encoding));
-    const b: u32 = @intCast(offsets.positionToOffset(text, range.end, server.encoding));
+fn rangeOffsets(server: *const Server, lines: offsets.LineIndex, range: types.Range) struct { u32, u32 } {
+    const a: u32 = @intCast(lines.offsetOf(range.start, server.encoding));
+    const b: u32 = @intCast(lines.offsetOf(range.end, server.encoding));
     return .{ @min(a, b), @max(a, b) };
 }
 
-/// File text and line index
+/// Text and line index of the `SourceText` of `file`; the line table is cached for each revision
+/// of the text (`LineStarts`)
+fn sourceLines(ctx: *Db.Ctx, file: Vfs.FileId) !offsets.LineIndex {
+    return .{ .text = (try ctx.get(syntax_q.SourceText, file)).text, .line_starts = try ctx.get(syntax_q.LineStarts, file) };
+}
+
+/// File text and line index; empty for a file without `FileText`
 fn fileLines(ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) !offsets.LineIndex {
-    const text = try ctx.get(FileText, file) orelse "";
-    return offsets.LineIndex.init(arena, text);
+    if (try ctx.get(FileText, file) == null) return offsets.LineIndex.init(arena, "");
+    // With `FileText`, the `SourceText` is that text
+    return sourceLines(ctx, file);
 }
 
 fn formatting(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentFormattingParams) HandlerError!types.ResultType("textDocument/formatting") {
@@ -6134,15 +6143,17 @@ fn targetLocation(server: *Server, r: *Resolver, arena: Allocator, t: ide.defini
     // The start of a file (the target of an import or of a path in `build.zig.zon`) needs no read
     // of the file: a path can point to a file of any size and content
     if (t.start == 0 and t.end == 0) return .{ .uri = target_uri, .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } } };
-    const target_text = (try r.ctx.get(syntax_q.SourceText, t.file)).text;
-    const lines = try offsets.LineIndex.init(arena, target_text);
+    const lines = try sourceLines(r.ctx, t.file);
     return .{ .uri = target_uri, .range = lines.range(t.start, t.end, server.encoding) };
 }
 
 fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.CompletionParams) HandlerError!types.ResultType("textDocument/completion") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const text = try r.ctx.get(FileText, file) orelse return null;
-    const line = offsets.Line.init(text, params.position.line);
+    if (try r.ctx.get(FileText, file) == null) return null;
+    // With `FileText`, the `SourceText` is that text
+    const lines = try sourceLines(r.ctx, file);
+    const text = lines.text;
+    const line = lines.lineAt(params.position.line);
     const offset: u32 = @intCast(if (line) |l| l.offset(params.position.character, server.encoding) else text.len);
     const auto_import = server.autoImportEnabled();
     // Auto-imports are not offered until the index has been built for the current module graph, and
@@ -6180,7 +6191,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
         if (first or !server.indexing.load(.acquire)) server.scheduleIndexingFromRead();
     }
     const out = try arena.alloc(types.CompletionItem, result.items.len);
-    var ranges: CompletionRanges = .{ .text = text, .line = line, .encoding = server.encoding };
+    var ranges: CompletionRanges = .{ .text = text, .line = line, .encoding = server.encoding, .lines = lines };
     for (result.items, out) |it, *o| {
         o.* = .{
             .label = it.label,
@@ -6335,11 +6346,11 @@ fn dataFile(server: *Server, data: std.json.ObjectMap, key: []const u8) ?Vfs.Fil
     return @fromBackingInt(@as(u32, @intCast(v.integer)));
 }
 
-/// The file, text and position of a request
-fn textPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position) !?struct { file: Vfs.FileId, text: []const u8, offset: u32 } {
+/// The file, text, line index and position of a request
+fn textPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position) !?struct { file: Vfs.FileId, text: []const u8, lines: offsets.LineIndex, offset: u32 } {
     const file = try server.lookupFile(arena, document_uri) orelse return null;
-    const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
-    return .{ .file = file, .text = text, .offset = @intCast(offsets.positionToOffset(text, pos, server.encoding)) };
+    const lines = try sourceLines(r.ctx, file);
+    return .{ .file = file, .text = lines.text, .lines = lines, .offset = @intCast(lines.offsetOf(pos, server.encoding)) };
 }
 
 /// Shown under a hover answered while a project is pending, so that a less precise type or an
@@ -6351,7 +6362,7 @@ fn hover(server: *Server, r: *Resolver, arena: Allocator, params: types.HoverPar
     // Checked before computing: a load that ends during the computation cancels this read
     const incomplete = server.projectsPending();
     const info = try ide.hover.hover(r, at.file, at.offset, try server.rootsAlloc(arena), server.config.hover_instances) orelse return null;
-    const lines = try offsets.LineIndex.init(arena, at.text);
+    const lines = at.lines;
     const text = if (!incomplete) info.text else try std.mem.concat(arena, u8, &.{ info.text, if (server.hover_markdown) "\n\n---\n\n_" ++ hover_loading_note ++ "_" else "\n\n" ++ hover_loading_note });
     return .{
         .contents = .{ .MarkupContent = try markup(arena, server.hover_markdown, text) },
@@ -6379,8 +6390,8 @@ fn signatureHelp(server: *Server, r: *Resolver, arena: Allocator, params: types.
 
 fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.InlayHintParams) HandlerError!types.ResultType("textDocument/inlayHint") {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
-    const start, const end = server.rangeOffsets(text, params.range);
+    const lines = try sourceLines(r.ctx, file);
+    const start, const end = server.rangeOffsets(lines, params.range);
     const opts: ide.inlay_hints.Options = blk: {
         server.config_mutex.lockUncancelable(server.io);
         defer server.config_mutex.unlock(server.io);
@@ -6397,7 +6408,6 @@ fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.Inla
         };
     };
     const hints = try ide.inlay_hints.inlayHints(r, file, start, end, opts);
-    const lines = try offsets.LineIndex.init(arena, text);
     const out = try arena.alloc(types.InlayHint, hints.len);
     for (hints, out) |h, *o| o.* = .{
         .position = lines.position(h.offset, server.encoding),
@@ -6497,7 +6507,7 @@ const RangeMapper = struct {
 
     fn range(m: *RangeMapper, file: Vfs.FileId, start: u32, end: u32) !types.Range {
         if (m.file != file) {
-            m.lines = try offsets.LineIndex.init(m.r.arena, (try m.r.ctx.get(syntax_q.SourceText, file)).text);
+            m.lines = try sourceLines(m.r.ctx, file);
             m.file = file;
         }
         return m.lines.range(start, end, m.server.encoding);
@@ -6572,7 +6582,7 @@ fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.
         const prefix = try std.fmt.allocPrint(arena, "cannot rename `{s}`", .{za.syntax.ast.identName(tok.text)});
         return .{ .failed = try server.fixProblem(r, arena, prefix, p.file, p.offset, p.message) };
     };
-    const lines = try offsets.LineIndex.init(arena, at.text);
+    const lines = at.lines;
     return .{ .ok = .{ .PrepareRenamePlaceholder = .{
         .range = lines.range(tok.offset, tok.offset + @as(u32, @intCast(tok.text.len)), server.encoding),
         .placeholder = za.syntax.ast.identName(tok.text),
@@ -6910,8 +6920,9 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
     // Every action carries an edit, which only `CodeAction` literals can hold
     if (!server.code_action_literals) return null;
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
-    const start, const end = server.rangeOffsets(text, params.range);
+    const lines = try sourceLines(r.ctx, file);
+    const text = lines.text;
+    const start, const end = server.rangeOffsets(lines, params.range);
     const only = params.context.only;
     const import_options = server.importOptionsFor(file);
     var actions: std.ArrayList(ide.code_actions.Action) = .empty;
@@ -6926,7 +6937,6 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
     if (only != null and wantsKind(only, types.CodeActionKind.SourceFixAll)) {
         if (try ide.code_actions.fixAll(r, file)) |a| try actions.append(arena, a);
     }
-    const lines = try offsets.LineIndex.init(arena, text);
     const doc_uri = try server.uriFor(arena, file);
     const Item = @typeInfo(@typeInfo(types.ResultType("textDocument/codeAction")).optional.child).pointer.child;
     var out: std.ArrayList(Item) = .empty;
@@ -7103,8 +7113,7 @@ fn renameProblem(server: *Server, r: *Resolver, arena: Allocator, old: []const u
 fn fixProblem(server: *Server, r: *Resolver, arena: Allocator, prefix: []const u8, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
     const shown = server.vfs.shownPath(try server.rootsAlloc(arena), server.vfs.path(file));
     const at = offset orelse return std.fmt.allocPrint(arena, "{s}: {s} ({s})", .{ prefix, reason, shown });
-    const text = (try r.ctx.get(syntax_q.SourceText, file)).text;
-    const pos = (try offsets.LineIndex.init(arena, text)).position(at, server.encoding);
+    const pos = (try sourceLines(r.ctx, file)).position(at, server.encoding);
     return std.fmt.allocPrint(arena, "{s}: {s} ({s}:{d}:{d})", .{ prefix, reason, shown, pos.line + 1, pos.character + 1 });
 }
 
