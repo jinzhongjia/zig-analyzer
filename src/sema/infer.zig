@@ -334,6 +334,8 @@ const Inferrer = struct {
     ret_type: ?Index = null,
     /// Labeled blocks and loops: types of the break values
     labels: std.ArrayList(LabelFrame) = .empty,
+    /// Labeled breaks, recorded for the `inline for` loops they leave (see `unrollInline`)
+    label_breaks: std.ArrayList(LabelBreak) = .empty,
     /// Method calls: field accesses that resolve to a function declaration on an instance
     /// (the self parameter is skipped in the call)
     bound: std.AutoHashMapUnmanaged(ExprId, void) = .empty,
@@ -413,6 +415,10 @@ const Inferrer = struct {
         /// `peerLiteral`)
         exprs: std.ArrayList(ExprId) = .empty,
     };
+
+    /// The break `expr` (with the value `value`), recorded at `pos` in `types` and `values` of the
+    /// label frame `frame`
+    const LabelBreak = struct { frame: usize, pos: usize, expr: ExprId, value: ?ExprId };
 
     fn runOwner(inf: *Inferrer, kind: ItemTree.Item.Kind, mode: Mode) Error!void {
         const b = inf.body;
@@ -1301,6 +1307,7 @@ const Inferrer = struct {
                 // labels may grow during inference, so re-fetch the frame by index
                 if (frame_index) |fi| if (inf.dead == 0) {
                     const frame = &inf.labels.items[fi];
+                    if (br.label != null) try inf.label_breaks.append(inf.scratch, .{ .frame = fi, .pos = frame.types.items.len, .expr = e, .value = br.value });
                     try frame.types.append(inf.scratch, brk.ty);
                     try frame.values.append(inf.scratch, brk);
                     if (br.value) |v| try frame.exprs.append(inf.scratch, v);
@@ -2542,10 +2549,16 @@ const Inferrer = struct {
         }
         if (l.cont) |c| _ = try inf.infer(c, null);
         // break values and the else branch take the loop's result type
+        const outer_frames = inf.labels.items.len;
+        const breaks_start = inf.label_breaks.items.len;
         try inf.labels.append(inf.scratch, .{ .name = l.label, .is_loop = true, .expected = expected });
         _ = try inf.infer(l.body, null);
         var frame = inf.labels.pop().?;
         if (iteration == null) inf.uncertain -= 1;
+        // A break to the loop itself makes the loop produce a value, even when a comptime branch
+        // of the body ends in a `return` (see `unrollInline`)
+        const own_break = frame.types.items.len != 0;
+        if (try inf.unrollInline(l, iteration == null, outer_frames, breaks_start, own_break)) return .{ .ty = .noreturn_type };
         // After the loop, a modified `comptime var` holds its value after all iterations, but only
         // one iteration is inferred here: record its value at the end of this iteration (the next
         // iteration starts from it), then set it to unknown
@@ -2566,6 +2579,78 @@ const Inferrer = struct {
         const ty = try inf.peer(frame.types.items);
         for (frame.exprs.items) |x| try inf.peerLiteral(x, ty);
         return .{ .ty = ty };
+    }
+
+    /// The labeled breaks out of loop `l` (to the label frames below `outer_frames`) recorded
+    /// since `breaks_start`, when `l` is an `inline for` inferred as a whole (`merged`). The
+    /// compiler analyzes the body once per iteration and stops at an iteration whose body does not
+    /// return (`break :blk helpMsg(T, n)` under `if (comptime eql(u8, name, "cmd"))`): then the
+    /// loop does not return either, and a break reached by no analyzed iteration is noreturn. So
+    /// each iteration is inferred in turn (see `LoopSeed`), and a break takes the peer of its
+    /// types in the iterations that reach it. Returns whether the loop does not return. The breaks
+    /// are kept for an enclosing `inline for` when this one is not unrolled.
+    fn unrollInline(inf: *Inferrer, l: Body.Loop, merged: bool, outer_frames: usize, breaks_start: usize, own_break: bool) Error!bool {
+        // Keep only the breaks out of this loop: the frames of the others have been popped
+        var kept = breaks_start;
+        for (inf.label_breaks.items[breaks_start..]) |b| if (b.frame < outer_frames) {
+            inf.label_breaks.items[kept] = b;
+            kept += 1;
+        };
+        inf.label_breaks.shrinkRetainingCapacity(kept);
+        if (kept == breaks_start or !merged or !l.is_inline or l.kind != .@"for" or l.capture.len == 0 or inf.dead > 0) return false;
+        const n = try inf.inlineIterations(l) orelse return false;
+        const pending = inf.label_breaks.items[breaks_start..];
+        const reached = try inf.scratch.alloc(std.ArrayList(TypedValue), pending.len);
+        @memset(reached, .empty);
+        const owner: hir.OwnerKey = .{ .file = inf.file, .item = try inf.body_owner() };
+        const inst = try inf.seededInstance(inf.seeds);
+        var stops = false;
+        for (0..n) |idx| {
+            const res = try inf.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = inf.mode, .inst = inst, .loop = .{ .binding = @backingInt(l.capture[0]), .index = @intCast(idx) } });
+            if (res.exprs.len != inf.body.exprs.len) return false;
+            for (pending, reached) |b, *values| {
+                if (queries.isInactive(inf.body, res, inf.body.range(b.expr))) continue;
+                try values.append(inf.scratch, if (b.value) |v| res.exprs[@backingInt(v)] else .{ .ty = .void_type, .val = .void_value });
+            }
+            if (!own_break and res.exprs[@backingInt(l.body)].ty == .noreturn_type) {
+                stops = true;
+                break;
+            }
+        }
+        for (pending, reached) |b, values| {
+            const types = try inf.scratch.alloc(Index, values.items.len);
+            for (values.items, types) |tv, *t| t.* = tv.ty;
+            const t = if (types.len == 0) .noreturn_type else try inf.peer(types);
+            const frame = &inf.labels.items[b.frame];
+            frame.types.items[b.pos] = t;
+            frame.values.items[b.pos] = .{ .ty = t, .val = if (types.len == 0) null else sameValue(values.items, t) };
+        }
+        inf.label_breaks.shrinkRetainingCapacity(breaks_start);
+        return stops;
+    }
+
+    /// Number of iterations of the `inline for` `l`: the length of its first known list (`a..b`
+    /// included), or of a tuple whose items have different types; null when none is known
+    fn inlineIterations(inf: *Inferrer, l: Body.Loop) Error!?usize {
+        for (l.inputs) |input| {
+            switch (inf.body.expr(input)) {
+                // `a..b`, whose bounds `bindForCaptures` inferred
+                .other => |range| {
+                    const start = if (range.len > 0) value.intOf(inf.ip, inf.get(range[0]).val) else null;
+                    const end = if (range.len > 1) value.intOf(inf.ip, inf.get(range[1]).val) else null;
+                    if (start != null and end != null) {
+                        const count = end.? - start.?;
+                        return if (count <= 0) 0 else std.math.cast(usize, count);
+                    }
+                },
+                else => {
+                    const list = inf.get(input);
+                    if (list.val != null) if (try eval.elemCount(inf.r, list)) |n| return n;
+                    if (tupleOf(inf.ip, list.ty)) |tt| return tt.types.len;
+                },
+            }
+        }
+        return null;
     }
 
     /// Inferring only up to the capture `stop_at`, which is one of `caps`

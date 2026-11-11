@@ -1789,6 +1789,59 @@ test "goto declaration of enum and struct literals in the arguments of type-cons
     }
 }
 
+test "goto declaration of a field of a value from a break out of an inline for" {
+    // The break's value was typed in the one iteration that reaches it, `?[2]Message`; with the
+    // loop body inferred once with an abstract loop variable it was unknown, and so was `message`
+    const text =
+        \\const std = @import("std");
+        \\const Message = struct { name: []const u8, message: []const u8 };
+        \\fn helpMsg(comptime T: type, comptime n: usize) ?[n]Message {
+        \\    _ = T;
+        \\    return null;
+        \\}
+        \\const Options = struct { cmd: union(enum) { a: void, b: void } };
+        \\fn printHelp(comptime O: type) void {
+        \\    const messages = if (@hasField(O, "cmd")) blk: {
+        \\        const s = @typeInfo(O).@"struct";
+        \\        inline for (s.field_names, s.field_types) |name, field_type| {
+        \\            if (comptime std.mem.eql(u8, name, "cmd")) {
+        \\                const u = @typeInfo(field_type).@"union";
+        \\                break :blk helpMsg(field_type, u.field_names.len);
+        \\            }
+        \\        }
+        \\    } else null;
+        \\    if (messages) |list| for (list) |message| {
+        \\        _ = message.name;
+        \\        _ = message.message;
+        \\    };
+        \\}
+        \\test {
+        \\    printHelp(Options);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try useRealStd(&w);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_][]const u8{ "message.name", "message.message" };
+    for (cases, 0..) |case, i| {
+        const at = std.mem.indexOf(u8, text, case).? + "message.".len;
+        const t = try definition.declaration(&r, file, @intCast(at)) orelse {
+            std.debug.print("case {d}: no target\n", .{i});
+            return error.NoTarget;
+        };
+        testing.expect(std.mem.startsWith(u8, text[t.start..], case["message.".len..])) catch |err| {
+            std.debug.print("case {d}: target `{s}`\n", .{ i, text[t.start..t.end] });
+            return err;
+        };
+    }
+}
+
 test "goto declaration of switch prong literals on a member of a loop's type" {
     // In merged inference the type of the literal at the cursor is `@Type(.enum_literal)`: it used
     // to be treated as an already known type instead of being inferred per iteration, and had no
