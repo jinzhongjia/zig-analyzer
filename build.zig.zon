@@ -1,6 +1,6 @@
 .{
     .name = .zig_analyzer,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .minimum_zig_version = "0.17.0",
     .paths = .{ "build.zig", "build.zig.zon", "src" },
     .fingerprint = 0xb193caa58310c950,
