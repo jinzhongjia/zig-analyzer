@@ -7,6 +7,6 @@ pub fn main() void {
     std.debug.print("{}\n", .{total});
 }
 
-test "square" {
+test "area" {
     try std.testing.expectEqual(@as(u32, 9), shapes.area(.{ .side = 3 }));
 }
