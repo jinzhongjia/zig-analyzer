@@ -88,6 +88,12 @@ mutex: Io.Mutex = .init,
 keys: std.StringArrayHashMapUnmanaged(void) = .empty,
 /// One-to-one with `keys`: the normalized path as first seen (original case preserved)
 paths: std.ArrayList([]const u8) = .empty,
+/// Each entry of `paths` → its FileId. A path spelled exactly as a file was first seen names that
+/// file: it normalizes to itself, and its identity key is the file's, since FileIds are never
+/// removed and the case rule found for a directory does not change (see `caseOf`). `intern` and
+/// `lookup` check it first, which saves normalizing the path and deriving its identity key for
+/// the paths that import resolution and the compile set computation pass again and again.
+by_path: std.StringHashMapUnmanaged(FileId) = .empty,
 /// Other spellings of interned files (see `alias`): identity key → FileId. An alias is kept for
 /// the lifetime of the Vfs, as FileIds are.
 aliases: std.StringHashMapUnmanaged(FileId) = .empty,
@@ -132,6 +138,7 @@ pub fn deinit(vfs: *Vfs) void {
     while (aliases.next()) |k| vfs.gpa.free(k.*);
     vfs.keys.deinit(vfs.gpa);
     vfs.paths.deinit(vfs.gpa);
+    vfs.by_path.deinit(vfs.gpa);
     vfs.aliases.deinit(vfs.gpa);
     var cached = vfs.case_cache.keyIterator();
     while (cached.next()) |k| vfs.gpa.free(k.*);
@@ -285,6 +292,7 @@ pub fn shownPath(vfs: *Vfs, roots: []const []const u8, file_path: []const u8) []
 /// Interns a path. The caller must ensure that `file_path` is absolute; the path is normalized
 /// (see `normalize`). An alias (see `alias`) maps to the file it was added for.
 pub fn intern(vfs: *Vfs, file_path: []const u8) Allocator.Error!FileId {
+    if (vfs.firstSeen(file_path)) |id| return id;
     const normalized = try vfs.normalizeOwn(file_path) orelse unreachable;
     errdefer vfs.gpa.free(normalized);
     const key = try vfs.identityKey(normalized);
@@ -294,6 +302,7 @@ pub fn intern(vfs: *Vfs, file_path: []const u8) Allocator.Error!FileId {
         vfs.mutex.lockUncancelable(vfs.io);
         defer vfs.mutex.unlock(vfs.io);
         try vfs.paths.ensureUnusedCapacity(vfs.gpa, 1);
+        try vfs.by_path.ensureUnusedCapacity(vfs.gpa, 1);
         if (vfs.aliases.count() != 0 and !vfs.keys.contains(key)) if (vfs.aliases.get(key)) |id| {
             vfs.gpa.free(key);
             vfs.gpa.free(normalized);
@@ -305,6 +314,8 @@ pub fn intern(vfs: *Vfs, file_path: []const u8) Allocator.Error!FileId {
             vfs.gpa.free(normalized);
         } else {
             vfs.paths.appendAssumeCapacity(normalized);
+            const entry = vfs.by_path.getOrPutAssumeCapacity(normalized);
+            if (!entry.found_existing) entry.value_ptr.* = @fromBackingInt(@intCast(gop.index));
         }
         break :blk .{ gop.index, !gop.found_existing };
     };
@@ -313,6 +324,7 @@ pub fn intern(vfs: *Vfs, file_path: []const u8) Allocator.Error!FileId {
 }
 
 pub fn lookup(vfs: *Vfs, file_path: []const u8) Allocator.Error!?FileId {
+    if (vfs.firstSeen(file_path)) |id| return id;
     const normalized = try vfs.normalizeOwn(file_path) orelse return null;
     defer vfs.gpa.free(normalized);
     const key = try vfs.identityKey(normalized);
@@ -321,6 +333,13 @@ pub fn lookup(vfs: *Vfs, file_path: []const u8) Allocator.Error!?FileId {
     defer vfs.mutex.unlock(vfs.io);
     if (vfs.keys.getIndex(key)) |i| return @fromBackingInt(@intCast(i));
     return vfs.aliases.get(key);
+}
+
+/// The file first seen spelled exactly as `file_path` (see `by_path`)
+fn firstSeen(vfs: *Vfs, file_path: []const u8) ?FileId {
+    vfs.mutex.lockUncancelable(vfs.io);
+    defer vfs.mutex.unlock(vfs.io);
+    return vfs.by_path.get(file_path);
 }
 
 /// Makes the absolute path `file_path` another spelling of `id`: `intern` and `lookup` return
@@ -471,6 +490,38 @@ test "case-sensitive: different spellings are different files" {
     defer vfs.deinit();
     try t.expect(try vfs.intern("/a/B.zig") != try vfs.intern("/a/b.zig"));
     try t.expectEqual(null, try vfs.lookup("/A/b.zig"));
+}
+
+test "the spelling a file was first seen with maps to that file under every rule" {
+    const t = std.testing;
+    const Volumes = struct {
+        fn probe(target: [:0]const u8) ?CaseMode {
+            return if (std.mem.startsWith(u8, target, "/cs")) .sensitive else .insensitive;
+        }
+    };
+    inline for (.{
+        Options{ .style = .posix, .case = .{ .fixed = .sensitive } },
+        Options{ .style = .posix, .case = .{ .fixed = .insensitive } },
+        Options{ .style = .posix, .case = .{ .per_volume = Volumes.probe } },
+        Options{ .style = .windows, .case = .{ .fixed = .insensitive } },
+    }) |options| {
+        var vfs: Vfs = .initOptions(t.io, t.allocator, options);
+        defer vfs.deinit();
+        const spellings: []const []const u8 = switch (options.style) {
+            .posix => &.{ "/Work/Src/A.zig", "/work/src/a.zig", "/Work/./Src/../Src/A.zig", "/cs/Parser.zig", "/cs/parser.zig", "/work/b.zig" },
+            .windows => &.{ "c:/Work/Src/A.zig", "C:\\work\\src\\a.zig", "C:\\Work\\Src\\B.zig" },
+        };
+        var ids: [6]FileId = undefined;
+        for (spellings, 0..) |s, i| ids[i] = try vfs.intern(s);
+        const files = vfs.count();
+        for (spellings, 0..) |s, i| {
+            const stored = vfs.path(ids[i]);
+            try t.expectEqual(ids[i], try vfs.intern(stored));
+            try t.expectEqual(ids[i], (try vfs.lookup(stored)).?);
+            try t.expectEqual(ids[i], try vfs.intern(s));
+        }
+        try t.expectEqual(files, vfs.count());
+    }
 }
 
 test "resolve: results that are not absolute paths are rejected" {
