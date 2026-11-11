@@ -6,7 +6,7 @@
 //!
 //!     { "zig": { "path": "/usr/local/bin/zig", "lib_path": "/usr/local/lib/zig", "builtin_path": "/tmp/builtin.zig",
 //!                "global_cache_path": "/home/me/.cache/zig" },
-//!       "build": { "enable": true, "args": ["-Dtarget=aarch64-linux"] },
+//!       "build": { "enable": true, "args": ["-Dtarget=aarch64-linux"], "sub_projects": true },
 //!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": false, "debounce_ms": 50 },
 //!       "inlay_hints": { "types": true, "field_types": true, "anonymous_containers": false, "parameters": true,
 //!                        "builtin_parameters": true, "exclude_single_argument": true, "hide_redundant_param_names": true,
@@ -64,6 +64,11 @@ zig_global_cache_path: ?[]const u8 = null,
 build_enable: bool = true,
 /// Extra arguments passed to `zig build` (such as `-Dtarget=...`)
 build_args: []const []const u8 = &.{},
+/// Whether to load the sub-projects under the workspace folders: directories with their own
+/// build.zig whose build.zig.zon depends by `.path` on a loaded project (such as the examples of a
+/// library). Each is loaded when one of its files is opened, or when find references or rename
+/// need it; when disabled, rename refuses to edit a name that one of their files mentions.
+build_sub_projects: bool = true,
 /// Steps used for diagnostics; when empty, `check` is used, or the default step if there is none
 diagnostics_steps: []const []const u8 = &.{},
 /// Whether to run the compiler to get diagnostics; when disabled, there are only live
@@ -241,6 +246,7 @@ const settings = [_]Setting{
     .{ .section = "zig", .key = "global_cache_path", .field = "zig_global_cache_path" },
     .{ .section = "build", .key = "enable", .field = "build_enable" },
     .{ .section = "build", .key = "args", .field = "build_args" },
+    .{ .section = "build", .key = "sub_projects", .field = "build_sub_projects" },
     .{ .section = "diagnostics", .key = "steps", .field = "diagnostics_steps" },
     .{ .section = "diagnostics", .key = "compiler", .field = "compiler_diagnostics" },
     .{ .section = "diagnostics", .key = "inactive_code", .field = "inactive_code" },
@@ -644,14 +650,17 @@ test "parse: nested fields, optional wrapper" {
     var empty = try parseText("{}");
     defer empty.deinit(testing.allocator);
     try testing.expect(empty.zig_path == null and empty.build_args.len == 0 and !empty.inactive_code and empty.build_enable and empty.callsite_seeding);
+    try testing.expect(empty.build_sub_projects);
     try testing.expectEqual(0, empty.diagnostics_steps.len);
     try testing.expect(!c.sameBuild(&empty) and !c.sameZig(&empty));
 
     var no_compiler = try parseText(
-        \\{"diagnostics": {"compiler": false}, "inlay_hints": {"types": false}}
+        \\{"diagnostics": {"compiler": false}, "inlay_hints": {"types": false}, "build": {"sub_projects": false}}
     );
     defer no_compiler.deinit(testing.allocator);
     try testing.expect(!no_compiler.compiler_diagnostics and !no_compiler.inlay_types and no_compiler.inlay_parameters);
+    try testing.expect(!no_compiler.build_sub_projects and no_compiler.build_enable);
+    try testing.expectEqual(0, no_compiler.warnings.len);
     try testing.expect(!no_compiler.sameBuild(&empty));
 
     try testing.expectEqual(Watcher.auto, empty.files_watcher);

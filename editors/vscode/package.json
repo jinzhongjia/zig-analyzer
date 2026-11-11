@@ -202,6 +202,11 @@
           "default": [],
           "markdownDescription": "Extra arguments passed to `zig build`, such as `-Dtarget=aarch64-linux`."
         },
+        "zig-analyzer.build.sub_projects": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Load the sub-projects under the workspace folders: directories with their own `build.zig` whose `build.zig.zon` depends by `.path` on a loaded project (such as the examples of a library), each when one of its files is opened or when find references or rename need it. Off leaves them unloaded, and rename then refuses to edit a name they mention."
+        },
         "zig-analyzer.diagnostics.steps": {
           "type": "array",
           "items": {

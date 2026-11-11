@@ -46,6 +46,13 @@
         // Example:
         //   .args = .{ "-Dtarget=aarch64-linux", "-Doptimize=ReleaseSafe" },
         .args = .{},
+
+        // Load the sub-projects under the workspace folders: directories with their own build.zig
+        // whose build.zig.zon depends by `.path` on a loaded project (such as the examples of a
+        // library), each when one of its files is opened or when find references or rename need
+        // it. false leaves them unloaded, and rename then refuses to edit a name they mention
+        // (editor only):
+        //   .sub_projects = true,
     },
 
     // Which diagnostics are computed, and how.
