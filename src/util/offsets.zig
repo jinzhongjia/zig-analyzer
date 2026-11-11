@@ -2,6 +2,7 @@
 //! offsets, and application of incremental document changes.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const types = @import("../lsp/types.zig");
 
@@ -28,8 +29,85 @@ pub const Encoding = enum {
     }
 };
 
+/// Bytes compared at once when scanning for line breaks and ASCII text: the vector length the
+/// target prefers (16 with NEON or SSE2, 32 with AVX2), or 0 for a byte-by-byte scan. Vectors are
+/// used on the backends `std.mem` uses them on; the others do not support them.
+const vector_len: usize = switch (builtin.zig_backend) {
+    .stage2_aarch64, .stage2_loongarch, .stage2_powerpc, .stage2_riscv64, .stage2_spirv => 0,
+    else => std.simd.suggestVectorLength(u8) orelse 0,
+};
+
+/// Offset of the first `\r` or `\n` at or after `start`
+fn findBreak(text: []const u8, start: usize) ?usize {
+    var i = start;
+    if (comptime vector_len > 0) {
+        const Chunk = @Vector(vector_len, u8);
+        while (i + vector_len <= text.len) : (i += vector_len) {
+            const c: Chunk = text[i..][0..vector_len].*;
+            const hits = (c == @as(Chunk, @splat('\r'))) | (c == @as(Chunk, @splat('\n')));
+            if (@reduce(.Or, hits)) return i + std.simd.firstTrue(hits).?;
+        }
+    }
+    return std.mem.indexOfAnyPos(u8, text, i, "\r\n");
+}
+
+/// Offset after the line break at `nl` (`\r\n` is one line break)
+fn breakEnd(text: []const u8, nl: usize) usize {
+    var next = nl + 1;
+    if (text[nl] == '\r' and next < text.len and text[next] == '\n') next += 1;
+    return next;
+}
+
+/// End of the whole chunks of ASCII bytes at the start of `text[from..stop]`; `from` when the
+/// first chunk holds another byte or does not fit. An ASCII byte is one character of one unit in
+/// every encoding.
+fn asciiChunksEnd(text: []const u8, from: usize, stop: usize) usize {
+    var i = from;
+    if (comptime vector_len > 0) {
+        const Chunk = @Vector(vector_len, u8);
+        while (i + vector_len <= stop) : (i += vector_len) {
+            const c: Chunk = text[i..][0..vector_len].*;
+            if (@reduce(.Or, c >= @as(Chunk, @splat(0x80)))) break;
+        }
+    }
+    return i;
+}
+
+/// Offsets where the lines of `text` start, the first being 0 (the table `LineIndex` keeps);
+/// owned by the caller
+pub fn lineStarts(gpa: Allocator, text: []const u8) Allocator.Error![]u32 {
+    var starts: std.ArrayList(u32) = .empty;
+    errdefer starts.deinit(gpa);
+    try starts.append(gpa, 0);
+    // Start of the line after the last break found; a `\n` before it is the end of a `\r\n`
+    var next: usize = 0;
+    var base: usize = 0;
+    // A bit mask of the line breaks of each chunk takes the breaks in order without a branch per
+    // byte; vector element `k` is bit `k` of the mask on little-endian targets
+    if (comptime vector_len > 0 and builtin.cpu.arch.endian() == .little) {
+        const Chunk = @Vector(vector_len, u8);
+        const Mask = @Int(.unsigned, vector_len);
+        while (base + vector_len <= text.len) : (base += vector_len) {
+            const c: Chunk = text[base..][0..vector_len].*;
+            var bits: Mask = @bitCast((c == @as(Chunk, @splat('\r'))) | (c == @as(Chunk, @splat('\n'))));
+            while (bits != 0) : (bits &= bits - 1) {
+                const nl = base + @ctz(bits);
+                if (nl < next) continue;
+                next = breakEnd(text, nl);
+                try starts.append(gpa, @intCast(next));
+            }
+        }
+    }
+    var i = @max(base, next);
+    while (findBreak(text, i)) |nl| {
+        i = breakEnd(text, nl);
+        try starts.append(gpa, @intCast(i));
+    }
+    return starts.toOwnedSlice(gpa);
+}
+
 fn lineEnd(text: []const u8, start: usize) usize {
-    return std.mem.indexOfAnyPos(u8, text, start, "\r\n") orelse text.len;
+    return findBreak(text, start) orelse text.len;
 }
 
 /// Decodes one UTF-8 character and returns its byte length and its number of units in `enc`.
@@ -52,6 +130,14 @@ fn countUnits(text: []const u8, from: usize, target: usize, end: usize, enc: Enc
     var i = from;
     var n: u32 = 0;
     while (i < stop) {
+        if (text[i] < 0x80) {
+            const ascii_end = asciiChunksEnd(text, i, stop);
+            if (ascii_end > i) {
+                n += @intCast(ascii_end - i);
+                i = ascii_end;
+                continue;
+            }
+        }
         const w = charWidth(text[i..end], enc);
         if (i + w.len > stop) break;
         n += w.units;
@@ -79,9 +165,7 @@ pub const Line = struct {
     pub fn init(text: []const u8, number: u32) ?Line {
         var start: usize = 0;
         for (0..number) |_| {
-            const nl = std.mem.indexOfAnyPos(u8, text, start, "\r\n") orelse return null;
-            start = nl + 1;
-            if (text[nl] == '\r' and start < text.len and text[start] == '\n') start += 1;
+            start = breakEnd(text, findBreak(text, start) orelse return null);
         }
         return .{ .text = text, .number = number, .start = start, .end = lineEnd(text, start) };
     }
@@ -91,6 +175,14 @@ pub const Line = struct {
         var i = l.start;
         var units: u32 = 0;
         while (i < l.end and units < character) {
+            if (l.text[i] < 0x80) {
+                const ascii_end = asciiChunksEnd(l.text, i, i + @min(l.end - i, character - units));
+                if (ascii_end > i) {
+                    units += @intCast(ascii_end - i);
+                    i = ascii_end;
+                    continue;
+                }
+            }
             const w = charWidth(l.text[i..l.end], enc);
             // When the column falls in the middle of a multi-unit character, round down to its start
             if (units + w.units > character) break;
@@ -113,6 +205,8 @@ pub fn positionToOffset(text: []const u8, pos: types.Position, enc: Encoding) us
     return line.offset(pos.character, enc);
 }
 
+/// Scans the text character by character from its start; the property tests compare the other
+/// conversions with it
 pub fn offsetToPosition(text: []const u8, offset: usize, enc: Encoding) types.Position {
     const target = @min(offset, text.len);
     var line: u32 = 0;
@@ -144,16 +238,7 @@ pub const LineIndex = struct {
     line_starts: []const u32,
 
     pub fn init(gpa: Allocator, text: []const u8) Allocator.Error!LineIndex {
-        var starts: std.ArrayList(u32) = .empty;
-        errdefer starts.deinit(gpa);
-        try starts.append(gpa, 0);
-        var i: usize = 0;
-        while (std.mem.indexOfAnyPos(u8, text, i, "\r\n")) |nl| {
-            i = nl + 1;
-            if (text[nl] == '\r' and i < text.len and text[i] == '\n') i += 1;
-            try starts.append(gpa, @intCast(i));
-        }
-        return .{ .text = text, .line_starts = try starts.toOwnedSlice(gpa) };
+        return .{ .text = text, .line_starts = try lineStarts(gpa, text) };
     }
 
     pub fn deinit(li: *LineIndex, gpa: Allocator) void {
@@ -175,6 +260,18 @@ pub const LineIndex = struct {
     pub fn position(li: LineIndex, offset: usize, enc: Encoding) types.Position {
         const line = li.lineOf(offset);
         return .{ .line = line, .character = li.units(line, li.line_starts[line], offset, enc) };
+    }
+
+    /// Offset of `pos`, as `positionToOffset` gives it, without counting the lines before it
+    pub fn offsetOf(li: LineIndex, pos: types.Position, enc: Encoding) usize {
+        const at = li.lineAt(pos.line) orelse return li.text.len;
+        return at.offset(pos.character, enc);
+    }
+
+    /// Line `number`, as `Line.init` gives it; null when the text has fewer lines
+    pub fn lineAt(li: LineIndex, number: u32) ?Line {
+        if (number >= li.line_starts.len) return null;
+        return .{ .text = li.text, .number = number, .start = li.line_starts[number], .end = li.contentEnd(number) };
     }
 
     /// Same as `position`. `prev` is the position of `prev_offset` (a character boundary): when it
@@ -405,10 +502,7 @@ const GapBuffer = struct {
 
     /// Start of the line after the one that contains `at`; null on the last line
     fn nextLineStart(text: []const u8, at: usize) ?usize {
-        const nl = std.mem.indexOfAnyPos(u8, text, at, "\r\n") orelse return null;
-        var next = nl + 1;
-        if (text[nl] == '\r' and next < text.len and text[next] == '\n') next += 1;
-        return next;
+        return breakEnd(text, findBreak(text, at) orelse return null);
     }
 
     /// Start of the line before the one that starts at `line_start` (> 0) in `text`, which
@@ -446,6 +540,45 @@ test "out-of-range positions are clamped" {
     const text = "ab\ncd";
     try testing.expectEqual(2, positionToOffset(text, .{ .line = 0, .character = 100 }, .utf16));
     try testing.expectEqual(text.len, positionToOffset(text, .{ .line = 9, .character = 0 }, .utf16));
+}
+
+test "vector scans: a line break or a multi-byte character at every position around chunk boundaries" {
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    const marks = [_]struct { bytes: []const u8, is_break: bool }{
+        .{ .bytes = "\r\n", .is_break = true },
+        .{ .bytes = "\r", .is_break = true },
+        .{ .bytes = "\n", .is_break = true },
+        .{ .bytes = "é", .is_break = false },
+        .{ .bytes = "😀", .is_break = false },
+        .{ .bytes = "\xff", .is_break = false },
+    };
+    // Positions 0 to 69 cover the boundaries of 16- and 32-byte chunks, and of the 64-byte one
+    for (0..70) |p| for (marks) |mark| {
+        buf.clearRetainingCapacity();
+        try buf.appendNTimes(a, 'x', p);
+        try buf.appendSlice(a, mark.bytes);
+        try buf.appendNTimes(a, 'y', 70 - p);
+        try buf.append(a, '\r');
+        const text = buf.items;
+        var li: LineIndex = try .init(a, text);
+        defer li.deinit(a);
+        const len: u32 = @intCast(text.len);
+        const after_mark: u32 = @intCast(p + mark.bytes.len);
+        try testing.expectEqualSlices(u32, if (mark.is_break) &.{ 0, after_mark, len } else &.{ 0, len }, li.line_starts);
+        for ([_]Encoding{ .utf8, .utf16, .utf32 }) |enc| {
+            for (0..text.len + 1) |off| {
+                const pos = offsetToPosition(text, off, enc);
+                try testing.expectEqual(pos, li.position(off, enc));
+                const back = li.offsetOf(pos, enc);
+                try testing.expectEqual(positionToOffset(text, pos, enc), back);
+                try testing.expectEqual(pos, offsetToPosition(text, back, enc));
+            }
+            // p + (70 - p) + 1 ASCII bytes around the mark, which is too short for a chunk
+            try testing.expectEqual(unitCount(mark.bytes, enc) + 71, unitCount(text, enc));
+        }
+    };
 }
 
 test applyChanges {
