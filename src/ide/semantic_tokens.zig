@@ -76,8 +76,8 @@ pub fn semanticTokens(r: *Resolver, file: FileId, lines: offsets.LineIndex, enc:
     if (range) |requested| if (!before(requested.start, requested.end)) return &.{};
     var b: Builder = .{ .r = r, .lines = lines, .enc = enc, .range = range, .options = options };
     if (range) |requested| {
-        const start = offsets.positionToOffset(lines.text, requested.start, enc);
-        var end = offsets.positionToOffset(lines.text, requested.end, enc);
+        const start = lines.offsetOf(requested.start, enc);
+        var end = lines.offsetOf(requested.end, enc);
         // When the end position falls in the middle of a multi-code-unit character, keep the
         // whole token that contains it.
         if (end < lines.text.len and before(lines.position(end, enc), requested.end)) {

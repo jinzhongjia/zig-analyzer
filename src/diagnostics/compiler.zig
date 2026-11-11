@@ -396,7 +396,12 @@ pub const MergeInput = struct {
     other_ctx: *anyopaque,
 };
 
-pub const OtherFile = struct { uri: []const u8, text: []const u8 };
+pub const OtherFile = struct {
+    uri: []const u8,
+    text: []const u8,
+    /// The line table of `text` when one is at hand; otherwise it is built for each note
+    line_starts: ?[]const u32 = null,
+};
 
 /// Returns the URI and text of another file (for note positions); null when the file cannot be
 /// read
@@ -676,7 +681,7 @@ fn compilerDiagnostic(arena: Allocator, in: MergeInput, item: Item, start: u32, 
     var related: std.ArrayList(types.DiagnosticRelatedInformation) = .empty;
     for (item.notes) |n| {
         const other = in.other_file(in.other_ctx, arena, n.path) orelse continue;
-        const lines = try offsets.LineIndex.init(arena, other.text);
+        const lines: offsets.LineIndex = if (other.line_starts) |s| .{ .text = other.text, .line_starts = s } else try offsets.LineIndex.init(arena, other.text);
         // The note's file changed since the note's build (unsaved changes, or a newer build of
         // the file): shift by the diff from the text that build read
         var note_start = n.start;

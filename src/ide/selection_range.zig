@@ -24,7 +24,7 @@ pub fn selectionRanges(
 ) Allocator.Error![]const types.SelectionRange {
     const result = try arena.alloc(types.SelectionRange, positions.len);
     for (positions, result) |pos, *out| {
-        const offset = expansionOffset(root, @intCast(offsets.positionToOffset(lines.text, pos, enc)));
+        const offset = expansionOffset(root, @intCast(lines.offsetOf(pos, enc)));
         const path = try root.coveringPath(arena, offset);
 
         // Built from the outside in; parent points to the outer level

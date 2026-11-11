@@ -128,6 +128,7 @@ Only `Canceled` and `OutOfMemory` propagate within the engine. Query results are
 - **Position-independent summaries**: `ItemNames` and `ContainerRels` hold no absolute positions (those stay in `ItemSummaries` / `FileAstIdMap`), so moving code does not invalidate semantic search.
 - **Typed AST layer** (`ast.zig`): centralizes which child node holds which information; accessors return optionals.
 - **Incomplete names**: an unterminated quoted identifier is recovered as a name in syntactic decisions; HIR lowers a reference without a valid name to an unknown expression.
+- **Line table**: `LineStarts`, the line starts of a file's `SourceText`, is computed once per revision of the text. Requests and diagnostics convert between byte offsets and LSP positions with it (`offsets.LineIndex`), so a conversion scans only the line of the position. The scans for line breaks and for runs of ASCII bytes (one code unit per byte in every encoding) compare a vector of bytes at a time where the compiler backend supports vectors, under the condition `std.mem` uses.
 
 ### Nesting depth
 

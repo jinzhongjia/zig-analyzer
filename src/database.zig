@@ -52,6 +52,7 @@ pub const Db = engine.Engine(*const Env, &.{
     syntax.SyntaxDialect,
     ide.format.ZigFmtRenderer,
     syntax.SourceText,
+    syntax.LineStarts,
     syntax.ParseFile,
     syntax.FileItemTree,
     syntax.FileAstIdMap,

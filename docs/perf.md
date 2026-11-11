@@ -83,6 +83,10 @@ Completion after `.` has p50 2.0-2.6 ms. An expected type changes the latency on
 
 On `Sema.zig`, edit → diagnostics p50 is 170 ms (169 ms when disabled), codeAction p50 is 3.8 ms, and resolving a local fix takes 68 ms. On ZLS, zigimg, and Cubyz, codeAction p50 is 1.0-1.5 ms, resolving a fix p50 12-19 ms, and the slowest cross-file one 128 ms.
 
+### Position conversion
+
+Requests convert positions with the cached line table of the file (`LineStarts`), built once per revision of the text. For `Sema.zig` (1.5 MB, 35,648 lines) the table takes 0.21 ms with 16-byte vectors, and counting the UTF-16 code units of the whole file 0.025 ms. In the full `lsp-bench` run on `Sema.zig` (macOS, ReleaseFast, six rounds), warm hover p50 is below 0.1 ms, goto 0.1 ms, completion 0.2 ms, and semantic tokens for a range 0.1 ms; the server uses 10.3 s of CPU time and executes 158 G instructions over the run, with a peak of 831 MB. Linux and Windows are not measured. The offsets tests cover the vector paths (NEON, SSE2, AVX2) and the byte loop that backends without vector support use.
+
 ### Hover in generic function bodies
 
 `BENCH_INSTANCE_HOVER=2000` on the Zig 0.17.0 compiler (`src` and `lib/std`, ReleaseSafe, project loaded) samples 2000 of the 37908 names in generic function bodies whose declaration can depend on the instance, in 276 files. Each file is opened and its names hovered, then goto is requested at every name, then hover again. "Instance only" is hover without the other instances; `"list"` is the default of `hover.instances`. Each configuration is one run, on macOS (arm64, 18 cores) and in a Linux container (arm64, 8 CPUs); Windows is not measured.
