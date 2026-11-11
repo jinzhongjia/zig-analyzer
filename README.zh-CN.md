@@ -54,3 +54,7 @@ zig build test-all                # 运行全部测试，包括会调用 PATH �
 ```
 
 配置项见 [`zig-analyzer.default.zon`](zig-analyzer.default.zon)，设计说明见 [`docs/design.md`](docs/design.md)。
+
+## 许可证
+
+[MIT](LICENSE)
