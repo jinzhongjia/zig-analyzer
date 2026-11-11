@@ -4,6 +4,7 @@
 
 - No LLM co-author information in commit messages (`Co-authored-by: ...`, `Generated with ...`).
 - Split work into commits by content; keep unrelated changes apart.
+- Give each pull request one changelog label (`tools/changelog.sh` sorts the release notes by them): `breaking` (users must act on it), `enhancement`, `bug`, `performance`, or `internal` (not visible to users).
 
 ## Language
 
