@@ -6541,7 +6541,10 @@ fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: ty
 /// Why `symbol` cannot be renamed, or null when it can: the user's own code (see
 /// `origin.Origin.user`) and unsaved documents can be renamed. In a file outside the workspace
 /// folders (`origin.Origin.outside`), only what its own file alone can refer to can be renamed
-/// (see `ownFileOnly`): which other files use the rest is not known.
+/// (see `ownFileOnly`): which other files use the rest is not known. That includes files outside
+/// the workspace folders that a project's module graph includes (modules added by path, such as a
+/// library a workspace folder depends on by `.path`): the library's other users (its tests, its
+/// other dependents) are not in the workspace either.
 fn renameRefusal(server: *Server, r: *Resolver, symbol: za.ide_db.search.Symbol) !?[]const u8 {
     const file = switch (symbol) {
         .def => |def| switch (def) {
@@ -6559,7 +6562,7 @@ fn renameRefusal(server: *Server, r: *Resolver, symbol: za.ide_db.search.Symbol)
     };
     if (try za.ide_db.search.symbolName(r, symbol) == null) return "cannot rename: there is no name here";
     const rules = try server.originRules(r.arena);
-    return switch (origin.classify(&server.vfs, rules, server.vfs.path(file), server.inProject(file))) {
+    return switch (origin.classify(&server.vfs, rules, server.vfs.path(file), false)) {
         // Unsaved documents (`untitled:` etc.) exist only in the editor
         .virtual, .user => null,
         .outside => if (try ownFileOnly(r, symbol))
