@@ -1642,6 +1642,71 @@ const Inferrer = struct {
     }
 
     /// A type in the standard library looked up by path (e.g. `builtin.Type`)
+    /// Result type of argument `i` of a builtin that constructs a type (`@Struct`, `@Pointer`,
+    /// ...), as in AstGen, so enum literals and struct literals in the arguments get their
+    /// types (`@Struct(.auto, ...)`). The compiler gives the field types, field attributes,
+    /// parameter attributes, and enum field values a pointer to an array with one element per
+    /// name or parameter type; a slice of the element type gives an array literal behind `&` the
+    /// same type. Arguments that are types (or that the arguments before them leave unknown) get
+    /// none.
+    fn reifyArgType(inf: *Inferrer, name: []const u8, args: []const ExprId, i: usize) Error!?Index {
+        const ip = inf.ip;
+        const eq = std.mem.eql;
+        const types = try ip.ptrTo(.type_type, .slice, true);
+        const names = try ip.ptrTo(try ip.ptrTo(.u8_type, .slice, true), .slice, true);
+        const lang = struct {
+            fn slice(in: *Inferrer, path: []const []const u8) Error!?Index {
+                const t = try in.stdType(path) orelse return null;
+                return try in.ip.ptrTo(t, .slice, true);
+            }
+        };
+        if (eq(u8, name, "@Tuple")) return if (i == 0) types else null;
+        if (eq(u8, name, "@Pointer")) return switch (i) {
+            0 => try inf.stdType(&.{ "builtin", "Type", "Pointer", "Size" }),
+            1 => try inf.stdType(&.{ "builtin", "Type", "Pointer", "Attributes" }),
+            // The sentinel is an optional of the element type; `?noreturn` for opaque types and
+            // `@TypeOf(null)`, which cannot be the child of an optional
+            3 => blk: {
+                if (args.len < 3) break :blk null;
+                const elem = inf.get(args[2]).asType() orelse break :blk null;
+                if (elem == .unknown) break :blk null;
+                const no_optional = elem == .null_type or elem == .anyopaque_type or switch (ip.key(elem)) {
+                    .container_type => |c| c.kind == .@"opaque",
+                    else => false,
+                };
+                break :blk try ip.optionalOf(if (no_optional) .noreturn_type else elem);
+            },
+            else => null,
+        };
+        if (eq(u8, name, "@Fn")) return switch (i) {
+            0 => types,
+            1 => try lang.slice(inf, &.{ "builtin", "Type", "Fn", "ParamAttributes" }),
+            3 => try inf.stdType(&.{ "builtin", "Type", "Fn", "Attributes" }),
+            else => null,
+        };
+        if (eq(u8, name, "@Struct") or eq(u8, name, "@Union")) {
+            const container = if (eq(u8, name, "@Struct")) "Struct" else "Union";
+            return switch (i) {
+                0 => try inf.stdType(&.{ "builtin", "Type", "ContainerLayout" }),
+                1 => try ip.optionalOf(.type_type),
+                2 => names,
+                3 => types,
+                4 => try lang.slice(inf, &.{ "builtin", "Type", container, "FieldAttributes" }),
+                else => null,
+            };
+        }
+        if (eq(u8, name, "@Enum")) return switch (i) {
+            1 => try inf.stdType(&.{ "builtin", "Type", "Enum", "Mode" }),
+            2 => names,
+            3 => blk: {
+                const tag = inf.get(args[0]).asType() orelse break :blk null;
+                break :blk if (tag == .unknown) null else try ip.ptrTo(tag, .slice, true);
+            },
+            else => null,
+        };
+        return null;
+    }
+
     fn stdType(inf: *Inferrer, path: []const []const u8) Error!?Index {
         var ns: Namespace = .{ .file = try inf.r.ctx.get(database.ModuleGraph.StdRoot, inf.r.context) orelse return null, .container = 0 };
         var t: Index = .unknown;
@@ -1913,7 +1978,7 @@ const Inferrer = struct {
             if (args.len != 2) return typeUnknown();
             // The signedness is any known `std.lang.Signedness` value (or an enum literal), the
             // bit count a `u16`
-            const sign_tv = try inf.infer(args[0], null);
+            const sign_tv = try inf.infer(args[0], try inf.stdType(&.{ "builtin", "Signedness" }));
             const sign: ?std.builtin.Signedness = if (sign_tv.val) |v| switch (ip.key(v)) {
                 .enum_literal => |n| std.meta.stringToEnum(std.builtin.Signedness, n),
                 .enum_tag => |t| std.meta.stringToEnum(std.builtin.Signedness, t.name),
@@ -1935,7 +2000,7 @@ const Inferrer = struct {
         // all comptime-known values)
         const reifying = [_][]const u8{ "@Pointer", "@Tuple", "@Enum", "@Struct", "@Union", "@Fn", "@Vector", "@EnumLiteral" };
         for (reifying) |n| if (eq(u8, name, n)) {
-            for (args) |a| _ = try inf.infer(a, null);
+            for (args, 0..) |a, i| _ = try inf.infer(a, try inf.reifyArgType(name, args, i));
             if (inf.dead > 0 or inf.r.ctx.incomplete()) return typeUnknown();
             const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
             return if (tv.val != null) tv else typeUnknown();
