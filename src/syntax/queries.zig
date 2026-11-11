@@ -12,6 +12,7 @@ const Parse = @import("Parse.zig");
 const ItemTree = @import("ItemTree.zig");
 const ast = @import("ast.zig");
 const mem = @import("../util/mem.zig");
+const offsets = @import("../util/offsets.zig");
 
 /// File contents: uses `FileText` when present (open documents, files loaded by the project),
 /// otherwise reads from disk.
@@ -46,6 +47,30 @@ pub const SourceText = struct {
 
     pub fn deinit(v: *Value, gpa: Allocator) void {
         if (v.owned) gpa.free(v.text);
+    }
+};
+
+/// Line start offsets of `SourceText` (the table of `offsets.LineIndex`): built once per revision
+/// of the text, so that the requests and the diagnostics on one text share it
+pub const LineStarts = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = Vfs.FileId;
+    pub const Value = []const u32;
+
+    pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
+        return offsets.lineStarts(ctx.db.gpa, (try ctx.get(SourceText, file)).text);
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(u32, a, b);
+    }
+
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.*);
+    }
+
+    pub fn bytes(v: Value) usize {
+        return v.len * @sizeOf(u32);
     }
 };
 
