@@ -6,8 +6,8 @@ description: Release a new version of the zig-analyzer server (version bump, loc
 # Release zig-analyzer
 
 A release is an annotated tag `vX.Y.Z` on `main`. Pushing it runs `.github/workflows/release.yml`,
-which checks the tag, cross-compiles ReleaseSafe executables for x86_64 / aarch64 × Linux / macOS /
-Windows, and publishes a GitHub release with the archives, `SHA256SUMS`, and the tag message as
+which checks the tag, cross-compiles ReleaseSafe and ReleaseFast executables for x86_64 / aarch64 ×
+Linux / macOS / Windows, and publishes a GitHub release with the archives, `SHA256SUMS`, and the tag message as
 the notes. The editor extensions in `editors/` are versioned and published separately; a release
 does not touch them.
 
@@ -112,8 +112,8 @@ but there is no release yet. Do not build and upload the release by hand unless 
 When it succeeds, check the release:
 
 ```sh
-gh release view vX.Y.Z    # 6 archives (.tar.gz, .zip for Windows) and SHA256SUMS
-gh release download vX.Y.Z -p '*-<this machine>.tar.gz' -p SHA256SUMS -D <empty temporary dir>
+gh release view vX.Y.Z    # 12 archives (.tar.gz, .zip for Windows) and SHA256SUMS
+gh release download vX.Y.Z -p '*-<this machine>-ReleaseSafe.tar.gz' -p SHA256SUMS -D <empty temporary dir>
 ```
 
 In that directory, verify the checksum (`shasum -a 256 -c SHA256SUMS --ignore-missing`), extract,
