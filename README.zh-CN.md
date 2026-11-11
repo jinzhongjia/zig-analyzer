@@ -54,6 +54,13 @@ vim.lsp.enable('zig_analyzer')
 
 把 `zig-analyzer`（Windows 上是 `zig-analyzer.exe`）放进 `PATH`，或在编辑器插件里配置它的路径。
 
+压缩包和 `SHA256SUMS` 用 [minisign](https://jedisct1.github.io/minisign/) 签名。用 [`minisign.pub`](minisign.pub) 里的公钥，以 `minisign` 或 [`minizign`](https://github.com/jedisct1/zig-minisign) 验证：
+
+```sh
+minisign -Vm zig-analyzer-<version>-<target>-ReleaseSafe.tar.gz -p minisign.pub
+minizign -V -p minisign.pub -m zig-analyzer-<version>-<target>-ReleaseSafe.tar.gz
+```
+
 ## 开发
 
 需要 Zig **0.17.0** 或 **0.17.1**。

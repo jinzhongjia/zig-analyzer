@@ -9,6 +9,8 @@ permissions:
 
 env:
   ZIG_VERSION: 0.17.1
+  # zig-minisign 0.1.14, which signs the release
+  MINIZIGN_COMMIT: 2f0e4b8a0fc60b9b1acf371ae5f833eff1471b36
 
 jobs:
   check:
@@ -29,6 +31,12 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$GITHUB_REF_NAME is not on main"; exit 1; }
           version=$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' build.zig.zon)
           test "v$version" = "$GITHUB_REF_NAME" || { echo "::error::build.zig.zon has version $version, the tag is $GITHUB_REF_NAME"; exit 1; }
+      - name: Signing is set up
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          test -n "$MINISIGN_SECRET_KEY" || { echo "::error::the secret MINISIGN_SECRET_KEY is not set"; exit 1; }
+          test -f minisign.pub || { echo "::error::minisign.pub is missing"; exit 1; }
 
   build:
     name: Build (${{ matrix.target }}, ${{ matrix.optimize }})
@@ -78,11 +86,22 @@ jobs:
     name: Publish the release
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Fetch the annotated tag
         run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: minizign
+      - name: Build minizign
+        run: |
+          git init -q "$RUNNER_TEMP/minizign"
+          git -C "$RUNNER_TEMP/minizign" fetch -q --depth 1 https://github.com/jedisct1/zig-minisign "$MINIZIGN_COMMIT"
+          git -C "$RUNNER_TEMP/minizign" checkout -q FETCH_HEAD
+          (cd "$RUNNER_TEMP/minizign" && zig build -Doptimize=ReleaseSafe)
+          echo "$RUNNER_TEMP/minizign/zig-out/bin" >> "$GITHUB_PATH"
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -90,6 +109,22 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+      # Each archive and SHA256SUMS get a `.minisig`, checked against the public key in the
+      # repository so that a secret key that does not match it fails the release
+      - name: Sign
+        working-directory: dist
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          key="$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          files=(*)
+          inputs=()
+          for f in "${files[@]}"; do inputs+=(-m "$f"); done
+          printf '%s\n' "$MINISIGN_PASSWORD" | minizign -S -s "$key" -t "zig-analyzer $GITHUB_REF_NAME" -c "zig-analyzer release signature" "${inputs[@]}"
+          rm "$key"
+          for f in "${files[@]}"; do minizign -V -q -p ../minisign.pub -m "$f"; done
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
