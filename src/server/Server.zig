@@ -108,7 +108,15 @@ roots: std.ArrayList([]u8) = .empty,
 /// the root is added, to avoid a wrong answer before the project finishes loading; updated when
 /// build.zig is created or deleted, see `refreshRoot`)
 root_has_build: std.ArrayList(bool) = .empty,
-/// Protects `roots` and `root_has_build`
+/// Sub-projects under the root directories (absolute, normalized): directories other than the root
+/// directories, under a root directory with a build.zig, that have a build.zig and whose
+/// build.zig.zon depends by `.path` on such a root directory or on another sub-project (such as
+/// the examples of a library). Found by each scan (see `refreshSubProjects`). With
+/// `Config.build_sub_projects`, the project of each is started on demand: when one of its files is
+/// opened (see `startSubProjectFor`), or when find references or rename need it (see
+/// `subProjectGap`).
+sub_projects: std.ArrayList([]u8) = .empty,
+/// Protects `roots`, `root_has_build` and `sub_projects`
 roots_mutex: Io.Mutex = .init,
 
 single_mutex: Io.Mutex = .init,
@@ -188,6 +196,9 @@ builtin_targets: std.AutoHashMapUnmanaged(Vfs.FileId, za.sema.InternPool.Target)
 index_generation: std.atomic.Value(u64) = .init(0),
 /// Config option `sema.callsite_seeding` (read by the IDE layer through `Env`)
 callsite_seeding: std.atomic.Value(bool) = .init(true),
+/// Config option `build.sub_projects`, readable where `config_mutex` cannot be taken (with
+/// `workspaces_mutex` held, see `startWorkspace`)
+sub_projects_enabled: std.atomic.Value(bool) = .init(true),
 /// Counting allocator (set by the executable; used for `heap_bytes` in `zig-analyzer/status`)
 heap: ?*const za.util.mem.Counting = null,
 /// Statistics of the release allocator (set by the executable; `allocator` in
@@ -521,6 +532,8 @@ pub fn deinit(server: *Server) void {
     for (server.roots.items) |r| server.gpa.free(r);
     server.roots.deinit(server.gpa);
     server.root_has_build.deinit(server.gpa);
+    for (server.sub_projects.items) |d| server.gpa.free(d);
+    server.sub_projects.deinit(server.gpa);
     for (server.single.values()) |*sf| sf.clearResult(server.gpa);
     server.single.deinit(server.gpa);
     for (server.envs.items) |env| {
@@ -1456,6 +1469,9 @@ fn scanOnce(server: *Server) Allocator.Error!void {
     const epoch = if (server.watcher) |w| w.watchEpoch() else 0;
     const found = try workspace_files.scan(server.io, a, &server.vfs, rules);
     defer if (server.watcher) |w| w.scanned(found.dirs, epoch);
+    // Also when the files are the same: a build.zig.zon may have changed (see
+    // `applyWatchedChanges`)
+    try server.refreshSubProjects(a, found.files);
     var set: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
     for (found.files) |p| try set.put(a, try server.vfs.intern(p), {});
     const files = set.keys();
@@ -2122,6 +2138,8 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
         // delta baselines from the period while the document was closed or from the old session.
         server.semantic_cache.remove(server.io, server.gpa, id);
     }
+    // Before publishing: a file of a sub-project then belongs to its project (loading)
+    server.startSubProjectFor(server.vfs.path(id));
     server.publishFiles(&.{id}, false);
     server.publishDependents(&.{id});
     if (server.openDocumentCount() > 1) server.requestRefresh();
@@ -2604,6 +2622,12 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
     // that were just started need not be restarted
     var refreshed: std.ArrayList([]const u8) = .empty;
     for (build_zig_dirs.items) |dir| if (try server.refreshRoot(dir)) try refreshed.append(arena, dir);
+    // A build.zig or build.zig.zon below a root directory changed: whether its directory is a
+    // sub-project may have changed (see `refreshSubProjects`)
+    if (server.started) for (build_files.items) |dir| if (server.nestedUnderRoot(dir)) {
+        server.scheduleScan();
+        break;
+    };
     const changed = changes.items.len != 0 or build_files.items.len != 0 or refreshed.items.len != 0;
 
     // Files whose rebuild a project in the middle of a build decides when the build completes, and
@@ -2968,6 +2992,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     const inactive_changed = server.config.inactive_code != new.inactive_code;
     const naming_changed = !server.config.sameNaming(&new);
     const build_was_enabled = server.config.build_enable;
+    const sub_projects_changed = server.config.build_sub_projects != new.build_sub_projects;
     const watcher_changed = server.config.files_watcher != new.files_watcher;
     const inlay_changed = server.config.inlay_types != new.inlay_types or server.config.inlay_field_types != new.inlay_field_types or
         server.config.inlay_anonymous_containers != new.inlay_anonymous_containers or
@@ -3010,6 +3035,14 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
             for (list) |ws| server.restartWorkspace(ws, 0);
         }
         // Files' compile contexts may have changed, and compiler diagnostics may be re-enabled
+        server.reconcileSingle();
+    }
+    if (sub_projects_changed and new.build_enable) {
+        // Off: the projects of sub-projects stop, and their open files get the unloaded-project
+        // hint. On: those that contain open documents start.
+        if (server.stopStrayProjects()) server.updateModuleGraph();
+        server.startOpenSubProjects();
+        server.publishOpenFiles();
         server.reconcileSingle();
     }
 }
@@ -3072,6 +3105,7 @@ fn startProjectsForRoots(server: *Server) void {
         _ = server.setRootHasBuild(root, has_build);
         if (has_build) server.startWorkspace(root);
     }
+    server.startOpenSubProjects();
 }
 
 /// Directory `dir` contains a file named build.zig. The name must match exactly: on
@@ -3132,6 +3166,8 @@ fn refreshRoot(server: *Server, dir: []const u8) Allocator.Error!bool {
     } else {
         log.info("{s}: build.zig was deleted", .{root});
         server.removeProject(root);
+        // Its sub-projects go with it
+        _ = server.stopStrayProjects();
         server.updateModuleGraph();
     }
     // Open files: single-file mode results no longer apply, or they switch to single-file mode
@@ -3171,6 +3207,7 @@ fn applyLogging(server: *Server, config: *const Config, reopen_file: bool) void 
     server.debounce_ms.store(config.debounce_ms, .monotonic);
     server.max_intern_pool_mb.store(config.max_intern_pool_mb, .monotonic);
     server.callsite_seeding.store(config.callsite_seeding, .monotonic);
+    server.sub_projects_enabled.store(config.build_sub_projects, .release);
     if (!reopen_file) return;
     za.util.log.setFile(config.log_file) catch |err| {
         log.warn("cannot open log file {s}: {t}", .{ config.log_file.?, err });
@@ -3581,10 +3618,16 @@ fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
     const path = server.vfs.path(file);
     const build = server.buildFlags().build;
     if (build) {
+        const sub_projects = server.sub_projects_enabled.load(.acquire);
         server.roots_mutex.lockUncancelable(server.io);
         defer server.roots_mutex.unlock(server.io);
         for (server.roots.items, server.root_has_build.items) |root, has_build| {
-            if (has_build and server.vfs.isUnder(path, root)) return .project_dir;
+            if (!has_build or !server.vfs.isUnder(path, root)) continue;
+            // A sub-project is loaded on demand when the setting is on (see `startSubProjectFor`);
+            // when it is off, its project is not loaded, and the root's project does not resolve
+            // its imports by name
+            if (!sub_projects and std.mem.endsWith(u8, path, ".zig") and server.subProjectOfLocked(path) != null) return .unloaded_project;
+            return .project_dir;
         }
     }
     if (!std.mem.endsWith(u8, path, ".zig")) return .none;
@@ -3939,7 +3982,7 @@ pub fn startWorkspace(server: *Server, root: []const u8) void {
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
-        if (!server.isProjectRoot(root)) return;
+        if (!server.startsProject(root)) return;
         for (server.workspaces.items) |w| if (server.vfs.samePath(w.root, root)) return;
     }
     const ws = Workspace.start(server, root, 0) catch |err| {
@@ -3951,10 +3994,11 @@ pub fn startWorkspace(server: *Server, root: []const u8) void {
     // The list takes over the reference returned by `start`. If the server began shutting down
     // meanwhile (stopping the projects missed this one, and waiting for idle would never end), a
     // project was started for the same root directory meanwhile, the root directory was removed or
-    // lost its build.zig meanwhile, or the list cannot grow, the new instance is discarded. A
-    // removal updates the root directories before it takes the project out of this list, so either
-    // it is seen here or it finds the project in the list.
-    const added = !server.shutting_down and server.isProjectRoot(root) and server.visibleFor(root) == null and
+    // lost its build.zig meanwhile (or, for a sub-project, it is no longer one or loading them was
+    // turned off), or the list cannot grow, the new instance is discarded. A removal updates the
+    // root directories (and the setting) before it takes the project out of this list, so either it
+    // is seen here or it finds the project in the list.
+    const added = !server.shutting_down and server.startsProject(root) and server.visibleFor(root) == null and
         (if (server.workspaces.append(server.gpa, ws)) |_| true else |_| false);
     if (!added) ws.stop();
     ws.placed.set(server.io);
@@ -3967,6 +4011,189 @@ fn isProjectRoot(server: *Server, root: []const u8) bool {
     defer server.roots_mutex.unlock(server.io);
     for (server.roots.items, server.root_has_build.items) |r, has_build| {
         if (server.vfs.samePath(r, root)) return has_build;
+    }
+    return false;
+}
+
+/// A project can be started for directory `root`: it is a root directory recorded as having a
+/// build.zig, or, while `build.sub_projects` is on, a sub-project (see `sub_projects`) under a root
+/// directory that still has one
+fn startsProject(server: *Server, root: []const u8) bool {
+    const enabled = server.sub_projects_enabled.load(.acquire);
+    server.roots_mutex.lockUncancelable(server.io);
+    defer server.roots_mutex.unlock(server.io);
+    for (server.roots.items, server.root_has_build.items) |r, has_build| {
+        if (server.vfs.samePath(r, root)) return has_build;
+    }
+    if (!enabled) return false;
+    const listed = for (server.sub_projects.items) |d| {
+        if (server.vfs.samePath(d, root)) break true;
+    } else false;
+    if (!listed) return false;
+    for (server.roots.items, server.root_has_build.items) |r, has_build| {
+        if (has_build and server.vfs.isUnder(root, r)) return true;
+    }
+    return false;
+}
+
+/// The innermost sub-project (see `sub_projects`) whose directory contains `path`, with
+/// `roots_mutex` held; the result is valid while it is held
+fn subProjectOfLocked(server: *Server, path: []const u8) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    for (server.sub_projects.items) |d| if (server.vfs.isUnder(path, d)) {
+        if (best == null or d.len > best.?.len) best = d;
+    };
+    return best;
+}
+
+/// `subProjectOfLocked`, allocated by `a`
+fn subProjectOf(server: *Server, a: Allocator, path: []const u8) Allocator.Error!?[]u8 {
+    server.roots_mutex.lockUncancelable(server.io);
+    defer server.roots_mutex.unlock(server.io);
+    const dir = server.subProjectOfLocked(path) orelse return null;
+    return try a.dupe(u8, dir);
+}
+
+/// One of the files of the sub-project that contains `path` (see `subProjectOf`) was opened: starts
+/// its project, while `build.sub_projects` is on (and once the zig environment is known; startup
+/// starts it otherwise, see `refreshSubProjects`)
+fn startSubProjectFor(server: *Server, path: []const u8) void {
+    if (!server.sub_projects_enabled.load(.acquire) or server.zigEnv() == null) return;
+    const dir = (server.subProjectOf(server.gpa, path) catch return) orelse return;
+    defer server.gpa.free(dir);
+    server.startWorkspace(dir);
+}
+
+/// Starts the projects of the sub-projects that contain open documents (see `startSubProjectFor`)
+fn startOpenSubProjects(server: *Server) void {
+    if (!server.sub_projects_enabled.load(.acquire) or server.zigEnv() == null) return;
+    var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const open = blk: {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        break :blk a.dupe(Vfs.FileId, server.open_docs.keys()) catch return;
+    };
+    var dirs: std.ArrayList([]const u8) = .empty;
+    for (open) |f| {
+        const dir = (server.subProjectOf(a, server.vfs.path(f)) catch return) orelse continue;
+        for (dirs.items) |d| {
+            if (std.mem.eql(u8, d, dir)) break;
+        } else dirs.append(a, dir) catch return;
+    }
+    for (dirs.items) |d| server.startWorkspace(d);
+}
+
+/// Stops the projects that can no longer be started (see `startsProject`): those of directories
+/// that are no longer sub-projects or whose root directory was removed or lost its build.zig, and
+/// all of sub-projects when `build.sub_projects` is off. Returns whether it stopped any (the
+/// caller updates the module graph).
+fn stopStrayProjects(server: *Server) bool {
+    const list = server.workspaceList(server.gpa) catch return false;
+    defer server.releaseList(server.gpa, list);
+    var stopped = false;
+    for (list) |ws| if (!server.startsProject(ws.root)) {
+        log.info("{s}: not a sub-project to load any more, stopping its project", .{ws.root});
+        server.removeProject(ws.root);
+        stopped = true;
+    };
+    return stopped;
+}
+
+/// Finds the sub-projects (see `sub_projects`) among the build.zig files of a scan (`files`, the
+/// paths found by `workspace_files.scan`), reading their build.zig.zon files from disk; when the
+/// list changes, stops the projects of directories that are no longer sub-projects, starts those
+/// of new sub-projects that contain open documents, and republishes the open documents (whose
+/// context may have changed, see `fileContext`). Nested projects whose build.zig.zon has no `.path`
+/// dependency on a root directory or another sub-project are left out, so that in a repository with
+/// many unrelated nested projects (the Zig source tree has dozens of test projects) none is loaded.
+fn refreshSubProjects(server: *Server, a: Allocator, files: []const []const u8) Allocator.Error!void {
+    var all_roots: std.ArrayList([]const u8) = .empty;
+    var build_roots: std.ArrayList([]const u8) = .empty;
+    {
+        server.roots_mutex.lockUncancelable(server.io);
+        defer server.roots_mutex.unlock(server.io);
+        for (server.roots.items, server.root_has_build.items) |r, has_build| {
+            const copy = try a.dupe(u8, r);
+            try all_roots.append(a, copy);
+            if (has_build) try build_roots.append(a, copy);
+        }
+    }
+    const Candidate = struct { dir: []const u8, deps: []const []const u8, eligible: bool = false };
+    var candidates: std.ArrayList(Candidate) = .empty;
+    for (files) |p| {
+        if (!std.mem.eql(u8, std.fs.path.basename(p), "build.zig")) continue;
+        const dir = std.fs.path.dirname(p) orelse continue;
+        if (server.containsPath(all_roots.items, dir)) continue;
+        const under = for (build_roots.items) |r| {
+            if (server.vfs.isUnder(dir, r)) break true;
+        } else false;
+        if (!under) continue;
+        const zon = try std.fs.path.join(a, &.{ dir, "build.zig.zon" });
+        const text = Io.Dir.cwd().readFileAllocOptions(server.io, zon, a, .limited(16 * 1024 * 1024), .of(u8), 0) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        try candidates.append(a, .{ .dir = dir, .deps = try za.project.packages.pathDependencies(a, server.gpa, dir, text) });
+    }
+    // A dependency chain can go through other sub-projects (an example that depends on another)
+    var eligible: std.ArrayList([]const u8) = .empty;
+    var grew = true;
+    while (grew) {
+        grew = false;
+        for (candidates.items) |*c| {
+            if (c.eligible) continue;
+            for (c.deps) |d| {
+                if (!server.containsPath(build_roots.items, d) and !server.containsPath(eligible.items, d)) continue;
+                c.eligible = true;
+                try eligible.append(a, c.dir);
+                grew = true;
+                break;
+            }
+        }
+    }
+    const changed = blk: {
+        server.roots_mutex.lockUncancelable(server.io);
+        defer server.roots_mutex.unlock(server.io);
+        const same = server.sub_projects.items.len == eligible.items.len and for (eligible.items) |d| {
+            if (!server.containsPath(server.sub_projects.items, d)) break false;
+        } else true;
+        if (same) break :blk false;
+        var fresh: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (fresh.items) |d| server.gpa.free(d);
+            fresh.deinit(server.gpa);
+        }
+        try fresh.ensureTotalCapacity(server.gpa, eligible.items.len);
+        for (eligible.items) |d| fresh.appendAssumeCapacity(try server.gpa.dupe(u8, d));
+        for (server.sub_projects.items) |d| server.gpa.free(d);
+        server.sub_projects.deinit(server.gpa);
+        server.sub_projects = fresh;
+        break :blk true;
+    };
+    if (!changed) return;
+    log.info("{d} sub-projects under the workspace folders", .{eligible.items.len});
+    for (eligible.items) |d| log.debug("sub-project: {s}", .{d});
+    if (server.stopStrayProjects()) server.updateModuleGraph();
+    server.startOpenSubProjects();
+    server.publishOpenFiles();
+    server.reconcileSingle();
+}
+
+/// Whether `list` has a path that is `path` (see `Vfs.samePath`)
+fn containsPath(server: *Server, list: []const []const u8, path: []const u8) bool {
+    for (list) |p| if (server.vfs.samePath(p, path)) return true;
+    return false;
+}
+
+/// Directory `dir` is under a root directory with a build.zig, and is not a root directory itself
+fn nestedUnderRoot(server: *Server, dir: []const u8) bool {
+    server.roots_mutex.lockUncancelable(server.io);
+    defer server.roots_mutex.unlock(server.io);
+    if (server.containsPath(server.roots.items, dir)) return false;
+    for (server.roots.items, server.root_has_build.items) |r, has_build| {
+        if (has_build and server.vfs.isUnder(dir, r)) return true;
     }
     return false;
 }
@@ -3995,8 +4222,8 @@ fn addRoot(server: *Server, root_uri: []const u8) !void {
     if (has_build and server.zigEnv() != null) server.startWorkspace(normalized);
 }
 
-/// Removes a workspace root directory: stops its project
-/// and clears the compiler diagnostics it published
+/// Removes a workspace root directory: stops its project and those of its sub-projects, and clears
+/// the compiler diagnostics they published
 fn removeRoot(server: *Server, arena: Allocator, root_uri: []const u8) !void {
     const path = uri.toPath(arena, root_uri) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -4013,6 +4240,7 @@ fn removeRoot(server: *Server, arena: Allocator, root_uri: []const u8) !void {
         };
     }
     server.removeProject(normalized);
+    _ = server.stopStrayProjects();
 }
 
 /// Stops the project of root directory `root` and clears the compiler diagnostics it published
@@ -5532,7 +5760,8 @@ fn appendUnloadedProjectHint(server: *Server, arena: Allocator, file: Vfs.FileId
     const path = server.vfs.path(file);
     if (!server.isOpen(path) or !server.startup_done.load(.acquire) or server.projectsLoading()) return diags;
     if (server.fileContext(file) != .unloaded_project) return diags;
-    const dir = server.projectDirOf(path) orelse return diags;
+    const sub_project = try server.subProjectOf(arena, path);
+    const dir = sub_project orelse server.projectDirOf(path) orelse return diags;
     const text = lines.text;
     var end: usize = 0;
     var chars: usize = 0;
@@ -5545,8 +5774,12 @@ fn appendUnloadedProjectHint(server: *Server, arena: Allocator, file: Vfs.FileId
         .range = lines.range(0, @intCast(@min(end, text.len)), server.encoding),
         .severity = .Hint,
         .source = "zig-analyzer",
-        .message = .{ .string = try std.fmt.allocPrint(arena, "this file belongs to the project at {s}, which is not loaded: it is not compiled on its own, " ++
-            "since only the project's build can resolve its imports by name; add the directory to the workspace folders to load the project", .{dir}) },
+        .message = .{ .string = if (sub_project != null)
+            try std.fmt.allocPrint(arena, "this file belongs to the sub-project at {s}, which is not loaded since `build.sub_projects` is off: it is not compiled " ++
+                "on its own, since only the project's build can resolve its imports by name; turn the setting on, or add the directory to the workspace folders, to load the project", .{dir})
+        else
+            try std.fmt.allocPrint(arena, "this file belongs to the project at {s}, which is not loaded: it is not compiled on its own, " ++
+                "since only the project's build can resolve its imports by name; add the directory to the workspace folders to load the project", .{dir}) },
     };
     return out;
 }
