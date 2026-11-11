@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.17.1
+
+jobs:
+  check:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # checkout leaves the tag lightweight; fetch the annotated tag object, whose message is the
+      # release notes
+      - name: Fetch the annotated tag
+        run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+      - name: The tag is annotated, on main, and matches build.zig.zon
+        run: |
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag || { echo "::error::$GITHUB_REF_NAME is not an annotated tag"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$GITHUB_REF_NAME is not on main"; exit 1; }
+          version=$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' build.zig.zon)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "::error::build.zig.zon has version $version, the tag is $GITHUB_REF_NAME"; exit 1; }
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: check
+    strategy:
+      fail-fast: true
+      matrix:
+        target: [x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos, x86_64-windows, aarch64-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # The full history and tags: without the tag, the executable prints a development version
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: release-${{ matrix.target }}
+      - name: Build the executable
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+      - name: The Windows build imports only functions Windows 10 1507 has
+        if: endsWith(matrix.target, '-windows')
+        run: zig build check -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+      - name: The executable prints the version of the tag
+        if: matrix.target == 'x86_64-linux'
+        run: test "$(zig-out/bin/zig-analyzer --version)" = "${GITHUB_REF_NAME#v}"
+      - name: Package
+        run: |
+          name="zig-analyzer-$GITHUB_REF_NAME-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp zig-out/bin/* LICENSE README.md "dist/$name/"
+          cd dist
+          case "${{ matrix.target }}" in
+            *-windows) zip -qr "$name.zip" "$name" ;;
+            *) tar -czf "$name.tar.gz" "$name" ;;
+          esac
+          rm -r "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the annotated tag
+        run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" dist/*

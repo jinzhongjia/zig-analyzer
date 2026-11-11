@@ -338,7 +338,7 @@ The `Configuration` format and in-process AstGen come from the standard library 
 - Formatting uses the renderer of the user's zig, in process, and the parser of the standard library zig-analyzer is compiled with (see `docs/features/formatting.md`).
 - With any other version, the build system is not started for roots with `build.zig`: no compiler diagnostics or named imports, only `zig ast-check` live diagnostics, and no single-file compiles there. The user is told at startup.
 - Other files still compile in single-file mode; the `ErrorBundle` is validated as in `docs/diagnostics.md`, never read out of bounds, though contents may be garbled.
-- Release versions follow Zig versions. The reported version comes from `git describe --tags`, falling back to `build.zig.zon`; `build.zig` is marked not cacheable because git's answer is outside the configure cache.
+- Release versions are semantic versions independent of Zig versions. `.version` in `build.zig.zon` is the version, and a release is its tag `v<version>`; git only adds what follows it: `0.1.0` at the tagged commit, `0.1.0+12.gd8b0905` after it, `0.1.0-dev+d8b0905` while the tag does not exist. `build.zig` is marked not cacheable because git's answer is outside the configure cache.
 
 ---
 

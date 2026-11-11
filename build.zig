@@ -228,17 +228,27 @@ pub fn build(b: *std.Build) void {
     } else stress_step.dependOn(&b.addFail("test-stress needs -Dstress-filter=<part of the full test names>").step);
 }
 
-/// The version when the repository has no tag to name it, or when git cannot tell the commit
-const fallback_version = @import("build.zig.zon").version ++ "-dev";
+/// The version of the release this source is or follows; its tag is `v` followed by it
+const version = @import("build.zig.zon").version;
 
-/// The output of `git describe --tags`: the latest tag reachable from HEAD, followed, when HEAD is
-/// not the tagged commit itself, by the number of commits since the tag and the current commit
-/// (`v0.17.0-12-gd8b0905`). Without a reachable tag, `fallback_version` with the current commit
-/// (`0.0.0-dev+d8b0905`). Without git or a repository, `fallback_version` and a warning.
+/// The version when the tag of `version` is not reachable, or when git cannot tell the commit
+const fallback_version = version ++ "-dev";
+
+/// `version` when HEAD is the commit of its tag; after the tag, followed by the number of commits
+/// since the tag and the current commit as build metadata (`0.1.0+12.gd8b0905`). Without the tag
+/// (`version` bumped but not yet tagged), `fallback_version` with the current commit
+/// (`0.1.0-dev+d8b0905`). Without git or a repository, `fallback_version` and a warning.
 fn gitVersion(b: *std.Build) []const u8 {
     // Commits and tags change what git prints without changing anything the configure cache tracks
     b.graph.poisonCache();
-    if (gitOutput(b, &.{ "git", "describe", "--tags" })) |described| return described;
+    // `v<version>-<count>-g<commit>`
+    if (gitOutput(b, &.{ "git", "describe", "--tags", "--long", "--match", "v" ++ version })) |described| {
+        var parts = std.mem.splitBackwardsScalar(u8, described, '-');
+        const commit = parts.first();
+        const count = parts.next().?;
+        if (std.mem.eql(u8, count, "0")) return version;
+        return b.fmt("{s}+{s}.{s}", .{ version, count, commit });
+    }
     if (gitOutput(b, &.{ "git", "rev-parse", "--short", "HEAD" })) |commit|
         return b.fmt("{s}+{s}", .{ fallback_version, commit });
     std.log.warn("no version information from git (not installed, or not a git repository): the version is {s}", .{fallback_version});
