@@ -50,6 +50,7 @@ const uri = za.base.uri;
 const Vfs = za.base.Vfs;
 const Server = @import("Server.zig");
 const Config = @import("Config.zig");
+const origin = @import("origin.zig");
 const workspace_files = @import("workspace_files.zig");
 
 const log = std.log.scoped(.watch);
@@ -159,6 +160,8 @@ pub const Watcher = struct {
     /// (`registerClientGlobs`); keys are allocated by `gpa`
     client_names: std.StringHashMapUnmanaged(void) = .empty,
     client_registrations: u32 = 0,
+    /// Classification of the interned files (see `classify`)
+    classes: Classes,
     /// Duration of the last poll (see `min_idle_factor`)
     poll_ns: i96 = 0,
     next_poll: ?Io.Timestamp = null,
@@ -193,6 +196,7 @@ pub const Watcher = struct {
             .listener = .{ .ctx = w, .notify = onNewPath },
             .state_arena = .init(gpa),
             .scan_arena = .init(gpa),
+            .classes = .{ .arena = .init(gpa) },
             .poller = .{ .gpa = gpa },
             .dir_poller = .{ .gpa = gpa, .dirs = true },
         };
@@ -204,6 +208,7 @@ pub const Watcher = struct {
         var names = w.client_names.keyIterator();
         while (names.next()) |k| w.gpa.free(k.*);
         w.client_names.deinit(w.gpa);
+        w.classes.deinit(w.gpa);
         w.backend.destroy(w.gpa);
         w.fallback.deinit(w.gpa);
         w.fallback_dirs.deinit(w.gpa);
@@ -368,6 +373,29 @@ pub const Watcher = struct {
         }
     }
 
+    /// The classification of the files interned so far, by FileId (see `Classes`): files
+    /// interned since the last call are classified under `rules`, and all of them again when the
+    /// rules have changed
+    fn classify(w: *Watcher, rules: origin.Rules) Allocator.Error![]const Classes.Class {
+        const server = w.server;
+        const c = &w.classes;
+        if (c.rules == null or !sameRules(c.rules.?, rules)) {
+            c.rules = null;
+            c.list.clearRetainingCapacity();
+            c.globs_done = 0;
+            _ = c.arena.reset(.retain_capacity);
+            c.rules = try dupeRules(c.arena.allocator(), rules);
+        }
+        const count = server.vfs.count();
+        try c.list.ensureTotalCapacity(w.gpa, count);
+        for (c.list.items.len..count) |i| {
+            const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
+            const watchable = server.watchable(rules, path);
+            c.list.appendAssumeCapacity(.{ .watchable = watchable, .in_root = watchable and server.vfs.rootOf(rules.roots, path) != null });
+        }
+        return c.list.items;
+    }
+
     /// When the client detects external changes, the initially registered globs cover only
     /// `.zig` and `.zon`: other interned files (files used by `@embedFile`, configure inputs) are
     /// additionally registered by file name (`**/<file name>`; notifications for other files with
@@ -375,19 +403,23 @@ pub const Watcher = struct {
     /// directories that contain interned files by their name (`**/<name>`: a directory deleted,
     /// moved or renamed is reported by its own path only), and configure input directories by
     /// their name and their entries (`**/<name>`, `**/<name>/*`). A name containing glob special
-    /// characters cannot be written as a glob and is not registered.
+    /// characters cannot be written as a glob and is not registered. Files handled by an earlier
+    /// call under the same rules are skipped: each of their globs is registered already or cannot
+    /// be written.
     fn registerClientGlobs(w: *Watcher) Allocator.Error!void {
         const server = w.server;
         var arena: std.heap.ArenaAllocator = .init(w.gpa);
         defer arena.deinit();
         const a = arena.allocator();
         const rules = try server.originRules(a);
+        const classes = try w.classify(rules);
         var globs: std.ArrayList([]const u8) = .empty;
         var dir_names: std.StringHashMapUnmanaged(void) = .empty;
-        for (0..server.vfs.count()) |i| {
+        for (w.classes.globs_done..classes.len) |i| {
+            if (!classes[i].watchable) continue;
             const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
-            if (!server.watchable(rules, path)) continue;
-            if (server.vfs.rootOf(rules.roots, path)) |root| {
+            if (classes[i].in_root) {
+                const root = server.vfs.rootOf(rules.roots, path).?;
                 var dir = std.fs.path.dirname(path);
                 while (dir) |d| : (dir = std.fs.path.dirname(d)) {
                     if (d.len <= root.len) break;
@@ -417,6 +449,7 @@ pub const Watcher = struct {
             std.json.Stringify.value(.{ .globPattern = glob }, .{}, &out.writer) catch return error.OutOfMemory;
             added += 1;
         }
+        w.classes.globs_done = @intCast(classes.len);
         if (added == 0) return;
         out.writer.writeAll("]}") catch return error.OutOfMemory;
         const options = std.json.parseFromSliceLeaky(std.json.Value, a, out.written(), .{}) catch return error.OutOfMemory;
@@ -548,11 +581,10 @@ pub const Watcher = struct {
         const rules = try server.originRules(a);
         // With `.outside_roots`, the client watches the files under the root directories
         const outside_only = scope == .outside_roots;
-        const count = server.vfs.count();
-        for (0..count) |i| {
+        for (try w.classify(rules), 0..) |class, i| {
+            if (!class.watchable) continue;
+            if (outside_only and class.in_root) continue;
             const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
-            if (!server.watchable(rules, path)) continue;
-            if (outside_only and server.vfs.rootOf(rules.roots, path) != null) continue;
             try files.put(gpa, try w.key(na, path), path);
         }
         if (!outside_only) {
@@ -997,6 +1029,67 @@ fn underAny(k: []const u8, dirs: *const std.StringHashMapUnmanaged(void)) bool {
 fn isDir(io: Io, path: []const u8) bool {
     const st = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return st.kind == .directory;
+}
+
+/// What `Watcher.classify` remembers. Under the same rules, whether an interned path is watched
+/// (`Server.watchable`) and whether it is under a root directory never change (the case rule of a
+/// directory is fixed once it has been seen), so each file is classified once instead of on every
+/// recomputation; loading a project recomputes many times while it interns thousands of files.
+const Classes = struct {
+    /// The rules the files are classified under (copied into `arena`); null before the first
+    /// classification
+    rules: ?origin.Rules = null,
+    arena: std.heap.ArenaAllocator,
+    /// By FileId, for the files interned up to the last classification
+    list: std.ArrayList(Class) = .empty,
+    /// How many of them `Watcher.registerClientGlobs` has handled under `rules`
+    globs_done: u32 = 0,
+
+    const Class = packed struct(u8) {
+        watchable: bool,
+        /// Under one of `rules.roots` (only computed for watchable files)
+        in_root: bool,
+        _: u6 = 0,
+    };
+
+    fn deinit(c: *Classes, gpa: Allocator) void {
+        c.list.deinit(gpa);
+        c.arena.deinit();
+    }
+};
+
+/// Whether two sets of classification rules are the same, field by field
+fn sameRules(x: origin.Rules, y: origin.Rules) bool {
+    const info = @typeInfo(origin.Rules).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        const a = @field(x, name);
+        const b = @field(y, name);
+        switch (T) {
+            ?[]const u8 => if (a == null or b == null) {
+                if (a != null or b != null) return false;
+            } else if (!std.mem.eql(u8, a.?, b.?)) return false,
+            []const []const u8 => {
+                if (a.len != b.len) return false;
+                for (a, b) |p, q| if (!std.mem.eql(u8, p, q)) return false;
+            },
+            else => @compileError("compare the rule field " ++ name),
+        }
+    }
+    return true;
+}
+
+/// A copy of `rules` in `a`
+fn dupeRules(a: Allocator, rules: origin.Rules) Allocator.Error!origin.Rules {
+    var out: origin.Rules = .{};
+    const info = @typeInfo(origin.Rules).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        @field(out, name) = switch (T) {
+            ?[]const u8 => if (@field(rules, name)) |s| try a.dupe(u8, s) else null,
+            []const []const u8 => try dupePaths(a, @field(rules, name)),
+            else => @compileError("copy the rule field " ++ name),
+        };
+    }
+    return out;
 }
 
 /// Copies of `paths` (the list and each path) in `a`

@@ -2438,6 +2438,41 @@ test "a folder renamed on disk is registered with the client and its files follo
     try h.notify("exit", {});
 }
 
+// Prevents skipping files seen before when the root directories change: a file outside the roots
+// that a new workspace folder contains has its folders registered with the client
+test "the folders of a file under an added workspace folder are registered with the client" {
+    var first = try fixture.Project.create(&.{.{ .path = "a.zig", .text = "pub const a = 1;\n" }});
+    defer first.deinit();
+    const inner_text = "pub const innerValue: u32 = 1;\n";
+    var second = try fixture.Project.create(&.{.{ .path = "sub/inner.zig", .text = inner_text }});
+    defer second.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    const first_uri = try za.base.uri.fromPath(a, first.root);
+    const second_uri = try za.base.uri.fromPath(a, second.root);
+    _ = try h.request("initialize", .{
+        .workspaceFolders = &.{.{ .uri = first_uri, .name = "first" }},
+        .capabilities = .{ .workspace = .{ .didChangeWatchedFiles = .{ .dynamicRegistration = true } } },
+        .initializationOptions = .{ .files = .{ .watcher = "client" } },
+    });
+    try h.notify("initialized", Empty{});
+    // Outside the roots: none of its folders is registered
+    const inner_uri = try za.base.uri.fromPath(a, try second.path(a, "sub/inner.zig"));
+    try open(&h, inner_uri, inner_text);
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(!registeredGlob(&h, "**/sub"));
+
+    try h.notify("workspace/didChangeWorkspaceFolders", .{ .event = .{ .added = &.{.{ .uri = second_uri, .name = "second" }}, .removed = &[_]Empty{} } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // Registered by a background task
+    while (!registeredGlob(&h, "**/sub")) _ = try h.next();
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 // Prevents leaving files unwatched when the client rejects the registration of file watchers
 test "a client that rejects the registration of file watchers leaves the watching to the server" {
     const main_text = "const util = @import(\"util.zig\");\npub fn main() void {\n    util.add(1, 2);\n}\n";
