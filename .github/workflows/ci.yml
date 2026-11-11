@@ -102,3 +102,64 @@ jobs:
       # uses LLVM and also has higher throughput. 50K runs per fuzz target.
       - name: zig build test --fuzz
         run: zig build test -Doptimize=ReleaseSafe --fuzz=50K
+
+  editors:
+    name: Editor integrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      ZIG_ANALYZER: ${{ github.workspace }}/zig-out/bin/zig-analyzer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: editors
+      # The smoke tests open editors/test-project, which the server loads with the zig in PATH
+      - name: Build the server
+        run: zig build
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - name: VS Code extension
+        working-directory: editors/vscode
+        run: |
+          npm ci
+          npm run typecheck
+          npm run check-settings
+          xvfb-run -a npm test
+      - name: Zed extension
+        working-directory: editors/zed
+        run: |
+          rustup target add wasm32-wasip2
+          cargo test
+          cargo build --release --target wasm32-wasip2
+      - name: Neovim plugin
+        run: |
+          curl -fsSL https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-linux-x86_64.tar.gz | tar -xz -C "$RUNNER_TEMP"
+          XDG_STATE_HOME="$RUNNER_TEMP/nvim-state" "$RUNNER_TEMP/nvim-linux-x86_64/bin/nvim" --headless --clean -u NONE -l editors/nvim/test/smoke.lua
+      # yegappan/lsp needs a newer Vim than Ubuntu's (9.1.0016): build the version the tests were
+      # written with
+      - uses: rhysd/action-setup-vim@v1
+        id: vim
+        with:
+          version: v9.2.1178
+      - name: Vim plugin (yegappan/lsp and vim-lsp)
+        # Not `VIM`: Vim reads it as the directory of its runtime files
+        env:
+          VIM_EXE: ${{ steps.vim.outputs.executable }}
+        run: |
+          "$VIM_EXE" --version | head -n 2
+          clone() { git init -q "$2" && git -C "$2" fetch -q --depth 1 "$1" "$3" && git -C "$2" checkout -q FETCH_HEAD; }
+          clone https://github.com/yegappan/lsp "$RUNNER_TEMP/yegappan-lsp" c741b2f1afb42b9f267824dac4049674908f4a41
+          clone https://github.com/prabirshrestha/vim-lsp "$RUNNER_TEMP/vim-lsp" 977e704cdbbbbc89a54f8f226d3468b0aa0405c9
+          status=0
+          for client in yegappan vimlsp; do
+            dir="$RUNNER_TEMP/yegappan-lsp"; [ "$client" = vimlsp ] && dir="$RUNNER_TEMP/vim-lsp"
+            ZA_CLIENT=$client ZA_CLIENT_DIR="$dir" ZA_RESULT="$RUNNER_TEMP/vim-$client.txt" \
+              timeout 600 "$VIM_EXE" -N -u NONE -i NONE --not-a-term -S editors/vim/test/smoke.vim > /dev/null || status=1
+            cat "$RUNNER_TEMP/vim-$client.txt" || status=1
+          done
+          exit $status

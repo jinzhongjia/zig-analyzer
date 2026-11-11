@@ -28,6 +28,8 @@ See `:help zig-analyzer` for the settings and commands, and `:checkhealth zig-an
 
 ## Test
 
+The smoke test opens a copy of `editors/test-project` and needs Zig 0.17 in `PATH`:
+
 ```sh
 XDG_STATE_HOME=$(mktemp -d) ZIG_ANALYZER=/path/to/zig-analyzer nvim --headless --clean -u NONE -l test/smoke.lua
 ```
