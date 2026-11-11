@@ -18,6 +18,8 @@ The scope of references, rename, reference-editing fixes, and workspace symbol: 
 
 References, rename, and those fixes that meet a walk scheduled or in progress wait until the walks scheduled up to then have finished and then answer, so a change on disk just before the request does not make them fail. Walks scheduled during the wait are for changes noticed after the request and are not waited for, so the wait ends even while source files keep being created. Before the first walk is scheduled and during a project's first load, they fail with that reason rather than returning partial results. Local names and non-`pub` declarations other than fields are exempt, since only their file can refer to them.
 
+Files of a sub-project (an example or benchmark under the root whose `build.zig.zon` depends on the root by `.path`, see "Sub-projects" in `design.md`) refer to the root's declarations only through their own build. When a sub-project whose project is not loaded has a file with the name being searched for in its `FileIndex`, the request starts that project, waits for its first load, and runs again, so renaming a library function also renames its calls in the examples. A sub-project still not loaded then (its project failed to load or cannot be started, or `build.sub_projects` is off) makes rename and those fixes fail with its directory and the reason; find references lists the references it found.
+
 ## Rename
 
 Only user code is modified. A rename whose references reach a dependency library or a stale copy in `.zig-cache` / `zig-pkg` is refused: a fetched package is restored from its hash, and the Zig installation is shared.

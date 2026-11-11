@@ -1313,6 +1313,242 @@ test "files of a project outside the workspace: not compiled alone, a hint until
     try shutdown(&h);
 }
 
+/// A library whose examples are projects of their own: hello depends on the library by `.path`,
+/// chain depends on hello (and so on the library through it), other has no `.path` dependency
+const sub_projects = [_]fixture.File{
+    .{ .path = "lib/build.zig", .text =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const lib = b.addModule("lib", .{ .root_source_file = b.path("src/root.zig"), .target = b.graph.host });
+    \\    b.step("check", "Check").dependOn(&b.addObject(.{ .name = "lib", .root_module = lib }).step);
+    \\}
+    \\
+    },
+    .{ .path = "lib/build.zig.zon", .text = ".{ .name = .lib, .version = \"0.0.0\", .fingerprint = 0xa90f3bcc12340001, .minimum_zig_version = \"0.17.0\", .paths = .{\"\"} }\n" },
+    .{ .path = "lib/src/root.zig", .text = sub_lib_root },
+    .{ .path = "lib/examples/hello/build.zig", .text =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const hello = b.addModule("hello", .{
+    \\        .root_source_file = b.path("hello.zig"),
+    \\        .target = b.graph.host,
+    \\        .imports = &.{.{ .name = "lib", .module = b.dependency("lib", .{}).module("lib") }},
+    \\    });
+    \\    b.step("check", "Check").dependOn(&b.addObject(.{ .name = "hello", .root_module = hello }).step);
+    \\}
+    \\
+    },
+    .{ .path = "lib/examples/hello/build.zig.zon", .text = ".{ .name = .hello, .version = \"0.0.0\", .fingerprint = 0x3610a68612340002, .minimum_zig_version = \"0.17.0\", " ++
+        ".dependencies = .{ .lib = .{ .path = \"../..\" } }, .paths = .{\"\"} }\n" },
+    .{ .path = "lib/examples/hello/hello.zig", .text = sub_hello },
+    .{ .path = "lib/examples/chain/build.zig", .text =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const root = b.createModule(.{
+    \\        .root_source_file = b.path("chain.zig"),
+    \\        .target = b.graph.host,
+    \\        .imports = &.{.{ .name = "hello", .module = b.dependency("hello", .{}).module("hello") }},
+    \\    });
+    \\    b.step("check", "Check").dependOn(&b.addObject(.{ .name = "chain", .root_module = root }).step);
+    \\}
+    \\
+    },
+    .{ .path = "lib/examples/chain/build.zig.zon", .text = ".{ .name = .chain, .version = \"0.0.0\", .fingerprint = 0xb10218ca12340003, .minimum_zig_version = \"0.17.0\", " ++
+        ".dependencies = .{ .hello = .{ .path = \"../hello\" } }, .paths = .{\"\"} }\n" },
+    .{ .path = "lib/examples/chain/chain.zig", .text = "const hello = @import(\"hello\");\nexport fn twice() u32 {\n    return hello.lib.handle(2);\n}\n" },
+    .{ .path = "lib/examples/other/build.zig", .text =
+    \\const std = @import("std");
+    \\pub fn build(b: *std.Build) void {
+    \\    const root = b.createModule(.{ .root_source_file = b.path("other.zig"), .target = b.graph.host });
+    \\    b.step("check", "Check").dependOn(&b.addObject(.{ .name = "other", .root_module = root }).step);
+    \\}
+    \\
+    },
+    .{ .path = "lib/examples/other/build.zig.zon", .text = ".{ .name = .other, .version = \"0.0.0\", .fingerprint = 0xd958352012340004, .minimum_zig_version = \"0.17.0\", .paths = .{\"\"} }\n" },
+    .{ .path = "lib/examples/other/other.zig", .text = "pub fn handle() void {}\nexport fn other() void {\n    handle();\n}\n" },
+};
+const sub_lib_root = "pub fn handle(x: u32) u32 {\n    return x + 1;\n}\n";
+const sub_hello = "pub const lib = @import(\"lib\");\nexport fn entry() u32 {\n    return lib.handle(1);\n}\n";
+
+/// Names of the root directories of the projects whose module graph has the file, sorted and
+/// separated by spaces
+fn projectsOf(h: *Harness, file_uri: []const u8) ![]const u8 {
+    const a = h.arena.allocator();
+    const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = file_uri } })).object.get("result").?.object;
+    var names: std.ArrayList([]const u8) = .empty;
+    for (status.get("projects").?.array.items) |p| try names.append(a, std.fs.path.basename(p.object.get("root").?.string));
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lessThan);
+    return std.mem.join(a, " ", names.items);
+}
+
+fn fileContextOf(h: *Harness, file_uri: []const u8) ![]const u8 {
+    const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = file_uri } })).object.get("result").?.object;
+    return status.get("context").?.string;
+}
+
+/// Renames `handle` in the library's root file to `process`, and checks the edits: the library, and
+/// hello and chain, which call it; not other, which has a `handle` of its own
+fn expectSubProjectsRenamed(h: *Harness, uris: struct { root: []const u8, hello: []const u8, chain: []const u8, other: []const u8 }) !void {
+    const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = uris.root }, .position = .{ .line = 0, .character = 7 }, .newName = "process" });
+    if (resp.object.get("error")) |e| {
+        std.debug.print("rename failed: {s}\n", .{e.object.get("message").?.string});
+        return error.TestUnexpectedResult;
+    }
+    const changes = resp.object.get("result").?.object.get("changes").?.object;
+    if (changes.count() != 3) {
+        for (changes.keys()) |k| std.debug.print("edited: {s}\n", .{k});
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(changes.get(uris.other) == null);
+    for ([_]struct { []const u8, i64, i64 }{ .{ uris.root, 0, 7 }, .{ uris.hello, 2, 15 }, .{ uris.chain, 2, 21 } }) |expected| {
+        const edits = changes.get(expected[0]).?.array.items;
+        try testing.expectEqual(1, edits.len);
+        const start = edits[0].object.get("range").?.object.get("start").?.object;
+        try testing.expectEqual(expected[1], start.get("line").?.integer);
+        try testing.expectEqual(expected[2], start.get("character").?.integer);
+        try testing.expectEqualStrings("process", edits[0].object.get("newText").?.string);
+    }
+}
+
+test "sub-projects: loaded when their files are opened and when rename or find references need them" {
+    var project = try fixture.Project.create(&sub_projects);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, try project.path(a, "lib"), false);
+    const hello_uri = try open(&h, try project.path(a, "lib/examples/hello/hello.zig"), sub_hello);
+    try waitIdle(&h);
+    // Opening a file of hello loads its project: `@import("lib")` resolves, and the file is not
+    // treated as a file of the library's project
+    try testing.expectEqualStrings("project", try fileContextOf(&h, hello_uri));
+    try testing.expectEqualStrings("hello", try projectsOf(&h, hello_uri));
+    try testing.expect(std.mem.endsWith(u8, try definitionPath(&h, hello_uri, sub_hello, "handle"), "root.zig"));
+    try expectDiagnostics(try h.diagnostics(), "hello.zig", &.{});
+    // No file of chain is open: its project is not loaded yet
+    const chain_uri = try za.base.uri.fromPath(a, try project.path(a, "lib/examples/chain/chain.zig"));
+    const other_uri = try za.base.uri.fromPath(a, try project.path(a, "lib/examples/other/other.zig"));
+    try testing.expectEqualStrings("", try projectsOf(&h, chain_uri));
+
+    // Rename waits for chain, which mentions the name, to load, and edits its use too. Prevents
+    // renaming the library's function while the examples keep calling the old name.
+    const root_uri = try open(&h, try project.path(a, "lib/src/root.zig"), sub_lib_root);
+    try expectSubProjectsRenamed(&h, .{ .root = root_uri, .hello = hello_uri, .chain = chain_uri, .other = other_uri });
+    try testing.expectEqualStrings("chain", try projectsOf(&h, chain_uri));
+    // other mentions the name too, but has no `.path` dependency on the library: never loaded
+    try testing.expectEqualStrings("", try projectsOf(&h, other_uri));
+    {
+        const resp = try h.request("textDocument/references", .{ .textDocument = .{ .uri = root_uri }, .position = .{ .line = 0, .character = 7 }, .context = .{ .includeDeclaration = true } });
+        try testing.expectEqual(3, resp.object.get("result").?.array.items.len);
+    }
+
+    // Removing the workspace folder stops the projects of its sub-projects with its own
+    const lib_uri = try za.base.uri.fromPath(a, try project.path(a, "lib"));
+    try h.notify("workspace/didChangeWorkspaceFolders", .{ .event = .{ .added = &[_]Empty{}, .removed = &.{.{ .uri = lib_uri, .name = "lib" }} } });
+    try waitIdle(&h);
+    try testing.expectEqualStrings("", try projectsOf(&h, hello_uri));
+    try testing.expectEqualStrings("", try projectsOf(&h, chain_uri));
+    try shutdown(&h);
+}
+
+test "sub-projects: with build.sub_projects off, a hint on their files and rename refuses names they mention" {
+    var project = try fixture.Project.create(&sub_projects);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initializeWith(&h, try project.path(a, "lib"), false, try jsonValue(&h,
+        \\{"build": {"sub_projects": false}}
+    ));
+    const hello_uri = try open(&h, try project.path(a, "lib/examples/hello/hello.zig"), sub_hello);
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "hello.zig", &.{"0:0 zig-analyzer: this file belongs to the sub-project at"});
+    try testing.expectEqualStrings("unloaded_project", try fileContextOf(&h, hello_uri));
+    try testing.expectEqualStrings("", try projectsOf(&h, hello_uri));
+
+    // The uses in hello and chain are not known: rename fails rather than leave them behind, and
+    // find references lists what it knows
+    const root_uri = try open(&h, try project.path(a, "lib/src/root.zig"), sub_lib_root);
+    {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = root_uri }, .position = .{ .line = 0, .character = 7 }, .newName = "process" });
+        const message = (resp.object.get("error") orelse return error.TestUnexpectedResult).object.get("message").?.string;
+        try testing.expect(std.mem.startsWith(u8, message, "cannot rename `handle` to `process`: files of the sub-project at "));
+        try testing.expect(std.mem.endsWith(u8, message, " mention it, but sub-projects are not loaded (`build.sub_projects` is off), so its uses there are not known"));
+    }
+    {
+        const resp = try h.request("textDocument/references", .{ .textDocument = .{ .uri = root_uri }, .position = .{ .line = 0, .character = 7 }, .context = .{ .includeDeclaration = true } });
+        try testing.expectEqual(1, resp.object.get("result").?.array.items.len);
+    }
+
+    // Turned on: hello, which has an open file, loads, and rename loads chain
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
+        \\{"zig-analyzer": {"build": {"sub_projects": true}}}
+    ) });
+    try waitIdle(&h);
+    try expectDiagnostics(try h.diagnostics(), "hello.zig", &.{});
+    try testing.expectEqualStrings("hello", try projectsOf(&h, hello_uri));
+    const chain_uri = try za.base.uri.fromPath(a, try project.path(a, "lib/examples/chain/chain.zig"));
+    const other_uri = try za.base.uri.fromPath(a, try project.path(a, "lib/examples/other/other.zig"));
+    try expectSubProjectsRenamed(&h, .{ .root = root_uri, .hello = hello_uri, .chain = chain_uri, .other = other_uri });
+
+    // Off again: their projects stop
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
+        \\{"zig-analyzer": {"build": {"sub_projects": false}}}
+    ) });
+    try waitIdle(&h);
+    try testing.expectEqualStrings("", try projectsOf(&h, hello_uri));
+    try testing.expectEqualStrings("", try projectsOf(&h, chain_uri));
+    try shutdown(&h);
+}
+
+test "sub-projects: rename refuses names that a sub-project whose project failed to load mentions" {
+    // The library and hello, plus an example whose build.zig does not compile
+    const files = sub_projects[0..6].* ++ [_]fixture.File{
+        .{ .path = "lib/examples/broken/build.zig", .text =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b;
+        \\    missing_name();
+        \\}
+        \\
+        },
+        .{ .path = "lib/examples/broken/build.zig.zon", .text = ".{ .name = .broken, .version = \"0.0.0\", .fingerprint = 0xe2abac7412340005, .minimum_zig_version = \"0.17.0\", " ++
+            ".dependencies = .{ .lib = .{ .path = \"../..\" } }, .paths = .{\"\"} }\n" },
+        .{ .path = "lib/examples/broken/broken.zig", .text = "const lib = @import(\"lib\");\nexport fn entry() u32 {\n    return lib.handle(3);\n}\n" },
+    };
+    var project = try fixture.Project.create(&files);
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&h, try project.path(a, "lib"), false);
+    const root_uri = try open(&h, try project.path(a, "lib/src/root.zig"), sub_lib_root);
+    try waitIdle(&h);
+    // Twice: the first waits for both sub-projects to load, the second finds the failed one
+    // without waiting
+    for (0..2) |_| {
+        const resp = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = root_uri }, .position = .{ .line = 0, .character = 7 }, .newName = "process" });
+        const message = (resp.object.get("error") orelse return error.TestUnexpectedResult).object.get("message").?.string;
+        try testing.expect(std.mem.startsWith(u8, message, "cannot rename `handle` to `process`: files of the sub-project at "));
+        try testing.expect(std.mem.endsWith(u8, message, "broken mention it, but its project failed to load, so its uses there are not known"));
+    }
+    // hello loaded during the wait: find references lists the uses it knows
+    const hello_uri = try za.base.uri.fromPath(a, try project.path(a, "lib/examples/hello/hello.zig"));
+    try testing.expectEqualStrings("hello", try projectsOf(&h, hello_uri));
+    {
+        const resp = try h.request("textDocument/references", .{ .textDocument = .{ .uri = root_uri }, .position = .{ .line = 0, .character = 7 }, .context = .{ .includeDeclaration = true } });
+        try testing.expectEqual(2, resp.object.get("result").?.array.items.len);
+    }
+    try shutdown(&h);
+}
+
 test "single-file mode: errors in imported files are published on them and cleared after a fix" {
     const a_text =
         \\const b = @import("b.zig");

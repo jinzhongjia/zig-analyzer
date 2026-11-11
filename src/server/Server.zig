@@ -495,6 +495,9 @@ pub const HandlerError = error{
     /// A scan of the root directories is scheduled or running, so the search scope may lack files:
     /// the request waits for the scans scheduled so far and runs again (see `scopeIncomplete`)
     ScanPending,
+    /// Sub-projects whose files may refer to the symbol are not loaded: the request starts their
+    /// projects, waits until they have loaded, and runs again (see `subProjectGap`)
+    SubProjectsPending,
 };
 
 /// Initializes in place: the query engine holds a pointer to `server.env`, so the Server must not
@@ -941,11 +944,14 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
                 if (server.waitSymbolIndex(pending) or waited_for_projects) pending.since = server.db.mark(pending.since.inputs);
             }
             server.testGate(method, .before_read, pending);
-            while (true) switch (attempt(server, pending, params, waited_for_projects)) {
+            var sub_projects: SubProjectWait = .{ .arena = arena.allocator() };
+            while (true) switch (attempt(server, pending, params, waited_for_projects, &sub_projects)) {
                 .answered => return,
                 .again => server.db.waitPendingWrites(),
                 // Outside the read transaction: the scan's write waits for read transactions
                 .after_scans => server.waitScans(pending),
+                // Likewise: loading a project writes the module graph
+                .after_sub_projects => server.loadSubProjects(pending, &sub_projects),
             };
         }
 
@@ -955,9 +961,12 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             again,
             /// Run again after the scans scheduled so far (see `HandlerError.ScanPending`)
             after_scans,
+            /// Run again once the sub-projects recorded have loaded (see
+            /// `HandlerError.SubProjectsPending`)
+            after_sub_projects,
         };
 
-        fn attempt(server: *Server, pending: *Pending, params: Params, waited_for_projects: bool) Next {
+        fn attempt(server: *Server, pending: *Pending, params: Params, waited_for_projects: bool, sub_projects: *SubProjectWait) Next {
             var attempt_arena: std.heap.ArenaAllocator = .init(server.gpa);
             defer attempt_arena.deinit();
             const a = attempt_arena.allocator();
@@ -983,9 +992,12 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             var r: Resolver = .{ .ctx = &ctx, .arena = a };
             handler_scans_awaited = pending.scans_awaited;
             defer handler_scans_awaited = 0;
-            const result = func(server, &r, a, params) catch |err| return failed(server, &ctx, pending, err);
+            sub_projects.dirs.clearRetainingCapacity();
+            handler_sub_projects = sub_projects;
+            defer handler_sub_projects = null;
+            const result = func(server, &r, a, params) catch |err| return failed(server, &ctx, pending, sub_projects, err);
             // As in ReadTask: a handler that swallowed `Canceled` has an incomplete result
-            ctx.checkCanceled() catch |err| return failed(server, &ctx, pending, err);
+            ctx.checkCanceled() catch |err| return failed(server, &ctx, pending, sub_projects, err);
             if (comptime isOutcome(@TypeOf(result))) switch (result) {
                 .ok => |v| server.sendResponse(pending.id, v),
                 .failed => |message| server.sendError(pending.id, jsonrpc.error_codes.request_failed, message),
@@ -993,10 +1005,14 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             return .answered;
         }
 
-        fn failed(server: *Server, ctx: *const Db.Ctx, pending: *const Pending, err: anyerror) Next {
+        fn failed(server: *Server, ctx: *const Db.Ctx, pending: *const Pending, sub_projects: *const SubProjectWait, err: anyerror) Next {
+            const go_on = !pending.cancel.load(.acquire) and !server.isShuttingDown();
             // Waits once: after the wait, the scans it waited for are enough (see `scopeIncomplete`),
             // so the scope is still incomplete only when the wait was cut short
-            if (err == error.ScanPending and pending.scans_awaited == 0 and !pending.cancel.load(.acquire) and !server.isShuttingDown()) return .after_scans;
+            if (err == error.ScanPending and pending.scans_awaited == 0 and go_on) return .after_scans;
+            // Likewise once: sub-projects still not loaded after the wait are left out (see
+            // `subProjectGap`), which does not report them again
+            if (err == error.SubProjectsPending and !sub_projects.awaited and go_on) return .after_sub_projects;
             return if (server.answerFailure(ctx, pending, err)) .answered else .again;
         }
     };
@@ -1456,6 +1472,26 @@ fn wakeScanWaiters(server: *Server) void {
     server.scan_wait_mutex.lockUncancelable(server.io);
     defer server.scan_wait_mutex.unlock(server.io);
     server.scan_wait_cond.broadcast(server.io);
+}
+
+/// Starts the projects of the sub-projects recorded in `wait` (see `subProjectGap`) and waits until
+/// none of them is loading, or until `pending` is canceled or the server shuts down. The request
+/// then runs again with `wait.awaited` set.
+fn loadSubProjects(server: *Server, pending: *const Pending, wait: *SubProjectWait) void {
+    wait.awaited = true;
+    for (wait.dirs.items) |dir| {
+        log.info("{s}: loading the sub-project, whose files may refer to the symbol", .{dir});
+        server.startWorkspace(dir);
+    }
+    server.project_wait_mutex.lockUncancelable(server.io);
+    defer server.project_wait_mutex.unlock(server.io);
+    while (!pending.cancel.load(.acquire) and !server.isShuttingDown()) {
+        const loading = for (wait.dirs.items) |dir| {
+            if (server.subProjectState(dir) == .loading) break true;
+        } else false;
+        if (!loading) return;
+        server.project_wait_cond.wait(server.io, &server.project_wait_mutex) catch return;
+    }
 }
 
 /// One scan: updates `WorkspaceFiles` when the files found differ, and then indexes them for
@@ -6661,9 +6697,10 @@ threadlocal var handler_scans_awaited: u64 = 0;
 
 /// Why the search scope may lack files that refer to a declaration right now, or null: the first
 /// scan of the root directories has not been scheduled yet (startup has not ended), or a project is
-/// still in its first load (until then, which files belong to it and what its imports by name
-/// resolve to are not known). Find references, rename and the fixes that edit references fail with
-/// this reason instead of returning partial results. While a scan is scheduled or running (source
+/// of a root directory is still in its first load (until then, which files belong to it and what
+/// its imports by name resolve to are not known; sub-projects are handled by `subProjectGap`).
+/// Find references, rename and the fixes that edit references fail with this reason instead of
+/// returning partial results. While a scan is scheduled or running (source
 /// files may have changed since the last one, see `scheduleScan`), returns `error.ScanPending`
 /// instead: the request waits for the scans scheduled so far, which takes a moment, and runs again
 /// (see `waitScans`). Once it has waited, the scans it waited for are enough.
@@ -6671,10 +6708,117 @@ fn scopeIncomplete(server: *Server) error{ScanPending}!?[]const u8 {
     const scheduled = server.scan_generation.load(.acquire);
     if (scheduled == 0)
         return "the workspace folders are still being searched for source files, so not all files that may refer to it are known yet";
-    if (server.projectsLoading()) return "the project is still loading, so not all files that may refer to it are known yet";
+    if (server.rootProjectsLoading()) return "the project is still loading, so not all files that may refer to it are known yet";
     const needed = if (handler_scans_awaited != 0) handler_scans_awaited else scheduled;
     if (server.scan_done.load(.acquire) < needed) return error.ScanPending;
     return null;
+}
+
+/// A project of a root directory is still in its first load (see `projectsLoading`)
+fn rootProjectsLoading(server: *Server) bool {
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    for (server.workspaces.items) |ws| if (ws.isLoading() and server.isProjectRoot(ws.root)) return true;
+    return false;
+}
+
+/// Sub-projects whose projects a semantic request starts and waits for before it runs again (see
+/// `subProjectGap`)
+const SubProjectWait = struct {
+    /// Lives as long as the request
+    arena: Allocator,
+    dirs: std.ArrayList([]const u8) = .empty,
+    /// The request has waited for them: it does not wait again
+    awaited: bool = false,
+};
+
+/// The `SubProjectWait` of the semantic request whose handler runs on this thread (see
+/// `SemanticTask`); null for other handlers
+threadlocal var handler_sub_projects: ?*SubProjectWait = null;
+
+/// What a request does with the references it finds (see `scopeIncompleteFor`)
+const ScopeUse = enum {
+    /// Lists them: uses in sub-projects that cannot be loaded are left out, as are those in a
+    /// project that failed to load
+    find,
+    /// Edits them: fails instead of leaving uses in such sub-projects behind
+    edit,
+};
+
+const SubProjectState = enum { loaded, loading, failed, unloaded };
+
+/// State of the project of sub-project `dir`: `loaded` once it takes part in the module graph,
+/// `failed` when its first load ended without (build.zig has errors, the build graph cannot be
+/// read)
+fn subProjectState(server: *Server, dir: []const u8) SubProjectState {
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    const ws = server.visibleFor(dir) orelse return .unloaded;
+    if (ws.isLoading()) return .loading;
+    if (ws.inModuleGraph()) return .loaded;
+    // Restarted after the first load failed: the new instance is loading
+    if (ws.successor) |fresh| if (fresh.isLoading()) return .loading;
+    return .failed;
+}
+
+/// Why the references of a declaration named `name` in sub-projects (see `sub_projects`) cannot all
+/// be found now, or null. A sub-project matters when one of its files in the search scope mentions
+/// the name: its files resolve their imports by name (`@import("lib")`) only once its project has
+/// loaded, and until then they are not known to reach the declaration. With `build.sub_projects`
+/// on, the first time such sub-projects are not loaded, they are recorded in
+/// `handler_sub_projects` and `error.SubProjectsPending` is returned: the request starts their
+/// projects, waits until they have loaded, and runs again (see `loadSubProjects`). A sub-project
+/// still not loaded then (its project failed to load or could not be started, or the wait was cut
+/// short), or not loaded with the setting off, leaves its uses out: `find` goes on without them,
+/// and `edit` fails with the reason.
+fn subProjectGap(server: *Server, r: *Resolver, name: []const u8, use: ScopeUse) !?[]const u8 {
+    if (!server.buildFlags().build) return null;
+    const dirs = blk: {
+        server.roots_mutex.lockUncancelable(server.io);
+        defer server.roots_mutex.unlock(server.io);
+        const dirs = try r.arena.alloc([]const u8, server.sub_projects.items.len);
+        for (dirs, server.sub_projects.items) |*d, s| d.* = try r.arena.dupe(u8, s);
+        break :blk dirs;
+    };
+    var scope: ?[]const Vfs.FileId = null;
+    const Missing = struct { dir: []const u8, state: SubProjectState };
+    var missing: std.ArrayList(Missing) = .empty;
+    for (dirs) |dir| {
+        const state = server.subProjectState(dir);
+        if (state == .loaded) continue;
+        if (scope == null) scope = try server.searchScope(r);
+        if (!try server.mentionedUnder(r, scope.?, dir, name)) continue;
+        try missing.append(r.arena, .{ .dir = dir, .state = state });
+    }
+    if (missing.items.len == 0) return null;
+    const enabled = server.sub_projects_enabled.load(.acquire);
+    // A project that failed to load stays so until build.zig changes: waiting would not help
+    if (enabled) if (handler_sub_projects) |wait| if (!wait.awaited) {
+        for (missing.items) |m| if (m.state != .failed) try wait.dirs.append(wait.arena, try wait.arena.dupe(u8, m.dir));
+        if (wait.dirs.items.len != 0) return error.SubProjectsPending;
+    };
+    if (use == .find) return null;
+    const m = missing.items[0];
+    const why = if (!enabled) "sub-projects are not loaded (`build.sub_projects` is off)" else switch (m.state) {
+        .loaded => unreachable,
+        .loading => "its project is still loading",
+        .failed => "its project failed to load",
+        .unloaded => "its project could not be started",
+    };
+    return try std.fmt.allocPrint(r.arena, "files of the sub-project at {s} mention it, but {s}, so its uses there are not known", .{ m.dir, why });
+}
+
+/// Whether a file of `scope` under directory `dir` has an identifier `name`: the same filter that
+/// find references applies to candidate files (see `FileIndex`), so a file without one has none of
+/// its references. build.zig.zon files are skipped: the build system gives their fields (`.name`,
+/// `.path`, ...), which do not refer to declarations.
+fn mentionedUnder(server: *Server, r: *Resolver, scope: []const Vfs.FileId, dir: []const u8, name: []const u8) !bool {
+    for (scope) |f| {
+        const path = server.vfs.path(f);
+        if (!server.vfs.isUnder(path, dir) or std.mem.eql(u8, std.fs.path.basename(path), "build.zig.zon")) continue;
+        if ((try r.ctx.get(za.syntax.FileIndex.Query, f)).contains(name)) return true;
+    }
+    return false;
 }
 
 /// Scope of find references and workspace symbol: project files in the module graph (excluding the
@@ -6714,11 +6858,13 @@ fn symbolsAtPosition(server: *Server, r: *Resolver, arena: Allocator, document_u
     return .{ .symbols = symbols, .file = at.file };
 }
 
-/// Why the references of `symbol` cannot all be found now (see `scopeIncomplete`); null also when
-/// only its own file can refer to it
-fn scopeIncompleteFor(server: *Server, r: *Resolver, symbol: za.ide_db.search.Symbol) !?[]const u8 {
-    if (!try ownFileOnly(r, symbol)) return server.scopeIncomplete();
-    return null;
+/// Why the references of `symbol` cannot all be found now (see `scopeIncomplete` and
+/// `subProjectGap`); null also when only its own file can refer to it
+fn scopeIncompleteFor(server: *Server, r: *Resolver, symbol: za.ide_db.search.Symbol, use: ScopeUse) !?[]const u8 {
+    if (try ownFileOnly(r, symbol)) return null;
+    if (try server.scopeIncomplete()) |reason| return reason;
+    const name = try za.ide_db.search.symbolName(r, symbol) orelse return null;
+    return server.subProjectGap(r, name, use);
 }
 
 /// Whether only the file of `symbol` can refer to it: local names, labels, and declarations without
@@ -6749,7 +6895,7 @@ const RangeMapper = struct {
 
 fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!Outcome(types.ResultType("textDocument/references")) {
     const found = try server.symbolsAtPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
-    for (found.symbols) |symbol| if (try server.scopeIncompleteFor(r, symbol)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot find all references: {s}", .{reason}) };
+    for (found.symbols) |symbol| if (try server.scopeIncompleteFor(r, symbol, .find)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot find all references: {s}", .{reason}) };
     const refs = try za.ide_db.search.symbolsReferences(r, found.symbols, .{ .scope = try server.searchScope(r) });
     var out: std.ArrayList(types.Location) = .empty;
     var m: RangeMapper = .{ .server = server, .r = r };
@@ -6967,7 +7113,7 @@ fn checkedErrorRename(server: *Server, r: *Resolver, arena: Allocator, file: Vfs
 /// a file that mentions the name has syntax errors.
 fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, symbol: za.ide_db.search.Symbol, old: []const u8, new: []const u8) !Outcome([]const za.ide_db.search.Reference) {
     if (symbol == .def) if (try ide.rename.stdRootLookup(r, symbol.def)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    if (try server.scopeIncompleteFor(r, symbol)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s}", .{ old, new, reason }) };
+    if (try server.scopeIncompleteFor(r, symbol, .edit)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s}", .{ old, new, reason }) };
     const scope = try server.searchScope(r);
     var ambiguous: ?za.ide_db.search.Reference = null;
     var uncertain: ?za.ide_db.search.Reference = null;
@@ -7397,7 +7543,7 @@ fn removeParamAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: [
 /// are not updated.
 fn removeParamEdit(server: *Server, r: *Resolver, arena: Allocator, t: ide.remove_param.Target) !Outcome(types.WorkspaceEdit) {
     const fn_name = (try r.itemTree(t.file)).items[t.item].name orelse "";
-    if (try server.scopeIncompleteFor(r, .{ .def = .{ .item = .{ .file = t.file, .item = t.item } } })) |reason|
+    if (try server.scopeIncompleteFor(r, .{ .def = .{ .item = .{ .file = t.file, .item = t.item } } }, .edit)) |reason|
         return .{ .failed = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`: {s}", .{ t.name, reason }) };
     const prefix = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`", .{t.name});
     switch (try ide.remove_param.edits(r, t, try server.searchScope(r))) {
@@ -7637,9 +7783,9 @@ fn sendHandlerError(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_
             server.sendError(id, jsonrpc.error_codes.content_modified, "content modified"),
         error.InvalidParams => server.sendError(id, jsonrpc.error_codes.invalid_params, "invalid params"),
         error.InvalidIdentifier => server.sendError(id, jsonrpc.error_codes.request_failed, "new name is not a valid identifier"),
-        // Answered only when the wait for scans was cut short, by a cancellation or the shutdown
-        // (see `SemanticTask`)
-        error.ScanPending => if (canceled_by_client)
+        // Answered only when the wait for scans or sub-projects was cut short, by a cancellation or
+        // the shutdown (see `SemanticTask`)
+        error.ScanPending, error.SubProjectsPending => if (canceled_by_client)
             server.sendError(id, jsonrpc.error_codes.request_cancelled, "request cancelled")
         else
             server.sendError(id, jsonrpc.error_codes.request_failed, "the server is shutting down"),

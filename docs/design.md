@@ -308,6 +308,15 @@ Failures:
 - A maker that exits before sending a build graph failed configure, so it is not restarted; the user is shown the stderr line with the cause (the last 64 KiB of stderr is always kept).
 - `bsp_configuration_failed` without errors (a `build.zig.zon` or package problem) takes the located errors from stderr and publishes them on `build.zig.zon`.
 
+### Sub-projects
+
+A library often keeps examples or benchmarks as projects of their own under its root, each with a `build.zig` and a `build.zig.zon` that depends on the library by `.path` (`.lib = .{ .path = "../.." }`). Their files resolve `@import("lib")` only through their own build, so the root's project cannot analyze them, and a rename in the library would leave their uses behind.
+
+- A sub-project is a directory under a root with `build.zig`, other than a root, that has a `build.zig` and whose `build.zig.zon` depends by `.path` on such a root or on another sub-project. Nested projects without such a dependency are not sub-projects: the Zig source tree has dozens of test projects, none of which depends on it, and none is loaded. Each workspace walk finds them again, and so does saving a nested `build.zig` or `build.zig.zon`.
+- With `build.sub_projects` (default on), a sub-project's project is started on demand: when one of its files is opened, and when find references, rename, or a fix that edits references needs it. The latter applies to a sub-project with a file the request's name filter matches (the identifier index find references uses; `build.zig.zon` files are skipped, since their fields are the build system's): the request records the sub-projects, starts their projects outside its read transaction, waits until their first loads have ended, and runs again. Sub-projects that mention no such name stay unloaded, so renaming in a library with many examples loads only those that use it. A started sub-project's project stays loaded like a root's.
+- A sub-project whose project failed to load is not waited for. One that is still not loaded after the wait (its project failed to load or cannot be started), or any while loading is off, leaves its uses out: rename and the fixes fail with the sub-project and the reason instead of returning a partial edit, and find references lists what it found. With loading off, its files get the unloaded-project hint.
+- Removing a root, deleting its `build.zig`, turning the setting off, or a sub-project that no longer qualifies stops the projects of the sub-projects concerned.
+
 ### Process management
 
 The maker and its children are a process group led by a watchdog `sh` on POSIX and a Job Object with `KILL_ON_JOB_CLOSE` on Windows, as is each single-file `zig build-obj`; however the server exits, they end with it. Shutdown does not wait for builds or publish their results. A maker ended this way never deletes a poisoned build graph left in `<local cache>/tmp`, so the server deletes it.

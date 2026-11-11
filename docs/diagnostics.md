@@ -56,8 +56,8 @@ Opening a file does not by itself create a compile entry point. Checked in this 
 
 1. Dependency library.
 2. Project: in some project's module graph.
-3. Project directory: under a root with `build.zig`, not in the module graph.
-4. Unloaded project: `.zig` files with a `build.zig` in an ancestor whose project is not loaded. Named imports need that project's build, so these are not compiled alone; as in rust-analyzer, a Hint suggests adding the directory to the workspace, published only after first loads finish. The search stops at `.zig-cache` and `zig-pkg`.
+3. Project directory: under a root with `build.zig`, not in the module graph. Opening a file of a sub-project (see "Sub-projects" in `design.md`) starts its project, which then usually has the file in its module graph.
+4. Unloaded project: `.zig` files with a `build.zig` in an ancestor whose project is not loaded, and files of sub-projects while `build.sub_projects` is off. Named imports need that project's build, so these are not compiled alone; as in rust-analyzer, a Hint suggests adding the directory to the workspace (or turning the setting on), published only after first loads finish. The search stops at `.zig-cache` and `zig-pkg`.
 5. Other `.zig` files are detached files, each compiled as its own root (single-file mode).
 
 ## File identity and aliasing
