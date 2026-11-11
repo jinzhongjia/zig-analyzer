@@ -61,6 +61,14 @@ minisign -Vm zig-analyzer-<version>-<target>-ReleaseSafe.tar.gz -p minisign.pub
 minizign -V -p minisign.pub -m zig-analyzer-<version>-<target>-ReleaseSafe.tar.gz
 ```
 
+每个压缩包还带有构建来源证明（build provenance attestation），可证明它是本仓库的 release workflow 从打 tag 的 commit 构建的：
+
+```sh
+gh attestation verify zig-analyzer-<version>-<target>-ReleaseSafe.tar.gz --repo jinzhongjia/zig-analyzer
+```
+
+带后缀的版本（`0.2.0-rc.1`）是预发布版本。各版本的变化见 [`CHANGELOG.md`](CHANGELOG.md)。
+
 ## 开发
 
 需要 Zig **0.17.0** 或 **0.17.1**。
