@@ -1180,9 +1180,13 @@ fn anyExceeds(ip: *InternPool, xs: []const Index, limit: u32) bool {
     return false;
 }
 
-/// Collected instances: deduplicated by instance, at most `limit` of them
+/// Collected instances: deduplicated by instance (the first call site of each is kept, in
+/// discovery order), at most `limit` of them. Closures add every instance found at every caller
+/// under every instance of that caller, so deduplication must not scan `found`.
 const Collector = struct {
     found: std.ArrayList(Found) = .empty,
+    /// The instances in `found`
+    seen: std.AutoHashMapUnmanaged(Index, void) = .empty,
     limit: usize,
     /// See `callIn`
     strict: bool = true,
@@ -1191,12 +1195,33 @@ const Collector = struct {
         return c.found.items.len >= c.limit;
     }
 
+    /// `a` must be the same allocator on every call
     fn add(c: *Collector, a: std.mem.Allocator, f: Found) std.mem.Allocator.Error!void {
         if (f.inst == null or c.full()) return;
-        for (c.found.items) |x| if (x.inst == f.inst) return;
-        try c.found.append(a, f);
+        try c.found.ensureUnusedCapacity(a, 1);
+        if ((try c.seen.getOrPut(a, f.inst.?)).found_existing) return;
+        c.found.appendAssumeCapacity(f);
     }
 };
+
+test Collector {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const at = struct {
+        fn f(inst: ?u32, expr: u32) Found {
+            return .{
+                .inst = if (inst) |i| @fromBackingInt(i) else null,
+                .owner = .{ .file = @fromBackingInt(0), .item = @fromBackingInt(0) },
+                .expr = @fromBackingInt(expr),
+            };
+        }
+    }.f;
+    var c: Collector = .{ .limit = 3 };
+    for ([_]Found{ at(7, 0), at(null, 1), at(5, 2), at(7, 3), at(5, 4), at(9, 5), at(11, 6), at(9, 7) }) |f| try c.add(a, f);
+    // The first call site of each instance, in discovery order; no more than the limit
+    try std.testing.expectEqualSlices(Found, &.{ at(7, 0), at(5, 2), at(9, 5) }, c.found.items);
+}
 
 fn collect(r: *Resolver, key: hir.OwnerKey, depth: u8, out: *Collector) resolve.Error!void {
     const tree = try r.itemTree(key.file);
