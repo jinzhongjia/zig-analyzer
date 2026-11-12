@@ -934,6 +934,48 @@ test "files of the zig installation are not standalone compilation roots during 
     }
 }
 
+test "a Zig installation under a workspace root, and any other Zig lib directory, is not compiled on its own" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // The root is laid out like a package manager's prefix (a git repository, which editors take as
+    // the root): the zig in use is installed in it, and another one besides. Their std/Build.zig
+    // files were compiled alone as user code ("file exists in modules 'std' and 'Build'")
+    var project = try fixture.Project.create(&.{.{ .path = "notes.zig", .text = "pub fn f() void {}\n" }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try project.tmp.dir.createDirPath(testing.io, "Cellar/zig/lib");
+    try project.tmp.dir.createDirPath(testing.io, "Cellar/other");
+    try project.tmp.dir.symLink(testing.io, project.env.lib_dir, "Cellar/zig/lib/zig", .{ .is_directory = true });
+    try project.tmp.dir.symLink(testing.io, project.env.lib_dir, "Cellar/other/lib", .{ .is_directory = true });
+    const lib = try project.path(a, "Cellar/zig/lib/zig");
+    const build_text = try std.Io.Dir.cwd().readFileAlloc(testing.io, try std.fs.path.join(a, &.{ project.env.std_dir, "Build.zig" }), a, .limited(4 * 1024 * 1024));
+    try initializeWith(&h, project.root, true, try settingsValue(&h, .{ .zig = .{ .lib_path = lib } }));
+    const in_use = try open(&h, try project.path(a, "Cellar/zig/lib/zig/std/Build.zig"), build_text);
+    const other = try open(&h, try project.path(a, "Cellar/other/lib/std/Build.zig"), build_text);
+    try waitIdle(&h);
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = in_use } });
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = other } });
+    try waitIdle(&h);
+    // The installation in use is the Zig installation; the other one is user code under the root,
+    // but a Zig lib directory all the same
+    for ([_]struct { []const u8, []const u8 }{ .{ in_use, "zig_lib" }, .{ other, "user" } }) |c| {
+        const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = c[0] } })).object.get("result").?.object;
+        try testing.expectEqualStrings(c[1], status.get("origin").?.string);
+        try testing.expectEqualStrings("library", status.get("context").?.string);
+        try expectNoErrors(&h, c[0]);
+    }
+    // Declarations of the installation in use cannot be renamed
+    const offset = std.mem.indexOf(u8, build_text, "pub const Cache").? + "pub const ".len;
+    const line = std.mem.count(u8, build_text[0..offset], "\n");
+    const column = offset - (std.mem.lastIndexOfScalar(u8, build_text[0..offset], '\n').? + 1);
+    const rename = try h.request("textDocument/prepareRename", .{ .textDocument = .{ .uri = in_use }, .position = .{ .line = line, .character = column } });
+    try testing.expect(rename.object.get("error") != null);
+    try shutdown(&h);
+    for (try progressTitles(&h)) |title| try testing.expect(!std.mem.startsWith(u8, title, "Compiling "));
+}
+
 test "single-file mode: errors a root reports in the standard library are published there, also once a project is added" {
     const bad =
         \\const std = @import("std");
