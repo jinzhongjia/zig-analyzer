@@ -115,6 +115,26 @@ check(joined:find('s:', 1, true), 'parameter hint enabled by the settings')
 local tokens = request('textDocument/semanticTokens/full', { textDocument = doc })
 check(tokens and #tokens.data > 0 and #tokens.data % 5 == 0, 'semantic tokens')
 
+-- A standard library file reached by going to a definition is attached to the running server: with
+-- a root of its own (the git repository of Homebrew, or none for an official archive), it started
+-- another server
+local std_defs = request('textDocument/definition', { textDocument = doc, position = pos('src/main.zig', 'std.debug.print', 10) }) or {}
+local std_def = std_defs[1] or std_defs
+local std_uri = std_def and (std_def.uri or std_def.targetUri)
+check(std_uri and std_uri:find('/std/', 1, true) ~= nil, 'definition in the standard library')
+if std_uri then
+  vim.cmd.edit(vim.uri_to_fname(std_uri))
+  local std_buf = vim.api.nvim_get_current_buf()
+  local attached
+  vim.wait(10000, function()
+    attached = vim.lsp.get_clients({ name = 'zig_analyzer', bufnr = std_buf })[1]
+    return attached ~= nil
+  end, 50)
+  check(attached and attached.id == client.id and #vim.lsp.get_clients({ name = 'zig_analyzer' }) == 1,
+    'the standard library file is attached to the running server')
+  vim.api.nvim_set_current_buf(main_buf)
+end
+
 vim.cmd.edit(path('src/shapes.zig'))
 local shapes_buf = vim.api.nvim_get_current_buf()
 request('zig-analyzer/waitIdle', nil, shapes_buf)

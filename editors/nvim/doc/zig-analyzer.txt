@@ -45,6 +45,10 @@ configuration in `lsp/zig_analyzer.lua` can also be used directly:
     vim.lsp.enable('zig_analyzer')
 <
 The workspace root is the nearest directory containing `build.zig` or `.git`.
+A file that a running server reports as a dependency library file (the Zig
+installation, a fetched package, a generated file), such as one reached by
+going to a definition in the standard library, is attached to that server
+instead of starting another one for its own root.
 
 ==============================================================================
 COMMANDS                                             *zig-analyzer-commands*
