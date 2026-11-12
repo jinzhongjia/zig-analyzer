@@ -100,11 +100,13 @@ fn enters(vfs: *Vfs, rules: origin.Rules, root: []const u8, dir: []const u8) boo
     return true;
 }
 
-/// `dir` is or lies in a local cache, a fetched package, or the global cache
+/// `dir` is or lies in a local cache, a fetched package, the global cache, or the Zig installation
+/// (unless it is Zig's own source tree, see `origin.Rules.zig_source_tree`)
 fn isLibraryDir(vfs: *Vfs, rules: origin.Rules, dir: []const u8) bool {
     for (rules.local_caches) |c| if (vfs.isUnder(dir, c)) return true;
     for (rules.packages) |p| if (vfs.isUnder(dir, p)) return true;
     if (rules.global_cache) |c| if (vfs.isUnder(dir, c)) return true;
+    if (rules.zig_lib) |l| if (!rules.zig_source_tree and vfs.isUnder(dir, l)) return true;
     return false;
 }
 
@@ -240,4 +242,34 @@ test scan {
     try testing.expectEqual(expected_dirs.len, dirs.items.len);
     for (expected_dirs, dirs.items) |e, d| try testing.expectEqualStrings(e, d);
     for (found.dirs) |d| try testing.expect(affectsScan(&vfs, rules, d));
+}
+
+test "scan: a Zig installation under a root is skipped unless it is Zig's own source tree" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "ws/main.zig", "ws/Cellar/zig/lib/zig/std/std.zig", "ws/Cellar/zig/lib/zig/std/Build.zig" }) |sub| {
+        try tmp.dir.createDirPath(testing.io, std.fs.path.dirname(sub).?);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = sub, .data = "" });
+    }
+    const base = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(base);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var vfs: Vfs = .init(testing.io, testing.allocator);
+    defer vfs.deinit();
+    const ws = try std.fs.path.join(a, &.{ base, "ws" });
+    const lib = try std.fs.path.join(a, &.{ ws, "Cellar", "zig", "lib", "zig" });
+    const build_zig = try std.fs.path.join(a, &.{ lib, "std", "Build.zig" });
+    // A package manager's prefix as the root: the installation in it is not workspace code
+    const prefix: origin.Rules = .{ .zig_lib = lib, .roots = &.{ws} };
+    const found = try scan(testing.io, a, &vfs, prefix);
+    try testing.expectEqual(1, found.files.len);
+    try testing.expectEqualStrings(try std.fs.path.join(a, &.{ ws, "main.zig" }), found.files[0]);
+    try testing.expect(!contains(&vfs, prefix, build_zig));
+    try testing.expect(!affectsScan(&vfs, prefix, try std.fs.path.join(a, &.{ lib, "std" })));
+    // Zig's own source tree: its lib directory is developed in the workspace
+    const source_tree: origin.Rules = .{ .zig_lib = lib, .zig_source_tree = true, .roots = &.{ws} };
+    try testing.expectEqual(3, (try scan(testing.io, a, &vfs, source_tree)).files.len);
+    try testing.expect(contains(&vfs, source_tree, build_zig));
 }

@@ -144,6 +144,9 @@ env_mutex: Io.Mutex = .init,
 /// configuration applied (see `applyZigPaths`). Queried in the background after startup; null
 /// until the query completes
 zig_env: ?*const ZigEnv = null,
+/// The lib directory of `zig_env` is the `lib` directory of Zig's own source tree (see
+/// `origin.Rules.zig_source_tree`); set together with it
+zig_source_tree: bool = false,
 /// `childEnviron` of `zig_env`, set together with it: the environment of the zig child processes
 /// that queries start (`zig ast-check` of live diagnostics, read through `Env`)
 zig_environ: std.atomic.Value(?*const std.process.Environ.Map) = .init(null),
@@ -2960,9 +2963,14 @@ fn watchRegistrationFailed(server: *Server) void {
 /// roots_mutex and then workspaces_mutex; must not be called inside a write transaction.
 pub fn originRules(server: *Server, arena: Allocator) Allocator.Error!origin.Rules {
     var rules: origin.Rules = .{};
-    if (server.zigEnv()) |env| {
-        rules.zig_lib = try arena.dupe(u8, env.lib_dir);
-        rules.global_cache = try arena.dupe(u8, env.global_cache_dir);
+    {
+        server.env_mutex.lockUncancelable(server.io);
+        defer server.env_mutex.unlock(server.io);
+        if (server.zig_env) |env| {
+            rules.zig_lib = try arena.dupe(u8, env.lib_dir);
+            rules.global_cache = try arena.dupe(u8, env.global_cache_dir);
+            rules.zig_source_tree = server.zig_source_tree;
+        }
     }
     rules.roots = try server.rootsAlloc(arena);
     var local_caches: std.ArrayList([]const u8) = .empty;
@@ -3543,6 +3551,7 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
         };
     };
 
+    const source_tree = if (std.fs.path.dirname(env.lib_dir)) |parent| server.hasBuildZig(parent) catch false else false;
     var change: ZigPathsChange = .{};
     var unused_builtin: ?[]u8 = default_builtin;
     {
@@ -3550,6 +3559,7 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
         defer server.env_mutex.unlock(io);
         change.env = server.zig_env != env;
         server.zig_env = env;
+        server.zig_source_tree = source_tree;
         server.zig_environ.store(env.childEnviron(), .release);
         if (!eqlOptionalStr(server.default_builtin, default_builtin)) {
             change.builtin = true;

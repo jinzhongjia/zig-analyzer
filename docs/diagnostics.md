@@ -43,7 +43,7 @@ Checked in this order (`server/origin.zig`):
 
 1. Fetched dependency packages: packages fetched by hash that contain modules (`<hash>` subdirectories of the package directory).
 2. Generated files: the global cache and each project's local cache.
-3. User code: files under a workspace root, excluding its `.zig-cache` and `zig-pkg`. A Zig installation under a root is user code, because Zig itself is being developed; a root inside the installation, such as its `std` opened as a folder, does not count.
+3. User code: files under a workspace root, excluding its `.zig-cache` and `zig-pkg`, and excluding the Zig installation in use when it lies under the root (a package manager's prefix such as Homebrew's is a git repository, which editors take as the root). The exception is Zig's own source tree, recognized by a `build.zig` next to the lib directory: there the lib directory is the code being developed. A root inside the installation, such as its `std` opened as a folder, does not count either.
 4. The Zig installation directory.
 5. User code: modules outside the roots that belong to some project (added by path, `--fork`).
 6. Other files outside the roots, in no project, are the user's files outside the workspace once the Zig installation's location is known; which other files use them is not known. Stale copies in a root's `.zig-cache` or `zig-pkg` are neither user code nor files outside the workspace.
