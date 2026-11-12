@@ -131,14 +131,17 @@ pub const FileItemTree = struct {
     pub const kind: engine.Kind = .derived;
     pub const Key = Vfs.FileId;
     pub const Value = *const ItemTree;
-    /// Bounds memory in long sessions: every visited file has one, which can reach 50 MB in a
-    /// large project (the Zig compiler sources and standard library).
+    /// Bounds memory in long sessions: every visited file has one. In the Zig compiler sources
+    /// and standard library, loading the project reads about 4,500 of them and a long session
+    /// about 5,500, about 70 MB in all; the limit keeps all of those, since an evicted tree is
+    /// read again from a new parse (loading, indexing, and the first requests after it read the
+    /// same files).
     /// Evicted ones are rebuilt on demand; when the dependencies are unchanged, the original
     /// changed_at is kept and downstream is not recomputed. When the file changed while its tree
     /// was evicted, the rebuilt tree is compared by `fingerprint`: an edit in a function body or a
     /// comment then does not recompute everything that depends on the tree
     pub const lru = 16 * 1024;
-    pub const lru_bytes = 32 * 1024 * 1024;
+    pub const lru_bytes = 128 * 1024 * 1024;
 
     pub fn bytes(v: Value) usize {
         return @sizeOf(ItemTree) + mem.arenaBytes(v.arena);
