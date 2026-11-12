@@ -52,7 +52,7 @@ Each [release](https://github.com/jinzhongjia/zig-analyzer/releases) has an arch
 | `ReleaseSafe` | Recommended. Safety checks stay on: a bug stops the server with a stack trace in the log instead of producing wrong results, and the editor restarts it. Include the log when reporting a crash. |
 | `ReleaseFast` | Safety checks off, somewhat faster. A bug may produce wrong results or crash without a trace. |
 
-Put `zig-analyzer` (`zig-analyzer.exe` on Windows) in `PATH`, or point the editor integration at it.
+Put `zig-analyzer` (`zig-analyzer.exe` on Windows) in `PATH`, or point the editor integration at it. Keep `zig-analyzer.dSYM` (macOS) or `zig-analyzer.pdb` (Windows) next to the executable: it holds the debug information that gives stack traces file names and line numbers.
 
 The archives and `SHA256SUMS` are signed with [minisign](https://jedisct1.github.io/minisign/). Verify with the public key in [`minisign.pub`](minisign.pub), using `minisign` or [`minizign`](https://github.com/jedisct1/zig-minisign):
 

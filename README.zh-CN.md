@@ -52,7 +52,7 @@ vim.lsp.enable('zig_analyzer')
 | `ReleaseSafe` | 推荐。保留安全检查：出现 bug 时服务器停止并在日志里留下栈回溯，而不是给出错误结果，编辑器会重启它。报告崩溃时请附上日志。 |
 | `ReleaseFast` | 关闭安全检查，稍快。出现 bug 时可能给出错误结果，或没有栈回溯地崩溃。 |
 
-把 `zig-analyzer`（Windows 上是 `zig-analyzer.exe`）放进 `PATH`，或在编辑器插件里配置它的路径。
+把 `zig-analyzer`（Windows 上是 `zig-analyzer.exe`）放进 `PATH`，或在编辑器插件里配置它的路径。`zig-analyzer.dSYM`（macOS）或 `zig-analyzer.pdb`（Windows）要和可执行文件放在一起：它们是调试信息，栈回溯靠它们显示文件名和行号。
 
 压缩包和 `SHA256SUMS` 用 [minisign](https://jedisct1.github.io/minisign/) 签名。用 [`minisign.pub`](minisign.pub) 里的公钥，以 `minisign` 或 [`minizign`](https://github.com/jedisct1/zig-minisign) 验证：
 

@@ -69,6 +69,18 @@ jobs:
           cache-key: release-${{ matrix.target }}-${{ matrix.optimize }}
       - name: Build the executable
         run: zig build -Doptimize=${{ matrix.optimize }} -Dtarget=${{ matrix.target }}
+      # A macOS executable keeps only references to the object files in the build cache, which do
+      # not leave this machine; dsymutil collects their DWARF into the `.dSYM` bundle that
+      # std.debug reads next to the executable, so stack traces have file names and line numbers
+      - name: Debug information for macOS
+        if: endsWith(matrix.target, '-macos')
+        run: |
+          if ! command -v dsymutil > /dev/null; then
+            ls /usr/lib/llvm-*/bin/dsymutil > /dev/null 2>&1 || { sudo apt-get update -q && sudo apt-get install -yq llvm; }
+            PATH="$(ls -d /usr/lib/llvm-*/bin | sort -V | tail -n 1):$PATH"
+          fi
+          dsymutil zig-out/bin/zig-analyzer
+          test -f zig-out/bin/zig-analyzer.dSYM/Contents/Resources/DWARF/zig-analyzer
       - name: The Windows build imports only functions Windows 10 1507 has
         if: endsWith(matrix.target, '-windows')
         run: zig build check -Doptimize=${{ matrix.optimize }} -Dtarget=${{ matrix.target }}
@@ -76,7 +88,7 @@ jobs:
         run: |
           name="zig-analyzer-$GITHUB_REF_NAME-${{ matrix.target }}-${{ matrix.optimize }}"
           mkdir -p "dist/$name"
-          cp zig-out/bin/* LICENSE README.md CHANGELOG.md "dist/$name/"
+          cp -R zig-out/bin/* LICENSE README.md CHANGELOG.md "dist/$name/"
           cd dist
           case "${{ matrix.target }}" in
             *-windows) zip -qr "$name.zip" "$name" ;;
@@ -129,6 +141,12 @@ jobs:
             *) tar -xzf *.tar.gz ;;
           esac
           cp -R "$GITHUB_WORKSPACE/editors/test-project" "$RUNNER_TEMP/test-project"
+      - name: The .dSYM bundle belongs to the executable
+        if: endsWith(matrix.target, '-macos')
+        run: |
+          dir="$RUNNER_TEMP/dist/zig-analyzer-$GITHUB_REF_NAME-${{ matrix.target }}-${{ matrix.optimize }}"
+          dwarfdump --uuid "$dir/zig-analyzer" "$dir/zig-analyzer.dSYM"
+          test "$(dwarfdump --uuid "$dir/zig-analyzer" "$dir/zig-analyzer.dSYM" | awk '{ print $2 }' | sort -u | wc -l)" -eq 1
       - name: Smoke test
         run: |
           exe="$RUNNER_TEMP/dist/zig-analyzer-$GITHUB_REF_NAME-${{ matrix.target }}-${{ matrix.optimize }}/zig-analyzer"
