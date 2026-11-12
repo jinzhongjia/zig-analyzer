@@ -10,33 +10,33 @@ Benchmark project: the Zig 0.17.0 compiler source (540k lines + standard library
 
 | Scenario | Metric | Target | Current | Status |
 |---|---|---|---|---|
-| Warm | hover / goto p95 | < 50 ms | ≤ 1.3 ms (slowest in the first round: 34 ms) | ✅ |
-| | completion p95 | < 100 ms | ≤ 1.2 ms (slowest in the first round: 13 ms) | ✅ |
-| | edit → live diagnostics | < 30 ms (excluding debounce) | ordinary files ≤ 9 ms; `Sema.zig` (35k lines) p50 177 ms (including the 50 ms debounce) | ⚠️ very large files |
-| | keystroke → hover (continuous typing) | — | `Sema.zig` p50 97 ms; other projects 5-21 ms | — |
+| Warm | hover / goto p95 | < 50 ms | ≤ 0.1 ms (slowest in the first round: 23 ms) | ✅ |
+| | completion p95 | < 100 ms | 2.5 ms (slowest in the first round: 20 ms) | ✅ |
+| | edit → live diagnostics | < 30 ms (excluding debounce) | ordinary files ≤ 9 ms; `Sema.zig` (35k lines) p50 73-76 ms including the 50 ms debounce (23-26 ms without) with the in-process AstGen, 109-133 ms with `zig ast-check` as a subprocess | ⚠️ very large files with a subprocess |
+| | keystroke → hover (continuous typing) | — | `Sema.zig` p50 13-14 ms (11-15 ms in a function body); other projects 5-21 ms | — |
 | | keystroke → name completion (typing words in a method) | — | `Sema.zig`: auto-import on p50 72-84 ms, p95 160-181 ms; off p50 43-45 ms, p95 67-73 ms (see below) | — |
 | | save → compiler diagnostics (`check` step) | < 1 s | small projects about 120 ms; Zig compiler 5.2 s | ⚠️ limited by the compiler |
-| | resident memory (long session) | does not grow over the session | Zig compiler source: heap 0.4-0.7 GB from round 40 on, RSS 0.9-1.3 GB from round 120 on (macOS, see below) | ✅ |
+| | resident memory (long session) | does not grow over the session | Zig compiler source: heap 1.7-1.8 GB and RSS 2.3-2.4 GB from round 120 on, the same after 240 rounds (macOS, see below) | ✅ |
 | Cold start | process start → `initialize` | < 100 ms | 1-9 ms | ✅ |
-| | open file → syntax features | < 200 ms | 53 ms (`Sema.zig`) | ✅ |
-| | open file → hover / goto / completion | < 3 s | project loading 1.5-4.4 s; hover is available before loading finishes (with incomplete name resolution, which the hover states; see Requests during project loading in `docs/design.md`) | ✅ |
-| | workspace symbol index (background) | < 30 s | 1.9 s | ✅ |
+| | open file → syntax features | < 200 ms | 28-30 ms (`Sema.zig`) | ✅ |
+| | open file → hover / goto / completion | < 3 s | project loading 2.5-3.1 s; hover is available before loading finishes (with incomplete name resolution, which the hover states; see Requests during project loading in `docs/design.md`) | ✅ |
+| | workspace symbol index (background) | < 30 s | 0.3 s | ✅ |
 
 Resident memory and time over a long session on the Zig compiler source (`BENCH_QUICK=1 BENCH_SESSION=160`, `src/Sema.zig`, ReleaseSafe):
 
-- macOS, 160 rounds: the session takes 140 s. RSS 0.9-1.3 GB from round 120 on, heap 636 MB at round 160, of which 426 MB are large allocations. Peak RSS 2.9-3.0 GB, with at most 1.1 GB assigned to size classes; about 73,000 pages are returned to the system over the session.
-- Linux, 160 rounds: the session takes 153 s. Heap 629 MB at round 160, of which 410 MB are large allocations. Peak RSS 2.8 GB, with at most 1.1 GB assigned to size classes; about 73,000 pages are returned to the system over the session.
+- macOS, 160 rounds: the session takes 130 s. RSS 2.3-2.4 GB from round 120 on, heap 1733 MB at round 160, of which 1341 MB are large allocations. Peak RSS 3.7 GB, with at most 1.5 GB assigned to size classes; about 93,000 pages are returned to the system over the session.
+- Linux, 160 rounds: the session takes 164 s. Heap 1758 MB at round 160, of which 1331 MB are large allocations. Peak RSS 3.5 GB, with at most 1.5 GB assigned to size classes; about 93,000 pages are returned to the system over the session.
 - Windows: not measured on the current code.
 
-The heap does not grow over the session: from round 40 on it stays between 0.4 and 0.7 GB, and falls at each reclaim of type information (rounds 14, 47, and 130 on both platforms). The peak comes from the hover that computes the largest instance closure (all instances of `Writer.printValue`, in rounds 27 and 144): it executes about 350,000 queries in one read transaction, 135,000 of them `Infer`, which holds at most 512 MB of inference results. The memory is returned to the system afterwards. The rounds that take 4 s or more (on macOS rounds 1, 3, 27, 40, 49, 60, and 144, 4-12 s each, about 30% of the session) load the project or compute large closures from scratch, after the start or after a reclaim. The edits between them do not make those closures recompute, since evicted item trees and bodies that are rebuilt unchanged keep their changed_at (see Memory reclamation in `docs/design.md`).
+The heap stops growing after round 120: from there on it stays between 1.7 and 1.8 GB on macOS (1.7-1.9 GB on Linux), and after 240 rounds it is the same (1.72 GB on macOS, 1.75 GB on Linux). Type information is reclaimed once, in round 24 on both platforms; the InternPool then grows to 581 MB and stays there, since one request adds about 315 MB of it and the reclaim waits until the type information is twice the most one request added (see Memory reclamation in `docs/design.md`). That request is the hover that computes the largest instance closure (all instances of `Writer.printValue`, in round 27): it executes about 2.2 million queries in one read transaction, 1.0 million of them `Infer`, which holds at most 512 MB of inference results. The rounds that take 4 s or more (on macOS rounds 3, 27, 40, 49, 52, and 121, 4-19 s each, about 37% of the session) load the project or compute large instance closures for the first time. The edits between them do not make those closures recompute, since evicted item trees and bodies that are rebuilt unchanged keep their changed_at (see Memory reclamation in `docs/design.md`).
 
-The allocator over 240 rounds (`BENCH_SESSION=240`; macOS, with the analyzer itself measured by `/usr/bin/time -l`): the analyzer uses 0.77 T cycles, 20 s of system time and 17.6 M page faults. About 92,000 pages are returned to the system and 82,000 taken back over the session (the same on Linux), which costs about 330,000 of the page faults and 0.3 s of system time. Nearly all other page faults come from the 1.1 million allocations above 32 KiB, which are mapped directly, 96% of them below 1 MiB. Keeping freed mappings of up to 1 MiB (16 MiB in all) for reuse by allocations of the same length removes a quarter of the page faults, but raises the peak RSS on Linux from 2.79 GB to 2.85-2.90 GB in most sessions, also with a limit of 128 or 256 KiB per mapping. The 280 segments mapped at the peak keep 4.4 MB resident once all their pages are returned (one 16 KiB system page each; 1.1 MB with 4 KiB pages).
+The allocator over 240 rounds (`BENCH_SESSION=240`; macOS, with the analyzer itself measured by `/usr/bin/time -l`): the analyzer uses 0.61 T cycles, 16 s of system time and 13.2 M page faults. About 93,000 pages are returned to the system and 80,000 taken back over the session (the same on Linux), which costs about 330,000 of the page faults and 0.3 s of system time. Nearly all other page faults come from the 0.85 million allocations above 32 KiB, which are mapped directly, 97% of them below 1 MiB. Keeping freed mappings of up to 1 MiB (16 MiB in all) for reuse by allocations of the same length removes a quarter of the page faults, but raises the peak RSS on Linux by 2-4% in most sessions, also with a limit of 128 or 256 KiB per mapping. The 385 segments mapped at the peak keep 6.0 MB resident once all their pages are returned (one 16 KiB system page each; 1.5 MB with 4 KiB pages).
 
 ## Real projects
 
 | Project (measured file) | Size | hover p50 | completion p50 | edit → diagnostics p50 | keystroke → hover p50 | Resident memory |
 |---|---|---|---|---|---|---|
-| Zig 0.17.0 compiler (`src/Sema.zig`) | 540k lines + std | 2.8 ms | 1.5 ms | 177 ms | 97 ms | 718 MB |
+| Zig 0.17.0 compiler (`src/Sema.zig`) | 540k lines + std | < 0.1 ms | 0.2 ms | 73-76 ms | 13-14 ms | 435 MB |
 | ghostty (`src/terminal/Terminal.zig`) | 370k lines | 1.6 ms | 1.2 ms | 118 ms | 21 ms | 112 MB |
 | ZLS (`src/analysis.zig`) | 57k lines | 0.7 ms | 0.5 ms | 90 ms | 16 ms | 218 MB |
 | superhtml (`src/html/Tokenizer.zig`) | 43k lines | 0.5 ms | 0.7 ms | 65 ms | 11 ms | 97 MB |
@@ -81,11 +81,11 @@ Completion after `.` has p50 2.0-2.6 ms. An expected type changes the latency on
 
 ### Naming checks
 
-On `Sema.zig`, edit → diagnostics p50 is 170 ms (169 ms when disabled), codeAction p50 is 3.8 ms, and resolving a local fix takes 68 ms. On ZLS, zigimg, and Cubyz, codeAction p50 is 1.0-1.5 ms, resolving a fix p50 12-19 ms, and the slowest cross-file one 128 ms.
+On `Sema.zig`, edit → diagnostics p50 is 84-107 ms (73-76 ms when disabled), codeAction p50 is 3.8 ms, and resolving a local fix takes 68 ms. On ZLS, zigimg, and Cubyz, codeAction p50 is 1.0-1.5 ms, resolving a fix p50 12-19 ms, and the slowest cross-file one 128 ms.
 
 ### Position conversion
 
-Requests convert positions with the cached line table of the file (`LineStarts`), built once per revision of the text. For `Sema.zig` (1.5 MB, 35,648 lines) the table takes 0.21 ms with 16-byte vectors, and counting the UTF-16 code units of the whole file 0.025 ms. In the full `lsp-bench` run on `Sema.zig` (macOS, ReleaseFast, six rounds), warm hover p50 is below 0.1 ms, goto 0.1 ms, completion 0.2 ms, and semantic tokens for a range 0.1 ms; the server uses 10.3 s of CPU time and executes 158 G instructions over the run, with a peak of 831 MB. Linux and Windows are not measured. The offsets tests cover the vector paths (NEON, SSE2, AVX2) and the byte loop that backends without vector support use.
+Requests convert positions with the cached line table of the file (`LineStarts`), built once per revision of the text. For `Sema.zig` (1.5 MB, 35,648 lines) the table takes 0.21 ms with 16-byte vectors, and counting the UTF-16 code units of the whole file 0.025 ms. In the full `lsp-bench` run on `Sema.zig` (macOS, ReleaseFast, six rounds), warm hover p50 is below 0.1 ms, goto 0.1 ms, completion 0.2 ms, and semantic tokens for a range 0.1 ms; the server uses 9.2 s of CPU time (8.1 s user) and executes 129 G instructions over the run, with a peak of 878 MB. Linux and Windows are not measured. The offsets tests cover the vector paths (NEON, SSE2, AVX2) and the byte loop that backends without vector support use.
 
 ### Hover in generic function bodies
 
@@ -93,22 +93,21 @@ Requests convert positions with the cached line table of the file (`LineStarts`)
 
 | | Instance only | `"list"` | `"full"` |
 |---|---|---|---|
-| macOS, first hover total | 67.1 s | 305.5 s | 307.9 s |
-| macOS, first hover p95 | 8.7 ms | 81.7 ms | 82.2 ms |
-| macOS, hover again p95 | 2.4 ms | 3.3 ms | 3.3 ms |
-| macOS, goto afterwards total | 248.3 s | 9.2 s | 9.4 s |
-| macOS, semantic tokens first: first hover total | 5.2 s | 124.2 s | — |
-| macOS, semantic tokens first: semantic tokens total | 627.7 s | 631.6 s | — |
-| Linux, first hover total | 78.4 s | 332.5 s | — |
-| Linux, first hover p95 | 12.8 ms | 154.2 ms | — |
-| Linux, goto afterwards total | 259.4 s | 13.0 s | — |
+| macOS, first hover total | 45.6 s | 80.9 s | 82.9 s |
+| macOS, first hover p95 | 10.5 ms | 105.1 ms | 119.6 ms |
+| macOS, hover again p95 | 2.0 ms | 3.6 ms | 3.2 ms |
+| macOS, goto afterwards total | 46.1 s | 9.3 s | 8.3 s |
+| macOS, semantic tokens first: first hover total | 6.2 s | 27.1 s | — |
+| macOS, semantic tokens first: semantic tokens total | 113.5 s | 110.3 s | — |
+| Linux, first hover total | 54.1 s | 102.9 s | — |
+| Linux, first hover p95 | 11.9 ms | 148.7 ms | — |
+| Linux, goto afterwards total | 52.7 s | 11.2 s | — |
 
-The added time is the inference of each body under every instance, which goto also performs: after the hovers, goto at the same names takes 4-7% of its time with instance-only hover. The time concentrates in a few names. Per name, the difference has p50 0 ms; 2.4% of names take more than 1 s longer (1.1% with semantic tokens first), 80% of the added time comes from 1-2% of the names, and the slowest takes 9.5-11.8 s longer. With semantic tokens requested first, as an editor does on open, whose last stage also covers every instance, 124 s is added in total, and the semantic tokens take the same time. `"full"` costs as much as `"list"`, since both find the same declarations. The peak resident memory of the server between files is about 3.4 GB in every configuration on macOS (not measured on Linux).
+The added time is the inference of each body under every instance, which goto also performs: after the hovers, goto at the same names takes 18-26% of its time with instance-only hover. The time concentrates in a few names. Per name, the difference has p50 0 ms; 0.5% of names take more than 1 s longer (0.2% with semantic tokens first, 0.6% on Linux), 80% of the added time comes from 1.2-1.4% of the names (0.8% with semantic tokens first), and the slowest takes 5.5 s longer on macOS and 7.2 s on Linux. With semantic tokens requested first, as an editor does on open, whose last stage also covers every instance, 21 s is added in total, and the semantic tokens take about the same time. `"full"` costs as much as `"list"`, since both find the same declarations. The peak resident memory of the server between files is about 3.4 GB in every configuration on macOS (not measured on Linux).
 
 ## Known gaps
 
-- **Edit → diagnostics on very large files**: on `Sema.zig`, most of the time goes to reparsing (about 54 ms) and the official AstGen (about 48 ms), about 85 ms with the default configuration; with `diagnostics.inactive_code` enabled, the whole file must also be inferred to compute the inactive code ranges.
-- **Keystroke → hover on very large files**: every keystroke requires reparsing and rebuilding ItemTree and FileIndex; on `Sema.zig`, about 100 ms is the lower bound.
+- **Edit → diagnostics on very large files**: when the project's zig differs from the version zig-analyzer was built with, live diagnostics run the `ast-check` of that zig as a subprocess; on `Sema.zig`, edit → diagnostics p50 is then 109-133 ms (59-83 ms without the debounce), against 73-76 ms with the in-process AstGen. With `diagnostics.inactive_code` enabled, the whole file must also be inferred to compute the inactive code ranges.
 - **Save → compiler diagnostics**: the time is spent in the compiler itself; `-fincremental` misses errors in 0.17, so it is not enabled by default.
 - **Cold-start find references**: for a declaration referenced from many files, the worst case is 1.9 s (the candidate files exceed the parse cache capacity and are parsed repeatedly); warm p95 is 124 ms.
 - **Cold-start goto for `error.Foo`**: when the expected error set does not correspond to a declaration (an inferred error set, `A || B`) or the name has no declaration, file indexes must be built for the whole import closure; on this repository's `src/server/Server.zig`, the first time takes about 0.3 s, after which the file indexes stay resident and the work is not repeated.
