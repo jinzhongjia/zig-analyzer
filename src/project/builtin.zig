@@ -45,6 +45,12 @@ fn generateOnHost(gpa: Allocator, io: Io, env: *const ZigEnv, args: []const []co
     try argv.append(gpa, zig_exe);
     try argv.append(gpa, if (args.len != 0) args[0] else "build-obj");
     try argv.append(gpa, "--show-builtin");
+    // The local cache is the global cache, as for the single-file compile (see
+    // `bsp.compileSingleFile`): otherwise zig looks for a build.zig above the current directory,
+    // which on case-insensitive file systems (macOS, Windows) also matches a `Build.zig`, and
+    // creates a `.zig-cache` next to it (such as in the standard library). The generated file
+    // does not depend on it. A `ZIG_LOCAL_CACHE_DIR` set by the user is left to zig.
+    if (!env.local_cache_dir_set) try argv.appendSlice(gpa, &.{ "--cache-dir", cache_dir });
     if (args.len > 1) try argv.appendSlice(gpa, args[1..]);
 
     const result = std.process.run(gpa, io, .{
@@ -348,4 +354,40 @@ test "a builtin.zig recorded on another host is not reused" {
     // Back on the first host: its record is still used
     try testing.expectEqualStrings(paths[0], paths[2]);
     try testing.expect(hostKey(io) == hostKey(io));
+}
+
+test "the local cache of --show-builtin is the global cache" {
+    // Without `--cache-dir`, zig put a `.zig-cache` next to the nearest build.zig above the
+    // current directory (on case-insensitive file systems also the standard library's `Build.zig`)
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    // A zig that records its arguments, one per line, in the file `argv`
+    const script = try std.fmt.allocPrint(gpa, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{s}/argv\"\necho 'pub const x = 1;'\n", .{root});
+    defer gpa.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "zig", .data = script, .flags = .{ .permissions = .executable_file } });
+    const zig = try std.fs.path.join(gpa, &.{ root, "zig" });
+    defer gpa.free(zig);
+    var env: ZigEnv = .{ .arena = .{}, .zig_exe = zig, .lib_dir = root, .std_dir = root, .global_cache_dir = root, .version = "0.17.0" };
+
+    const global = (try generateOnHost(gpa, io, &env, &.{ "build-obj", "-Odebug" }, 1)).?;
+    defer gpa.free(global);
+    const argv = try tmp.dir.readFileAlloc(io, "argv", gpa, .unlimited);
+    defer gpa.free(argv);
+    const expected = try std.fmt.allocPrint(gpa, "build-obj\n--show-builtin\n--cache-dir\n{s}\n-Odebug\n", .{root});
+    defer gpa.free(expected);
+    try testing.expectEqualStrings(expected, argv);
+
+    // With `ZIG_LOCAL_CACHE_DIR` set, zig keeps the local cache there
+    env.local_cache_dir_set = true;
+    const local = (try generateOnHost(gpa, io, &env, &.{ "build-obj", "-Odebug" }, 2)).?;
+    defer gpa.free(local);
+    const local_argv = try tmp.dir.readFileAlloc(io, "argv", gpa, .unlimited);
+    defer gpa.free(local_argv);
+    try testing.expectEqualStrings("build-obj\n--show-builtin\n-Odebug\n", local_argv);
 }
