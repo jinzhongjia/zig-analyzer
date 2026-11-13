@@ -139,6 +139,20 @@ local function leftovers()
   return false
 end
 
+-- The install of every release target is found (`x86_64` has an underscore)
+for _, t in ipairs({ 'x86_64-linux', 'aarch64-linux', 'x86_64-macos', 'aarch64-macos', 'x86_64-windows', 'aarch64-windows' }) do
+  for _, opt in ipairs(install.optimize_modes) do
+    local name = ('zig-analyzer-v1.2.3-rc.1-%s-%s'):format(t, opt)
+    vim.fn.mkdir(data .. '/' .. name, 'p')
+    sh({ 'cp', server, data .. '/' .. name .. '/zig-analyzer' })
+    vim.fn.writefile({ name }, data .. '/current')
+    check(select(2, install.installed()) == name, 'an install for ' .. t .. ' ' .. opt .. ' is found')
+    vim.fn.delete(data .. '/' .. name, 'rf')
+  end
+end
+vim.fn.delete(data .. '/current')
+check(install.installed() == nil, 'without an install none is found')
+
 -- Rejected installs leave nothing installed
 release('v9.9.7', { key = other })
 local err = run({ version = 'v9.9.7' })

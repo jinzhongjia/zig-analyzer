@@ -49,7 +49,8 @@ end
 ---@return string? release
 function M.installed()
   local release = vim.trim(read(vim.fs.joinpath(M.dir(), 'current')) or '')
-  if not release:match('^zig%-analyzer%-v[%w.%-]+$') then return nil end
+  -- `zig-analyzer-<tag>-<arch>-<os>-<optimize>`; the arch may be `x86_64`
+  if not release:match('^zig%-analyzer%-v[%w._%-]+$') then return nil end
   local exe = vim.fs.joinpath(M.dir(), release, exe_name)
   if vim.fn.executable(exe) == 0 then return nil end
   return exe, release
