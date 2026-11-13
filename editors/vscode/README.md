@@ -7,8 +7,22 @@ for `.zig` and `.zon` files.
 
 ## Requirements
 
-- `zig-analyzer` in `PATH`, or its path in `zig-analyzer.server.path`.
+- The server: see below.
 - Zig 0.17.0 or 0.17.1 in `PATH`, or its path in `zig-analyzer.zig.path`.
+
+## The server
+
+The extension runs `zig-analyzer.server.path` when it is set, else the release installed by
+**zig-analyzer: Install Server**, else `zig-analyzer` from `PATH`. It downloads nothing by itself:
+**Install Server** asks for the latest release (built with ReleaseSafe or ReleaseFast) or a tag
+such as `v0.1.1`, downloads it from
+[GitHub](https://github.com/jinzhongjia/zig-analyzer/releases) into the extension's global storage,
+and restarts the running server with it. When the server cannot start, the error message offers to
+run it.
+
+Before an install, the minisign signature of the release's `SHA256SUMS` must verify with the
+zig-analyzer release key and its trusted comment must name the release, and the archive must have
+the SHA-256 that `SHA256SUMS` lists for it.
 
 ## The Zig extension and ZLS
 
@@ -36,6 +50,7 @@ Settings of the extension itself:
 Click the `zig-analyzer` status bar item, or run from the command palette:
 
 - **zig-analyzer: Restart Server**
+- **zig-analyzer: Install Server**: download a release of the server (see above).
 - **zig-analyzer: Reload Workspace**: rerun `build.zig` and reload the projects.
 - **zig-analyzer: Show Server Status**, **Show File Status**, **Show Syntax Tree**,
   **Show Module Graph**: what the server knows, for reporting problems.
@@ -46,9 +61,10 @@ Click the `zig-analyzer` status bar item, or run from the command palette:
 npm install
 npm run typecheck
 npm run check-settings   # package.json settings match src/server/Config.zig
-npm test                 # smoke test on editors/test-project; ZIG_ANALYZER=<server> VSCODE_EXECUTABLE=<code> are optional
+npm test                 # unit tests, smoke test, Install Server test; ZIG_ANALYZER=<server> VSCODE_EXECUTABLE=<code> are optional
 npm run package          # build zig-analyzer-<version>.vsix
 ```
 
-The smoke test needs Zig 0.17 in `PATH`. On Linux without a display, run it with
-`xvfb-run -a npm test`.
+The smoke test opens a copy of `editors/test-project` and needs Zig 0.17 in `PATH`; the test of
+Install Server installs fake releases of the server from a local server, and needs `tar`. The
+tests run on macOS and Linux; on Linux without a display, run them with `xvfb-run -a npm test`.

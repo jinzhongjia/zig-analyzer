@@ -49,10 +49,10 @@ export function expandPath(p: string): string {
   return p;
 }
 
-/** The command that starts the server */
-export function serverCommand(): string {
+/** The server executable of `zig-analyzer.server.path`; undefined when it is not set */
+export function configuredServer(): string | undefined {
   const configured = vscode.workspace.getConfiguration(section).get<string>("server.path")?.trim();
-  return configured ? expandPath(configured) : "zig-analyzer";
+  return configured ? expandPath(configured) : undefined;
 }
 
 export function serverEnv(): NodeJS.ProcessEnv {
