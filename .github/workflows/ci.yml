@@ -142,6 +142,7 @@ jobs:
         run: |
           curl -fsSL https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-linux-x86_64.tar.gz | tar -xz -C "$RUNNER_TEMP"
           XDG_STATE_HOME="$RUNNER_TEMP/nvim-state" "$RUNNER_TEMP/nvim-linux-x86_64/bin/nvim" --headless --clean -u NONE -l editors/nvim/test/smoke.lua
+          XDG_DATA_HOME="$RUNNER_TEMP/nvim-install-data" XDG_STATE_HOME="$RUNNER_TEMP/nvim-install-state" "$RUNNER_TEMP/nvim-linux-x86_64/bin/nvim" --headless --clean -u NONE -l editors/nvim/test/install.lua
       # yegappan/lsp needs a newer Vim than Ubuntu's (9.1.0016): build the version the tests were
       # written with
       - uses: rhysd/action-setup-vim@febef33995d6649302e9d88dda81e071b68f16a7 # v1.6.1

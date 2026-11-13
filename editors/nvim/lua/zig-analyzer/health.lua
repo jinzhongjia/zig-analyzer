@@ -11,13 +11,21 @@ function M.check()
   if vim.fn.has('nvim-0.12') == 0 then vim.health.error('Neovim 0.12 or later is required') end
 
   local config = vim.lsp.config.zig_analyzer or {}
+  local install = require('zig-analyzer.install')
   local cmd = type(config.cmd) == 'table' and config.cmd[1] or nil
-  if not cmd then
+  if config.cmd == install.cmd then
+    local exe, source = install.command()
+    if exe then
+      vim.health.ok(('server (%s): %s (%s)'):format(source, vim.fn.exepath(exe), version({ exe, '--version' }) or 'unknown version'))
+    else
+      vim.health.error('zig-analyzer is not installed', { 'Run `:ZigAnalyzer install`, or set `cmd` in setup()' })
+    end
+  elseif not cmd then
     vim.health.info('`cmd` is a function; the server executable is not checked')
   elseif vim.fn.executable(cmd) == 1 then
-    vim.health.ok(('server: %s (%s)'):format(vim.fn.exepath(cmd), version({ cmd, '--version' }) or 'unknown version'))
+    vim.health.ok(('server (`cmd`): %s (%s)'):format(vim.fn.exepath(cmd), version({ cmd, '--version' }) or 'unknown version'))
   else
-    vim.health.error(('`%s` is not executable'):format(cmd), { 'Install zig-analyzer, or set `cmd` in setup()' })
+    vim.health.error(('`%s` (`cmd`) is not executable'):format(cmd), { 'Fix `cmd` in setup(), or remove it and run `:ZigAnalyzer install`' })
   end
 
   local settings = (config.settings or {})['zig-analyzer'] or {}

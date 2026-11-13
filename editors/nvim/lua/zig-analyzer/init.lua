@@ -16,6 +16,14 @@ function M.setup(opts)
   M.create_command()
 end
 
+--- Downloads and verifies a release of the server, and starts it (see `:ZigAnalyzer install`).
+--- `opts.version` is a release tag (the latest release by default), `opts.optimize` `ReleaseSafe`
+--- (default) or `ReleaseFast`.
+---@param opts? { version?: string, optimize?: string }
+function M.install(opts)
+  require('zig-analyzer.install').install(opts)
+end
+
 --- Defines `:ZigAnalyzer`. `plugin/zig-analyzer.lua` calls it at startup; `setup()` calls it too,
 --- for plugin managers that load the plugin after startup or add only `lua/` to 'runtimepath'
 function M.create_command()
@@ -25,12 +33,18 @@ function M.create_command()
       vim.notify('ZigAnalyzer: unknown subcommand ' .. (args.fargs[1] or '(none)'), vim.log.levels.ERROR)
       return
     end
-    f()
+    f(vim.list_slice(args.fargs, 2))
   end, {
-    nargs = 1,
+    nargs = '+',
     desc = 'zig-analyzer commands',
-    complete = function(lead)
-      local names = vim.tbl_keys(M.commands)
+    complete = function(lead, line)
+      local words = vim.split(line:sub(1, -#lead - 1), '%s+', { trimempty = true })
+      local names = {}
+      if #words <= 1 then
+        names = vim.tbl_keys(M.commands)
+      elseif words[2] == 'install' then
+        names = { 'latest', unpack(require('zig-analyzer.install').optimize_modes) }
+      end
       table.sort(names)
       return vim.tbl_filter(function(n) return vim.startswith(n, lead) end, names)
     end,
@@ -112,6 +126,9 @@ M.commands = {
   end,
   log = function()
     vim.cmd.tabnew(vim.lsp.log.get_filename())
+  end,
+  install = function(args)
+    require('zig-analyzer.install').command_install(args)
   end,
 }
 

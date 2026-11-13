@@ -67,7 +67,9 @@ end
 
 ---@type vim.lsp.Config
 return {
-  cmd = { 'zig-analyzer' },
+  -- The server installed by `:ZigAnalyzer install`, else `zig-analyzer` from PATH, looked up each
+  -- time a client starts. `cmd` in setup() replaces it.
+  cmd = require('zig-analyzer.install').cmd,
   filetypes = { 'zig', 'zon' },
   -- Match directory entries by their exact names. `root_markers = { 'build.zig', '.git' }` checks
   -- paths, which on case-insensitive file systems (macOS and Windows by default) also finds the
