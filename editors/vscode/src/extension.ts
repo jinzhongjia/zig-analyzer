@@ -119,14 +119,9 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
 async function restart(context: vscode.ExtensionContext): Promise<void> {
   const old = client;
   client = undefined;
-  if (old) {
-    try {
-      await old.stop();
-    } catch {
-      // A server that already exited cannot be stopped; start a new one anyway
-    }
-    await old.dispose();
-  }
+  // dispose() stops the client, which rejects when its server failed to start or already exited:
+  // start a new one anyway
+  await old?.dispose().catch(() => {});
   await start(context);
 }
 
