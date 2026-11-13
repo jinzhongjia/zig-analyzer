@@ -934,11 +934,11 @@ test "files of the zig installation are not standalone compilation roots during 
     }
 }
 
-test "a Zig installation under a workspace root, and any other Zig lib directory, is not compiled on its own" {
+test "the Zig installation in use under a workspace root is a library, not compiled on its own" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     // The root is laid out like a package manager's prefix (a git repository, which editors take as
-    // the root): the zig in use is installed in it, and another one besides. Their std/Build.zig
-    // files were compiled alone as user code ("file exists in modules 'std' and 'Build'")
+    // the root) with the zig in use installed in it. Its std/Build.zig was compiled alone as user
+    // code ("file exists in modules 'std' and 'Build'")
     var project = try fixture.Project.create(&.{.{ .path = "notes.zig", .text = "pub fn f() void {}\n" }});
     defer project.deinit();
     var h: Harness = undefined;
@@ -946,32 +946,50 @@ test "a Zig installation under a workspace root, and any other Zig lib directory
     defer h.finish();
     const a = h.arena.allocator();
     try project.tmp.dir.createDirPath(testing.io, "Cellar/zig/lib");
-    try project.tmp.dir.createDirPath(testing.io, "Cellar/other");
     try project.tmp.dir.symLink(testing.io, project.env.lib_dir, "Cellar/zig/lib/zig", .{ .is_directory = true });
-    try project.tmp.dir.symLink(testing.io, project.env.lib_dir, "Cellar/other/lib", .{ .is_directory = true });
     const lib = try project.path(a, "Cellar/zig/lib/zig");
     const build_text = try std.Io.Dir.cwd().readFileAlloc(testing.io, try std.fs.path.join(a, &.{ project.env.std_dir, "Build.zig" }), a, .limited(4 * 1024 * 1024));
     try initializeWith(&h, project.root, true, try settingsValue(&h, .{ .zig = .{ .lib_path = lib } }));
     const in_use = try open(&h, try project.path(a, "Cellar/zig/lib/zig/std/Build.zig"), build_text);
-    const other = try open(&h, try project.path(a, "Cellar/other/lib/std/Build.zig"), build_text);
     try waitIdle(&h);
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = in_use } });
-    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = other } });
     try waitIdle(&h);
-    // The installation in use is the Zig installation; the other one is user code under the root,
-    // but a Zig lib directory all the same
-    for ([_]struct { []const u8, []const u8 }{ .{ in_use, "zig_lib" }, .{ other, "user" } }) |c| {
-        const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = c[0] } })).object.get("result").?.object;
-        try testing.expectEqualStrings(c[1], status.get("origin").?.string);
-        try testing.expectEqualStrings("library", status.get("context").?.string);
-        try expectNoErrors(&h, c[0]);
-    }
+    const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = in_use } })).object.get("result").?.object;
+    try testing.expectEqualStrings("zig_lib", status.get("origin").?.string);
+    try testing.expectEqualStrings("library", status.get("context").?.string);
+    try expectNoErrors(&h, in_use);
     // Declarations of the installation in use cannot be renamed
     const offset = std.mem.indexOf(u8, build_text, "pub const Cache").? + "pub const ".len;
     const line = std.mem.count(u8, build_text[0..offset], "\n");
     const column = offset - (std.mem.lastIndexOfScalar(u8, build_text[0..offset], '\n').? + 1);
     const rename = try h.request("textDocument/prepareRename", .{ .textDocument = .{ .uri = in_use }, .position = .{ .line = line, .character = column } });
     try testing.expect(rename.object.get("error") != null);
+    try shutdown(&h);
+    for (try progressTitles(&h)) |title| try testing.expect(!std.mem.startsWith(u8, title, "Compiling "));
+}
+
+test "Zig's own source tree with build integration off: the lib directory in use is user code, not compiled on its own" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // The zig in use takes its lib directory from the tree (a build.zig next to it). Outside any
+    // project, std/Build.zig was a detached file, compiled alone ("file exists in modules 'std'
+    // and 'Build'")
+    var project = try fixture.Project.create(&.{.{ .path = "build.zig", .text = "pub fn build(_: *@import(\"std\").Build) void {}\n" }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try project.tmp.dir.symLink(testing.io, project.env.lib_dir, "lib", .{ .is_directory = true });
+    const build_text = try std.Io.Dir.cwd().readFileAlloc(testing.io, try std.fs.path.join(a, &.{ project.env.std_dir, "Build.zig" }), a, .limited(4 * 1024 * 1024));
+    try initializeWith(&h, project.root, true, try settingsValue(&h, .{ .zig = .{ .lib_path = try project.path(a, "lib") }, .build = .{ .enable = false } }));
+    const uri = try open(&h, try project.path(a, "lib/std/Build.zig"), build_text);
+    try waitIdle(&h);
+    try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = uri } });
+    try waitIdle(&h);
+    const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = uri } })).object.get("result").?.object;
+    try testing.expectEqualStrings("user", status.get("origin").?.string);
+    try testing.expectEqualStrings("library", status.get("context").?.string);
+    try expectNoErrors(&h, uri);
     try shutdown(&h);
     for (try progressTitles(&h)) |title| try testing.expect(!std.mem.startsWith(u8, title, "Compiling "));
 }

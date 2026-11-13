@@ -3619,12 +3619,13 @@ fn reloadZigPathsTask(server: *Server) Io.Cancelable!void {
 /// Compile context of a file: decides whether it can be compiled as a root in single-file mode, and
 /// whether single-file compile results are used for its diagnostics. Checked in order: dependency
 /// library, a project's module graph, a root directory with build.zig, an unloaded project in an
-/// ancestor directory; only a .zig file that is none of these is a detached file.
+/// ancestor directory, the Zig lib directory in use; only a .zig file that is none of these is a
+/// detached file.
 const FileContext = enum {
     /// Not compiled: virtual documents, and non-.zig files that belong to no project
     none,
-    /// A file in a dependency library (see `origin.Origin.isLibrary`), or in any Zig lib directory
-    /// outside the projects (see `inZigLibDir`): compiled only as a dependency, never as a root.
+    /// A file in a dependency library (see `origin.Origin.isLibrary`), or in the Zig lib directory
+    /// in use outside the projects (see `inZigLib`): compiled only as a dependency, never as a root.
     /// Errors reported in it by the real compile entry points are published as usual.
     library,
     /// In some project's module graph (the compile set, or reachable from the other compile steps):
@@ -3678,26 +3679,19 @@ fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
     }
     if (!std.mem.endsWith(u8, path, ".zig")) return .none;
     if (build and server.projectDirOf(path) != null) return .unloaded_project;
-    if (server.inZigLibDir(path)) return .library;
+    if (server.inZigLib(path)) return .library;
     return .detached;
 }
 
-/// `path` lies in a Zig lib directory: an ancestor directory has `std/std.zig`, as zig itself and
-/// `zig.lib_path` recognize one. Such a file is compiled only as a dependency, whichever
-/// installation (or Zig's own source tree) it belongs to: compiled on its own with any standard
-/// library, a file of `std` would be in two modules ("file exists in modules 'std' and ..."), the
-/// files in `lib/compiler` lack the modules the build system provides, and the compile would write
-/// a `.zig-cache` into the installation.
-fn inZigLibDir(server: *Server, path: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sep = std.fs.path.sep_str;
-    var dir = std.fs.path.dirname(path);
-    while (dir) |d| : (dir = std.fs.path.dirname(d)) {
-        const marker = std.fmt.bufPrint(&buf, "{s}" ++ sep ++ "std" ++ sep ++ "std.zig", .{std.mem.trimEnd(u8, d, sep)}) catch continue;
-        Io.Dir.cwd().access(server.io, marker, .{}) catch continue;
-        return true;
-    }
-    return false;
+/// `path` lies in the lib directory of the zig in use (`zig env`, or `zig.lib_path`). Zig compiles
+/// its files as parts of its own modules (`std`, and the build runner, compiler_rt and the other
+/// roots in `lib/compiler`), so they are never compiled on their own, even where they are user code
+/// (Zig's own source tree, see `origin.Rules.zig_source_tree`): compiled alone, a file of `std`
+/// would be in two modules ("file exists in modules 'std' and ..."). Other Zig installations are
+/// not told apart from other files: only the toolchain in use says where its library is.
+fn inZigLib(server: *Server, path: []const u8) bool {
+    const env = server.zigEnv() orelse return false;
+    return server.vfs.isUnder(path, env.lib_dir);
 }
 
 /// Directory of the project a file belongs to: the first of its directory and that directory's

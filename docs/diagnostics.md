@@ -48,7 +48,7 @@ Checked in this order (`server/origin.zig`):
 5. User code: modules outside the roots that belong to some project (added by path, `--fork`).
 6. Other files outside the roots, in no project, are the user's files outside the workspace once the Zig installation's location is known; which other files use them is not known. Stale copies in a root's `.zig-cache` or `zig-pkg` are neither user code nor files outside the workspace.
 
-Fetched packages, generated files, and the Zig installation are **dependency libraries**. The compile context, durability levels, rename and workspace symbol scopes, and server-side watching all derive from this classification.
+Fetched packages, generated files, and the Zig installation are **dependency libraries**. Their locations come only from the zig in use (`zig env`, `zig.lib_path`) and the projects' build graphs, never from the layout of directories, and inside a root they take precedence over it; rust-analyzer does the same with the sysroot `rustc` reports and the dependencies `cargo metadata` reports. Another Zig installation is therefore not a library. The compile context, durability levels, rename and workspace symbol scopes, and server-side watching all derive from this classification.
 
 ## Compile context
 
@@ -58,7 +58,7 @@ Opening a file does not by itself create a compile entry point. Checked in this 
 2. Project: in some project's module graph.
 3. Project directory: under a root with `build.zig`, not in the module graph. Opening a file of a sub-project (see "Sub-projects" in `design.md`) starts its project, which then usually has the file in its module graph.
 4. Unloaded project: `.zig` files with a `build.zig` in an ancestor whose project is not loaded, and files of sub-projects while `build.sub_projects` is off. Named imports need that project's build, so these are not compiled alone; as in rust-analyzer, a Hint suggests adding the directory to the workspace (or turning the setting on), published only after first loads finish. The search stops at `.zig-cache` and `zig-pkg`.
-5. Zig lib directories: files under a directory with `std/std.zig`, such as another Zig installation or version, outside the projects. They are never compiled on their own: compiled alone, a file of `std` is in two modules ("file exists in modules 'std' and ..."), the files in `lib/compiler` lack the modules the build system provides, and the compile writes a `.zig-cache` into the installation.
+5. The Zig lib directory in use, where it is user code (Zig's own source tree outside the projects, such as with build integration off). Zig compiles its files as parts of its own modules (`std`, and the build runner and the other roots in `lib/compiler`), so they are never compiled on their own: compiled alone, a file of `std` is in two modules ("file exists in modules 'std' and ...").
 6. Other `.zig` files are detached files, each compiled as its own root (single-file mode).
 
 ## File identity and aliasing
