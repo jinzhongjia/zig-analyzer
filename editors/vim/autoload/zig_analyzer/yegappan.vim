@@ -9,15 +9,20 @@ import autoload 'lsp/util.vim' as lsputil
 # On case-insensitive file systems a lookup of `build.zig` also finds a `Build.zig` (the standard
 # library's `std/Build.zig`), so `zig_analyzer#root` finds the root instead and `rootSearch` holds
 # the absolute path of the entry it found, which yegappan/lsp finds from any directory. The
-# server is added once there is a Zig buffer to take the root from.
+# server is added once there is a Zig buffer to take the root from and a server to run.
 
 var added = false
+# The server object of yegappan/lsp (a copy of the registered dictionary), whose `path` and
+# `args` it starts the server with
+var lsp_server: dict<any> = {}
 
 export def Register()
   for info in getbufinfo({bufloaded: 1})
     if Attaches(info.bufnr)
-      AddServer(info.bufnr)
-      return
+      if AddServer(info.bufnr)
+        return
+      endif
+      break
     endif
   endfor
   autocmd_add([{
@@ -29,9 +34,8 @@ export def Register()
 enddef
 
 export def OnZig(bnr: number)
-  if !added && Attaches(bnr)
+  if !added && Attaches(bnr) && AddServer(bnr)
     autocmd_delete([{group: 'zig_analyzer', event: 'FileType', pattern: 'zig'}])
-    AddServer(bnr)
   endif
 enddef
 
@@ -41,9 +45,14 @@ def Attaches(bnr: number): bool
     && !lsputil.LspUriRemote(bnr->bufname()->fnamemodify(':p'))
 enddef
 
-def AddServer(bnr: number)
-  added = true
+# Adds the server, with the root of buffer `bnr`; false when there is no server to run
+def AddServer(bnr: number): bool
   var cmd: list<string> = zig_analyzer#cmd()
+  if cmd->empty()
+    zig_analyzer#missing()
+    return false
+  endif
+  added = true
   g:LspAddServer([{
     name: g:zig_analyzer#name,
     filetype: ['zig'],
@@ -53,6 +62,56 @@ def AddServer(bnr: number)
     initializationOptions: zig_analyzer#settings(),
     workspaceConfig: zig_analyzer#workspace_config(),
   }])
+  # Adding it attaches it to the Zig buffers at once
+  for s in lspbuf.BufLspServersGet(bnr)
+    if !s->empty() && s.name == g:zig_analyzer#name
+      lsp_server = s
+    endif
+  endfor
+  return true
+enddef
+
+# After `:ZigAnalyzer install`: adds the server if there was none to add, else makes the server
+# start the installed one, and restarts it in a window of a Zig buffer it is attached to
+export def Installed()
+  if !added
+    for bnr in [bufnr()] + getbufinfo({bufloaded: 1})->map((_, info) => info.bufnr)
+      if Attaches(bnr)
+        if AddServer(bnr)
+          autocmd_delete([{group: 'zig_analyzer', event: 'FileType', pattern: 'zig'}])
+        endif
+        return
+      endif
+    endfor
+    return
+  endif
+  if lsp_server->empty()
+    return
+  endif
+  var cmd: list<string> = zig_analyzer#cmd()
+  lsp_server.path = cmd[0]
+  lsp_server.args = cmd[1 :]
+  if !lsp_server.running
+    return
+  endif
+  for winid in [win_getid()] + getwininfo()->map((_, info) => info.winid)
+    var bnr: number = winbufnr(winid)
+    if bnr->getbufvar('&filetype') == 'zig' && Serves(bnr)
+      win_execute(winid, 'call zig_analyzer#yegappan#Restart()')
+      return
+    endif
+  endfor
+  lsputil.InfoMsg('zig-analyzer: the installed server starts with `:ZigAnalyzer restart` in a Zig buffer')
+enddef
+
+# Whether the server is attached to buffer `bnr`
+def Serves(bnr: number): bool
+  for s in lspbuf.BufLspServersGet(bnr)
+    if s is lsp_server
+      return true
+    endif
+  endfor
+  return false
 enddef
 
 # The `rootSearch` of the root of buffer `bnr`. Empty without a root, which leaves the root to

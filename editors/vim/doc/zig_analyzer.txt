@@ -9,8 +9,8 @@ Registers the zig-analyzer language server with an LSP client and adds
 - yegappan/lsp (Vim 9)
 - prabirshrestha/vim-lsp
 
-The server is registered with the first one that is loaded. Requires
-`zig-analyzer` in PATH, and Zig 0.17.0 or 0.17.1.
+The server is registered with the first one that is loaded. Requires the
+server (see |zig_analyzer-server|), and Zig 0.17.0 or 0.17.1.
 
 ==============================================================================
 INSTALLATION                                    *zig_analyzer-installation*
@@ -24,10 +24,45 @@ The plugin is developed in `editors/vim` of jinzhongjia/zig-analyzer, which
 jinzhongjia/zig-analyzer.vim mirrors.
 
 ==============================================================================
+SERVER                                                *zig_analyzer-server*
+
+The server executable is, in this order:
+1. |g:zig_analyzer_cmd|, when it is set;
+2. the release installed by |:ZigAnalyzer-install|;
+3. `zig-analyzer` in PATH.
+The plugin downloads nothing unless |:ZigAnalyzer-install| is run.
+
+                                                     *:ZigAnalyzer-install*
+:ZigAnalyzer install [{tag}|latest] [ReleaseSafe|ReleaseFast]
+    Download a release from https://github.com/jinzhongjia/zig-analyzer/releases
+    (the latest one, or {tag} such as `v0.1.1`; built with ReleaseSafe unless
+    ReleaseFast is given) into |g:zig_analyzer_data_dir|, keep it as the
+    server, remove the previously installed release, and restart the running
+    server with it. The archive must have the SHA-256 that the release's
+    `SHA256SUMS` lists for it. When minisign (https://jedisct1.github.io/minisign/)
+    is installed, `SHA256SUMS` must also carry a minisign signature by the
+    zig-analyzer release key whose trusted comment names the release; without
+    minisign the install says that the signature is not checked. Needs `curl`,
+    `tar`, and `sha256sum` or `shasum` (on Windows, `curl`, `tar`, and
+    `certutil` ship with Windows 10 and later). Releases exist for x86_64 and
+    aarch64 Linux, macOS, and Windows.
+
+==============================================================================
 OPTIONS                                              *zig_analyzer-options*
 
 *g:zig_analyzer_cmd*        The server command, a List or a String.
-                          Default: `['zig-analyzer']`.
+                          Unset by default: see |zig_analyzer-server|.
+
+*g:zig_analyzer_data_dir*   The directory |:ZigAnalyzer-install| installs to.
+                          Default: `vim/zig-analyzer` in `$XDG_DATA_HOME`
+                          (`~/.local/share` when unset), or in
+                          `%LOCALAPPDATA%` on Windows.
+
+*g:zig_analyzer_minisign*   The minisign command |:ZigAnalyzer-install|
+                          checks signatures with; '' to not check them.
+                          When it is set and not an executable, the install
+                          fails. Default: `'minisign'`, skipped with a
+                          warning when it is not in PATH.
 
 *g:zig_analyzer_settings*   The server settings: the options of
                           `zig-analyzer.default.zon` as a Dictionary
@@ -62,5 +97,7 @@ COMMANDS                                             *zig_analyzer-commands*
 :ZigAnalyzer reloadWorkspace Rerun `build.zig` and reload the projects.
 :ZigAnalyzer restart         Restart the server, with the root of the current
                              file.
+:ZigAnalyzer install         Install a release of the server: see
+                             |:ZigAnalyzer-install|.
 
  vim:tw=78:ts=8:ft=help:norl:

@@ -4,7 +4,7 @@ Vim plugin for the [zig-analyzer](https://github.com/jinzhongjia/zig-analyzer) Z
 registers it with [yegappan/lsp](https://github.com/yegappan/lsp) (Vim 9) or
 [vim-lsp](https://github.com/prabirshrestha/vim-lsp), whichever is loaded, and adds `:ZigAnalyzer`
 for the server's own requests. Vim recognizes `.zig` and `.zon` files as `zig` by itself. Requires
-`zig-analyzer` in `PATH` (or `g:zig_analyzer_cmd`) and Zig 0.17.0 or 0.17.1.
+the server (see below) and Zig 0.17.0 or 0.17.1.
 
 This repository is a read-only mirror of
 [`editors/vim`](https://github.com/jinzhongjia/zig-analyzer/tree/main/editors/vim) in the
@@ -59,6 +59,22 @@ git clone https://github.com/yegappan/lsp ~/.vim/pack/plugins/start/lsp
 git clone https://github.com/jinzhongjia/zig-analyzer.vim ~/.vim/pack/plugins/start/zig-analyzer.vim
 ```
 
+## The server
+
+The plugin runs `g:zig_analyzer_cmd` when it is set, else the release installed by
+`:ZigAnalyzer install`, else `zig-analyzer` from `PATH`. It downloads nothing by itself:
+
+```vim
+:ZigAnalyzer install                    " the latest release, built with ReleaseSafe
+:ZigAnalyzer install v0.1.1 ReleaseFast " a given release and optimize mode
+```
+
+installs a release from GitHub into `~/.local/share/vim/zig-analyzer` (`g:zig_analyzer_data_dir`)
+and restarts the running server with it. The archive must have the SHA-256 listed in the
+release's `SHA256SUMS`, and when [minisign](https://jedisct1.github.io/minisign/) is installed,
+`SHA256SUMS` must be signed by the release key; without minisign the install warns that the
+signature is not checked. Needs `curl`, `tar`, and `sha256sum` or `shasum` (`certutil` on Windows).
+
 ## Settings
 
 ```vim
@@ -81,3 +97,7 @@ ZIG_ANALYZER=/path/to/zig-analyzer ZA_CLIENT=yegappan ZA_CLIENT_DIR=/path/to/yeg
 ```
 
 `ZA_CLIENT=vimlsp` with `ZA_CLIENT_DIR` pointing at vim-lsp tests the other client.
+
+`test/install.vim` tests `:ZigAnalyzer install` the same way, on fake releases in a local
+directory signed by `test/release.mjs`; it also needs `node`, `minisign`, `curl`, `tar`, and
+`sha256sum` or `shasum`.

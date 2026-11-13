@@ -16,4 +16,4 @@ augroup zig_analyzer
   autocmd VimEnter * call zig_analyzer#register_loaded()
 augroup END
 
-command! -nargs=1 -complete=customlist,zig_analyzer#complete ZigAnalyzer call zig_analyzer#command(<q-args>)
+command! -nargs=+ -complete=customlist,zig_analyzer#complete ZigAnalyzer call zig_analyzer#command(<f-args>)
