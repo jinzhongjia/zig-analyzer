@@ -4,8 +4,11 @@ Decide, for each mainstream editor, what zig-analyzer users need beyond the serv
 plugin, an upstream configuration entry, or only documentation), and what the server and the
 release process must provide for it.
 
-Integrations in `editors/`: VS Code, Zed, Neovim, and Vim (yegappan/lsp and vim-lsp). They find
-`zig-analyzer` in PATH or a configured path; none downloads binaries or manages the Zig toolchain.
+Integrations in `editors/`: VS Code, Zed, Neovim, and Vim (yegappan/lsp and vim-lsp). They start a
+configured path first, then a release they installed, then `zig-analyzer` in PATH. Each installs a
+GitHub release only when the user asks (a command in VS Code, Neovim, and Vim; the `download`
+setting in Zed), after verifying the minisign signature of its `SHA256SUMS` and the SHA-256 of the
+archive. None manages the Zig toolchain.
 
 ## What the server offers a client today
 
@@ -34,8 +37,9 @@ These facts constrain every integration and are the baseline of the research.
 - Custom requests: `zig-analyzer/status`, `zig-analyzer/fileStatus`, `zig-analyzer/syntaxTree`,
   `zig-analyzer/moduleGraph`, `zig-analyzer/reloadWorkspace` (and `zig-analyzer/waitIdle`, used by
   tests). No `workspace/executeCommand`, code lens, or custom notifications to the client.
-- Distribution: `build.zig.zon` version is `0.0.0`; CI builds and tests on Linux, macOS, and
-  Windows but publishes no release artifacts. Users build from source.
+- Distribution: tagged releases (`.github/workflows/release.yml`) publish archives for x86_64 and
+  aarch64 Linux, macOS, and Windows, named `zig-analyzer-<tag>-<arch>-<os>-<optimize>`, with a
+  `SHA256SUMS` signed with the key of `minisign.pub`.
 
 ## Editors in scope
 
@@ -132,11 +136,10 @@ For each editor in scope, answer the following and record the answers in a singl
 - [ ] Write the matrix and recommendations; list server-side prerequisites.
 - [ ] Decide which plugins to build and open a plan for each, starting with the release
       pipeline if any plugin downloads binaries.
+- [x] Release install in each integration (#324), only on the user's request.
 
 ## Open questions
 
-- Should plugins download release binaries, or only find a user-installed `zig-analyzer`? This
-  decides whether the release pipeline comes first.
 - Should a plugin also manage the Zig toolchain (as `vscode-zig` does), or leave that to the
   user and existing tools?
 - Is a separate VS Code extension acceptable, or should the first attempt be an alternative
