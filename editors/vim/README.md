@@ -97,3 +97,7 @@ ZIG_ANALYZER=/path/to/zig-analyzer ZA_CLIENT=yegappan ZA_CLIENT_DIR=/path/to/yeg
 ```
 
 `ZA_CLIENT=vimlsp` with `ZA_CLIENT_DIR` pointing at vim-lsp tests the other client.
+
+`test/install.vim` tests `:ZigAnalyzer install` the same way, on fake releases in a local
+directory signed by `test/release.mjs`; it also needs `node`, `minisign`, `curl`, `tar`, and
+`sha256sum` or `shasum`.

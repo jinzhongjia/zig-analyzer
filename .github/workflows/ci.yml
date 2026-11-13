@@ -154,6 +154,8 @@ jobs:
           VIM_EXE: ${{ steps.vim.outputs.executable }}
         run: |
           "$VIM_EXE" --version | head -n 2
+          # test/install.vim checks the signatures of its fake releases with minisign
+          sudo apt-get update -q > /dev/null && sudo apt-get install -y -q minisign > /dev/null
           clone() { git init -q "$2" && git -C "$2" fetch -q --depth 1 "$1" "$3" && git -C "$2" checkout -q FETCH_HEAD; }
           clone https://github.com/yegappan/lsp "$RUNNER_TEMP/yegappan-lsp" c741b2f1afb42b9f267824dac4049674908f4a41
           clone https://github.com/prabirshrestha/vim-lsp "$RUNNER_TEMP/vim-lsp" 977e704cdbbbbc89a54f8f226d3468b0aa0405c9
@@ -163,5 +165,8 @@ jobs:
             ZA_CLIENT=$client ZA_CLIENT_DIR="$dir" ZA_RESULT="$RUNNER_TEMP/vim-$client.txt" \
               timeout 600 "$VIM_EXE" -N -u NONE -i NONE --not-a-term -S editors/vim/test/smoke.vim > /dev/null || status=1
             cat "$RUNNER_TEMP/vim-$client.txt" || status=1
+            ZA_CLIENT=$client ZA_CLIENT_DIR="$dir" ZA_RESULT="$RUNNER_TEMP/vim-install-$client.txt" \
+              timeout 600 "$VIM_EXE" -N -u NONE -i NONE --not-a-term -S editors/vim/test/install.vim > /dev/null || status=1
+            cat "$RUNNER_TEMP/vim-install-$client.txt" || status=1
           done
           exit $status
