@@ -1,5 +1,10 @@
 use zed_extension_api::{self as zed, serde_json, settings::LspSettings, LanguageServerId, Result};
 
+mod archive;
+mod install;
+#[cfg(test)]
+mod test_util;
+
 /// The name of the language server, in `extension.toml` and in the `lsp` section of Zed's settings
 const SERVER: &str = "zig-analyzer";
 
