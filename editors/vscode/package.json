@@ -83,6 +83,11 @@
         "category": "zig-analyzer"
       },
       {
+        "command": "zig-analyzer.installServer",
+        "title": "Install Server",
+        "category": "zig-analyzer"
+      },
+      {
         "command": "zig-analyzer.reloadWorkspace",
         "title": "Reload Workspace (rerun build.zig)",
         "category": "zig-analyzer"
@@ -132,7 +137,7 @@
           "type": "string",
           "default": "",
           "scope": "machine-overridable",
-          "markdownDescription": "Path to the `zig-analyzer` executable. Empty: looked up in `PATH`. A leading `~/` is the home directory. Takes effect after restarting the server."
+          "markdownDescription": "Path to the `zig-analyzer` executable. Empty: the release installed by **zig-analyzer: Install Server**, else `zig-analyzer` in `PATH`. A leading `~/` is the home directory. Takes effect after restarting the server."
         },
         "zig-analyzer.server.extraEnv": {
           "type": "object",
