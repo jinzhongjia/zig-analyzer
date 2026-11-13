@@ -7,9 +7,34 @@ let g:zig_analyzer#name = 'zig-analyzer'
 " 'yegappan' or 'vimlsp': the client the server is registered with
 let s:backend = ''
 
+" The server command: `g:zig_analyzer_cmd` when it is set, else the server installed by
+" `:ZigAnalyzer install`, else `zig-analyzer` from PATH; an empty List when there is none
 function! zig_analyzer#cmd() abort
-  let l:cmd = get(g:, 'zig_analyzer_cmd', ['zig-analyzer'])
-  return type(l:cmd) == v:t_string ? [l:cmd] : l:cmd
+  if exists('g:zig_analyzer_cmd')
+    return type(g:zig_analyzer_cmd) == v:t_string ? [g:zig_analyzer_cmd] : g:zig_analyzer_cmd
+  endif
+  let l:exe = zig_analyzer#install#installed()[0]
+  if !empty(l:exe)
+    return [l:exe]
+  endif
+  return executable('zig-analyzer') ? ['zig-analyzer'] : []
+endfunction
+
+" Says how to get a server, when `zig_analyzer#cmd()` finds none
+function! zig_analyzer#missing() abort
+  call s:error('zig-analyzer is not installed: run `:ZigAnalyzer install`, or set g:zig_analyzer_cmd')
+endfunction
+
+" Called when `:ZigAnalyzer install` has installed a server: runs it in place of the running one
+function! zig_analyzer#installed() abort
+  if exists('g:zig_analyzer_cmd')
+    return
+  endif
+  if s:backend ==# 'yegappan'
+    call zig_analyzer#yegappan#Installed()
+  elseif s:backend ==# 'vimlsp'
+    call zig_analyzer#vimlsp#installed()
+  endif
 endfunction
 
 " The server settings: the options of `zig-analyzer.default.zon` as a dictionary
@@ -114,11 +139,30 @@ let s:commands = {
       \ }
 
 function! zig_analyzer#complete(lead, line, pos) abort
-  let l:names = sort(keys(s:commands) + ['reloadWorkspace', 'restart'])
-  return filter(l:names, 'v:val =~# "^" . a:lead')
+  " The arguments before the one being completed
+  let l:words = split(strpart(a:line, 0, a:pos))[1 :]
+  if !empty(a:lead)
+    call remove(l:words, -1)
+  endif
+  if empty(l:words)
+    let l:names = sort(keys(s:commands) + ['install', 'reloadWorkspace', 'restart'])
+  elseif l:words[0] ==# 'install'
+    let l:names = ['latest'] + copy(g:zig_analyzer#install#optimize_modes)
+  else
+    return []
+  endif
+  return filter(l:names, 'stridx(v:val, a:lead) == 0')
 endfunction
 
-function! zig_analyzer#command(name) abort
+function! zig_analyzer#command(name, ...) abort
+  if a:name ==# 'install'
+    call zig_analyzer#install#command(a:000)
+    return
+  endif
+  if a:0 > 0
+    call s:error(a:name . ' takes no arguments')
+    return
+  endif
   if a:name ==# 'reloadWorkspace'
     call zig_analyzer#request('zig-analyzer/reloadWorkspace', v:null, {r, e -> s:report(e)})
     return

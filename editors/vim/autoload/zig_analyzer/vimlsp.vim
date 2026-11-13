@@ -1,15 +1,23 @@
 " Registration and requests through prabirshrestha/vim-lsp
 
 function! zig_analyzer#vimlsp#register() abort
-  let l:cmd = zig_analyzer#cmd()
   call lsp#register_server({
         \ 'name': g:zig_analyzer#name,
-        \ 'cmd': {server_info -> l:cmd},
+        \ 'cmd': {server_info -> s:cmd()},
         \ 'allowlist': ['zig'],
         \ 'root_uri': {server_info -> s:root_uri()},
         \ 'initialization_options': zig_analyzer#settings(),
         \ 'workspace_config': function('zig_analyzer#workspace_config'),
         \ })
+endfunction
+
+" vim-lsp gets the command each time it starts the server, and starts none when it is empty
+function! s:cmd() abort
+  let l:cmd = zig_analyzer#cmd()
+  if empty(l:cmd)
+    call zig_analyzer#missing()
+  endif
+  return l:cmd
 endfunction
 
 function! s:root_uri() abort
@@ -51,4 +59,23 @@ function! s:reopen(buf) abort
   if bufexists(a:buf) && bufnr('%') == a:buf
     doautocmd <nomodeline> lsp BufReadPost
   endif
+endfunction
+
+" After `:ZigAnalyzer install`: stops the running server, then starts the installed one for the
+" Zig buffers in windows
+function! zig_analyzer#vimlsp#installed() abort
+  call lsp#stop_server(g:zig_analyzer#name)
+  call s:start_when_stopped(100)
+endfunction
+
+function! s:start_when_stopped(tries) abort
+  if index(['running', 'starting'], lsp#get_server_status(g:zig_analyzer#name)) >= 0 && a:tries > 0
+    call timer_start(100, {-> s:start_when_stopped(a:tries - 1)})
+    return
+  endif
+  for l:win in getwininfo()
+    if getbufvar(l:win.bufnr, '&filetype') ==# 'zig'
+      call win_execute(l:win.winid, 'call lsp#activate()')
+    endif
+  endfor
 endfunction
