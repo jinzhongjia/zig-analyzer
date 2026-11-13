@@ -23,10 +23,11 @@ function! zig_analyzer#workspace_config(...) abort
   return {'zig-analyzer': zig_analyzer#settings()}
 endfunction
 
-" The nearest directory above `path` that contains an entry named exactly `build.zig` or `.git`.
+" The nearest directory above `path` that contains an entry named exactly `build.zig` or `.git`,
+" and the name of that entry (`build.zig` when it has both); `['', '']` when there is none.
 " Entries are compared by name, not looked up by path: on case-insensitive file systems a lookup
 " of `build.zig` also finds the standard library's `std/Build.zig`.
-function! zig_analyzer#root(path) abort
+function! s:find_root(path) abort
   let l:dir = fnamemodify(a:path, ':p:h')
   while 1
     try
@@ -34,15 +35,33 @@ function! zig_analyzer#root(path) abort
     catch
       let l:names = []
     endtry
-    if index(l:names, 'build.zig') >= 0 || index(l:names, '.git') >= 0
-      return l:dir
-    endif
+    for l:name in ['build.zig', '.git']
+      if index(l:names, l:name) >= 0
+        return [l:dir, l:name]
+      endif
+    endfor
     let l:parent = fnamemodify(l:dir, ':h')
     if l:parent ==# l:dir
-      return ''
+      return ['', '']
     endif
     let l:dir = l:parent
   endwhile
+endfunction
+
+" The workspace root of `path` (see `s:find_root`), '' when there is none
+function! zig_analyzer#root(path) abort
+  return s:find_root(a:path)[0]
+endfunction
+
+" The entry that makes the workspace root of `path` a root, as an absolute path in the form of a
+" yegappan/lsp `rootSearch` entry (a directory ends in `/`); '' when there is no root
+function! zig_analyzer#root_entry(path) abort
+  let [l:dir, l:name] = s:find_root(a:path)
+  if empty(l:dir)
+    return ''
+  endif
+  let l:entry = substitute(l:dir, '[/\\]$', '', '') . '/' . l:name
+  return isdirectory(l:entry) ? l:entry . '/' : l:entry
 endfunction
 
 function! zig_analyzer#register(backend) abort
@@ -106,7 +125,7 @@ function! zig_analyzer#command(name) abort
   endif
   if a:name ==# 'restart'
     if s:backend ==# 'yegappan'
-      LspServer restart
+      call zig_analyzer#yegappan#Restart()
     elseif s:backend ==# 'vimlsp'
       call zig_analyzer#vimlsp#restart()
     endif

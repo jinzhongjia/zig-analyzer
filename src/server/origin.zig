@@ -11,7 +11,8 @@ const isVirtual = @import("Server.zig").isVirtual;
 pub const Origin = enum {
     /// Documents not on disk (`untitled:`, etc.)
     virtual,
-    /// The Zig installation outside the workspace roots: the standard library, `lib/compiler`, etc.
+    /// The Zig installation: the standard library, `lib/compiler`, etc. Under a workspace root too,
+    /// unless it is Zig's own source tree (see `Rules.zig_source_tree`)
     zig_lib,
     /// Generated files: the global cache and the local caches used by each project's maker
     generated,
@@ -54,6 +55,10 @@ pub const Rules = struct {
     /// lib_dir and global_cache_dir from `zig env`; null when the zig environment is unknown
     zig_lib: ?[]const u8 = null,
     global_cache: ?[]const u8 = null,
+    /// `zig_lib` is the `lib` directory of Zig's own source tree: its parent directory has a
+    /// build.zig. Under a root, the installation is then Zig itself being developed, user code;
+    /// otherwise it stays the installation (a root such as a package manager's prefix contains it)
+    zig_source_tree: bool = false,
     /// Workspace root directories
     roots: []const []const u8 = &.{},
     /// Local cache directories used by each project's maker (one that contains the build root is
@@ -65,8 +70,8 @@ pub const Rules = struct {
 
 /// Origin of `path`; `in_project` means the file is in some project's module graph, and only
 /// affects files outside the roots. Checked in order: dependency packages, generated files (even
-/// under a root), user code under a root, the Zig installation (under a root, it is being edited
-/// by developers of Zig itself, so it is user code), project modules, and then the user's files
+/// under a root), user code under a root, the Zig installation (under a root too, unless it is
+/// Zig's own source tree, see `Rules.zig_source_tree`), project modules, and then the user's files
 /// outside the workspace. A root inside the Zig installation (such as its `std` directory opened
 /// as a workspace folder) does not make the installation user code.
 pub fn classify(vfs: *Vfs, rules: Rules, path: []const u8, in_project: bool) Origin {
@@ -78,6 +83,7 @@ pub fn classify(vfs: *Vfs, rules: Rules, path: []const u8, in_project: bool) Ori
     roots: for (rules.roots) |root| {
         if (path.len <= root.len or !vfs.isUnder(path, root)) continue;
         if (rules.zig_lib) |l| if (vfs.isUnder(root, l)) continue;
+        if (rules.zig_lib) |l| if (!rules.zig_source_tree and vfs.isUnder(path, l)) continue;
         in_root = true;
         const rest = path[root.len..];
         const sub = if (std.fs.path.isSep(rest[0])) rest[1..] else rest;
@@ -140,9 +146,17 @@ test classify {
             return err;
         };
     }
-    // The Zig installation is under a workspace root: Zig itself is being developed
-    const in_root: Rules = .{ .zig_lib = native("/ws/lib"), .roots = &.{native("/ws")} };
+    // The lib directory of Zig's own source tree under a workspace root: Zig itself is being
+    // developed
+    const in_root: Rules = .{ .zig_lib = native("/ws/lib"), .zig_source_tree = true, .roots = &.{native("/ws")} };
     try testing.expectEqual(.user, classify(&vfs, in_root, native("/ws/lib/std/std.zig"), true));
+    try testing.expectEqual(.user, classify(&vfs, in_root, native("/ws/src/Sema.zig"), true));
+    // A Zig installation under a root that is not its source tree, such as a package manager's
+    // prefix (a git repository, which editors take as the root): it was compiled alone as user code
+    const prefix: Rules = .{ .zig_lib = native("/opt/brew/Cellar/zig/lib/zig"), .roots = &.{native("/opt/brew")} };
+    try testing.expectEqual(.zig_lib, classify(&vfs, prefix, native("/opt/brew/Cellar/zig/lib/zig/std/Build.zig"), false));
+    try testing.expectEqual(.zig_lib, classify(&vfs, prefix, native("/opt/brew/Cellar/zig/lib/zig/std/Build.zig"), true));
+    try testing.expectEqual(.user, classify(&vfs, prefix, native("/opt/brew/Cellar/zig/notes.zig"), false));
     // A workspace root inside the Zig installation: renaming there would edit the installation
     const inside: Rules = .{ .zig_lib = native("/zig/lib"), .roots = &.{ native("/proj"), native("/zig/lib/std") } };
     try testing.expectEqual(.zig_lib, classify(&vfs, inside, native("/zig/lib/std/mem.zig"), false));

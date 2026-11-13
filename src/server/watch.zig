@@ -1072,6 +1072,7 @@ fn sameRules(x: origin.Rules, y: origin.Rules) bool {
                 if (a.len != b.len) return false;
                 for (a, b) |p, q| if (!std.mem.eql(u8, p, q)) return false;
             },
+            bool => if (a != b) return false,
             else => @compileError("compare the rule field " ++ name),
         }
     }
@@ -1086,6 +1087,7 @@ fn dupeRules(a: Allocator, rules: origin.Rules) Allocator.Error!origin.Rules {
         @field(out, name) = switch (T) {
             ?[]const u8 => if (@field(rules, name)) |s| try a.dupe(u8, s) else null,
             []const []const u8 => try dupePaths(a, @field(rules, name)),
+            bool => @field(rules, name),
             else => @compileError("copy the rule field " ++ name),
         };
     }

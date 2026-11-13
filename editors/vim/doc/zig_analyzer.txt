@@ -45,7 +45,11 @@ Set them before the LSP client loads, for example in |vimrc|:
           \ 'inlay_hints': {'parameters': v:false},
           \ }
 <
-The workspace root is the nearest directory containing `build.zig` or `.git`.
+The workspace root is the nearest directory containing an entry named exactly
+`build.zig` or `.git` (a `Build.zig` does not count, also on case-insensitive
+file systems). yegappan/lsp runs one server, with the root of the first Zig
+file opened; `:ZigAnalyzer restart` restarts it with the root of the current
+file.
 
 ==============================================================================
 COMMANDS                                             *zig_analyzer-commands*
@@ -56,6 +60,7 @@ COMMANDS                                             *zig_analyzer-commands*
 :ZigAnalyzer syntaxTree      Show the syntax tree of the current file.
 :ZigAnalyzer moduleGraph     Show the module graph of the projects.
 :ZigAnalyzer reloadWorkspace Rerun `build.zig` and reload the projects.
-:ZigAnalyzer restart         Restart the server.
+:ZigAnalyzer restart         Restart the server, with the root of the current
+                             file.
 
  vim:tw=78:ts=8:ft=help:norl:

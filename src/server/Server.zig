@@ -144,6 +144,9 @@ env_mutex: Io.Mutex = .init,
 /// configuration applied (see `applyZigPaths`). Queried in the background after startup; null
 /// until the query completes
 zig_env: ?*const ZigEnv = null,
+/// The lib directory of `zig_env` is the `lib` directory of Zig's own source tree (see
+/// `origin.Rules.zig_source_tree`); set together with it
+zig_source_tree: bool = false,
 /// `childEnviron` of `zig_env`, set together with it: the environment of the zig child processes
 /// that queries start (`zig ast-check` of live diagnostics, read through `Env`)
 zig_environ: std.atomic.Value(?*const std.process.Environ.Map) = .init(null),
@@ -2960,9 +2963,14 @@ fn watchRegistrationFailed(server: *Server) void {
 /// roots_mutex and then workspaces_mutex; must not be called inside a write transaction.
 pub fn originRules(server: *Server, arena: Allocator) Allocator.Error!origin.Rules {
     var rules: origin.Rules = .{};
-    if (server.zigEnv()) |env| {
-        rules.zig_lib = try arena.dupe(u8, env.lib_dir);
-        rules.global_cache = try arena.dupe(u8, env.global_cache_dir);
+    {
+        server.env_mutex.lockUncancelable(server.io);
+        defer server.env_mutex.unlock(server.io);
+        if (server.zig_env) |env| {
+            rules.zig_lib = try arena.dupe(u8, env.lib_dir);
+            rules.global_cache = try arena.dupe(u8, env.global_cache_dir);
+            rules.zig_source_tree = server.zig_source_tree;
+        }
     }
     rules.roots = try server.rootsAlloc(arena);
     var local_caches: std.ArrayList([]const u8) = .empty;
@@ -3543,6 +3551,7 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
         };
     };
 
+    const source_tree = if (std.fs.path.dirname(env.lib_dir)) |parent| server.hasBuildZig(parent) catch false else false;
     var change: ZigPathsChange = .{};
     var unused_builtin: ?[]u8 = default_builtin;
     {
@@ -3550,6 +3559,7 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
         defer server.env_mutex.unlock(io);
         change.env = server.zig_env != env;
         server.zig_env = env;
+        server.zig_source_tree = source_tree;
         server.zig_environ.store(env.childEnviron(), .release);
         if (!eqlOptionalStr(server.default_builtin, default_builtin)) {
             change.builtin = true;
@@ -3609,13 +3619,14 @@ fn reloadZigPathsTask(server: *Server) Io.Cancelable!void {
 /// Compile context of a file: decides whether it can be compiled as a root in single-file mode, and
 /// whether single-file compile results are used for its diagnostics. Checked in order: dependency
 /// library, a project's module graph, a root directory with build.zig, an unloaded project in an
-/// ancestor directory; only a .zig file that is none of these is a detached file.
+/// ancestor directory, the Zig lib directory in use; only a .zig file that is none of these is a
+/// detached file.
 const FileContext = enum {
     /// Not compiled: virtual documents, and non-.zig files that belong to no project
     none,
-    /// A file in a dependency library (see `origin.Origin.isLibrary`):
-    /// compiled only as a dependency, never as a root. Errors reported
-    /// in it by the real compile entry points are published as usual.
+    /// A file in a dependency library (see `origin.Origin.isLibrary`), or in the Zig lib directory
+    /// in use outside the projects (see `inZigLib`): compiled only as a dependency, never as a root.
+    /// Errors reported in it by the real compile entry points are published as usual.
     library,
     /// In some project's module graph (the compile set, or reachable from the other compile steps):
     /// compiler diagnostics come from the project's build
@@ -3668,7 +3679,19 @@ fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
     }
     if (!std.mem.endsWith(u8, path, ".zig")) return .none;
     if (build and server.projectDirOf(path) != null) return .unloaded_project;
+    if (server.inZigLib(path)) return .library;
     return .detached;
+}
+
+/// `path` lies in the lib directory of the zig in use (`zig env`, or `zig.lib_path`). Zig compiles
+/// its files as parts of its own modules (`std`, and the build runner, compiler_rt and the other
+/// roots in `lib/compiler`), so they are never compiled on their own, even where they are user code
+/// (Zig's own source tree, see `origin.Rules.zig_source_tree`): compiled alone, a file of `std`
+/// would be in two modules ("file exists in modules 'std' and ..."). Other Zig installations are
+/// not told apart from other files: only the toolchain in use says where its library is.
+fn inZigLib(server: *Server, path: []const u8) bool {
+    const env = server.zigEnv() orelse return false;
+    return server.vfs.isUnder(path, env.lib_dir);
 }
 
 /// Directory of the project a file belongs to: the first of its directory and that directory's

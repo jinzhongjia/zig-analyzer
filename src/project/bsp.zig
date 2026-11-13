@@ -720,9 +720,14 @@ pub const SingleFileCompiles = struct {
 };
 
 /// Single-file mode (no build.zig): runs `zig build-obj -fno-emit-bin --listen=- <file>` with the
-/// zig of `env` and requests one compilation. The compiler and the processes it starts form a
-/// group (see `Group`) that ends with the server however it exits, and that `compiles.stop` ends
-/// at once; the compile then returns `error.Stopped`.
+/// zig of `env` and requests one compilation. Its local cache is the global cache (`--cache-dir`),
+/// where zig puts it when no directory above the file has a build.zig: otherwise zig looks for one
+/// there, which on case-insensitive file systems (macOS, Windows) also matches a `Build.zig`, and
+/// writes a `.zig-cache` next to it (such as into the standard library) or into a project the file
+/// is not compiled in. A `ZIG_LOCAL_CACHE_DIR` set by the user is left to zig.
+/// The compiler and the processes it starts form a group (see `Group`) that ends with the server
+/// however it exits, and that `compiles.stop` ends at once; the compile then returns
+/// `error.Stopped`.
 /// When zig ends before reporting the result for any other reason (it crashed or was killed), the
 /// compile returns `error.WriteFailed` if zig had ended before the request was written to it and
 /// `error.EndOfStream` otherwise; in either case the group is ended and its processes are reaped
@@ -730,6 +735,8 @@ pub const SingleFileCompiles = struct {
 pub fn compileSingleFile(gpa: Allocator, io: Io, env: *const ZigEnv, file_path: []const u8, compiles: *SingleFileCompiles) !SingleFileResult {
     const dir = std.fs.path.dirname(file_path) orelse ".";
     if (compiles.isStopped(io)) return error.Stopped;
+    const argv_cache = [_][]const u8{ env.zig_exe, "build-obj", "-fno-emit-bin", "--listen=-", std.fs.path.basename(file_path), "--cache-dir", env.global_cache_dir };
+    const argv: []const []const u8 = if (env.local_cache_dir_set) argv_cache[0..5] else &argv_cache;
     var group: Group = .create(io);
     defer group.destroy(io);
     // Started while holding the lock, so that `stop` either sees the compile or prevents it
@@ -739,7 +746,7 @@ pub fn compileSingleFile(gpa: Allocator, io: Io, env: *const ZigEnv, file_path: 
         return error.Stopped;
     }
     var child = child_process.spawn(io, .{
-        .argv = &.{ env.zig_exe, "build-obj", "-fno-emit-bin", "--listen=-", std.fs.path.basename(file_path) },
+        .argv = argv,
         .cwd = .{ .path = dir },
         .environ_map = env.childEnviron(),
         .stdin = .pipe,
@@ -1028,6 +1035,26 @@ test "single-file mode: compile one file, get its errors and the files it read" 
         try testing.expectEqual(0, r.errors.errorMessageCount());
         try testing.expectEqual(2, r.inputs.len);
         for (r.inputs) |input| try testing.expect(std.mem.eql(u8, input, ok) or std.mem.eql(u8, input, dep));
+    }
+}
+
+test "single-file mode: the compile keeps its cache in the global cache, not next to a build.zig" {
+    // zig put the local cache next to the nearest build.zig above the file (on case-insensitive
+    // file systems also a `Build.zig`, as in the standard library)
+    var project = try @import("fixture.zig").Project.create(&.{
+        .{ .path = "build.zig", .text = "pub fn build(_: *@import(\"std\").Build) void {}\n" },
+        .{ .path = "src/one.zig", .text = "fn g() void {\n    var u = 1;\n}\n" },
+    });
+    defer project.deinit();
+    const gpa = testing.allocator;
+    const path = try project.path(gpa, "src/one.zig");
+    defer gpa.free(path);
+    var compiles: SingleFileCompiles = .{};
+    var result = try compileSingleFile(gpa, testing.io, &project.env, path, &compiles);
+    defer result.deinit(gpa);
+    try testing.expectEqual(1, result.errors.errorMessageCount());
+    for ([_][]const u8{ ".zig-cache", "src/.zig-cache" }) |sub| {
+        try testing.expectError(error.FileNotFound, project.tmp.dir.access(testing.io, sub, .{}));
     }
 }
 
