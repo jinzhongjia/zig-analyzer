@@ -216,7 +216,8 @@ check(restarted ~= nil and restarted.id ~= old, ':ZigAnalyzer restart')
 
 vim.cmd('checkhealth zig-analyzer')
 local health = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), '\n')
-check(health:find('server: ') ~= nil and health:find('zig_analyzer is enabled') ~= nil, ':checkhealth zig-analyzer')
+check(health:find('server (`cmd`): ', 1, true) ~= nil and health:find('zig_analyzer is enabled') ~= nil,
+  ':checkhealth zig-analyzer')
 
 for _, c in ipairs(vim.lsp.get_clients()) do c:stop(true) end
 vim.fn.delete(dir, 'rf')

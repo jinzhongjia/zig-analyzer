@@ -5,7 +5,7 @@ INTRODUCTION                                              *zig-analyzer*
 
 Configures the zig-analyzer language server with |vim.lsp.config()| and adds
 |:ZigAnalyzer| for the server's own requests. Requires Neovim 0.12 or later,
-`zig-analyzer` in PATH, and Zig 0.17.0 or 0.17.1.
+the server (see |zig-analyzer-server|), and Zig 0.17.0 or 0.17.1.
 
 ==============================================================================
 INSTALLATION                                  *zig-analyzer-installation*
@@ -23,11 +23,36 @@ The plugin is developed in `editors/nvim` of jinzhongjia/zig-analyzer, which
 jinzhongjia/zig-analyzer.nvim mirrors.
 
 ==============================================================================
+SERVER                                              *zig-analyzer-server*
+
+The server executable is, in this order:
+1. `cmd` in `setup()` (or in |vim.lsp.config()|), such as
+   `cmd = { '/path/to/zig-analyzer' }`;
+2. the release installed by |:ZigAnalyzer-install|;
+3. `zig-analyzer` in PATH.
+The plugin downloads nothing unless |:ZigAnalyzer-install| is run.
+
+                                                     *:ZigAnalyzer-install*
+:ZigAnalyzer install [{tag}|latest] [ReleaseSafe|ReleaseFast]
+    Download a release from https://github.com/jinzhongjia/zig-analyzer/releases
+    (the latest one, or {tag} such as `v0.1.1`; built with ReleaseSafe unless
+    ReleaseFast is given) into `stdpath('data')/zig-analyzer`, keep it as the
+    server, remove the previously installed release, and restart the running
+    servers with it. The release must be signed: its `SHA256SUMS` carries a
+    minisign signature by the zig-analyzer release key, whose trusted comment
+    names the release, and the archive must have the SHA-256 listed there.
+    Needs `curl` and `tar` (both ship with Windows 10 and later). Releases
+    exist for x86_64 and aarch64 Linux, macOS, and Windows.
+
+Lua: `require('zig-analyzer').install({ version = 'v0.1.1', optimize =
+'ReleaseFast' })`.
+
+==============================================================================
 SETUP                                                *zig-analyzer-setup*
 
 >lua
     require('zig-analyzer').setup({
-      -- Any field of |vim.lsp.Config|; `cmd` defaults to { 'zig-analyzer' }
+      -- Any field of |vim.lsp.Config|; see |zig-analyzer-server| for `cmd`
       settings = {
         build = { args = { '-Dtarget=aarch64-linux' } },
         inlay_hints = { parameters = false },
@@ -62,6 +87,7 @@ COMMANDS                                             *zig-analyzer-commands*
 :ZigAnalyzer reloadWorkspace Rerun `build.zig` and reload the projects.
 :ZigAnalyzer restart         Restart the server (|:lsp-restart|).
 :ZigAnalyzer log             Open the LSP log.
+:ZigAnalyzer install         Install the server (|:ZigAnalyzer-install|).
 
 Run |:checkhealth| zig-analyzer to check the server and Zig executables.
 
