@@ -47,6 +47,9 @@ endif
 let s:dir = resolve(tempname())
 call mkdir(s:dir, 'p')
 call system('cp -R ' . shellescape(s:root . '/../test-project') . '/. ' . shellescape(s:dir))
+" Named like the standard library's `std/Build.zig`: on case-insensitive file systems a lookup of
+" `build.zig` from `src` finds it, and the root must still be the project directory
+call writefile(['pub const name = "Build";'], s:dir . '/src/Build.zig')
 
 function! s:path(rel) abort
   return s:dir . '/' . a:rel
@@ -246,6 +249,9 @@ ZigAnalyzer restart
 let s:restarted = s:wait('!empty(s:server_pids()) && s:server_pids() != s:pids_before', 30000)
       \ && s:wait('s:idle()', 30000)
 call s:check(s:restarted, ':ZigAnalyzer restart')
+let s:status = s:request('zig-analyzer/fileStatus', {'textDocument': s:doc})
+call s:check(type(s:status) == v:t_dict && len(s:status.projects) == 1 && s:status.projects[0].root ==# s:dir,
+      \ 'the restarted server has the project root')
 
 call add(s:results, s:failures == 0 ? 'all checks passed' : s:failures . ' checks failed')
 if s:failures > 0
