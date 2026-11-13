@@ -39,6 +39,9 @@ lib_dir: []const u8,
 std_dir: []const u8,
 global_cache_dir: []const u8,
 version: []const u8,
+/// `ZIG_LOCAL_CACHE_DIR` is set in the environment zig runs in (as `zig env` reports): zig then
+/// keeps every local cache there
+local_cache_dir_set: bool = false,
 /// Environment variables of the child processes running zig (`zig build`, `zig build-obj` and so
 /// on); when null, they inherit those of the current process. When the lib directory or the global
 /// cache directory is overridden, zig is told through `ZIG_LIB_DIR` and `ZIG_GLOBAL_CACHE_DIR`:
@@ -177,6 +180,7 @@ pub fn withOverrides(
         .std_dir = try a.dupe(u8, base.std_dir),
         .global_cache_dir = try a.dupe(u8, base.global_cache_dir),
         .version = try a.dupe(u8, base.version),
+        .local_cache_dir_set = base.local_cache_dir_set,
     };
     var lib_dir: ?[]const u8 = null;
     if (overrides.lib_dir) |path| {
@@ -325,6 +329,7 @@ pub fn parse(gpa: Allocator, text: []const u8) error{ OutOfMemory, ParseZon }!Zi
         std_dir: []const u8,
         global_cache_dir: []const u8,
         version: []const u8,
+        env: struct { ZIG_LOCAL_CACHE_DIR: ?[]const u8 = null } = .{},
     };
     const raw = try std.zon.parse.fromSlice(Raw, .{
         .gpa = gpa,
@@ -340,6 +345,7 @@ pub fn parse(gpa: Allocator, text: []const u8) error{ OutOfMemory, ParseZon }!Zi
         .std_dir = raw.std_dir,
         .global_cache_dir = raw.global_cache_dir,
         .version = raw.version,
+        .local_cache_dir_set = raw.env.ZIG_LOCAL_CACHE_DIR != null,
     };
 }
 
@@ -360,6 +366,13 @@ test parse {
     try std.testing.expectEqualStrings("/opt/zig/lib/std", env.std_dir);
     try std.testing.expectEqualStrings("C:\\Users\\u\\AppData\\Local\\zig", env.global_cache_dir);
     try std.testing.expectEqualStrings("0.17.0", env.version);
+    try std.testing.expect(!env.local_cache_dir_set);
+
+    var local = try parse(std.testing.allocator,
+        \\.{ .zig_exe = "zig", .lib_dir = "lib", .std_dir = "lib/std", .global_cache_dir = "c", .version = "0.17.0", .env = .{ .ZIG_LIB_DIR = null, .ZIG_LOCAL_CACHE_DIR = "/tmp/lc" } }
+    );
+    defer local.deinit(std.testing.allocator);
+    try std.testing.expect(local.local_cache_dir_set);
 }
 
 test fromOutput {

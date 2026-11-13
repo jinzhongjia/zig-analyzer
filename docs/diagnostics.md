@@ -78,6 +78,7 @@ Opening a file does not by itself create a compile entry point. Checked in this 
 ## Single-file mode
 
 - Errors in imported files are published on those files, open or not.
+- The compile's local cache is the global cache, as zig chooses when no directory above the file has a `build.zig`. zig would otherwise look for one, which on case-insensitive file systems (macOS, Windows) also matches the standard library's `Build.zig`, and write a `.zig-cache` there. A `ZIG_LOCAL_CACHE_DIR` set by the user is left to zig.
 - Compiles are deferred until startup and first loads finish, since until then it is not known whether a file belongs to a project.
 - Whenever file context may have changed, roots that are no longer detached drop their results, and deferred compiles run.
 - A root missing from disk drops its results.
