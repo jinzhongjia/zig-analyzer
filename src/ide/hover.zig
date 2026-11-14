@@ -321,7 +321,9 @@ fn isShortText(content: []const u8) bool {
 
 /// A field name in an initializer (`.{ .name = x }`, `T{ .name = x }`): the field of the
 /// initializer's type, with its type in that type (the field type in the instance for a generic
-/// container; inside a generic function body, in a call-site instance) and its documentation
+/// container; inside a generic function body, in a call-site instance) and its documentation. A
+/// field of a constructed type (`@Struct`, such as `std.enums.EnumFieldStruct`) has no
+/// declaration: only its name and type.
 fn initFieldHover(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.ExprId, instances: Instances, roots: []const []const u8) resolve.Error!?Info {
     const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
     const fields = a.body.expr(e).init.fields;
@@ -341,9 +343,15 @@ fn initFieldHover(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.Expr
             from = s;
         }
     };
-    const def = try context.defOfKey(r, field.member orelse return null) orelse return null;
     var out: std.Io.Writer.Allocating = .init(r.arena);
     const w = &out.writer;
+    const member = field.member orelse {
+        const ty = field.ty orelse return null;
+        if (ty == .unknown) return null;
+        w.print("```zig\n{f}: {s}\n```", .{ std.zig.fmtId(fields[k].name.?), try render.typeAlloc(r, ty) }) catch return error.OutOfMemory;
+        return .{ .text = out.written(), .start = tok.offset, .end = tok.range().end };
+    };
+    const def = try context.defOfKey(r, member) orelse return null;
     w.print("```zig\n{s}\n```", .{try context.signature(r, def, .{ .ty = field.ty orelse .unknown }, .multi_line)}) catch return error.OutOfMemory;
     if (from) |s| {
         w.writeAll("\n\ninferred from ") catch return error.OutOfMemory;
