@@ -236,6 +236,43 @@ test "hover on field names in initializers shows the field" {
     }
 }
 
+test "hover on field names in initializers of reified structs shows the name and type" {
+    // Prevents a null hover on `.red` in `std.EnumArray(Color, u32).init(.{ .red = 1 })`
+    const text =
+        \\const std = @import("std");
+        \\const S = @Struct(.auto, null, &.{ "alpha", "beta" }, &.{ u32, bool }, &@splat(.{}));
+        \\const Color = enum { red, green, blue };
+        \\test {
+        \\    const s: S = .{ .alpha = 1, .beta = true };
+        \\    const arr = std.EnumArray(Color, []const u8).init(.{ .red = "r", .green = "g", .blue = "b" });
+        \\    _ = .{ s, arr };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try useRealStd(&w);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "alpha = 1", "```zig\nalpha: u32\n```" },
+        .{ "beta = true", "```zig\nbeta: bool\n```" },
+        .{ "red = \"r\"", "```zig\nred: []const u8\n```" },
+    }) |c| {
+        const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .list)) orelse {
+            std.debug.print("no hover at `{s}`\n", .{c[0]});
+            return error.NoHover;
+        };
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("hover at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "hover on field names of build.zig option structs" {
     const text =
         \\const std = @import("std");
