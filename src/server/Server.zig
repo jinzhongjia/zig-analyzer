@@ -7652,13 +7652,13 @@ fn moduleName(server: *Server, g: *const ModuleGraph, module: u32) []const u8 {
     return server.vfs.path(root);
 }
 
-/// Syntax tree of the document: indented nodes and tokens (without trivia), followed by the syntax
-/// errors. Used to diagnose problems with parsing and error recovery.
+/// Syntax tree of the document: indented nodes and tokens (without trivia) with their byte ranges,
+/// followed by the syntax errors. Used to diagnose problems with parsing and error recovery.
 fn syntaxTree(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: DocumentParams) HandlerError!?[]const u8 {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const parse = try ctx.get(syntax_q.ParseFile, file);
     var out: std.Io.Writer.Allocating = .init(arena);
-    parse.rootNode().dump(&out.writer, .{}) catch return error.OutOfMemory;
+    parse.rootNode().dump(&out.writer, .{ .token_ranges = true }) catch return error.OutOfMemory;
     for (parse.errors) |e| out.writer.print("error@{d}: {s}\n", .{ e.offset, e.message }) catch return error.OutOfMemory;
     return out.written();
 }

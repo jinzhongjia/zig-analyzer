@@ -167,6 +167,8 @@ pub const SyntaxNode = struct {
 
     pub const DumpOptions = struct {
         trivia: bool = false,
+        /// Writes the byte range of tokens too (`kind@start..end "text"`)
+        token_ranges: bool = false,
     };
 
     fn dumpRec(n: SyntaxNode, w: *std.Io.Writer, opts: DumpOptions, depth: usize) std.Io.Writer.Error!void {
@@ -178,7 +180,9 @@ pub const SyntaxNode = struct {
             .token => |t| {
                 if (!opts.trivia and kind_mod.isTrivia(t.kind)) continue;
                 try w.splatByteAll(' ', (depth + 1) * 2);
-                try w.print("{t} \"{f}\"\n", .{ t.kind, std.zig.fmtString(t.text) });
+                try w.print("{t}", .{t.kind});
+                if (opts.token_ranges) try w.print("@{d}..{d}", .{ t.range().start, t.range().end });
+                try w.print(" \"{f}\"\n", .{std.zig.fmtString(t.text)});
             },
         };
     }
