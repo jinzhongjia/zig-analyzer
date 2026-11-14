@@ -45,6 +45,14 @@ vim.lsp.enable('zig_analyzer')
 
 ## 安装
 
+macOS 和 Linux 上可以用 [Homebrew](https://brew.sh) 安装：
+
+```sh
+brew install jinzhongjia/tap/zig-analyzer
+```
+
+它安装最新 release 的 ReleaseSafe 构建，每次发布后 `brew upgrade` 即可更新。预发布版本不进 tap。
+
 每个 [release](https://github.com/jinzhongjia/zig-analyzer/releases) 都为每个平台（Linux、macOS、Windows 的 x86_64 和 aarch64）提供两种构建：
 
 | 构建 | 用途 |
