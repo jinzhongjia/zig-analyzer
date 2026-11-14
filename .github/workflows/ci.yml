@@ -89,15 +89,6 @@ jobs:
           git diff --exit-code -- src/lsp/types.zig src/ide/builtin_data.zig src/ide/manifest_data.zig
       - name: The Windows build imports only functions Windows 10 1507 has
         run: zig build check -Dtarget=x86_64-windows
-      # The release workflow generates the formula for each release; a fake SHA256SUMS checks the
-      # script and the Ruby syntax of its output
-      - name: Homebrew formula
-        run: |
-          for t in aarch64-macos x86_64-macos aarch64-linux x86_64-linux; do
-            printf '%064d  zig-analyzer-v0.0.0-%s-ReleaseSafe.tar.gz\n' 0 "$t"
-          done > "$RUNNER_TEMP/SHA256SUMS"
-          packaging/homebrew/formula.sh v0.0.0 "$RUNNER_TEMP/SHA256SUMS" > "$RUNNER_TEMP/zig-analyzer.rb"
-          ruby -c "$RUNNER_TEMP/zig-analyzer.rb"
 
   fuzz:
     name: Coverage-guided fuzzing

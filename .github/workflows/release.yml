@@ -231,6 +231,10 @@ jobs:
     environment: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: homebrew
       - name: Download SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
@@ -251,7 +255,7 @@ jobs:
           echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > ~/.ssh/known_hosts
           export GIT_SSH_COMMAND='ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes'
           git clone -q --depth 1 git@github.com:jinzhongjia/homebrew-tap.git "$RUNNER_TEMP/tap"
-          packaging/homebrew/formula.sh "$GITHUB_REF_NAME" "$RUNNER_TEMP/SHA256SUMS" > "$RUNNER_TEMP/tap/Formula/zig-analyzer.rb"
+          zig build homebrew-formula -- "$GITHUB_REF_NAME" "$RUNNER_TEMP/SHA256SUMS" "$RUNNER_TEMP/tap/Formula/zig-analyzer.rb"
           cd "$RUNNER_TEMP/tap"
           if git diff --quiet; then
             echo "The formula is already at $GITHUB_REF_NAME"
