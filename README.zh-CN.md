@@ -51,7 +51,14 @@ macOS 和 Linux 上可以用 [Homebrew](https://brew.sh) 安装：
 brew install jinzhongjia/tap/zig-analyzer
 ```
 
-它安装最新 release 的 ReleaseSafe 构建，每次发布后 `brew upgrade` 即可更新。预发布版本不进 tap。
+Windows（x86_64 和 aarch64）上可以用 [Scoop](https://scoop.sh) 安装：
+
+```pwsh
+scoop bucket add jin https://github.com/jinzhongjia/scoop-bucket
+scoop install jin/zig-analyzer
+```
+
+两者都安装最新 release 的 ReleaseSafe 构建及其调试信息，用 `brew upgrade` 或 `scoop update zig-analyzer` 更新。tap 在 release 发布时更新，Scoop bucket 在几小时内更新。预发布版本都不收录。
 
 每个 [release](https://github.com/jinzhongjia/zig-analyzer/releases) 都为每个平台（Linux、macOS、Windows 的 x86_64 和 aarch64）提供两种构建：
 

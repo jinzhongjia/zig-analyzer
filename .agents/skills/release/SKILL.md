@@ -132,7 +132,10 @@ jinzhongjia/zig-analyzer`), and the checksum (`shasum -a 256 -c SHA256SUMS --ign
 extract and check that `zig-analyzer --version` prints `X.Y.Z`.
 
 For a final release, check that the tap has the commit `zig-analyzer X.Y.Z` and that its CI passed
-(`gh run list -R jinzhongjia/homebrew-tap --limit 1`).
+(`gh run list -R jinzhongjia/homebrew-tap --limit 1`). The Scoop manifest `bucket/zig-analyzer.json`
+of `jinzhongjia/scoop-bucket` is not updated by this workflow: the bucket's Excavator workflow
+picks up the latest release within four hours (its `checkver` and `autoupdate`, hashes from
+`SHA256SUMS`).
 
 ## Pre-releases
 
