@@ -51,7 +51,14 @@ On macOS and Linux, with [Homebrew](https://brew.sh):
 brew install jinzhongjia/tap/zig-analyzer
 ```
 
-It installs the ReleaseSafe build of the latest release, and `brew upgrade` updates it after each release. Pre-releases are not in the tap.
+On Windows (x86_64 and aarch64), with [Scoop](https://scoop.sh):
+
+```pwsh
+scoop bucket add jin https://github.com/jinzhongjia/scoop-bucket
+scoop install jin/zig-analyzer
+```
+
+Both install the ReleaseSafe build of the latest release, with its debug information; `brew upgrade` or `scoop update zig-analyzer` updates it. The tap is updated when a release is published, the Scoop bucket within a few hours. Pre-releases are in neither.
 
 Each [release](https://github.com/jinzhongjia/zig-analyzer/releases) has an archive per platform (x86_64 and aarch64 on Linux, macOS, and Windows) in two builds:
 
