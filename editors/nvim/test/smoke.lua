@@ -186,18 +186,31 @@ vim.api.nvim_set_current_buf(main_buf)
 vim.cmd('ZigAnalyzer syntaxTree')
 vim.wait(10000, function() return vim.api.nvim_buf_get_name(0):find('syntax%-tree') ~= nil end, 50)
 check(vim.api.nvim_buf_get_lines(0, 0, 1, false)[1]:match('^source_file@') ~= nil, ':ZigAnalyzer syntaxTree')
-vim.cmd.close()
+-- `<CR>` on the `std` identifier of `const std = ...` goes to it in the source
+local std_line = vim.fn.search('^\\s*identifier@\\d\\+\\.\\.\\d\\+ "std"$')
+vim.api.nvim_win_set_cursor(0, { std_line, 0 })
+vim.api.nvim_feedkeys(vim.keycode('<CR>'), 'x', false)
+local std_pos = pos('src/main.zig', 'std')
+check(vim.api.nvim_get_current_buf() == main_buf
+  and vim.deep_equal(vim.api.nvim_win_get_cursor(0), { std_pos.line + 1, std_pos.character }),
+  ':ZigAnalyzer syntaxTree: <CR> goes to the source')
+vim.cmd('only')
 
 vim.cmd('ZigAnalyzer moduleGraph')
 vim.wait(10000, function() return vim.api.nvim_buf_get_name(0):find('module%-graph') ~= nil end, 50)
-check(table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false)):find(path('src/main.zig'), 1, true) ~= nil,
+check(table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false)):find(vim.fn.fnamemodify(path('src/main.zig'), ':~:.'), 1, true) ~= nil,
   ':ZigAnalyzer moduleGraph lists the project root module')
 vim.cmd.close()
 
 vim.cmd('ZigAnalyzer status')
-vim.wait(10000, function() return vim.api.nvim_buf_get_name(0):find('status%.json') ~= nil end, 50)
-check(vim.bo.filetype == 'json' and table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false)):find('"revision"') ~= nil,
-  ':ZigAnalyzer status')
+vim.wait(10000, function() return vim.api.nvim_buf_get_name(0):find('zig%-analyzer://status') ~= nil end, 50)
+check(vim.api.nvim_buf_get_lines(0, 0, 1, false)[1]:match('^Revision ') ~= nil, ':ZigAnalyzer status')
+vim.cmd.close()
+
+vim.cmd('ZigAnalyzer fileStatus')
+vim.wait(10000, function() return vim.api.nvim_buf_get_name(0):find('file%-status') ~= nil end, 50)
+check(table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('\nProjects +' .. vim.pesc(vim.fn.fnamemodify(dir, ':~:.'))) ~= nil,
+  ':ZigAnalyzer fileStatus')
 vim.cmd.close()
 
 vim.cmd('ZigAnalyzer reloadWorkspace')

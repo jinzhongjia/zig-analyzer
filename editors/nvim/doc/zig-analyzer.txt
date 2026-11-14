@@ -89,6 +89,12 @@ COMMANDS                                             *zig-analyzer-commands*
 :ZigAnalyzer log             Open the LSP log.
 :ZigAnalyzer install         Install the server (|:ZigAnalyzer-install|).
 
+The views open in a split, which the next run of the same command reuses.
+In a view, <CR> follows the line under the cursor: it opens a file, goes to
+the module an import refers to, or in the syntax tree goes to the node or
+token in the source file. Moving the cursor in the syntax tree highlights the
+range of the node in the source file. `q` closes the view.
+
 Run |:checkhealth| zig-analyzer to check the server and Zig executables.
 
  vim:tw=78:ts=8:ft=help:norl:
