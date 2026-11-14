@@ -219,3 +219,44 @@ jobs:
           case "$version" in *-*) prerelease=(--prerelease) ;; esac
           gh release create "$GITHUB_REF_NAME" --verify-tag --draft "${prerelease[@]}" --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" dist/*
           gh release edit "$GITHUB_REF_NAME" --draft=false
+
+  # The formula of the tap jinzhongjia/homebrew-tap installs the latest release; a pre-release
+  # does not change it
+  homebrew:
+    name: Update the Homebrew formula
+    needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
+      - name: Commit the formula to jinzhongjia/homebrew-tap
+        # A deploy key with write access to the tap repository only
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::The secret HOMEBREW_TAP_DEPLOY_KEY (a deploy key of jinzhongjia/homebrew-tap with write access) of the environment release is not set"
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+          # GitHub's published host key
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND='ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes'
+          git clone -q --depth 1 git@github.com:jinzhongjia/homebrew-tap.git "$RUNNER_TEMP/tap"
+          packaging/homebrew/formula.sh "$GITHUB_REF_NAME" "$RUNNER_TEMP/SHA256SUMS" > "$RUNNER_TEMP/tap/Formula/zig-analyzer.rb"
+          cd "$RUNNER_TEMP/tap"
+          if git diff --quiet; then
+            echo "The formula is already at $GITHUB_REF_NAME"
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -q -am "zig-analyzer ${GITHUB_REF_NAME#v}"
+          git push origin HEAD:main
