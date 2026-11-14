@@ -131,11 +131,12 @@ function! s:document() abort
   return {'textDocument': {'uri': l:uri}}
 endfunction
 
+" The inspection requests: the view title, and whether the request takes the current file
 let s:commands = {
-      \ 'status': ['status.json', 'zig-analyzer/status', 0, 'json'],
-      \ 'fileStatus': ['file-status.json', 'zig-analyzer/fileStatus', 1, 'json'],
-      \ 'syntaxTree': ['syntax-tree.txt', 'zig-analyzer/syntaxTree', 1, 'text'],
-      \ 'moduleGraph': ['module-graph.json', 'zig-analyzer/moduleGraph', 0, 'json'],
+      \ 'status': ['status', 0],
+      \ 'fileStatus': ['file-status', 1],
+      \ 'syntaxTree': ['syntax-tree', 1],
+      \ 'moduleGraph': ['module-graph', 0],
       \ }
 
 function! zig_analyzer#complete(lead, line, pos) abort
@@ -179,13 +180,14 @@ function! zig_analyzer#command(name, ...) abort
     call s:error('unknown subcommand: ' . a:name)
     return
   endif
-  let [l:title, l:method, l:needs_file, l:filetype] = s:commands[a:name]
+  let [l:title, l:needs_file] = s:commands[a:name]
   if l:needs_file && &filetype !=# 'zig'
     call s:error('open a Zig or ZON file first')
     return
   endif
   let l:params = l:needs_file ? s:document() : v:null
-  call zig_analyzer#request(l:method, l:params, function('s:show', [l:title, l:filetype]))
+  let l:source = a:name ==# 'syntaxTree' ? bufnr('%') : -1
+  call zig_analyzer#request('zig-analyzer/' . a:name, l:params, function('s:show', [a:name, l:title, l:source]))
 endfunction
 
 function! s:report(error) abort
@@ -194,7 +196,7 @@ function! s:report(error) abort
   endif
 endfunction
 
-function! s:show(title, filetype, result, error) abort
+function! s:show(kind, title, source, result, error) abort
   if !empty(a:error)
     call s:report(a:error)
     return
@@ -203,13 +205,7 @@ function! s:show(title, filetype, result, error) abort
     call s:error('the file is not known to the server')
     return
   endif
-  let l:lines = type(a:result) == v:t_string ? split(a:result, "\n") : split(zig_analyzer#json#pretty(a:result), "\n")
-  botright vnew
-  setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
-  silent! execute 'file zig-analyzer://' . a:title
-  call setline(1, l:lines)
-  let &l:filetype = a:filetype
-  setlocal nomodifiable
+  call zig_analyzer#view#show(a:kind, a:title, a:result, a:source)
 endfunction
 
 function! s:error(message) abort
