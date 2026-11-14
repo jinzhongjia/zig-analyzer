@@ -53,7 +53,10 @@ Click the `zig-analyzer` status bar item, or run from the command palette:
 - **zig-analyzer: Install Server**: download a release of the server (see above).
 - **zig-analyzer: Reload Workspace**: rerun `build.zig` and reload the projects.
 - **zig-analyzer: Show Server Status**, **Show File Status**, **Show Syntax Tree**,
-  **Show Module Graph**: what the server knows, for reporting problems.
+  **Show Module Graph**: what the server knows, for reporting problems. In a view, Go to
+  Definition (Ctrl/Cmd-click) follows a line: it opens a file, goes to the module an import refers
+  to, or goes to a node or token of the syntax tree in the source file. The cursor's line in the
+  syntax tree highlights its range in the source file.
 
 ## Development
 

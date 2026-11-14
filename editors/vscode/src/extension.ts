@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
@@ -8,6 +9,7 @@ import {
 } from "vscode-languageclient/node";
 import * as installer from "./install";
 import { configuredServer, section, serverEnv, serverSettings } from "./settings";
+import * as views from "./views";
 
 /** Scheme of the read-only documents that show the results of the server's custom requests */
 const viewScheme = "zig-analyzer";
@@ -17,8 +19,13 @@ let client: LanguageClient | undefined;
 let clientCommand: string | undefined;
 let statusItem: vscode.StatusBarItem;
 let output: vscode.OutputChannel;
-const views = new Map<string, string>();
+/** The open views by URI, with the document the syntax tree describes */
+const openViews = new Map<string, { view: views.View; source?: vscode.Uri }>();
 const viewChanged = new vscode.EventEmitter<vscode.Uri>();
+/** The decoration of each style of the views */
+const viewStyles = new Map<views.Style, vscode.TextEditorDecorationType>();
+/** The range of the syntax tree line under the cursor, in the source document */
+let rangeDecoration: vscode.TextEditorDecorationType;
 let releaseSource = installer.github;
 let installing = false;
 
@@ -42,29 +49,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
   statusItem.command = "zig-analyzer.menu";
   context.subscriptions.push(output, statusItem, viewChanged);
 
+  registerViews(context);
   context.subscriptions.push(
-    vscode.workspace.registerTextDocumentContentProvider(viewScheme, {
-      onDidChange: viewChanged.event,
-      provideTextDocumentContent: (uri) => views.get(uri.toString()) ?? "",
-    }),
     vscode.commands.registerCommand("zig-analyzer.menu", showMenu),
     vscode.commands.registerCommand("zig-analyzer.restartServer", () => restart(context)),
     vscode.commands.registerCommand("zig-analyzer.installServer", (options?: installer.InstallOptions) =>
       installCommand(context, options),
     ),
     vscode.commands.registerCommand("zig-analyzer.reloadWorkspace", reloadWorkspace),
-    vscode.commands.registerCommand("zig-analyzer.showStatus", () =>
-      showView("status.json", "zig-analyzer/status", undefined, json),
-    ),
-    vscode.commands.registerCommand("zig-analyzer.showFileStatus", () =>
-      withEditor((uri) => showView("file-status.json", "zig-analyzer/fileStatus", { textDocument: { uri } }, json)),
-    ),
-    vscode.commands.registerCommand("zig-analyzer.showSyntaxTree", () =>
-      withEditor((uri) => showView("syntax-tree.txt", "zig-analyzer/syntaxTree", { textDocument: { uri } }, text)),
-    ),
-    vscode.commands.registerCommand("zig-analyzer.showModuleGraph", () =>
-      showView("module-graph.json", "zig-analyzer/moduleGraph", undefined, json),
-    ),
+    vscode.commands.registerCommand("zig-analyzer.showStatus", () => showView("status", "status")),
+    vscode.commands.registerCommand("zig-analyzer.showFileStatus", () => withEditor((doc) => showView("fileStatus", "file-status", doc))),
+    vscode.commands.registerCommand("zig-analyzer.showSyntaxTree", () => withEditor((doc) => showView("syntaxTree", "syntax-tree", doc))),
+    vscode.commands.registerCommand("zig-analyzer.showModuleGraph", () => showView("moduleGraph", "module-graph")),
     vscode.commands.registerCommand("zig-analyzer.showOutput", () => output.show(true)),
     vscode.workspace.onDidChangeConfiguration(async (e) => {
       if (!e.affectsConfiguration(`${section}.server`)) return;
@@ -312,27 +308,129 @@ async function reloadWorkspace(): Promise<void> {
   await runningClient()?.sendRequest("zig-analyzer/reloadWorkspace");
 }
 
-function withEditor(f: (uri: string) => Promise<void>): Promise<void> {
+function withEditor(f: (doc: vscode.Uri) => Promise<void>): Promise<void> {
   const editor = vscode.window.activeTextEditor;
   if (editor?.document.languageId !== "zig") {
     void vscode.window.showWarningMessage("zig-analyzer: open a Zig or ZON file first.");
     return Promise.resolve();
   }
-  return f(editor.document.uri.toString());
+  return f(editor.document.uri);
 }
 
-const json = (r: unknown) => JSON.stringify(r, null, 2);
-const text = (r: unknown) => (typeof r === "string" ? r : json(r));
+const viewColors: Record<views.Style, vscode.DecorationRenderOptions> = {
+  type: { color: new vscode.ThemeColor("symbolIcon.classForeground") },
+  token: { color: new vscode.ThemeColor("symbolIcon.variableForeground") },
+  string: { color: new vscode.ThemeColor("debugTokenExpression.string") },
+  comment: { color: new vscode.ThemeColor("descriptionForeground") },
+  number: { color: new vscode.ThemeColor("debugTokenExpression.number") },
+  title: { fontWeight: "bold" },
+  label: { color: new vscode.ThemeColor("symbolIcon.propertyForeground") },
+  path: { color: new vscode.ThemeColor("textLink.foreground") },
+  error: { color: new vscode.ThemeColor("errorForeground") },
+};
 
-async function showView(name: string, method: string, params: unknown, render: (r: unknown) => string): Promise<void> {
+const viewFormat: views.Format = {
+  path(p) {
+    const shown = vscode.workspace.asRelativePath(p, false);
+    const home = os.homedir();
+    return shown === p && p.startsWith(home + path.sep) ? "~" + p.slice(home.length) : shown;
+  },
+  time(ms) {
+    const d = new Date(ms);
+    const two = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
+  },
+};
+
+/**
+ * The views are read-only documents of the `zig-analyzer` scheme, styled with decorations. Go to
+ * Definition (Ctrl/Cmd-click) follows a line: it opens a file, goes to the module an import refers
+ * to, or goes to the node or token of a syntax tree line in the source document, whose range is
+ * highlighted while the cursor is on the line.
+ */
+function registerViews(context: vscode.ExtensionContext): void {
+  for (const [style, options] of Object.entries(viewColors)) viewStyles.set(style as views.Style, vscode.window.createTextEditorDecorationType(options));
+  rangeDecoration = vscode.window.createTextEditorDecorationType({ backgroundColor: new vscode.ThemeColor("editor.rangeHighlightBackground") });
+  context.subscriptions.push(
+    ...viewStyles.values(),
+    rangeDecoration,
+    vscode.workspace.registerTextDocumentContentProvider(viewScheme, {
+      onDidChange: viewChanged.event,
+      provideTextDocumentContent: (uri) => openViews.get(uri.toString())?.view.lines.join("\n") ?? "",
+    }),
+    vscode.languages.registerDefinitionProvider({ scheme: viewScheme }, { provideDefinition: (doc, pos) => viewTarget(doc.uri, pos.line) }),
+    vscode.window.onDidChangeVisibleTextEditors(() => {
+      for (const e of vscode.window.visibleTextEditors) decorateView(e);
+      highlightRange();
+    }),
+    vscode.workspace.onDidChangeTextDocument((e) => {
+      if (e.document.uri.scheme !== viewScheme) return;
+      for (const editor of vscode.window.visibleTextEditors) if (editor.document === e.document) decorateView(editor);
+    }),
+    vscode.window.onDidChangeTextEditorSelection((e) => {
+      if (e.textEditor.document.uri.scheme === viewScheme) highlightRange();
+    }),
+  );
+}
+
+function decorateView(editor: vscode.TextEditor): void {
+  const open = openViews.get(editor.document.uri.toString());
+  if (editor.document.uri.scheme !== viewScheme || !open) return;
+  const ranges = new Map<views.Style, vscode.Range[]>();
+  for (const s of open.view.styles) {
+    let list = ranges.get(s.style);
+    if (!list) ranges.set(s.style, (list = []));
+    list.push(new vscode.Range(s.line, s.start, s.line, s.end));
+  }
+  for (const [style, type] of viewStyles) editor.setDecorations(type, ranges.get(style) ?? []);
+}
+
+/** The range of byte offsets `range` in `doc` */
+function sourceRange(doc: vscode.TextDocument, range: [number, number]): vscode.Range {
+  const index = new views.ByteIndex(doc.getText());
+  const start = index.position(range[0]);
+  const end = index.position(range[1]);
+  return new vscode.Range(start.line, start.character, end.line, end.character);
+}
+
+async function viewTarget(uri: vscode.Uri, line: number): Promise<vscode.Location | undefined> {
+  const open = openViews.get(uri.toString());
+  const t = open?.view.targets.get(line);
+  if (!t) return undefined;
+  if ("file" in t) return new vscode.Location(vscode.Uri.file(t.file), new vscode.Position(0, 0));
+  if ("line" in t) return new vscode.Location(uri, new vscode.Position(t.line, 0));
+  if (!open?.source) return undefined;
+  const doc = await vscode.workspace.openTextDocument(open.source);
+  return new vscode.Location(open.source, sourceRange(doc, t.range).start);
+}
+
+/** Highlights, in the visible source editors, the range of the syntax tree line under the cursor */
+function highlightRange(): void {
+  const ranges = new Map<string, vscode.Range[]>();
+  for (const e of vscode.window.visibleTextEditors) {
+    const open = openViews.get(e.document.uri.toString());
+    const t = open?.view.targets.get(e.selection.active.line);
+    if (!open?.source || !t || !("range" in t)) continue;
+    const source = vscode.workspace.textDocuments.find((d) => d.uri.toString() === open.source!.toString());
+    if (source) ranges.set(source.uri.toString(), [sourceRange(source, t.range)]);
+  }
+  for (const e of vscode.window.visibleTextEditors) e.setDecorations(rangeDecoration, ranges.get(e.document.uri.toString()) ?? []);
+}
+
+async function showView(kind: views.Kind, name: string, source?: vscode.Uri): Promise<void> {
   const c = runningClient();
   if (!c) return;
-  const result = await c.sendRequest(method, params);
+  const result = await c.sendRequest(`zig-analyzer/${kind}`, source ? { textDocument: { uri: source.toString() } } : undefined);
   const uri = vscode.Uri.from({ scheme: viewScheme, path: "/" + name });
-  views.set(uri.toString(), result === null ? "No result: the file is not known to zig-analyzer." : render(result));
+  const view: views.View =
+    result === null
+      ? { lines: ["No result: the file is not known to zig-analyzer."], styles: [], targets: new Map() }
+      : views.render(kind, result, viewFormat);
+  openViews.set(uri.toString(), { view, source: kind === "syntaxTree" ? source : undefined });
   viewChanged.fire(uri);
   const doc = await vscode.workspace.openTextDocument(uri);
-  await vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.Beside });
+  const editor = await vscode.window.showTextDocument(doc, { preview: true, viewColumn: vscode.ViewColumn.Beside });
+  decorateView(editor);
 }
 
 /**

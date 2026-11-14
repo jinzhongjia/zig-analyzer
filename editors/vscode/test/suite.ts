@@ -178,12 +178,20 @@ export async function run(): Promise<void> {
     );
     return d?.getText() ?? "";
   };
-  check(/^source_file@0\.\.\d+$/m.test(await view("zig-analyzer.showSyntaxTree", "syntax-tree.txt")), "Show Syntax Tree");
+  const tree = await view("zig-analyzer.showSyntaxTree", "syntax-tree");
+  check(/^source_file@0\.\.\d+$/m.test(tree), "Show Syntax Tree");
+  // Go to Definition on the `std` identifier of `const std = ...` goes to it in the source
+  const treeUri = vscode.Uri.from({ scheme: "zig-analyzer", path: "/syntax-tree" });
+  const stdLine = tree.split("\n").findIndex((l) => /^\s*identifier@\d+\.\.\d+ "std"$/.test(l));
+  const treeDefs = await vscode.commands.executeCommand<vscode.Location[]>("vscode.executeDefinitionProvider", treeUri, new vscode.Position(stdLine, 4));
+  check(treeDefs?.[0]?.uri.toString() === main.toString() && treeDefs[0].range.start.isEqual(pos("src/main.zig", "std")),
+    "Show Syntax Tree: a line goes to the source");
   await vscode.window.showTextDocument(doc);
-  check((await view("zig-analyzer.showModuleGraph", "module-graph.json")).includes(JSON.stringify(main.fsPath)), "Show Module Graph lists the project root module");
-  check((await view("zig-analyzer.showStatus", "status.json")).includes('"revision"'), "Show Server Status");
+  const graph = await view("zig-analyzer.showModuleGraph", "module-graph");
+  check(graph.split("\n").some((l) => /^\[\d+\] src\/main\.zig /.test(l)), "Show Module Graph lists the project root module");
+  check(/^Revision +\d+$/m.test(await view("zig-analyzer.showStatus", "status")), "Show Server Status");
   await vscode.window.showTextDocument(doc);
-  check((await view("zig-analyzer.showFileStatus", "file-status.json")).includes('"projects"'), "Show File Status");
+  check(/^Projects +\S/m.test(await view("zig-analyzer.showFileStatus", "file-status")), "Show File Status");
 
   await vscode.commands.executeCommand("zig-analyzer.reloadWorkspace");
   await client!.sendRequest("zig-analyzer/waitIdle");

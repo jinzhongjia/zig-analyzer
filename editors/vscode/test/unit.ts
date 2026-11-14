@@ -10,6 +10,7 @@ import * as path from "node:path";
 import { crc32, tarEntries, unpack, zipEntries } from "../src/archive";
 import * as installer from "../src/install";
 import * as minisign from "../src/minisign";
+import * as views from "../src/views";
 import { newKey, serve, sign, writeRelease } from "./release";
 
 const results: string[] = [];
@@ -348,8 +349,50 @@ async function installs(): Promise<void> {
   await server.close();
 }
 
+function inspectionViews(): void {
+  const format: views.Format = { path: (p) => p.replace(/^\/p\//, ""), time: () => "T" };
+  const tree = views.render("syntaxTree", 'source_file@0..9\n  identifier@0..3 "abc"\n  error_node@4..9\nerror@4: expected expression\n', format);
+  check(tree.lines[1] === '  identifier@0..3 "abc"' && JSON.stringify(tree.targets.get(1)) === '{"range":[0,3]}', "syntax tree: a token line leads to its range");
+  check(tree.styles.some((s) => s.line === 2 && s.style === "error") && JSON.stringify(tree.targets.get(3)) === '{"range":[4,4]}', "syntax tree: errors");
+
+  const graph = views.render("moduleGraph", {
+    std_root: "/p/std/std.zig",
+    modules: [
+      { root: "/p/main.zig", builtin: "/p/builtin.zig", imports: [{ name: "std", module: 4294967295 }, { name: "lib", module: 1 }], files: 2 },
+      { root: "/p/lib.zig", imports: [], files: 1 },
+    ],
+  }, format);
+  check(graph.lines.join("\n") === [
+    "std  std/std.zig", "", "[0] main.zig  2 files", "    builtin builtin.zig", "    import lib → [1] lib.zig", "    import std → std", "", "[1] lib.zig  1 file",
+  ].join("\n"), "module graph: modules with their builtin and sorted imports");
+  check(JSON.stringify(graph.targets.get(4)) === '{"line":7}' && JSON.stringify(graph.targets.get(5)) === '{"file":"/p/std/std.zig"}', "module graph: an import leads to its module");
+
+  const file = views.render("fileStatus", {
+    path: "/p/main.zig", origin: "user", context: "project", open: true, modules: ["/p/main.zig", "std"],
+    projects: [{ root: "/p", last_build: { at_ms: 0, files: 1, diagnostics: 2 } }], single_file_roots: [],
+  }, format);
+  check(file.lines.join("\n") === [
+    "File               main.zig", "Origin             user", "Context            project", "Open               yes",
+    "Modules            main.zig", "                   std", "Projects           /p  last build T: 1 files, 2 diagnostics", "Single-file roots  none",
+  ].join("\n"), "file status: aligned fields");
+
+  const q = (name: string, total: number) => ({ name, executions: 1, hits: 0, cutoffs: 0, total_ms: total, self_ms: 0, max_ms: 0, memos: 0, keys: 0, bytes: 2048, deps: 0, incomplete: 0 });
+  const status = views.render("status", {
+    revision: 1, files: 2, deep_verifications: 0, writes: 0, max_rss_kb: 1024, intern_pool_items: 0, intern_pool_bytes: 0, heap_bytes: 0,
+    allocator: null, queries: [q("a", 1), q("b", 5)],
+  }, format);
+  const rows = status.lines.filter((l) => /^ {2}[ab] /.test(l));
+  check(status.lines[0] === "Revision            1" && status.lines.includes("Max RSS             1.0 MiB") && rows[0].startsWith("  b ") && rows[0].includes("2.0 KiB"),
+    "status: fields, sizes, and queries by total time");
+
+  const index = new views.ByteIndex("aé\r\n𝄞x\n");
+  check(JSON.stringify(index.position(3)) === '{"line":0,"character":2}' && JSON.stringify(index.position(9)) === '{"line":1,"character":2}'
+    && JSON.stringify(index.position(11)) === '{"line":2,"character":0}', "byte offsets to UTF-16 positions");
+}
+
 async function main(): Promise<void> {
   try {
+    inspectionViews();
     blake2b();
     await signatures();
     await archives();
