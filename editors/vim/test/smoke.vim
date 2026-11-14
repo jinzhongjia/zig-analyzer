@@ -218,21 +218,27 @@ execute 'buffer ' . s:main
 ZigAnalyzer syntaxTree
 call s:wait('bufname("%") =~# "syntax-tree"', 10000)
 call s:check(getline(1) =~# '^source_file@', ':ZigAnalyzer syntaxTree')
-close
+" `<CR>` on the `std` identifier of `const std = ...` goes to it in the source
+call search('^\s*identifier@\d\+\.\.\d\+ "std"$')
+execute "normal \<CR>"
+let s:std_pos = s:pos('src/main.zig', 'std')
+call s:check(bufnr('%') == s:main && [line('.'), col('.')] == [s:std_pos.line + 1, s:std_pos.character + 1],
+      \ ':ZigAnalyzer syntaxTree: <CR> goes to the source')
+only
 
 ZigAnalyzer moduleGraph
 call s:wait('bufname("%") =~# "module-graph"', 10000)
-call s:check(stridx(join(getline(1, '$')), json_encode(s:path('src/main.zig'))) >= 0, ':ZigAnalyzer moduleGraph lists the project root module')
+call s:check(stridx(join(getline(1, '$')), fnamemodify(s:path('src/main.zig'), ':~:.')) >= 0, ':ZigAnalyzer moduleGraph lists the project root module')
 close
 
 ZigAnalyzer status
-call s:wait('bufname("%") =~# "status.json"', 10000)
-call s:check(&filetype ==# 'json' && join(getline(1, '$')) =~# '"revision"', ':ZigAnalyzer status')
+call s:wait('bufname("%") ==# "zig-analyzer://status"', 10000)
+call s:check(getline(1) =~# '^Revision ', ':ZigAnalyzer status')
 close
 
 ZigAnalyzer fileStatus
-call s:wait('bufname("%") =~# "file-status.json"', 10000)
-call s:check(join(getline(1, '$')) =~# '"projects"', ':ZigAnalyzer fileStatus')
+call s:wait('bufname("%") =~# "file-status"', 10000)
+call s:check(!empty(filter(getline(1, '$'), {_, l -> l =~# '^Projects \+' . escape(fnamemodify(s:dir, ':~:.'), '\.~')})), ':ZigAnalyzer fileStatus')
 close
 
 ZigAnalyzer reloadWorkspace
