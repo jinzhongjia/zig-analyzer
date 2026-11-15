@@ -2,8 +2,8 @@
 //! Text is parsed by the standard library zig-analyzer was built with, so the result can differ
 //! from `zig fmt` only where the parsers of the two versions differ (see
 //! `docs/features/formatting.md`).
-//! Outputs the minimal replacement range in whole lines (the part outside the common prefix /
-//! suffix), avoiding a whole-document replacement that would lose the cursor and folds.
+//! Outputs one edit per modified region in whole lines (a line diff), avoiding replacing
+//! unmodified lines, which would lose the cursor, marks, and folds on them.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const engine = @import("../db/engine.zig");
 const types = @import("../lsp/types.zig");
 const offsets = @import("../util/offsets.zig");
+const line_diff = @import("../util/line_diff.zig");
 const nesting = @import("../syntax/nesting.zig");
 const render_0_17_0 = @import("render/zig_0_17_0.zig");
 const render_0_17_1 = @import("render/zig_0_17_1.zig");
@@ -54,13 +55,24 @@ pub const ZigFmtRenderer = struct {
 pub fn format(arena: Allocator, lines: offsets.LineIndex, mode: Mode, enc: offsets.Encoding, renderer: Renderer) Allocator.Error!?[]const types.TextEdit {
     const text = lines.text;
     const formatted = try renderText(arena, text, mode, renderer) orelse return null;
-    if (std.mem.eql(u8, formatted, text)) return &.{};
-    const d = lineDiff(text, formatted);
-    const edit: types.TextEdit = .{
-        .range = lines.range(d.start, d.old_end, enc),
-        .newText = formatted[d.start..d.new_end],
-    };
-    return try arena.dupe(types.TextEdit, &.{edit});
+    const regions = try line_diff.diff(arena, text, formatted);
+    var edits: std.ArrayList(types.TextEdit) = try .initCapacity(arena, regions.len);
+    // Touching regions (a line terminator change next to modified lines) are merged into one edit
+    var i: usize = 0;
+    while (i < regions.len) {
+        const first = regions[i];
+        // Shift of the new text accumulated by the regions before
+        const shift = if (i == 0) 0 else @as(i64, regions[i - 1].new_end) - @as(i64, regions[i - 1].old_end);
+        const new_start: usize = @intCast(@as(i64, first.start) + shift);
+        var last = first;
+        i += 1;
+        while (i < regions.len and regions[i].start == last.old_end) : (i += 1) last = regions[i];
+        edits.appendAssumeCapacity(.{
+            .range = lines.range(first.start, last.old_end, enc),
+            .newText = formatted[new_start..last.new_end],
+        });
+    }
+    return edits.items;
 }
 
 /// Result of the renderer on the text; null on syntax errors or when nesting is too deep
@@ -124,9 +136,14 @@ test {
     _ = @import("format_test.zig");
 }
 
-fn applyEdit(gpa: Allocator, text: []const u8, edit: types.TextEdit) ![]u8 {
-    const changes = [_]types.TextDocumentContentChangeEvent{.{ .TextDocumentContentChangePartial = .{ .range = edit.range, .text = edit.newText } }};
-    return offsets.applyChanges(gpa, text, &changes, .utf16);
+/// Applies the edits of one response, whose ranges refer to the original text, back to front
+fn applyEdits(gpa: Allocator, text: []const u8, edits: []const types.TextEdit) ![]u8 {
+    const changes = try gpa.alloc(types.TextDocumentContentChangeEvent, edits.len);
+    for (changes, 0..) |*c, i| {
+        const e = edits[edits.len - 1 - i];
+        c.* = .{ .TextDocumentContentChangePartial = .{ .range = e.range, .text = e.newText } };
+    }
+    return offsets.applyChanges(gpa, text, changes, .utf16);
 }
 
 test "deeply nested source is formatted on a large stack, beyond the depth limit it is rejected" {
@@ -144,7 +161,7 @@ test "deeply nested source is formatted on a large stack, beyond the depth limit
         const lines = try offsets.LineIndex.init(a, text.items);
         const edits = (try format(a, lines, .zig, .utf16, renderer)).?;
         try testing.expectEqual(1, edits.len);
-        try testing.expectEqualStrings(try std.mem.replaceOwned(u8, a, text.items, "const  x", "const x"), try applyEdit(a, text.items, edits[0]));
+        try testing.expectEqualStrings(try std.mem.replaceOwned(u8, a, text.items, "const  x", "const x"), try applyEdits(a, text.items, edits));
 
         // Beyond the depth limit: rejected
         text.clearRetainingCapacity();
@@ -170,7 +187,25 @@ test format {
     // Only the second line is replaced
     try testing.expectEqual(1, edits[0].range.start.line);
     try testing.expectEqual(2, edits[0].range.end.line);
-    try testing.expectEqualStrings("const a = 1;\nfn f() void {}\nconst b = 2;\n", try applyEdit(a, text, edits[0]));
+    try testing.expectEqualStrings("const a = 1;\nfn f() void {}\nconst b = 2;\n", try applyEdits(a, text, edits));
+
+    // Modifications at the start and the end: the unmodified lines between them are not replaced
+    const both = "const  a = 1;\nconst b = 2;\nconst c = 3;\nconst  d = 4;\n";
+    const both_lines = try offsets.LineIndex.init(a, both);
+    const both_edits = (try format(a, both_lines, .zig, .utf16, .built)).?;
+    try testing.expectEqual(2, both_edits.len);
+    try testing.expectEqual(0, both_edits[0].range.start.line);
+    try testing.expectEqual(1, both_edits[0].range.end.line);
+    try testing.expectEqual(3, both_edits[1].range.start.line);
+    try testing.expectEqual(4, both_edits[1].range.end.line);
+    try testing.expectEqualStrings("const a = 1;\nconst b = 2;\nconst c = 3;\nconst d = 4;\n", try applyEdits(a, both, both_edits));
+
+    // A line terminator change next to a modified line yields one edit
+    const crlf = "const a = 1;\r\nconst  b = 2;\n";
+    const crlf_lines = try offsets.LineIndex.init(a, crlf);
+    const crlf_edits = (try format(a, crlf_lines, .zig, .utf16, .built)).?;
+    try testing.expectEqual(1, crlf_edits.len);
+    try testing.expectEqualStrings("const a = 1;\nconst b = 2;\n", try applyEdits(a, crlf, crlf_edits));
 
     const ok = try offsets.LineIndex.init(a, "const a = 1;\n");
     try testing.expectEqual(0, (try format(a, ok, .zig, .utf16, .built)).?.len);
