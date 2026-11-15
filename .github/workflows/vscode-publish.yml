@@ -1,0 +1,57 @@
+name: Publish the VS Code extension
+
+# Run by hand on main after the version in editors/vscode/package.json is raised. The extension is
+# published with the version in package.json; a version that is published already fails.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # Trusted publishing: the Marketplace accepts the GitHub OIDC token of this workflow
+      id-token: write
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - name: The workflow runs on main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::publish from main, not $GITHUB_REF"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - name: Check the extension
+        run: |
+          npm ci
+          npm run typecheck
+          npm run check-settings
+      - name: Package
+        run: npx vsce package --no-dependencies -o zig-analyzer.vsix
+      - name: Publish to the VS Code Marketplace
+        run: npx vsce publish --oidc --packagePath zig-analyzer.vsix
+      # Open VSX serves VSCodium, Cursor, and other VS Code forks; skipped without its token
+      - name: Publish to Open VSX
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          if [ -z "$OVSX_PAT" ]; then
+            echo "::notice::OVSX_PAT is not set; not published to Open VSX"
+            exit 0
+          fi
+          npx --yes ovsx@1.4.0 publish zig-analyzer.vsix -p "$OVSX_PAT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zig-analyzer.vsix
+          path: editors/vscode/zig-analyzer.vsix
