@@ -15,8 +15,12 @@ server. Pushing the tag runs `.github/workflows/vscode-publish.yml`:
 3. `vsce publish --oidc` publishes the `.vsix` to the VS Code Marketplace (publisher
    `jinzhongjia`) through trusted publishing: no token, the Marketplace trusts the workflow file
    `vscode-publish.yml` of this repository.
-4. When the secret `OVSX_PAT` is set, `ovsx publish` publishes the same `.vsix` to Open VSX
-   (namespace `jinzhongjia`); otherwise the step is skipped with a notice.
+4. `ovsx publish` publishes the same `.vsix` to Open VSX (namespace `jinzhongjia`), also through
+   trusted publishing: the trusted publisher registered for the namespace names this repository
+   and `vscode-publish.yml`.
+
+Both publish steps pass `--skip-duplicate`: a version that a registry has already is skipped, so
+rerunning the workflow after one registry failed publishes to the other.
 
 The tag does not start with `v`, so the server's `release.yml`, the `Release tags` ruleset, and the
 `release` environment (all `v*`) do not apply to it. A version published to the Marketplace cannot
@@ -79,8 +83,8 @@ gh run watch <run id> --exit-status
 
 When it succeeds, the new version appears on the Marketplace after its automatic scan (minutes,
 sometimes longer): check `npx --yes @vscode/vsce@4 show jinzhongjia.zig-analyzer` and
-https://marketplace.visualstudio.com/items?itemName=jinzhongjia.zig-analyzer. With Open VSX
-enabled, check https://open-vsx.org/extension/jinzhongjia/zig-analyzer.
+https://marketplace.visualstudio.com/items?itemName=jinzhongjia.zig-analyzer. Check Open VSX at
+https://open-vsx.org/extension/jinzhongjia/zig-analyzer.
 
 ## 6. When something fails
 
@@ -91,9 +95,10 @@ enabled, check https://open-vsx.org/extension/jinzhongjia/zig-analyzer.
 - The Marketplace publish fails with an authentication error: the trusted publishing policy of
   the publisher (https://marketplace.visualstudio.com/manage) must name owner `jinzhongjia`,
   repository `zig-analyzer`, workflow `vscode-publish.yml`, and no environment. Fix it there and
-  rerun the job (`gh run rerun <run id> --failed`).
-- The Marketplace has the version but Open VSX failed: fix the token or namespace and rerun the
-  failed job; the Marketplace step then fails as already published, so publish the `.vsix`
-  artifact of the run to Open VSX by hand (`npx ovsx publish <vsix> -p <token>`, with consent).
+  rerun the failed job (`gh run rerun <run id> --failed`).
+- The Open VSX publish fails with an authentication error: the trusted publisher of the
+  namespace `jinzhongjia` (https://open-vsx.org, Settings, Trusted Publishers) must name the same
+  repository and workflow. Fix it there and rerun the failed job; the Marketplace step skips the
+  version it already has.
 - After the Marketplace has published a version, never move its tag: release a new patch version
   instead.
