@@ -7,42 +7,43 @@ extension, which must be installed too.
 ## Requirements
 
 - The Zig extension.
-- The server: `zig-analyzer` in `PATH`, its path in `lsp.zig-analyzer.binary.path`, or a release
-  that the extension downloads when `lsp.zig-analyzer.settings.download` is set (see
-  [Server](#server)).
+- The server: `zig-analyzer` in `PATH`, its path in `lsp.zig-analyzer.binary.path`, or else a
+  release that the extension downloads (see [Server](#server)).
 - Zig 0.17.0 or 0.17.1 in `PATH` (the server sees the PATH of your login shell), or its path in
   the `zig.path` server setting.
 
 ## Installation
 
-Until the extension is published: run `zed: install dev extension` and select this directory
-(`editors/zed`). Zed builds it with the Rust toolchain from rustup.
+Install zig-analyzer from Zed's extensions page (`zed: extensions`). To try a local checkout, run
+`zed: install dev extension` and select this directory (`editors/zed`); Zed builds it with the Rust
+toolchain from rustup.
 
 ## Server
 
 The extension starts the first of:
 
 1. `lsp.zig-analyzer.binary.path`, when it is set;
-2. the release that the extension installed, when `lsp.zig-analyzer.settings.download` is set;
-3. `zig-analyzer` in `PATH`.
+2. `zig-analyzer` in `PATH`;
+3. the release that the extension installs.
 
-The extension downloads nothing unless `download` is set. Zed extensions cannot add commands, so
-this setting is the way to ask for a download:
+The `download` setting selects the release; when it is `true` or an object, the release starts
+even with a server in `PATH`:
 
 ```json
 {
   "lsp": {
     "zig-analyzer": {
-      "settings": { "download": true }
+      "settings": { "download": { "version": "v0.1.1", "optimize": "ReleaseFast" } }
     }
   }
 }
 ```
 
-`true` selects the ReleaseSafe build of the latest release; an object selects another one:
-`{ "version": "v0.1.1", "optimize": "ReleaseFast" }`, where `version` is `"latest"` (the default) or
-a release tag, and `optimize` is `"ReleaseSafe"` (the default) or `"ReleaseFast"`. `false` or no
-`download` turns it off. The extension reads the setting itself and does not send it to the server.
+No `download`, or `true`, selects the ReleaseSafe build of the latest release; an object selects
+another one, where `version` is `"latest"` (the default) or a release tag, and `optimize` is
+`"ReleaseSafe"` (the default) or `"ReleaseFast"`. `false` turns downloads off, leaving only
+`binary.path` and `PATH`. The extension reads the setting itself and does not send it to the
+server.
 
 The release is installed when the server starts (when a Zig file is opened, or on
 `editor: restart language server`); Zed shows "Checking for updates to zig-analyzer" and

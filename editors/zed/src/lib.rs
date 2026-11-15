@@ -50,9 +50,15 @@ impl zed::Extension for ZigAnalyzerExtension {
             Some(path) => path,
             None => {
                 let (_, download) = split_settings(settings);
+                // Unset, `download` installs a release only when PATH has no server; set, it
+                // selects the server alone
+                let unset = matches!(download, None | Some(serde_json::Value::Null));
                 match download_options(download.as_ref())? {
                     None => worktree.which(SERVER).ok_or_else(not_found)?,
-                    Some(options) => self.downloaded_server(id, &options)?,
+                    Some(options) => match unset.then(|| worktree.which(SERVER)).flatten() {
+                        Some(path) => path,
+                        None => self.downloaded_server(id, &options)?,
+                    },
                 }
             }
         };
@@ -127,8 +133,8 @@ fn fallback(
 
 fn not_found() -> String {
     format!(
-        "`{SERVER}` was not found in PATH: install it, set `lsp.{SERVER}.binary.path` in the settings, \
-         or set `lsp.{SERVER}.settings.{DOWNLOAD}` to `true` to download a release"
+        "`{SERVER}` was not found in PATH and `lsp.{SERVER}.settings.{DOWNLOAD}` is `false`: install it, \
+         set `lsp.{SERVER}.binary.path` in the settings, or remove the `{DOWNLOAD}` setting to download a release"
     )
 }
 
@@ -190,8 +196,8 @@ fn server_settings(worktree: &zed::Worktree) -> serde_json::Value {
     split_settings(raw_settings(LspSettings::for_worktree(SERVER, worktree).ok().as_ref())).0
 }
 
-/// The release that the `download` setting selects: none when it is unset or `false`; the latest
-/// ReleaseSafe build for `true`; `{ "version": "latest" | "<tag>", "optimize": "ReleaseSafe" |
+/// The release that the `download` setting selects: none for `false`; the latest ReleaseSafe build
+/// when it is unset or `true`; `{ "version": "latest" | "<tag>", "optimize": "ReleaseSafe" |
 /// "ReleaseFast" }` for another one
 fn download_options(value: Option<&serde_json::Value>) -> Result<Option<install::Options>> {
     use serde_json::Value;
@@ -201,8 +207,8 @@ fn download_options(value: Option<&serde_json::Value>) -> Result<Option<install:
         optimize: install::Optimize::ReleaseSafe,
     };
     match value {
-        None | Some(Value::Null) | Some(Value::Bool(false)) => return Ok(None),
-        Some(Value::Bool(true)) => {}
+        Some(Value::Bool(false)) => return Ok(None),
+        None | Some(Value::Null) | Some(Value::Bool(true)) => {}
         Some(Value::Object(fields)) => {
             for (key, value) in fields {
                 match (key.as_str(), value) {
@@ -271,10 +277,8 @@ mod tests {
     }
 
     #[test]
-    fn download_is_off_unless_it_is_set() {
-        assert_eq!(download_options(None), Ok(None));
+    fn download_is_off_only_when_it_is_false() {
         assert_eq!(download_options(Some(&json!(false))), Ok(None));
-        assert_eq!(download_options(Some(&json!(null))), Ok(None));
     }
 
     #[test]
@@ -283,6 +287,8 @@ mod tests {
             version: None,
             optimize: Optimize::ReleaseSafe,
         };
+        assert_eq!(download_options(None), Ok(Some(latest_safe.clone())));
+        assert_eq!(download_options(Some(&json!(null))), Ok(Some(latest_safe.clone())));
         assert_eq!(download_options(Some(&json!(true))), Ok(Some(latest_safe.clone())));
         assert_eq!(download_options(Some(&json!({}))), Ok(Some(latest_safe.clone())));
         assert_eq!(download_options(Some(&json!({ "version": "latest" }))), Ok(Some(latest_safe)));
