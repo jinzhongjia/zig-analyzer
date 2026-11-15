@@ -80,7 +80,10 @@ return {
   -- root of its own, another server would start without the project the file was reached from: the
   -- Zig installation of a package manager such as Homebrew lies in a git repository, and that of
   -- an official archive under no marker at all.
+  --
+  -- Without a server for the default `cmd`, no client is started (see `install.missing`).
   root_dir = function(bufnr, on_dir)
+    if require('zig-analyzer.install').missing() then return end
     local root = vim.fs.root(bufnr, function(name)
       return name == 'build.zig' or name == '.git'
     end)

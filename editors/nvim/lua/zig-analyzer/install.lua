@@ -66,14 +66,34 @@ function M.command()
   return nil, 'missing'
 end
 
+--- Whether the configuration's `cmd` is the default one (and so starts the installed server)
+local function default_cmd()
+  local config = vim.lsp.config[name]
+  return config ~= nil and config.cmd == M.cmd
+end
+
+local missing_message = 'zig-analyzer is not installed: run `:ZigAnalyzer install`, or set `cmd` in setup()'
+local missing_reported = false
+
+--- Whether the configuration's `cmd` is the default one and finds no server. Says so once per
+--- session: Neovim tries to start a client for each Zig buffer and each `FileType` event (a plugin
+--- manager loading the plugin on a file type fires it again), and shows every failure.
+---@return boolean
+function M.missing()
+  if not default_cmd() or M.command() then return false end
+  if not missing_reported then
+    missing_reported = true
+    vim.notify(missing_message, vim.log.levels.WARN)
+  end
+  return true
+end
+
 --- The `cmd` of the default configuration: starts `M.command()` when the client starts
 ---@param dispatchers vim.lsp.rpc.Dispatchers
 ---@param config vim.lsp.ClientConfig
 function M.cmd(dispatchers, config)
   local exe = M.command()
-  if not exe then
-    error('zig-analyzer is not installed: run `:ZigAnalyzer install`, or set `cmd` in setup()', 0)
-  end
+  if not exe then error(missing_message, 0) end
   return vim.lsp.rpc.start({ exe }, dispatchers, {
     cwd = config.cmd_cwd,
     env = config.cmd_env,
@@ -137,12 +157,6 @@ function M._fail(co, err)
   M.busy = false
   notify('install failed: ' .. tostring(err), vim.log.levels.ERROR)
   if s and s.on_done then s.on_done(tostring(err)) end
-end
-
---- Whether the configuration's `cmd` is the default one (and so starts the installed server)
-local function default_cmd()
-  local config = vim.lsp.config[name]
-  return config ~= nil and config.cmd == M.cmd
 end
 
 --- Starts the installed server: restarts the running clients, or starts the clients of open Zig

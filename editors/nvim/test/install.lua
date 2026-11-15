@@ -254,11 +254,20 @@ for _, d in ipairs(vim.split(vim.env.PATH, ':', { trimempty = true })) do
 end
 vim.env.PATH = table.concat(path, ':')
 check(install.command() == nil, 'without an install and PATH entry there is no server')
-require('zig-analyzer').setup({ cmd = install.cmd })
+-- setup() already tries to start a client for the open buffer of the project
 messages = {}
+require('zig-analyzer').setup({ cmd = install.cmd })
 vim.cmd.edit(project .. '/build.zig')
 vim.wait(5000, function() return notified('not installed') end, 50)
 check(notified(':ZigAnalyzer install'), 'without a server, opening a Zig file says how to install one')
+vim.cmd.edit(project .. '/src/main.zig')
+vim.api.nvim_exec_autocmds('FileType', { buffer = 0 })
+vim.wait(500)
+local count = 0
+for _, m in ipairs(messages) do
+  if m.msg:find('not installed') then count = count + 1 end
+end
+check(count == 1, 'without a server, more Zig buffers and FileType events say so only once')
 
 vim.fn.delete(tmp, 'rf')
 print(failures == 0 and 'all checks passed' or (failures .. ' checks failed'))
