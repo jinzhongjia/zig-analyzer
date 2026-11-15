@@ -233,6 +233,9 @@ check(cmd == exe, 'the running server restarts with the new install')
 -- Installing the installed release again downloads nothing
 vim.fn.delete(('%s/download/v9.9.8/zig-analyzer-v9.9.8-%s-ReleaseFast.tar.gz'):format(releases, target))
 check(run({ version = 'v9.9.8', optimize = 'ReleaseFast' }) == nil, 'reinstalling the installed release needs no download')
+-- The restart starts its client once the old server has exited, with the old configuration
+cmd, client = server_command(client and client.id)
+check(cmd == exe, 'the running server restarts after the reinstall')
 
 local completion = vim.fn.getcompletion('ZigAnalyzer install ', 'cmdline')
 check(vim.tbl_contains(completion, 'ReleaseFast') and vim.tbl_contains(completion, 'latest'), 'install arguments complete')
