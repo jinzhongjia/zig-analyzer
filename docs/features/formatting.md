@@ -13,6 +13,8 @@ The parser is not copied: text is parsed by `std.zig.Ast.parse` of the Zig that 
 
 These differences are accepted: such text is rare, and copying the parser as well would keep a second parser for it.
 
+The result is returned as one edit per modified region, in whole lines (a patience line diff, `src/util/line_diff.zig`; regions that touch are merged), so unmodified lines keep their cursor, marks, and folds.
+
 Deeply nested text is formatted on a dedicated thread (with a stack sized by the estimated depth, at most 8 GiB), and text whose estimated depth exceeds 147456 (36864 on 32-bit platforms) is rejected.
 
 The limit is calibrated on common nesting forms: `zig fmt` (46 MiB main-thread stack) can format up to 36864 levels (consecutive prefix operators can go deeper); on 64-bit platforms the limit is 4 times that.
