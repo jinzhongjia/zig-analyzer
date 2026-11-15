@@ -1,9 +1,11 @@
 name: Publish the VS Code extension
 
-# Run by hand on main after the version in editors/vscode/package.json is raised. The extension is
-# published with the version in package.json; a version that is published already fails.
+# A release of the VS Code extension is an annotated tag `editors/vscode/vX.Y.Z` on main, with
+# X.Y.Z the version in editors/vscode/package.json. The tag does not start with `v`, so that it
+# matches neither the server's release workflow nor the `v*` tag ruleset and environment.
 on:
-  workflow_dispatch:
+  push:
+    tags: ['editors/vscode/v*']
 
 permissions:
   contents: read
@@ -17,32 +19,42 @@ jobs:
       contents: read
       # Trusted publishing: the Marketplace accepts the GitHub OIDC token of this workflow
       id-token: write
-    defaults:
-      run:
-        working-directory: editors/vscode
     steps:
-      - name: The workflow runs on main
-        if: github.ref != 'refs/heads/main'
-        run: |
-          echo "::error::publish from main, not $GITHUB_REF"
-          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # checkout leaves the tag lightweight; fetch the annotated tag object
+      - name: Fetch the annotated tag
+        run: git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+      - name: The tag is annotated, on main, and matches package.json
+        run: |
+          version=${GITHUB_REF_NAME#editors/vscode/v}
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag || { echo "::error::$GITHUB_REF_NAME is not an annotated tag"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$GITHUB_REF_NAME is not on main"; exit 1; }
+          package=$(node -p 'require("./editors/vscode/package.json").version')
+          test "$package" = "$version" || { echo "::error::editors/vscode/package.json has version $package, the tag is $GITHUB_REF_NAME"; exit 1; }
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: editors/vscode/package-lock.json
-      - name: Check the extension
+      - name: Check and package the extension
+        working-directory: editors/vscode
         run: |
           npm ci
           npm run typecheck
           npm run check-settings
-      - name: Package
-        run: npx vsce package --no-dependencies -o zig-analyzer.vsix
+          npx vsce package --no-dependencies -o zig-analyzer.vsix
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zig-analyzer.vsix
+          path: editors/vscode/zig-analyzer.vsix
       - name: Publish to the VS Code Marketplace
+        working-directory: editors/vscode
         run: npx vsce publish --oidc --packagePath zig-analyzer.vsix
       # Open VSX serves VSCodium, Cursor, and other VS Code forks; skipped without its token
       - name: Publish to Open VSX
+        working-directory: editors/vscode
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
@@ -51,7 +63,3 @@ jobs:
             exit 0
           fi
           npx --yes ovsx@1.4.0 publish zig-analyzer.vsix -p "$OVSX_PAT"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: zig-analyzer.vsix
-          path: editors/vscode/zig-analyzer.vsix
