@@ -99,7 +99,7 @@ fn formula(w: *Io.Writer, tag: []const u8, sums: []const u8) (Io.Writer.Error ||
 
 /// The checksum of the ReleaseSafe archive of `target` in the output of `sha256sum` (`<hash>  <name>`,
 /// or `<hash> *<name>` for binary mode)
-fn checksum(sums: []const u8, tag: []const u8, target: []const u8) ?[]const u8 {
+pub fn checksum(sums: []const u8, tag: []const u8, target: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, sums, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trimEnd(u8, line, "\r");
