@@ -27,7 +27,8 @@ The signing key is in the secrets `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` 
 environment, which only `v*` tags can deploy to; `HOMEBREW_TAP_DEPLOY_KEY` there is a deploy key of
 the tap with write access. Only repository admins can create, move, or delete
 `v*` tags (ruleset "Release tags"), and published releases are immutable. The editor extensions in
-`editors/` are versioned and published separately; a release does not touch them.
+`editors/` are versioned and published separately; a release does not touch them (the VS Code
+extension: the release-vscode skill).
 
 Ask the user before each step that is visible to others: pushing to `main`, pushing the tag, and
 deleting a tag or release.
