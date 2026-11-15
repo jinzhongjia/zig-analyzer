@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      # Trusted publishing: the Marketplace accepts the GitHub OIDC token of this workflow
+      # Trusted publishing: the Marketplace and Open VSX accept the GitHub OIDC token of this workflow
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,17 +49,12 @@ jobs:
         with:
           name: zig-analyzer.vsix
           path: editors/vscode/zig-analyzer.vsix
+      # --skip-duplicate: a rerun after one registry failed publishes to the other one
       - name: Publish to the VS Code Marketplace
         working-directory: editors/vscode
-        run: npx vsce publish --oidc --packagePath zig-analyzer.vsix
-      # Open VSX serves VSCodium, Cursor, and other VS Code forks; skipped without its token
+        run: npx vsce publish --oidc --skip-duplicate --packagePath zig-analyzer.vsix
+      # Open VSX serves VSCodium, Cursor, and other VS Code forks. Without an access token, ovsx
+      # publishes through trusted publishing with the OIDC token of this workflow.
       - name: Publish to Open VSX
         working-directory: editors/vscode
-        env:
-          OVSX_PAT: ${{ secrets.OVSX_PAT }}
-        run: |
-          if [ -z "$OVSX_PAT" ]; then
-            echo "::notice::OVSX_PAT is not set; not published to Open VSX"
-            exit 0
-          fi
-          npx --yes ovsx@1.4.0 publish zig-analyzer.vsix -p "$OVSX_PAT"
+        run: npx --yes ovsx@1.4.0 publish zig-analyzer.vsix --skip-duplicate
