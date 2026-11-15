@@ -51,6 +51,12 @@ On macOS and Linux, with [Homebrew](https://brew.sh):
 brew install jinzhongjia/tap/zig-analyzer
 ```
 
+On Arch Linux (x86_64 and aarch64), from the [AUR](https://aur.archlinux.org/packages/zig-analyzer-bin), with an AUR helper such as yay:
+
+```sh
+yay -S zig-analyzer-bin
+```
+
 On Windows (x86_64 and aarch64), with [Scoop](https://scoop.sh):
 
 ```pwsh
@@ -58,7 +64,7 @@ scoop bucket add jin https://github.com/jinzhongjia/scoop-bucket
 scoop install jin/zig-analyzer
 ```
 
-Both install the ReleaseSafe build of the latest release, with its debug information; `brew upgrade` or `scoop update zig-analyzer` updates it. The tap is updated when a release is published, the Scoop bucket within a few hours. Pre-releases are in neither.
+Each installs the ReleaseSafe build of the latest release, with its debug information; `brew upgrade`, `yay -Syu`, or `scoop update zig-analyzer` updates it. The tap and the AUR package are updated when a release is published, the Scoop bucket within a few hours. Pre-releases are in none of them.
 
 Each [release](https://github.com/jinzhongjia/zig-analyzer/releases) has an archive per platform (x86_64 and aarch64 on Linux, macOS, and Windows) in two builds:
 
