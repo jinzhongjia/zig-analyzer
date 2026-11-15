@@ -4,11 +4,12 @@ Decide, for each mainstream editor, what zig-analyzer users need beyond the serv
 plugin, an upstream configuration entry, or only documentation), and what the server and the
 release process must provide for it.
 
-Integrations in `editors/`: VS Code, Zed, Neovim, and Vim (yegappan/lsp and vim-lsp). They start a
-configured path first, then a release they installed, then `zig-analyzer` in PATH. Each installs a
-GitHub release only when the user asks (a command in VS Code, Neovim, and Vim; the `download`
-setting in Zed), after verifying the minisign signature of its `SHA256SUMS` and the SHA-256 of the
-archive. None manages the Zig toolchain.
+Integrations in `editors/`: VS Code, Zed, Neovim, and Vim (yegappan/lsp and vim-lsp). VS Code,
+Neovim, and Vim start a configured path first, then a release they installed, then `zig-analyzer`
+in PATH, and install a GitHub release only when the user runs a command. Zed starts a configured
+path, then `zig-analyzer` in PATH, then a release it installs (the `download` setting selects it or
+turns it off). Each verifies the minisign signature of the release's `SHA256SUMS` and the SHA-256 of
+the archive. None manages the Zig toolchain.
 
 ## What the server offers a client today
 
