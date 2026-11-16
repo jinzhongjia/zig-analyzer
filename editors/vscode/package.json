@@ -2,7 +2,7 @@
   "name": "zig-analyzer",
   "displayName": "zig-analyzer",
   "description": "Zig language support through the zig-analyzer language server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "jinzhongjia",
   "license": "MIT",
   "icon": "icon.png",
