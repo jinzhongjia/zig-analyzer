@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="zig-analyzer" width="220">
+</p>
+
 # zig-analyzer
 
 English | [简体中文](README.zh-CN.md)
