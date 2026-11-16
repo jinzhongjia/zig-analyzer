@@ -24,12 +24,14 @@ Before an install, the minisign signature of the release's `SHA256SUMS` must ver
 zig-analyzer release key and its trusted comment must name the release, and the archive must have
 the SHA-256 that `SHA256SUMS` lists for it.
 
-## The Zig extension and ZLS
+## The Zig extension
 
-If the Zig extension (`ziglang.vscode-zig`) is installed, it starts its own language server, ZLS,
-for Zig files, and you would get results from both servers. This extension offers to turn ZLS off
-(`zig.zls.enabled: "off"`). Only ZLS is turned off: the Zig extension's other features, such as
-installing Zig, build tasks, and run and debug, keep working.
+This extension does not need the Zig extension (`ziglang.vscode-zig`). With both enabled, Zig files
+get diagnostics and formatting from each: the Zig extension starts its own language server, ZLS,
+runs `zig ast-check` on every edit when ZLS is off, and makes itself the default formatter. This
+extension offers to open it in the Extensions view, where you can disable it.
+
+Unlike the Zig extension, this extension does not install Zig.
 
 ## Running, debugging, and tests
 

@@ -14,6 +14,8 @@ import * as views from "./views";
 
 /** Scheme of the read-only documents that show the results of the server's custom requests */
 const viewScheme = "zig-analyzer";
+/** The Zig extension, which this extension replaces */
+const zigExtension = "ziglang.vscode-zig";
 
 let client: LanguageClient | undefined;
 /** The server command of `client` */
@@ -75,7 +77,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
     { dispose: () => void client?.stop() },
   );
 
-  checkZls(context);
+  checkZigExtension(context);
   await start(context);
   return {
     client: () => client,
@@ -436,27 +438,20 @@ async function showView(kind: views.Kind, name: string, source?: vscode.Uri): Pr
 }
 
 /**
- * The Zig extension (`ziglang.vscode-zig`) starts ZLS for the same files: offer to turn it off in
- * this workspace, so that the two servers do not answer the same requests twice.
+ * The Zig extension (`ziglang.vscode-zig`) does what this extension does, and has no setting that
+ * stops its diagnostics: offer to open it in the Extensions view, where it can be disabled.
  */
-function checkZls(context: vscode.ExtensionContext): void {
-  if (!vscode.extensions.getExtension("ziglang.vscode-zig")) return;
-  const zls = vscode.workspace.getConfiguration("zig.zls");
-  if (zls.get<string>("enabled") === "off") return;
-  if (context.globalState.get<boolean>("zlsPromptDismissed")) return;
+function checkZigExtension(context: vscode.ExtensionContext): void {
+  if (!vscode.extensions.getExtension(zigExtension)) return;
+  if (context.globalState.get<boolean>("zigExtensionPromptDismissed")) return;
   void vscode.window
     .showInformationMessage(
-      "The Zig extension also starts ZLS for Zig files. Turn ZLS off to use only zig-analyzer?",
-      "Turn Off ZLS",
+      "zig-analyzer does not need the Zig extension, and with both enabled Zig files get diagnostics and formatting from each. Disable the Zig extension?",
+      "Show Zig Extension",
       "Don't Ask Again",
     )
     .then(async (choice) => {
-      if (choice === "Turn Off ZLS") {
-        await zls.update("enabled", "off", vscode.ConfigurationTarget.Global);
-        const reload = await vscode.window.showInformationMessage("Reload the window to stop ZLS?", "Reload");
-        if (reload === "Reload") await vscode.commands.executeCommand("workbench.action.reloadWindow");
-      } else if (choice === "Don't Ask Again") {
-        await context.globalState.update("zlsPromptDismissed", true);
-      }
+      if (choice === "Show Zig Extension") await vscode.commands.executeCommand("extension.open", zigExtension);
+      else if (choice === "Don't Ask Again") await context.globalState.update("zigExtensionPromptDismissed", true);
     });
 }
