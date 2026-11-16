@@ -8,6 +8,7 @@ import {
   State,
 } from "vscode-languageclient/node";
 import * as installer from "./install";
+import * as runner from "./run";
 import { configuredServer, section, serverEnv, serverSettings } from "./settings";
 import * as views from "./views";
 
@@ -50,6 +51,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
   context.subscriptions.push(output, statusItem, viewChanged);
 
   registerViews(context);
+  runner.register(context, output);
   context.subscriptions.push(
     vscode.commands.registerCommand("zig-analyzer.menu", showMenu),
     vscode.commands.registerCommand("zig-analyzer.restartServer", () => restart(context)),

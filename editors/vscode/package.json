@@ -116,6 +116,16 @@
         "command": "zig-analyzer.showOutput",
         "title": "Show Output",
         "category": "zig-analyzer"
+      },
+      {
+        "command": "zig-analyzer.run",
+        "title": "Run",
+        "category": "zig-analyzer"
+      },
+      {
+        "command": "zig-analyzer.debug",
+        "title": "Debug",
+        "category": "zig-analyzer"
       }
     ],
     "menus": {
@@ -126,6 +136,14 @@
         },
         {
           "command": "zig-analyzer.showSyntaxTree",
+          "when": "editorLangId == zig"
+        },
+        {
+          "command": "zig-analyzer.run",
+          "when": "editorLangId == zig"
+        },
+        {
+          "command": "zig-analyzer.debug",
           "when": "editorLangId == zig"
         }
       ]
@@ -187,6 +205,11 @@
           ],
           "default": "off",
           "markdownDescription": "Log the messages between VS Code and the server to the `zig-analyzer` output channel."
+        },
+        "zig-analyzer.debug.adapter": {
+          "type": "string",
+          "default": "lldb",
+          "markdownDescription": "The debugger type that **Debug** and debugging a test launch, as in the `type` of a launch configuration: `lldb` is the CodeLLDB extension."
         },
         "zig-analyzer.zig.path": {
           "type": [
