@@ -92,5 +92,42 @@ Live diagnostics use the buffer. Compiler diagnostics use the saved contents, wi
 Off by default and enabled by `diagnostics.inactive_code`. It covers:
 
 - branches known at comptime not to execute;
-- statements after a statement known at comptime to be noreturn;
+- statements after a statement known at comptime to be noreturn, including a loop whose condition is comptime true and that no `break` leaves;
 - the right-hand side of an `and` / `or` whose left-hand side decides the result.
+
+## Analyzer-owned diagnostics
+
+Hints that are not compiler output have `source = "zig-analyzer"` and a code. They never stand in for an error and never change the compiler's diagnostics: the consistency definition above applies to `source = "zig"` alone.
+
+| Code | What it marks | Enabled by |
+|---|---|---|
+| `naming.<rule>` | a name that does not follow the Names section of the style guide | `naming.enable` |
+| `unused.declaration` | a private `fn`, `const` or `var` that no code in its file reaches | `unused.enable` |
+| `inactive` | code that is not compiled under the current build configuration | `diagnostics.inactive_code` |
+
+Hints are published for open files of user code (or files outside the workspace), not for dependency libraries, generated files, or the Zig installation; `naming.exclude` applies to the naming check. Hints on unused declarations and inactive code are tagged `Unnecessary`, which editors show faded.
+
+### Unused declarations
+
+A declaration without `pub`, `export` or `extern` is visible only in the file that declares it: the compiler rejects `S.x` and `@field(S, "x")` from another file, also when the container is a type returned by a generic function. `@hasDecl` and `std.meta.declarations` see only `pub` declarations, and `@typeInfo` does not list declarations. The check therefore searches references in the file only.
+
+Hints follow reachability, not just direct references: a private helper used only by another unused declaration is reported too. Live declarations are the file-scope declarations that code outside the file or the compiler can reach (`pub`, `export`, `extern`, tests, `comptime` blocks, fields) and, through the declaration that defines a nested container, the members of that container's interface (fields, `pub`/`export`/`extern` declarations, tests, `comptime` blocks). A `@field` with a string literal is treated as a reference to the declaration of that name, since its first operand may be a type; a `@hasDecl` with a string literal is treated the same way, although it only sees `pub` declarations. A `@field` whose name is computed disables the check for the file, since it could name any declaration. Files with syntax errors get no hint, and names starting with `_` or written as `@"..."` are left out.
+
+### Suppression comments
+
+A comment suppresses analyzer hints by code, without turning a rule off for the file:
+
+| Comment | Effect |
+|---|---|
+| `// zig-analyzer-disable-next-line` | Every analyzer hint on the next line with code |
+| `// zig-analyzer-disable-next-line: naming, unused` | The named hints on that line |
+| `// zig-analyzer-disable` | Every analyzer hint until `enable` or the end of the file |
+| `// zig-analyzer-disable: naming.type` | The named hints until `enable` or the end of the file |
+| `// zig-analyzer-enable` | Ends every range |
+| `// zig-analyzer-enable: naming.type` | Ends the ranges of the named hints |
+
+- A code names itself and its family: `naming` covers `naming.type`, but `naming.t` names neither `naming.type` nor `naming.type_function`.
+- A directive applies when it falls anywhere in the range of a diagnostic, so a `disable-next-line` inside inactive code covers the whole inactive range.
+- `disable-next-line` applies to the next line that contains code (a token that is not whitespace or a comment), skipping blank lines, plain comments, and doc comments.
+- Directives are read from line-comment tokens, so text inside a string does not count. A repeated `disable` keeps the first start; an `enable` without codes ends the ranges of every code.
+- Compiler diagnostics (`source = "zig"`) and diagnostics without a code, such as the problems of `zig-analyzer.zon` and the unloaded-project hint, are never suppressed.

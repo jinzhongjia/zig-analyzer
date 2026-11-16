@@ -20,6 +20,8 @@ A language server (LSP) for Zig, built on an incremental query engine.
 - **ZON files**: highlighting, formatting, and error diagnostics in any `.zon` file; outline; completion, goto, and inlay hints for files imported with a result type and for `build.zig.zon`; completion and option descriptions in `zig-analyzer.zon`.
 - **Structure**: folding ranges and selection ranges.
 - **Naming checks** (opt-in): hints based on the [Names](https://ziglang.org/documentation/0.17.1/#Names) section of the Zig style guide, with safe rename fixes.
+- **Unused declarations** (opt-in): hints on private declarations that no code in the same file reaches, including helpers used only by other unused declarations.
+- **Hint suppressions**: comments such as `// zig-analyzer-disable-next-line: naming` silence analyzer hints for a line or a range; diagnostics from Zig itself are never affected.
 
 ## Editor support
 

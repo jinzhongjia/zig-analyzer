@@ -5707,6 +5707,7 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     if (text != null) if (is_zon and std.mem.eql(u8, std.fs.path.basename(server.vfs.path(file)), Config.project_file)) {
         diags = try server.appendProjectConfigProblems(arena, lines, diags);
     };
+    if (text != null) diags = try filterSuppressed(ctx, arena, file, lines, diags);
     return .{ .uri = document_uri, .diagnostics = diags };
 }
 
@@ -6091,6 +6092,41 @@ fn appendUnused(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileI
         .message = .{ .string = try std.fmt.allocPrint(arena, "declaration `{s}` is never used", .{f.name}) },
     });
     return out.items;
+}
+
+/// Removes analyzer-owned diagnostics covered by a suppression comment in the file. Compiler
+/// diagnostics are never removed: published diagnostics must equal the compiler's output (see
+/// `docs/diagnostics.md`)
+fn filterSuppressed(ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, lines: offsets.LineIndex, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+    var any = false;
+    for (diags) |d| if (suppressibleCode(d) != null) {
+        any = true;
+        break;
+    };
+    if (!any) return diags;
+    const parse = try ctx.get(database.syntax.ParseFile, file);
+    const map = try ide.suppression.parse(arena, parse, lines);
+    if (map.next_lines.len == 0 and map.ranges.len == 0) return diags;
+    var out: std.ArrayList(types.Diagnostic) = .empty;
+    for (diags) |d| {
+        const code = suppressibleCode(d) orelse {
+            try out.append(arena, d);
+            continue;
+        };
+        if (map.isSuppressed(d.range.start.line, d.range.end.line, code)) continue;
+        try out.append(arena, d);
+    }
+    return out.items;
+}
+
+/// The code of an analyzer-owned diagnostic that a suppression comment may remove
+fn suppressibleCode(d: types.Diagnostic) ?[]const u8 {
+    const source = d.source orelse return null;
+    const code = switch (d.code orelse return null) {
+        .string => |s| s,
+        else => return null,
+    };
+    return ide.hints.suppressible(source, code);
 }
 
 // ── Request handlers ──────────────────────────────────────────────────
@@ -7895,6 +7931,7 @@ test {
     _ = @import("names_e2e_test.zig");
     _ = @import("refs_e2e_test.zig");
     _ = @import("naming_e2e_test.zig");
+    _ = @import("hints_e2e_test.zig");
     _ = @import("remove_param_e2e_test.zig");
     _ = @import("unused_capture_e2e_test.zig");
     _ = @import("workspace_e2e_test.zig");
