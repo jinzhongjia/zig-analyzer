@@ -3035,6 +3035,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     const imports_enabled = !server.config.completion_auto_import and new.completion_auto_import;
     const inactive_changed = server.config.inactive_code != new.inactive_code;
     const naming_changed = !server.config.sameNaming(&new);
+    const unused_changed = server.config.unused_enable != new.unused_enable;
     const build_was_enabled = server.config.build_enable;
     const sub_projects_changed = server.config.build_sub_projects != new.build_sub_projects;
     const watcher_changed = server.config.files_watcher != new.files_watcher;
@@ -3052,7 +3053,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     server.config = new;
     server.config_mutex.unlock(server.io);
     server.wakeProjectWaiters();
-    if (inactive_changed or naming_changed) server.publishOpenFiles();
+    if (inactive_changed or naming_changed or unused_changed) server.publishOpenFiles();
     if (watcher_changed) server.resyncWatcher();
 
     if (zig_changed and server.started) server.showWarning("zig.path takes effect after restarting zig-analyzer");
@@ -5699,6 +5700,9 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     if (text) |t| if (try server.namingFor(arena, file, t)) |settings| {
         diags = try server.appendNaming(ctx, arena, file, lines, settings, diags);
     };
+    if (text) |t| if (server.unusedFor(file, t)) {
+        diags = try appendUnused(server, ctx, arena, file, lines, diags);
+    };
     if (text != null) diags = try server.appendUnloadedProjectHint(arena, file, lines, diags);
     if (text != null) if (is_zon and std.mem.eql(u8, std.fs.path.basename(server.vfs.path(file)), Config.project_file)) {
         diags = try server.appendProjectConfigProblems(arena, lines, diags);
@@ -5873,7 +5877,8 @@ fn appendInactiveCode(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
         out[n] = .{
             .range = lines.range(x.start, x.end, server.encoding),
             .severity = .Hint,
-            .source = "zig-analyzer",
+            .source = ide.hints.source,
+            .code = .{ .string = ide.hints.inactive_code },
             .message = .{ .string = "code is inactive: a comptime condition excludes it under the current build configuration" },
             .tags = &.{.Unnecessary},
         };
@@ -5913,11 +5918,7 @@ const NamingSettings = struct {
 /// `origin.Origin.user` and `origin.Origin.outside`) with the check enabled, not in
 /// `naming.exclude`, and not generated code (see `naming.isGenerated`)
 fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const u8) Allocator.Error!?NamingSettings {
-    {
-        server.docs_mutex.lockUncancelable(server.io);
-        defer server.docs_mutex.unlock(server.io);
-        if (!server.open_docs.contains(file)) return null;
-    }
+    if (!hintsEligible(server, file, text)) return null;
     const path = server.vfs.path(file);
     var enable: bool = undefined;
     var ignore: []const []const u8 = undefined;
@@ -5963,12 +5964,48 @@ fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const 
         std.mem.replaceScalar(u8, normalized, '\\', '/');
         for (exclude) |pattern| if (ide.naming.globMatch(pattern, normalized)) return null;
     }
+    return .{ .ignore = ignore, .rules = rules };
+}
+
+/// Whether the file gets analyzer-owned hints: open user code (or a file outside the workspace),
+/// not generated
+fn hintsEligible(server: *Server, file: Vfs.FileId, text: []const u8) bool {
+    {
+        server.docs_mutex.lockUncancelable(server.io);
+        defer server.docs_mutex.unlock(server.io);
+        if (!server.open_docs.contains(file)) return false;
+    }
     switch (server.fileOrigin(file)) {
         .virtual, .user, .outside => {},
-        .zig_lib, .generated, .package, .other => return null,
+        .zig_lib, .generated, .package, .other => return false,
     }
-    if (ide.naming.isGenerated(text)) return null;
-    return .{ .ignore = ignore, .rules = rules };
+    return !ide.naming.isGenerated(text);
+}
+
+/// Whether the file gets unused-declaration hints: the setting from the client or the project of
+/// the file, for open user code that is not generated
+fn unusedFor(server: *Server, file: Vfs.FileId, text: []const u8) bool {
+    if (!hintsEligible(server, file, text)) return false;
+    const path = server.vfs.path(file);
+    var enable = false;
+    {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        enable = server.config.unused_enable;
+    }
+    {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        // For nested projects, take the innermost one
+        var best: ?*Workspace = null;
+        for (server.workspaces.items) |ws| {
+            if (server.vfs.isUnder(path, ws.root) and (best == null or ws.root.len > best.?.root.len)) best = ws;
+        }
+        if (best) |ws| if (ws.project) |*p| {
+            if (p.isSet("unused_enable")) enable = p.unused_enable;
+        };
+    }
+    return enable;
 }
 
 fn dupeStrings(arena: Allocator, list: []const []const u8) Allocator.Error![]const []const u8 {
@@ -6030,10 +6067,29 @@ fn appendNaming(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileI
             .severity = .Hint,
             .code = .{ .string = f.rule.code() },
             .codeDescription = .{ .href = guide_url },
-            .source = "zig-analyzer",
+            .source = ide.hints.source,
             .message = .{ .string = try ide.naming.message(arena, f) },
         });
     }
+    return out.items;
+}
+
+/// Private declarations that no code in the file uses: hints tagged `Unnecessary`, which editors
+/// show faded
+fn appendUnused(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, lines: offsets.LineIndex, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+    var r: Resolver = .{ .ctx = ctx, .arena = arena };
+    const found = try ide.unused.findings(&r, file);
+    if (found.len == 0) return diags;
+    var out: std.ArrayList(types.Diagnostic) = .empty;
+    try out.appendSlice(arena, diags);
+    for (found) |f| try out.append(arena, .{
+        .range = lines.range(f.start, f.end, server.encoding),
+        .severity = .Hint,
+        .code = .{ .string = ide.hints.unused_code },
+        .source = ide.hints.source,
+        .tags = &.{.Unnecessary},
+        .message = .{ .string = try std.fmt.allocPrint(arena, "declaration `{s}` is never used", .{f.name}) },
+    });
     return out.items;
 }
 

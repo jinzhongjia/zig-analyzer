@@ -274,6 +274,21 @@
         },
     },
 
+    // Hint private container-level declarations that no code in their file uses. A declaration
+    // without `pub` is visible only in its own file, so this needs no reference outside it.
+    // Hints follow reachability: a helper used only by another unused declaration is reported
+    // too, and the interface of a container (fields, public declarations, tests and `comptime`
+    // blocks) is live when the declaration that defines the container is. Only open files of your
+    // own code are checked.
+    // Example:
+    //   .unused = .{ .enable = true },
+    .unused = .{
+        // Hint declarations that no code in the file uses. Off by default.
+        // Example:
+        //   .enable = true,
+        .enable = false,
+    },
+
     // Who detects changes on disk (editor only):
     //   .files = .{ .watcher = .auto },
     // .auto: the server watches files when the editor cannot register file watchers;
