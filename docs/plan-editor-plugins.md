@@ -124,7 +124,8 @@ For each editor in scope, answer the following and record the answers in a singl
 - [x] Neovim plugin (`editors/nvim`), with a headless smoke test.
 - [x] Vim plugin (`editors/vim`) for yegappan/lsp and vim-lsp; with a smoke test for each client.
 - [x] Shared test project (`editors/test-project`); the VS Code, Neovim, and Vim smoke tests run
-      the same checks on it in CI (`Editor integrations` job). Zed is tried by hand.
+      the same checks on it in CI (`VS Code extension`, `Neovim plugin`, and `Vim plugin` jobs).
+      Zed is tried by hand.
 - [ ] Prepare the sample project and a debug build with logging.
 - [ ] Capture `initialize` and walk through features in VS Code.
 - [ ] Same for Zed.
