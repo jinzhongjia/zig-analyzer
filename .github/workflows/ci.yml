@@ -15,8 +15,80 @@ env:
   ZIG_VERSION: 0.17.1
 
 jobs:
+  # A pull request runs the jobs of the paths it changes; a push to main and a release run every
+  # job, so that changes that pass one at a time still meet each other in CI
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      zig: ${{ steps.detect.outputs.zig }}
+      vscode: ${{ steps.detect.outputs.vscode }}
+      zed: ${{ steps.detect.outputs.zed }}
+      nvim: ${{ steps.detect.outputs.nvim }}
+      vim: ${{ steps.detect.outputs.vim }}
+    steps:
+      # The three-dot diff of a pull request needs the base commit and the merge base
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+      - name: Detect the changed paths
+        id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          zig=false vscode=false zed=false nvim=false vim=false
+          all() { zig=true vscode=true zed=true nvim=true vim=true; }
+
+          if [ "$EVENT" != pull_request ]; then
+            all
+          else
+            if [ -z "$BASE" ]; then
+              echo "::error::a pull request without a base commit"
+              exit 1
+            fi
+            # A file, not a pipe: a failed diff must fail the job instead of reading no paths
+            changed="$RUNNER_TEMP/changed-paths"
+            git diff --no-renames --name-only -z "$BASE...$HEAD" > "$changed"
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                # A change to CI itself is tested by running all of it
+                .github/workflows/ci.yml) all ;;
+                # The VS Code extension checks its settings against the server's settings table
+                src/server/Config.zig) zig=true; vscode=true ;;
+                src/*|tools/*|build.zig|build.zig.zon|zig-analyzer.default.zon) zig=true ;;
+                # Every editor checks its release key against the repository's
+                minisign.pub) vscode=true; zed=true; nvim=true; vim=true ;;
+                # The VS Code, Neovim, and Vim tests open a copy of the shared test project
+                editors/test-project/*) vscode=true; nvim=true; vim=true ;;
+                editors/vscode/*) vscode=true ;;
+                editors/zed/*) zed=true ;;
+                editors/nvim/*) nvim=true ;;
+                editors/vim/*) vim=true ;;
+                docs/*|assets/*|README*|CHANGELOG.md|LICENSE|AGENTS.md|.agents/*|.claude/*|.gitignore) ;;
+                # A path that no rule knows may need anything: run everything
+                *) all ;;
+              esac
+            done < "$changed"
+          fi
+
+          printf 'Jobs: zig=%s vscode=%s zed=%s nvim=%s vim=%s\n' "$zig" "$vscode" "$zed" "$nvim" "$vim"
+          {
+            printf 'zig=%s\n' "$zig"
+            printf 'vscode=%s\n' "$vscode"
+            printf 'zed=%s\n' "$zed"
+            printf 'nvim=%s\n' "$nvim"
+            printf 'vim=%s\n' "$vim"
+          } >> "$GITHUB_OUTPUT"
+
   test:
     name: Test (${{ matrix.os }}, Zig ${{ matrix.zig }}, ${{ matrix.optimize }})
+    needs: changes
+    if: needs.changes.outputs.zig == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -36,6 +108,8 @@ jobs:
 
   build:
     name: Build (${{ matrix.os }}, Zig ${{ matrix.zig }})
+    needs: changes
+    if: needs.changes.outputs.zig == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +130,8 @@ jobs:
 
   corpus:
     name: Corpus cross-check (${{ matrix.os }}, Zig ${{ matrix.zig }})
+    needs: changes
+    if: needs.changes.outputs.zig == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -74,6 +150,8 @@ jobs:
 
   lint:
     name: Formatting and generated code
+    needs: changes
+    if: needs.changes.outputs.zig == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -92,6 +170,8 @@ jobs:
 
   fuzz:
     name: Coverage-guided fuzzing
+    needs: changes
+    if: needs.changes.outputs.zig == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -105,8 +185,10 @@ jobs:
       - name: zig build test --fuzz
         run: zig build test -Doptimize=ReleaseSafe --fuzz=50K
 
-  editors:
-    name: Editor integrations
+  vscode:
+    name: VS Code extension
+    needs: changes
+    if: needs.changes.outputs.vscode == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -116,8 +198,8 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
-          cache-key: editors
-      # The smoke tests open editors/test-project, which the server loads with the zig in PATH
+          cache-key: vscode
+      # The smoke test opens editors/test-project, which the server loads with the zig in PATH
       - name: Build the server
         run: zig build
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -132,17 +214,70 @@ jobs:
           npm run typecheck
           npm run check-settings
           xvfb-run -a npm test
+
+  zed:
+    name: Zed extension
+    needs: changes
+    if: needs.changes.outputs.zed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Zed extension
         working-directory: editors/zed
         run: |
           rustup target add wasm32-wasip2
           cargo test
           cargo build --release --target wasm32-wasip2
+
+  nvim:
+    name: Neovim plugin
+    needs: changes
+    if: needs.changes.outputs.nvim == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      ZIG_ANALYZER: ${{ github.workspace }}/zig-out/bin/zig-analyzer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: nvim
+      # The smoke test opens editors/test-project, which the server loads with the zig in PATH
+      - name: Build the server
+        run: zig build
+      # The install test signs its fake releases with Node
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
       - name: Neovim plugin
         run: |
           curl -fsSL https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-linux-x86_64.tar.gz | tar -xz -C "$RUNNER_TEMP"
           XDG_STATE_HOME="$RUNNER_TEMP/nvim-state" "$RUNNER_TEMP/nvim-linux-x86_64/bin/nvim" --headless --clean -u NONE -l editors/nvim/test/smoke.lua
           XDG_DATA_HOME="$RUNNER_TEMP/nvim-install-data" XDG_STATE_HOME="$RUNNER_TEMP/nvim-install-state" "$RUNNER_TEMP/nvim-linux-x86_64/bin/nvim" --headless --clean -u NONE -l editors/nvim/test/install.lua
+
+  vim:
+    name: Vim plugin (yegappan/lsp and vim-lsp)
+    needs: changes
+    if: needs.changes.outputs.vim == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      ZIG_ANALYZER: ${{ github.workspace }}/zig-out/bin/zig-analyzer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: vim
+      # The smoke test opens editors/test-project, which the server loads with the zig in PATH
+      - name: Build the server
+        run: zig build
+      # The install test signs its fake releases with Node
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
       # yegappan/lsp needs a newer Vim than Ubuntu's (9.1.0016): build the version the tests were
       # written with
       - uses: rhysd/action-setup-vim@febef33995d6649302e9d88dda81e071b68f16a7 # v1.6.1
