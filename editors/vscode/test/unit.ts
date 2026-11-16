@@ -8,6 +8,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { crc32, tarEntries, unpack, zipEntries } from "../src/archive";
+import * as entries from "../src/entries";
 import * as installer from "../src/install";
 import * as minisign from "../src/minisign";
 import * as views from "../src/views";
@@ -390,8 +391,30 @@ function inspectionViews(): void {
     && JSON.stringify(index.position(11)) === '{"line":2,"character":0}', "byte offsets to UTF-16 positions");
 }
 
+function runnableEntries(): void {
+  const text = [
+    'test "adds" {}',
+    "    test decl {",
+    '// test "in a comment" {',
+    '    \\\\test "in a string" {',
+    "test {}",
+    "pub fn main() void {}",
+    "    pub fn main(init: std.process.Init) !void {",
+    "fn main() void {}",
+    "",
+  ].join("\n");
+  const tests = entries.tests(text);
+  check(
+    JSON.stringify(tests.map((t) => t.name)) === '["adds","decl"]' && text.startsWith("test decl", tests[1].offset),
+    "named tests are found at their `test` keyword, not in comments or multiline strings",
+  );
+  const mains = entries.mains(text);
+  check(mains.length === 2 && mains.every((m) => text.startsWith("pub fn main", m.offset)), "`pub fn main` declarations are found");
+}
+
 async function main(): Promise<void> {
   try {
+    runnableEntries();
     inspectionViews();
     blake2b();
     await signatures();

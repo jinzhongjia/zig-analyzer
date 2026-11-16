@@ -14,7 +14,7 @@ const manifest = JSON.parse(readFileSync(fileURLToPath(new URL("../package.json"
 const client = new Set(
   Object.keys(manifest.contributes.configuration.properties)
     .map((k) => k.slice("zig-analyzer.".length))
-    .filter((k) => !k.startsWith("server.") && !k.startsWith("trace.")),
+    .filter((k) => !["server.", "trace.", "debug."].some((p) => k.startsWith(p))),
 );
 
 const missing = [...server].filter((k) => !client.has(k));

@@ -5,7 +5,7 @@ import * as vscode from "vscode";
 export const section = "zig-analyzer";
 
 /** Settings read by the extension itself; they are not sent to the server */
-const clientOnly = ["server.", "trace."];
+const clientOnly = ["server.", "trace.", "debug."];
 
 /** Every server setting key below `zig-analyzer.`, read from the extension's manifest */
 function serverKeys(extension: vscode.Extension<unknown>): string[] {
@@ -53,6 +53,12 @@ export function expandPath(p: string): string {
 export function configuredServer(): string | undefined {
   const configured = vscode.workspace.getConfiguration(section).get<string>("server.path")?.trim();
   return configured ? expandPath(configured) : undefined;
+}
+
+/** The `zig` that runs and tests programs: `zig-analyzer.zig.path`, else `zig` from PATH */
+export function zigPath(): string {
+  const configured = vscode.workspace.getConfiguration(section).get<string | null>("zig.path")?.trim();
+  return configured ? expandPath(configured) : "zig";
 }
 
 export function serverEnv(): NodeJS.ProcessEnv {

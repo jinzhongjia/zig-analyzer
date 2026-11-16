@@ -3,7 +3,7 @@
 Zig language support through the [zig-analyzer](https://github.com/jinzhongjia/zig-analyzer)
 language server: diagnostics from the Zig compiler, comptime-aware completion, hover, goto,
 references, rename, code actions, inlay hints, semantic highlighting, and `zig fmt` formatting,
-for `.zig` and `.zon` files.
+for `.zig` and `.zon` files; and running, debugging, and testing with `zig`.
 
 ## Requirements
 
@@ -24,12 +24,27 @@ Before an install, the minisign signature of the release's `SHA256SUMS` must ver
 zig-analyzer release key and its trusted comment must name the release, and the archive must have
 the SHA-256 that `SHA256SUMS` lists for it.
 
-## The Zig extension and ZLS
+## The Zig extension
 
-If the Zig extension (`ziglang.vscode-zig`) is installed, it starts its own language server, ZLS,
-for Zig files, and you would get results from both servers. This extension offers to turn ZLS off
-(`zig.zls.enabled: "off"`). Only ZLS is turned off: the Zig extension's other features, such as
-installing Zig, build tasks, and run and debug, keep working.
+This extension does not need the Zig extension (`ziglang.vscode-zig`). With both enabled, Zig files
+get diagnostics and formatting from each: the Zig extension starts its own language server, ZLS,
+runs `zig ast-check` on every edit when ZLS is off, and makes itself the default formatter. This
+extension offers to open it in the Extensions view, where you can disable it.
+
+Unlike the Zig extension, this extension does not install Zig.
+
+## Running, debugging, and tests
+
+- **zig-analyzer: Run** and the **Run** code lens above `pub fn main` run `zig build run` in the
+  project of the file (the nearest directory above it with a `build.zig`), and `zig run <file>` for
+  a file outside any project.
+- **zig-analyzer: Debug** and the **Debug** code lens build the executable and start the debugger
+  of `zig-analyzer.debug.adapter` on it: in a project, the executable `zig build` installs; else
+  the file's.
+- The named tests of the open Zig files are in the Testing view and have a run button in the
+  gutter. A test runs as `zig test <file> --test-filter <name>`, so a file that imports the modules
+  of its `build.zig` cannot be tested this way.
+- The `$zig` problem matcher reads the errors of `zig build` in tasks.
 
 ## Settings
 
@@ -44,6 +59,7 @@ Settings of the extension itself:
 - `zig-analyzer.server.path`: the server executable.
 - `zig-analyzer.server.extraEnv`: extra environment variables of the server.
 - `zig-analyzer.trace.server`: log the LSP messages to the `zig-analyzer` output channel.
+- `zig-analyzer.debug.adapter`: the debugger type to launch; `lldb` is the CodeLLDB extension.
 
 ## Commands
 
@@ -52,6 +68,7 @@ Click the `zig-analyzer` status bar item, or run from the command palette:
 - **zig-analyzer: Restart Server**
 - **zig-analyzer: Install Server**: download a release of the server (see above).
 - **zig-analyzer: Reload Workspace**: rerun `build.zig` and reload the projects.
+- **zig-analyzer: Run**, **zig-analyzer: Debug**: see above.
 - **zig-analyzer: Show Server Status**, **Show File Status**, **Show Syntax Tree**,
   **Show Module Graph**: what the server knows, for reporting problems. In a view, Go to
   Definition (Ctrl/Cmd-click) follows a line: it opens a file, goes to the module an import refers
