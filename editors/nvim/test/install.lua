@@ -233,6 +233,9 @@ check(cmd == exe, 'the running server restarts with the new install')
 -- Installing the installed release again downloads nothing
 vim.fn.delete(('%s/download/v9.9.8/zig-analyzer-v9.9.8-%s-ReleaseFast.tar.gz'):format(releases, target))
 check(run({ version = 'v9.9.8', optimize = 'ReleaseFast' }) == nil, 'reinstalling the installed release needs no download')
+-- The restart starts its client once the old server has exited, with the old configuration
+cmd, client = server_command(client and client.id)
+check(cmd == exe, 'the running server restarts after the reinstall')
 
 local completion = vim.fn.getcompletion('ZigAnalyzer install ', 'cmdline')
 check(vim.tbl_contains(completion, 'ReleaseFast') and vim.tbl_contains(completion, 'latest'), 'install arguments complete')
@@ -254,11 +257,20 @@ for _, d in ipairs(vim.split(vim.env.PATH, ':', { trimempty = true })) do
 end
 vim.env.PATH = table.concat(path, ':')
 check(install.command() == nil, 'without an install and PATH entry there is no server')
-require('zig-analyzer').setup({ cmd = install.cmd })
+-- setup() already tries to start a client for the open buffer of the project
 messages = {}
+require('zig-analyzer').setup({ cmd = install.cmd })
 vim.cmd.edit(project .. '/build.zig')
 vim.wait(5000, function() return notified('not installed') end, 50)
 check(notified(':ZigAnalyzer install'), 'without a server, opening a Zig file says how to install one')
+vim.cmd.edit(project .. '/src/main.zig')
+vim.api.nvim_exec_autocmds('FileType', { buffer = 0 })
+vim.wait(500)
+local count = 0
+for _, m in ipairs(messages) do
+  if m.msg:find('not installed') then count = count + 1 end
+end
+check(count == 1, 'without a server, more Zig buffers and FileType events say so only once')
 
 vim.fn.delete(tmp, 'rf')
 print(failures == 0 and 'all checks passed' or (failures .. ' checks failed'))
