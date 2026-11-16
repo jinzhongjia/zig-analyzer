@@ -123,6 +123,21 @@ test "ItemTree changes when signatures, fields or members change" {
     try testing.expect(!try treesEqual(base, "const S = union { a: u32 };\nfn f(x: u32) u32 { return x; }"));
 }
 
+test "file doc: leading //! lines, cleaned up like /// docs" {
+    var t = try buildTree("// license\n//! First line.\r\n//!Second\n//!\n\nconst a = 1;\n//! not leading\n");
+    defer t.parse.destroy();
+    defer t.items.deinit(testing.allocator);
+    try testing.expectEqualStrings("First line.\nSecond\n", t.items.file_doc.?);
+
+    var none = try buildTree("/// A.\nconst a = 1;\n");
+    defer none.parse.destroy();
+    defer none.items.deinit(testing.allocator);
+    try testing.expectEqual(null, none.items.file_doc);
+
+    try testing.expect(!try treesEqual("//! A.\nconst a = 1;", "//! B.\nconst a = 1;"));
+    try testing.expect(!try treesEqual("//! A.\nconst a = 1;", "const a = 1;"));
+}
+
 test "AstId stable across edits, AstIdMap finds the node" {
     var a = try buildTree("const A = 1;\nfn f() void {}\n");
     defer a.parse.destroy();

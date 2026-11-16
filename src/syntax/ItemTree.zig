@@ -30,6 +30,9 @@ containers: []const Container,
 items: []const Item,
 /// Members of each container (indices into `items`), split by `Container.members`
 member_list: []const u32,
+/// The `//!` doc at the start of the file (with the `//!` prefix removed), lines joined with `\n`;
+/// kept here so that showing it does not need the syntax tree of the file
+file_doc: ?[]const u8,
 
 /// Node ID stable within the file: hashed from the parent node ID, kind, name, and ordinal among
 /// same-named nodes; stays the same across edits as long as the node is not renamed or moved.
@@ -124,6 +127,7 @@ pub fn hasFields(self: *const ItemTree, container: u32) bool {
 pub fn eql(a: *const ItemTree, b: *const ItemTree) bool {
     if (a.containers.len != b.containers.len or a.items.len != b.items.len) return false;
     if (!std.mem.eql(u32, a.member_list, b.member_list)) return false;
+    if (!optStrEql(a.file_doc, b.file_doc)) return false;
     for (a.containers, b.containers) |x, y| {
         if (x.ast_id != y.ast_id or x.kind != y.kind or x.parent_item != y.parent_item) return false;
         if (x.layout != y.layout or x.auto_enum != y.auto_enum or x.nonexhaustive != y.nonexhaustive or x.is_value != y.is_value or x.in_signature != y.in_signature) return false;
@@ -151,6 +155,7 @@ pub fn fingerprint(self: *const ItemTree) u128 {
     h.word(self.items.len);
     h.word(self.member_list.len);
     h.sip.update(std.mem.sliceAsBytes(self.member_list));
+    h.optStr(self.file_doc);
     for (self.containers) |c| {
         h.word(@backingInt(c.ast_id));
         h.word(@backingInt(c.kind));
@@ -221,7 +226,8 @@ pub fn build(gpa: Allocator, root: SyntaxNode, mode: Mode) Allocator.Error!ItemT
     }
     const containers = try b.arena.dupe(Container, b.containers.items);
     const items = try b.arena.dupe(Item, b.items.items);
-    return .{ .arena = arena.state, .containers = containers, .items = items, .member_list = member_list.items };
+    const file_doc = try docLines(b.arena, root, .container_doc_comment);
+    return .{ .arena = arena.state, .containers = containers, .items = items, .member_list = member_list.items, .file_doc = file_doc };
 }
 
 const Builder = struct {
@@ -355,22 +361,30 @@ const Builder = struct {
     }
 
     fn docText(b: *Builder, member: SyntaxNode) Allocator.Error!?[]const u8 {
-        var out: std.ArrayList(u8) = .empty;
-        var it = member.children();
-        while (it.next()) |e| {
-            if (e != .token) break;
-            if (e.token.kind != .doc_comment) {
-                if (isTrivia(e.token.kind)) continue;
-                break;
-            }
-            var line = e.token.text["///".len..];
-            if (std.mem.startsWith(u8, line, " ")) line = line[1..];
-            if (out.items.len != 0) try out.append(b.arena, '\n');
-            try out.appendSlice(b.arena, std.mem.trimEnd(u8, line, "\r"));
-        }
-        return if (out.items.len == 0) null else out.items;
+        return docLines(b.arena, member, .doc_comment);
     }
 };
+
+/// The doc comments of `kind` (`///` or `//!`, both three bytes long) among the leading tokens of
+/// `node`, before its first token that is neither trivia nor such a comment: one line each, with
+/// the prefix, one following space, and a trailing `\r` removed, joined with `\n`; null when
+/// there are none
+fn docLines(arena: Allocator, node: SyntaxNode, kind: SyntaxKind) Allocator.Error!?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = node.children();
+    while (it.next()) |e| {
+        if (e != .token) break;
+        if (e.token.kind != kind) {
+            if (isTrivia(e.token.kind)) continue;
+            break;
+        }
+        var line = e.token.text["///".len..];
+        if (std.mem.startsWith(u8, line, " ")) line = line[1..];
+        if (out.items.len != 0) try out.append(arena, '\n');
+        try out.appendSlice(arena, std.mem.trimEnd(u8, line, "\r"));
+    }
+    return if (out.items.len == 0) null else out.items;
+}
 
 fn mixId(parent: u32, kind: []const u8, name: []const u8, ordinal: u32) AstId {
     var h: std.hash.Wyhash = .init(parent);
