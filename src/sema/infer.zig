@@ -2572,6 +2572,10 @@ const Inferrer = struct {
         }
         if (endless) {
             if (l.@"else") |el| _ = try inf.inferArm(el, expected, true);
+            // A loop whose condition is comptime true and that no break leaves does not return:
+            // the compiler types `while (true) {}` as noreturn and `while (true) { break; }` as
+            // void. Statements after the loop are dead (see `block`)
+            if (frame.types.items.len == 0) return .{ .ty = .noreturn_type };
         } else if (l.@"else") |el| {
             try frame.types.append(inf.scratch, (try inf.infer(el, expected)).ty);
             try frame.exprs.append(inf.scratch, el);

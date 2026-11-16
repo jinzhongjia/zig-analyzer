@@ -9276,6 +9276,32 @@ test "a comptime branch that is @compileError gives way to the other branch" {
     });
 }
 
+test "a loop with a comptime true condition and no break is noreturn" {
+    try expectTypes(
+        \\fn ends() void {
+        \\    const loop_never = while (true) {};
+        \\    _ = loop_never;
+        \\}
+        \\fn breaks(flag: bool) void {
+        \\    const loop_break = while (true) {
+        \\        if (flag) break;
+        \\    };
+        \\    _ = loop_break;
+        \\}
+        \\fn runtime(flag: bool) void {
+        \\    const loop_runtime = while (flag) {};
+        \\    _ = loop_runtime;
+        \\}
+        \\test {
+        \\    _ = .{ ends, breaks, runtime };
+        \\}
+    , &.{
+        .{ "loop_never", "noreturn" },
+        .{ "loop_break", "void" },
+        .{ "loop_runtime", "void" },
+    });
+}
+
 test "a field of a literal-initialized constant is known when other fields are not" {
     try expectTypes(
         \\const Arch = enum { x86, wasm32 };

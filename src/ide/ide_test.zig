@@ -6418,6 +6418,36 @@ test "code after a statement that comptime makes noreturn is inactive" {
     try testing.expectEqualStrings("const y = x + 2;\n    return y;", text[ranges[0].start..ranges[0].end]);
 }
 
+test "code after a loop that cannot end is inactive" {
+    const text =
+        \\fn never() void {
+        \\    while (true) { continue; }
+        \\    const after_never = 1;
+        \\}
+        \\fn breaks(flag: bool) void {
+        \\    while (true) {
+        \\        if (flag) break;
+        \\    }
+        \\    const after_break = 2;
+        \\}
+        \\fn runtime(flag: bool) void {
+        \\    while (flag) {}
+        \\    const after_runtime = 3;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const ranges = try inactive.ranges(&r, file);
+    try testing.expectEqual(1, ranges.len);
+    try testing.expectEqualStrings("const after_never = 1;", text[ranges[0].start..ranges[0].end]);
+}
+
 test "the right side of a comptime short-circuited and / or is inactive" {
     const text =
         \\const debug = false;
