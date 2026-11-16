@@ -19,7 +19,6 @@ const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
 const seed = @import("../ide_db/seed.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
-const isTrivia = @import("../syntax/kind.zig").isTrivia;
 
 pub const At = struct {
     file: FileId,
@@ -187,23 +186,10 @@ pub fn valueFileDoc(r: *Resolver, tv: TypedValue) resolve.Error!?[]const u8 {
 }
 
 /// The `//!` doc at the start of the file, cleaned up the same way as `///` docs (see
-/// `ItemTree`); null when there is none
+/// `ItemTree.file_doc`); null when there is none
 pub fn fileDoc(r: *Resolver, file: FileId) resolve.Error!?[]const u8 {
-    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
-    var out: std.ArrayList(u8) = .empty;
-    var it = root.children();
-    while (it.next()) |e| {
-        if (e != .token) break;
-        if (e.token.kind != .container_doc_comment) {
-            if (isTrivia(e.token.kind)) continue;
-            break;
-        }
-        var line = e.token.text["//!".len..];
-        if (std.mem.startsWith(u8, line, " ")) line = line[1..];
-        if (out.items.len != 0) try out.append(r.arena, '\n');
-        try out.appendSlice(r.arena, std.mem.trimEnd(u8, line, "\r"));
-    }
-    return if (out.items.len == 0) null else out.items;
+    const text = (try r.itemTree(file)).file_doc orelse return null;
+    return try r.arena.dupe(u8, text);
 }
 
 /// Signature of a definition: the prototype for functions (see `ast.FnProto.writeSignature`), the
