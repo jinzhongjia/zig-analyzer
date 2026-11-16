@@ -130,6 +130,36 @@
         }
       ]
     },
+    "configurationDefaults": {
+      "[zig]": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "jinzhongjia.zig-analyzer",
+        "files.eol": "\n"
+      },
+      "explorer.autoRevealExclude": {
+        "**/.zig-cache": true,
+        "**/zig-cache": true,
+        "**/zig-pkg": true
+      }
+    },
+    "problemMatchers": [
+      {
+        "name": "zig",
+        "owner": "zig",
+        "fileLocation": [
+          "relative",
+          "${workspaceFolder}"
+        ],
+        "pattern": {
+          "regexp": "([^\\s]*):(\\d+):(\\d+):\\s+(?:fatal\\s+)?(note|error):\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      }
+    ],
     "configuration": {
       "title": "zig-analyzer",
       "properties": {
