@@ -2718,19 +2718,34 @@ const Snippet = struct {
 const statement_snippets = [_]Snippet{
     .{ .label = "if", .text = "if ($1) {$0}" },
     .{ .label = "if else", .text = "if ($1) {$2} else {$0}" },
+    .{ .label = "if capture", .text = "if ($1) |${2:value}| {$0}" },
+    .{ .label = "if error", .text = "if ($1) |${2:value}| {$3} else |${4:err}| {$0}" },
     .{ .label = "for", .text = "for ($1) |${2:value}| {$0}" },
     .{ .label = "fori", .text = "for ($1, 0..) |${2:value}, ${3:i}| {$0}" },
+    .{ .label = "for range", .text = "for (0..$1) |${2:i}| {$0}" },
+    .{ .label = "inline for", .text = "inline for ($1) |${2:item}| {$0}" },
     .{ .label = "while", .text = "while ($1) {$0}" },
+    .{ .label = "while capture", .text = "while ($1) |${2:value}| {$0}" },
+    .{ .label = "while continue", .text = "while ($1) : ($2) {$0}" },
     .{ .label = "switch", .text = "switch ($1) {$0}" },
+    .{ .label = "defer", .text = "defer $0;" },
+    .{ .label = "errdefer", .text = "errdefer $0;" },
+    .{ .label = "try", .text = "try $1;" },
+    .{ .label = "const", .text = "const ${1:name} = $0;" },
+    .{ .label = "var", .text = "var ${1:name} = $0;" },
 };
 
 /// Snippets at the start of a statement when `std` is the standard library
 const std_statement_snippets = [_]Snippet{
     .{ .label = "print", .text = "std.debug.print(\"$1\", .{$0});" },
+    .{ .label = "assert", .text = "std.debug.assert(${1:condition});" },
     .{ .label = "log err", .text = "std.log.err(\"$1\", .{$0});" },
     .{ .label = "log warn", .text = "std.log.warn(\"$1\", .{$0});" },
     .{ .label = "log info", .text = "std.log.info(\"$1\", .{$0});" },
     .{ .label = "log debug", .text = "std.log.debug(\"$1\", .{$0});" },
+    .{ .label = "expect", .text = "try std.testing.expect(${1:condition});" },
+    .{ .label = "expectEqual", .text = "try std.testing.expectEqual(${1:expected}, ${2:actual});" },
+    .{ .label = "expectEqualStrings", .text = "try std.testing.expectEqualStrings(${1:expected}, ${2:actual});" },
 };
 
 /// Snippets at the start of a container member
@@ -2738,18 +2753,24 @@ const member_snippets = [_]Snippet{
     .{ .label = "fn", .text = "fn ${1:name}($2) ${3:!void} {$0}" },
     .{ .label = "pub fn", .text = "pub fn ${1:name}($2) ${3:!void} {$0}", .no_pub = true },
     .{ .label = "test", .text = "test \"${1:name}\" {$0}", .no_pub = true, .no_doc = true },
+    .{ .label = "const", .text = "const ${1:name} = $0;" },
     .{ .label = "struct", .text = "const ${1:Name} = struct {$0};" },
+    .{ .label = "packed struct", .text = "const ${1:Name} = packed struct {$0};" },
+    .{ .label = "extern struct", .text = "const ${1:Name} = extern struct {$0};" },
     .{ .label = "enum", .text = "const ${1:Name} = enum {$0};" },
+    .{ .label = "enum(u8)", .text = "const ${1:Name} = enum(u8) {$0};" },
     .{ .label = "union", .text = "const ${1:Name} = union {$0};" },
-    .{ .label = "union tagged", .text = "const ${1:Name} = union(${2:enum}) {$0};" },
+    .{ .label = "union(enum)", .text = "const ${1:Name} = union(enum) {$0};" },
     .{ .label = "error set", .text = "const ${1:Error} = error{$0};" },
     .{ .label = "import", .text = "const $1 = @import(\"$2\");" },
+    .{ .label = "comptime", .text = "comptime {$0}", .no_pub = true, .no_doc = true },
 };
 
-/// Common snippets at the start of a statement or a container member: control flow, printing and
-/// logging; declarations of functions, types, tests and imports, and the `main` and `format`
-/// functions. Snippets that use `std` are offered only when `std` is the standard library; the
-/// `std` and `builtin` imports, `main` and `format` only when not declared yet
+/// Common snippets at the start of a statement or a container member: control flow, `defer`,
+/// `errdefer`, `try`, `const` and `var` declarations, printing, assertions, logging and testing;
+/// declarations of functions, types, tests and imports, `comptime` blocks, and the `main` and
+/// `format` functions. Snippets that use `std` are offered only when `std` is the standard library;
+/// the `std` and `builtin` imports, `main` and `format` only when not declared yet
 fn addKeywordSnippets(r: *Resolver, file: FileId, text: []const u8, offset: u32, visible: Visible, pos: Position, items: *std.ArrayList(Item)) resolve.Error!void {
     switch (visible.context) {
         .none, .scope => {},

@@ -8347,16 +8347,16 @@ fn snippetFixture(w: *World, text: []const u8, std_root: []const u8) !World.Fixt
 }
 
 test "completion: statement and declaration snippets follow the syntax position" {
-    const statements = "if, if else, for, fori, while, switch";
-    const logging = ", print, log err, log warn, log info, log debug";
-    const declarations = "fn, pub fn, test, struct, enum, union, union tagged, error set, import";
+    const statements = "if, if else, if capture, if error, for, fori, for range, inline for, while, while capture, while continue, switch, defer, errdefer, try, const, var";
+    const std_statements = ", print, assert, log err, log warn, log info, log debug, expect, expectEqual, expectEqualStrings";
+    const declarations = "fn, pub fn, test, const, struct, packed struct, extern struct, enum, enum(u8), union, union(enum), error set, import, comptime";
     const cases = [_]struct { []const u8, []const u8 }{
         // Start of a statement in a block; snippets that use `std` only when `std` is the standard
         // library
         .{ "fn t() void {\n    <|>\n}", statements },
         // Snippets that match the input come first
-        .{ "fn t() void {\n    wh<|>\n}", "while, if, if else, for, fori, switch" },
-        .{ "const std = @import(\"std\");\nfn t() void {\n    const a = 1;\n    _ = a;\n    <|>\n}", statements ++ logging },
+        .{ "fn t() void {\n    wh<|>\n}", "while, while capture, while continue, if, if else, if capture, if error, for, fori, for range, inline for, switch, defer, errdefer, try, const, var" },
+        .{ "const std = @import(\"std\");\nfn t() void {\n    const a = 1;\n    _ = a;\n    <|>\n}", statements ++ std_statements },
         .{ "const std = struct {};\nfn t() void {\n    <|>\n}", statements },
         .{ "fn t() void {\n    if (true) {}\n    <|>\n}", statements },
         .{ "fn t(x: u8) void {\n    switch (x) {\n        else => {},\n    }\n    <|>\n}", statements },
@@ -8377,8 +8377,8 @@ test "completion: statement and declaration snippets follow the syntax position"
         // Start of a container member
         .{ "<|>", declarations ++ ", std, builtin, main" },
         .{ "const a = 1;\nfo<|>", declarations ++ ", std, builtin, main" },
-        .{ "pub <|>", "fn, struct, enum, union, union tagged, error set, import, main" },
-        .{ "/// doc\n<|>", "fn, pub fn, struct, enum, union, union tagged, error set, import, std, builtin, main" },
+        .{ "pub <|>", "fn, const, struct, packed struct, extern struct, enum, enum(u8), union, union(enum), error set, import, main" },
+        .{ "/// doc\n<|>", "fn, pub fn, const, struct, packed struct, extern struct, enum, enum(u8), union, union(enum), error set, import, std, builtin, main" },
         .{ "const std = @import(\"std\");\npub fn main() void {}\n<|>", declarations ++ ", builtin" },
         .{ "const S = struct {\n    a: u8,\n    <|>\n};", declarations ++ ", std, builtin" },
         .{ "const std = @import(\"std\");\nconst S = struct {\n    a: u8,\n    <|>\n};", declarations ++ ", builtin, format" },
@@ -8418,6 +8418,24 @@ test "completion: snippets insert declarations that fit the position and the sta
         .{ "const std = @import(\"std\");\nconst S = struct {\n    <|>\n};", "", "format", "missing" },
         .{ "const std = @import(\"std\");\nfn t() void {\n    <|>\n}", snippet_std_root, "print", "std.debug.print(\"$1\", .{$0});" },
         .{ "fn t() void {\n    <|>\n}", snippet_std_root, "for", "for ($1) |${2:value}| {$0}" },
+        .{ "fn t() void {\n    <|>\n}", snippet_std_root, "for range", "for (0..$1) |${2:i}| {$0}" },
+        .{ "fn t() void {\n    <|>\n}", snippet_std_root, "inline for", "inline for ($1) |${2:item}| {$0}" },
+        .{ "fn t() void {\n    <|>\n}", snippet_std_root, "if capture", "if ($1) |${2:value}| {$0}" },
+        .{ "fn t() void {\n    <|>\n}", snippet_std_root, "if error", "if ($1) |${2:value}| {$3} else |${4:err}| {$0}" },
+        .{ "fn t() void {\n    <|>\n}", snippet_std_root, "while capture", "while ($1) |${2:value}| {$0}" },
+        .{ "fn t() void {\n    <|>\n}", snippet_std_root, "while continue", "while ($1) : ($2) {$0}" },
+        .{ "fn t() void {\n    <|>\n}", snippet_std_root, "defer", "defer $0;" },
+        .{ "fn t() void {\n    <|>\n}", snippet_std_root, "errdefer", "errdefer $0;" },
+        .{ "fn t() void {\n    <|>\n}", snippet_std_root, "try", "try $1;" },
+        .{ "fn t() void {\n    <|>\n}", snippet_std_root, "const", "const ${1:name} = $0;" },
+        .{ "<|>", snippet_std_root, "packed struct", "const ${1:Name} = packed struct {$0};" },
+        .{ "<|>", snippet_std_root, "extern struct", "const ${1:Name} = extern struct {$0};" },
+        .{ "<|>", snippet_std_root, "enum(u8)", "const ${1:Name} = enum(u8) {$0};" },
+        .{ "<|>", snippet_std_root, "union(enum)", "const ${1:Name} = union(enum) {$0};" },
+        .{ "<|>", snippet_std_root, "comptime", "comptime {$0}" },
+        .{ "const std = @import(\"std\");\nfn t() void {\n    <|>\n}", snippet_std_root, "assert", "std.debug.assert(${1:condition});" },
+        .{ "const std = @import(\"std\");\nfn t() void {\n    <|>\n}", snippet_std_root, "expect", "try std.testing.expect(${1:condition});" },
+        .{ "const std = @import(\"std\");\nfn t() void {\n    <|>\n}", snippet_std_root, "expectEqual", "try std.testing.expectEqual(${1:expected}, ${2:actual});" },
     };
     for (cases, 0..) |c, i| {
         var w: World = undefined;
