@@ -51,6 +51,12 @@ macOS 和 Linux 上可以用 [Homebrew](https://brew.sh) 安装：
 brew install jinzhongjia/tap/zig-analyzer
 ```
 
+Arch Linux（x86_64 和 aarch64）上可以从 [AUR](https://aur.archlinux.org/packages/zig-analyzer-bin) 安装，例如用 AUR 助手 yay：
+
+```sh
+yay -S zig-analyzer-bin
+```
+
 Windows（x86_64 和 aarch64）上可以用 [Scoop](https://scoop.sh) 安装：
 
 ```pwsh
@@ -58,7 +64,7 @@ scoop bucket add jin https://github.com/jinzhongjia/scoop-bucket
 scoop install jin/zig-analyzer
 ```
 
-两者都安装最新 release 的 ReleaseSafe 构建及其调试信息，用 `brew upgrade` 或 `scoop update zig-analyzer` 更新。tap 在 release 发布时更新，Scoop bucket 在几小时内更新。预发布版本都不收录。
+它们都安装最新 release 的 ReleaseSafe 构建及其调试信息，用 `brew upgrade`、`yay -Syu` 或 `scoop update zig-analyzer` 更新。tap 和 AUR 包在 release 发布时更新，Scoop bucket 在几小时内更新。预发布版本都不收录。
 
 每个 [release](https://github.com/jinzhongjia/zig-analyzer/releases) 都为每个平台（Linux、macOS、Windows 的 x86_64 和 aarch64）提供两种构建：
 

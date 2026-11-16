@@ -203,6 +203,19 @@ pub fn build(b: *std.Build) void {
     homebrew_formula_run.addPassthruArgs();
     b.step("homebrew-formula", "Write the Homebrew formula of a release (see tools/homebrew_formula.zig)").dependOn(&homebrew_formula_run.step);
 
+    // The AUR package of a release: zig build aur-pkgbuild -- <tag> <SHA256SUMS> <output directory>
+    const aur_pkgbuild = b.addExecutable(.{
+        .name = "aur-pkgbuild",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/aur_pkgbuild.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const aur_pkgbuild_run = b.addRunArtifact(aur_pkgbuild);
+    aur_pkgbuild_run.addPassthruArgs();
+    b.step("aur-pkgbuild", "Write the AUR package of a release (see tools/aur_pkgbuild.zig)").dependOn(&aur_pkgbuild_run.step);
+
     // Test runner: the runner bundled with Zig, with stack trace recording enabled for the testing
     // allocator (so that leaks can be located under ReleaseSafe too), unwound with frame pointers
     // on aarch64 Darwin (see tools/patch_test_runner.zig)
@@ -220,7 +233,7 @@ pub fn build(b: *std.Build) void {
 
     // check also compiles every tool: CI runs only some of them, and a tool that nothing compiles
     // stops compiling unnoticed when the analyzer's interfaces change
-    for ([_]*std.Build.Step.Compile{ check_imports, gen_lsp, gen_builtins, gen_manifest, corpus, sema_corpus, bench, release_smoke, changelog, homebrew_formula, patch_runner }) |tool| check.dependOn(&tool.step);
+    for ([_]*std.Build.Step.Compile{ check_imports, gen_lsp, gen_builtins, gen_manifest, corpus, sema_corpus, bench, release_smoke, changelog, homebrew_formula, aur_pkgbuild, patch_runner }) |tool| check.dependOn(&tool.step);
 
     // Tests that depend on a real zig (build system protocol, single-file compilation, end-to-end)
     // run only in test-all and test-stress: under `zig build test` zig is not found (see
@@ -242,12 +255,14 @@ pub fn build(b: *std.Build) void {
     const imports_checker_run = b.addRunArtifact(b.addTest(.{ .root_module = check_imports.root_module }));
     const changelog_test_run = b.addRunArtifact(b.addTest(.{ .root_module = changelog.root_module }));
     const homebrew_formula_test_run = b.addRunArtifact(b.addTest(.{ .root_module = homebrew_formula.root_module }));
+    const aur_pkgbuild_test_run = b.addRunArtifact(b.addTest(.{ .root_module = aur_pkgbuild.root_module }));
     const test_step = b.step("test", "Run the tests that need no external tools");
     test_step.dependOn(&generator_run.step);
     test_step.dependOn(&manifest_generator_run.step);
     test_step.dependOn(&imports_checker_run.step);
     test_step.dependOn(&changelog_test_run.step);
     test_step.dependOn(&homebrew_formula_test_run.step);
+    test_step.dependOn(&aur_pkgbuild_test_run.step);
     test_step.dependOn(&runAnalyzerTests(b, analyzerTests(b, target, optimize, test_runner, tracy != null, false, null)).step);
     const all_step = b.step("test-all", "Run all tests, including those that run the zig in PATH");
     all_step.dependOn(&generator_run.step);
@@ -255,6 +270,7 @@ pub fn build(b: *std.Build) void {
     all_step.dependOn(&imports_checker_run.step);
     all_step.dependOn(&changelog_test_run.step);
     all_step.dependOn(&homebrew_formula_test_run.step);
+    all_step.dependOn(&aur_pkgbuild_test_run.step);
     all_step.dependOn(&runAnalyzerTests(b, analyzerTests(b, target, optimize, test_runner, tracy != null, true, null)).step);
 
     // Stress verification (for concurrency-related changes): run the selected tests repeatedly, one
