@@ -16,6 +16,11 @@ Everything in the repository is in English: code, comments, logs, errors, panic 
 - Fix history, interim results, and measurements belong in the commit message or PR description.
 - A regression test may state in one sentence the wrong behavior it prevents.
 
+## Logging
+
+- Server code logs through `std.log`: the executable's `logFn` (`src/util/log.zig`) filters by the runtime level and also appends to the log file. `std.debug.print` has no level filter and locks and writes stderr on every call, so it is not used in server code.
+- `std.debug.print` is for test failure messages and the output of the standalone tools (`tools/`).
+
 ## Documentation (`docs/`)
 
 - `design.md`: design goals and key design points (layers, query engine, syntax / name / semantic layers, build integration, server, and automated acceptance tests). Updated with the code; no milestones, development logs, or fix records.
