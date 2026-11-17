@@ -171,14 +171,7 @@ pub const Resolver = struct {
     /// Members of a container that can be referenced directly by name (declarations; fields are not
     /// names in scope)
     pub fn lookupDecl(tree: *const ItemTree, container: u32, name: []const u8) ?u32 {
-        for (tree.containerMembers(container)) |m| {
-            const it = tree.items[m];
-            switch (it.kind) {
-                .@"fn", .@"const", .@"var" => if (it.name) |n| if (std.mem.eql(u8, n, name)) return m,
-                else => {},
-            }
-        }
-        return null;
+        return tree.lookupDecl(container, name);
     }
 
     /// `ns.name`: declarations, and for enums also their fields (`E.a`)

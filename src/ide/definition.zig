@@ -499,9 +499,7 @@ fn reifiedFieldTarget(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Ta
 /// single byte `@as(*const [1]u8, &c)`): the member is defined at the call that constructs the type
 fn constructionSite(r: *Resolver, rt: InternPool.Reified) resolve.Error!?Target {
     const tree = try r.itemTree(rt.file);
-    const item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.ast_id == rt.owner) break @intCast(i);
-    } else return null;
+    const item: u32 = tree.itemOf(rt.owner) orelse return null;
     const node = try r.itemNode(rt.file, item) orelse return null;
     const body = try r.body(rt.file, item);
     if (rt.expr >= body.exprs.len) return null;
@@ -617,17 +615,14 @@ fn declOf(r: *Resolver, file: FileId, item: u32, body: *const Body, e: Body.Expr
 }
 
 fn itemOf(r: *Resolver, key: database.hir.OwnerKey) resolve.Error!?u32 {
-    for ((try r.itemTree(key.file)).items, 0..) |it, i| if (it.ast_id == key.item) return @intCast(i);
-    return null;
+    return (try r.itemTree(key.file)).itemOf(key.item);
 }
 
 /// The member that constructs the type (`rt.owner`): its local bindings are also candidates for
 /// the origin of a name
 fn ownerLocal(r: *Resolver, rt: InternPool.Reified) resolve.Error!?Local {
     const tree = try r.itemTree(rt.file);
-    const item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.ast_id == rt.owner) break @intCast(i);
-    } else return null;
+    const item: u32 = tree.itemOf(rt.owner) orelse return null;
     const node = try r.itemNode(rt.file, item) orelse return null;
     const at = try context.at(r, rt.file, node.offset, false) orelse return null;
     if (at.item != item) return null;

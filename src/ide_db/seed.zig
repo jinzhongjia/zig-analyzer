@@ -565,9 +565,7 @@ pub const Found = struct { inst: ?Index, owner: hir.OwnerKey, expr: Body.ExprId 
 
 fn present(r: *Resolver, target: hir.OwnerKey, found: Found) resolve.Error!?Seed {
     const tree = try r.itemTree(found.owner.file);
-    const item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.ast_id == found.owner.item) break @intCast(i);
-    } else return null;
+    const item: u32 = tree.itemOf(found.owner.item) orelse return null;
     const offset = try r.itemOffset(found.owner.file, item) orelse return null;
     const body = try r.ctx.get(hir.ItemBody, found.owner);
     if (@backingInt(found.expr) >= body.exprs.len) return null;
@@ -748,9 +746,7 @@ fn rootCallers(ctx: *database.Db.Ctx, root: hir.OwnerKey, strict: bool, part: un
     var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
     const empty: CallerList = .{ .found = &.{}, .callers = &.{}, .flow_start = 0, .cut = false };
     const tree = try r.itemTree(root.file);
-    const item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.ast_id == root.item) break @intCast(i);
-    } else return empty;
+    const item: u32 = tree.itemOf(root.item) orelse return empty;
     const candidates = try ctx.get(Candidates, root);
     const files = candidates.all_files;
     var importers: std.AutoHashMapUnmanaged(FileId, void) = .empty;
@@ -806,13 +802,9 @@ pub const CallsIn = struct {
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
         const target_tree = try r.itemTree(key.target.file);
-        const item: u32 = for (target_tree.items, 0..) |it, i| {
-            if (it.ast_id == key.target.item) break @intCast(i);
-        } else return &.{};
+        const item: u32 = target_tree.itemOf(key.target.item) orelse return &.{};
         const tree = try r.itemTree(key.owner.file);
-        const i: u32 = for (tree.items, 0..) |it, k| {
-            if (it.ast_id == key.owner.item) break @intCast(k);
-        } else return &.{};
+        const i: u32 = tree.itemOf(key.owner.item) orelse return &.{};
         const names = (try ctx.get(Candidates, key.target)).names;
         const body = try ctx.get(hir.ItemBody, key.owner);
         const seeded = try ctx.get(queries.Infer, .{ .owner = key.owner, .mode = .full, .inst = key.inst });
@@ -837,9 +829,7 @@ pub const CallsIn = struct {
 /// normalized for the member
 pub fn allFound(r: *Resolver, owner: hir.OwnerKey) resolve.Error![]const Found {
     const tree = try r.itemTree(owner.file);
-    const item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.ast_id == owner.item) break @intCast(i);
-    } else return &.{};
+    const item: u32 = tree.itemOf(owner.item) orelse return &.{};
     const root = try genericRoot(r, owner.file, item) orelse return &.{};
     const all = try r.ctx.get(AllInstances, try r.ownerKey(owner.file, root));
     const out = try r.arena.alloc(Found, all.found.len);
@@ -1010,9 +1000,7 @@ const Closure = struct {
         for (c.roots.items, 0..) |x, k| if (std.meta.eql(x.key, key)) return k;
         const r = c.r;
         const tree = try r.itemTree(key.file);
-        const item: u32 = for (tree.items, 0..) |it, i| {
-            if (it.ast_id == key.item) break @intCast(i);
-        } else return null;
+        const item: u32 = tree.itemOf(key.item) orelse return null;
         try c.roots.append(r.arena, .{ .key = key, .file = key.file, .item = item, .found = .{ .limit = std.math.maxInt(usize) }, .filtered = !c.importers.contains(key.file) });
         try c.unscanned.append(r.arena, c.roots.items.len - 1);
         return c.roots.items.len - 1;
@@ -1225,9 +1213,7 @@ test Collector {
 
 fn collect(r: *Resolver, key: hir.OwnerKey, depth: u8, out: *Collector) resolve.Error!void {
     const tree = try r.itemTree(key.file);
-    const item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.ast_id == key.item) break @intCast(i);
-    } else return;
+    const item: u32 = tree.itemOf(key.item) orelse return;
     const root = try genericRoot(r, key.file, item) orelse return;
     const root_key = try r.ownerKey(key.file, root);
     const candidates = try r.ctx.get(Candidates, root_key);
@@ -1267,9 +1253,7 @@ fn collectIn(r: *Resolver, in: FileId, i: u32, file: FileId, item: u32, root_key
 /// The first call site of member `key` that yields a concrete instance. See `callIn` for `strict`.
 fn search_(r: *Resolver, key: hir.OwnerKey, depth: u8, strict: bool) resolve.Error!?Found {
     const tree = try r.itemTree(key.file);
-    const item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.ast_id == key.item) break @intCast(i);
-    } else return null;
+    const item: u32 = tree.itemOf(key.item) orelse return null;
     const root = try genericRoot(r, key.file, item) orelse return null;
     const root_key = try r.ownerKey(key.file, root);
     const candidates = try r.ctx.get(Candidates, root_key);
@@ -1365,9 +1349,7 @@ const Flow = struct {
             if (std.mem.indexOfScalar(Index, fl.visited.items, called.inst) != null) continue;
             try fl.visited.append(r.arena, called.inst);
             const ct = try r.itemTree(called.file);
-            const ci: u32 = for (ct.items, 0..) |it, k| {
-                if (it.ast_id == called.decl) break @intCast(k);
-            } else continue;
+            const ci: u32 = ct.itemOf(called.decl) orelse continue;
             const owner = try r.ownerKey(called.file, ci);
             const callee_body = try r.ctx.get(hir.ItemBody, owner);
             const norm = try queries.normalizeInst(r, called.file, ci, called.inst);
@@ -1471,9 +1453,7 @@ pub const Callers = struct {
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
         const file = key.root.file;
-        const root: u32 = for ((try r.itemTree(file)).items, 0..) |it, i| {
-            if (it.ast_id == key.root.item) break @intCast(i);
-        } else return &.{};
+        const root: u32 = (try r.itemTree(file)).itemOf(key.root.item) orelse return &.{};
         const names = (try ctx.get(Candidates, key.root)).names;
         var out: std.ArrayList(u32) = .empty;
         const tree = try r.itemTree(key.in);
@@ -1525,9 +1505,7 @@ pub const Candidates = struct {
         defer scratch.deinit();
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
         const tree = try r.itemTree(key.file);
-        const root: u32 = for (tree.items, 0..) |it, i| {
-            if (it.ast_id == key.item) break @intCast(i);
-        } else {
+        const root: u32 = tree.itemOf(key.item) orelse {
             data.files = &.{};
             data.all_files = &.{};
             data.names = &.{};

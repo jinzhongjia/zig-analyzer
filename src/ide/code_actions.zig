@@ -500,8 +500,8 @@ const Purity = struct {
     fn isVar(p: Purity, member: ?database.hir.OwnerKey) resolve.Error!bool {
         const key = member orelse return false;
         const tree = try p.r.itemTree(key.file);
-        for (tree.items) |it| if (it.ast_id == key.item) return it.kind == .@"var";
-        return false;
+        const i = tree.itemOf(key.item) orelse return false;
+        return tree.items[i].kind == .@"var";
     }
 };
 

@@ -1195,7 +1195,7 @@ test lastNameStart {
 
 fn keyDef(r: *Resolver, key: hir.OwnerKey) resolve.Error!?Def {
     const tree = try r.itemTree(key.file);
-    for (tree.items, 0..) |it, i| if (it.ast_id == key.item) return .{ .item = .{ .file = key.file, .item = @intCast(i) } };
+    if (tree.itemOf(key.item)) |i| return .{ .item = .{ .file = key.file, .item = i } };
     return null;
 }
 

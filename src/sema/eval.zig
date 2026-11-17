@@ -199,9 +199,7 @@ fn runUntil(r: *Resolver, scratch: *std.heap.ArenaAllocator, owner: hir.OwnerKey
     const ctx = r.ctx;
     const ip = ctx.db.env.ip;
     const tree = try r.itemTree(owner.file);
-    const item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.ast_id == owner.item) break @intCast(i);
-    } else return .unknown;
+    const item: u32 = tree.itemOf(owner.item) orelse return .unknown;
     switch (tree.items[item].kind) {
         .@"fn" => {},
         .@"const", .@"var", .field, .@"comptime" => return runInitializerUntil(r, scratch, owner, item, key_inst, body, stop),
@@ -1143,8 +1141,7 @@ const Evaluator = struct {
 
     fn itemIndex(ev: *Evaluator, owner: hir.OwnerKey) Error!?u32 {
         const tree = try ev.r.itemTree(owner.file);
-        for (tree.items, 0..) |it, i| if (it.ast_id == owner.item) return @intCast(i);
-        return null;
+        return tree.itemOf(owner.item);
     }
 
     fn newFrame(ev: *Evaluator, file: FileId, item: u32, body: *const Body, inst: ?Index) Error!Frame {
@@ -6867,8 +6864,7 @@ const Evaluator = struct {
             },
             .reified_type => |rt| blk: {
                 const tree = try ev.r.itemTree(rt.file);
-                for (tree.items, 0..) |it, i| if (it.ast_id == rt.owner) break :blk .{ rt.file, @as(?u32, @intCast(i)) };
-                return null;
+                break :blk .{ rt.file, @as(?u32, tree.itemOf(rt.owner) orelse return null) };
             },
             else => return null,
         };

@@ -184,9 +184,7 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
     const scope = try queries.enterContext(&r, owner.file, inst);
     defer scope.leave();
     const tree = try r.itemTree(owner.file);
-    const item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.ast_id == owner.item) break @intCast(i);
-    } else return empty(gpa);
+    const item: u32 = tree.itemOf(owner.item) orelse return empty(gpa);
     const body = try ctx.get(hir.ItemBody, owner);
     const split = try splitIteration(ctx.db.env.ip, scratch.allocator(), owner, inst);
     // The seeds of the enclosing loops come from the instance, the innermost one is `loop_seed`
@@ -239,9 +237,7 @@ pub fn runLocal(ctx: *Db.Ctx, owner: hir.OwnerKey, target_ref: @FieldType(querie
     const scope = try queries.enterContext(&r, owner.file, inst);
     defer scope.leave();
     const tree = try r.itemTree(owner.file);
-    const item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.ast_id == owner.item) break @intCast(i);
-    } else return .unknown;
+    const item: u32 = tree.itemOf(owner.item) orelse return .unknown;
     const body = try ctx.get(hir.ItemBody, owner);
     const split = try splitIteration(ctx.db.env.ip, a, owner, inst);
     var inf: Inferrer = .{
@@ -1481,9 +1477,7 @@ const Inferrer = struct {
             else => return null,
         };
         const tree = try inf.r.itemTree(owner.file);
-        const item = for (tree.items) |it| {
-            if (it.ast_id == owner.item) break it;
-        } else return null;
+        const item = tree.items[tree.itemOf(owner.item) orelse return null];
         if (item.kind != .@"const") return null;
         const body = try inf.r.ctx.get(hir.ItemBody, owner);
         const init = switch (body.expr(body.value orelse return null)) {
@@ -3543,8 +3537,8 @@ const Inferrer = struct {
                 // A declaration of a container
                 if (inf.members[@backingInt(e)]) |owner| {
                     const tree = try inf.r.itemTree(owner.file);
-                    for (tree.items) |it| if (it.ast_id == owner.item) return declKnownness(it);
-                    return .uncertain;
+                    const i = tree.itemOf(owner.item) orelse return .uncertain;
+                    return declKnownness(tree.items[i]);
                 }
                 return inf.anyRuntime(&.{fa.lhs}, depth);
             },
@@ -3556,8 +3550,8 @@ const Inferrer = struct {
                     else => return .uncertain,
                 };
                 const tree = try inf.r.itemTree(fv.file);
-                for (tree.items) |it| if (it.ast_id == fv.decl) return if (it.flags.is_inline) .uncertain else .runtime;
-                return .uncertain;
+                const i = tree.itemOf(fv.decl) orelse return .uncertain;
+                return if (tree.items[i].flags.is_inline) .uncertain else .runtime;
             },
             .binary => |x| return inf.anyRuntime(&.{ x.lhs, x.rhs }, depth),
             .prefix => |x| return if (x.op == .ampersand) inf.addressKnownness(x.operand, depth) else inf.anyRuntime(&.{x.operand}, depth),
@@ -4243,9 +4237,7 @@ pub fn declAlternatives(r: *Resolver, a: Allocator, def: resolve.Def) Error![]co
 /// has one)
 pub fn typeInfoMember(r: *Resolver, rt: InternPool.Reified, name: []const u8) Error!?resolve.Def {
     const tree = try r.itemTree(rt.file);
-    const owner_item: u32 = for (tree.items, 0..) |it, i| {
-        if (it.ast_id == rt.owner) break @intCast(i);
-    } else return null;
+    const owner_item: u32 = tree.itemOf(rt.owner) orelse return null;
     const owner = try r.ownerKey(rt.file, owner_item);
     const body = try r.ctx.get(hir.ItemBody, owner);
     const res = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = rt.inst });
@@ -4464,8 +4456,7 @@ fn appendUnique(a: Allocator, out: *std.ArrayList(Index), t: Index) Allocator.Er
 /// Index of the item in `ItemTree.items` whose AST id is `key.item`
 fn itemOfKey(r: *Resolver, key: hir.OwnerKey) Error!?u32 {
     const tree = try r.itemTree(key.file);
-    for (tree.items, 0..) |it, i| if (it.ast_id == key.item) return @intCast(i);
-    return null;
+    return tree.itemOf(key.item);
 }
 
 fn branchLeaves(a: Allocator, body: *const Body, e: ExprId, out: *std.ArrayList(ExprId), depth: u32) Allocator.Error!void {

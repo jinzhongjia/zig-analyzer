@@ -1147,7 +1147,7 @@ fn writeValue(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, value: anytype) 
     if (T == za.database.hir.OwnerKey) {
         try w.writeAll(std.fs.path.basename(server.vfs.path(value.file)));
         const tree = ctx.get(syntax_q.FileItemTree, value.file) catch return w.print("#{d}", .{@backingInt(value.item)});
-        for (tree.items) |it| if (it.ast_id == value.item) return w.print(":{s}", .{it.name orelse "_"});
+        if (tree.itemOf(value.item)) |i| return w.print(":{s}", .{tree.items[i].name orelse "_"});
         return w.print("#{d}", .{@backingInt(value.item)});
     }
     switch (@typeInfo(T)) {

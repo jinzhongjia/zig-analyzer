@@ -17,9 +17,7 @@ const mem = @import("../util/mem.zig");
 /// members (including containers defined inside the root expression of a ZON file) as members
 fn ownerOf(ctx: anytype, key: OwnerKey, node: ast.SyntaxNode) engine.Error!lower_mod.Owner {
     const tree = try ctx.get(syntax.FileItemTree, key.file);
-    const it = for (tree.items) |it| {
-        if (it.ast_id == key.item) break it;
-    } else return .member;
+    const it = tree.items[tree.itemOf(key.item) orelse return .member];
     if (it.kind == .zon) return .zon;
     return if (fieldIsName(tree, it, node)) .bare_field else .member;
 }

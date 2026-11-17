@@ -64,9 +64,7 @@ const Builder = struct {
     /// are only lexically inside it (local types, call arguments, `?struct {...}`) are not listed
     fn childrenOf(b: *Builder, item: u32, level: u32) Allocator.Error![]const types.DocumentSymbol {
         var out: std.ArrayList(types.DocumentSymbol) = .empty;
-        for (b.items.containers, 0..) |c, ci| {
-            if (c.parent_item == item and c.is_value) try out.appendSlice(b.arena, try b.container(@intCast(ci), level));
-        }
+        for (b.items.valueContainers(item)) |ci| try out.appendSlice(b.arena, try b.container(ci, level));
         return out.items;
     }
 };
@@ -145,13 +143,11 @@ pub fn symbolKind(items: *const ItemTree, index: u32, container_kind: ItemTree.C
     return switch (item.kind) {
         .@"fn" => if (container_kind == .file) .Function else .Method,
         .@"var" => .Variable,
-        .@"const" => for (items.containers) |c| {
-            if (c.parent_item == index and c.is_value) break switch (c.kind) {
-                .@"enum" => .Enum,
-                .@"union", .@"struct" => .Struct,
-                .@"opaque", .file => .Object,
-            };
-        } else .Constant,
+        .@"const" => if (items.valueContainers(index).len == 0) .Constant else switch (items.containers[items.valueContainers(index)[0]].kind) {
+            .@"enum" => .Enum,
+            .@"union", .@"struct" => .Struct,
+            .@"opaque", .file => .Object,
+        },
         .field => if (container_kind == .@"enum") .EnumMember else .Field,
         .@"test" => .Method,
         .@"comptime" => .Namespace,

@@ -110,9 +110,7 @@ const ContainerNames = struct {
     fn writeContent(n: ContainerNames, c: InternPool.Container, w: *Io.Writer) Io.Writer.Error!void {
         if (n.anonymous) |seen| seen.* = true;
         const tree = n.r.itemTree(c.file) catch return w.writeAll(@tagName(c.kind));
-        const ci = for (tree.containers, 0..) |x, i| {
-            if (x.ast_id == c.ast_id) break i;
-        } else return w.writeAll(@tagName(c.kind));
+        const ci = tree.containerOf(c.ast_id) orelse return w.writeAll(@tagName(c.kind));
         const x = tree.containers[ci];
         const ip = n.r.ctx.db.env.ip;
         if (x.layout != .auto) try w.print("{t} ", .{x.layout});
@@ -196,11 +194,9 @@ const ContainerNames = struct {
         };
         const inst = shown.?;
         const tree = n.r.itemTree(i.file) catch return ip.printReified(t, w, n);
-        for (tree.items) |it| if (it.ast_id == i.decl) {
-            try w.writeAll(it.name orelse return ip.printReified(t, w, n));
-            return n.writeArgs(inst, w);
-        };
-        return ip.printReified(t, w, n);
+        const it = tree.items[tree.itemOf(i.decl) orelse return ip.printReified(t, w, n)];
+        try w.writeAll(it.name orelse return ip.printReified(t, w, n));
+        return n.writeArgs(inst, w);
     }
 
     /// Instance context `inst` without the instances of members that are not functions
@@ -293,27 +289,26 @@ const ContainerNames = struct {
     /// `?struct {...}` have no name; returns null. Files are not handled here (see `write`).
     fn name(n: ContainerNames, c: InternPool.Container) resolve.Error!?Naming {
         const tree = try n.r.itemTree(c.file);
-        for (tree.containers, 0..) |x, ci| if (x.ast_id == c.ast_id) {
-            const parent = x.parent_item orelse return null;
-            const item = tree.items[parent];
-            if (item.kind == .field) return null;
-            const rel = try n.r.containerRel(.{ .file = c.file, .container = @intCast(ci) }) orelse return null;
-            const b = try n.r.body(c.file, parent);
-            if (item.kind == .@"const" or item.kind == .@"var") {
-                const value = b.value orelse return null;
-                if (!yields(b, value, rel)) return null;
-                return .{ .name = item.name orelse return null, .item = parent, .by = .member };
-            }
-            for (b.bindings) |binding| {
-                const init = binding.init orelse continue;
-                if (yields(b, init, rel)) return .{ .name = binding.name, .item = parent, .by = .local };
-            }
-            if (item.kind != .@"fn") return null;
-            for (b.exprs) |e| switch (e) {
-                .@"return" => |v| if (v) |operand| if (yields(b, operand, rel)) return .{ .name = item.name orelse return null, .item = parent, .by = .returned },
-                else => {},
-            };
-            return null;
+        const ci = tree.containerOf(c.ast_id) orelse return null;
+        const x = tree.containers[ci];
+        const parent = x.parent_item orelse return null;
+        const item = tree.items[parent];
+        if (item.kind == .field) return null;
+        const rel = try n.r.containerRel(.{ .file = c.file, .container = ci }) orelse return null;
+        const b = try n.r.body(c.file, parent);
+        if (item.kind == .@"const" or item.kind == .@"var") {
+            const value = b.value orelse return null;
+            if (!yields(b, value, rel)) return null;
+            return .{ .name = item.name orelse return null, .item = parent, .by = .member };
+        }
+        for (b.bindings) |binding| {
+            const init = binding.init orelse continue;
+            if (yields(b, init, rel)) return .{ .name = binding.name, .item = parent, .by = .local };
+        }
+        if (item.kind != .@"fn") return null;
+        for (b.exprs) |e| switch (e) {
+            .@"return" => |v| if (v) |operand| if (yields(b, operand, rel)) return .{ .name = item.name orelse return null, .item = parent, .by = .returned },
+            else => {},
         };
         return null;
     }
@@ -340,13 +335,11 @@ const ContainerNames = struct {
 pub fn declaresContainer(r: *Resolver, c: InternPool.Container, file: FileId, item: u32) resolve.Error!bool {
     if (c.kind == .file or c.file != file) return false;
     const tree = try r.itemTree(file);
-    for (tree.containers, 0..) |x, ci| if (x.ast_id == c.ast_id) {
-        if (x.parent_item != item) return false;
-        const rel = try r.containerRel(.{ .file = file, .container = @intCast(ci) }) orelse return false;
-        const b = try r.body(file, item);
-        return ContainerNames.yields(b, b.value orelse return false, rel);
-    };
-    return false;
+    const ci = tree.containerOf(c.ast_id) orelse return false;
+    if (tree.containers[ci].parent_item != item) return false;
+    const rel = try r.containerRel(.{ .file = file, .container = ci }) orelse return false;
+    const b = try r.body(file, item);
+    return ContainerNames.yields(b, b.value orelse return false, rel);
 }
 
 /// Display listing the full contents: types in hover and completion details (values there are
@@ -508,9 +501,7 @@ const QualifiedNames = struct {
             else => {},
         };
         const tree = try q.r.itemTree(file);
-        const item = for (tree.items) |it| {
-            if (it.ast_id == decl) break it;
-        } else return error.Unnamed;
+        const item = tree.items[tree.itemOf(decl) orelse return error.Unnamed];
         try q.writeType(try queries.containerType(q.r, .{ .file = file, .container = item.container }, inst));
         try q.w.print(".{s}", .{item.name orelse return error.Unnamed});
     }
@@ -542,9 +533,7 @@ const QualifiedNames = struct {
         const r = q.r;
         if (c.kind == .file) return q.writeFile(c.file);
         const tree = try r.itemTree(c.file);
-        const ci = for (tree.containers, 0..) |x, i| {
-            if (x.ast_id == c.ast_id) break i;
-        } else return error.Unnamed;
+        const ci = tree.containerOf(c.ast_id) orelse return error.Unnamed;
         const ns: Namespace = .{ .file = c.file, .container = @intCast(ci) };
         const parent = tree.containers[ns.container].parent_item orelse return error.Unnamed;
         const item = tree.items[parent];
@@ -640,9 +629,7 @@ const QualifiedNames = struct {
             cur = k.parent;
             if (k.file == c.file and exempt == k.decl) continue;
             const tree = try r.itemTree(k.file);
-            const fn_item = for (tree.items, 0..) |it, n| {
-                if (it.ast_id == k.decl) break n;
-            } else return error.Unnamed;
+            const fn_item = tree.itemOf(k.decl) orelse return error.Unnamed;
             const params = (try r.body(k.file, @intCast(fn_item))).params;
             if (params.len == 0) continue;
             if (k.file != ns.file) return error.Unnamed;
