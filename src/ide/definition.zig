@@ -50,16 +50,22 @@ pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Targe
 
 /// The targets of definition for `def` at a name in `file`: the end of its alias chain
 /// (`Resolver.aliasTarget`), followed by the definitions that correspond to it in the other
-/// modules `file` imports under the same name (`Resolver.moduleAlternatives`), each through its own
-/// alias chain. A declaration `const x = @import(...)` among them is replaced by the start of each
-/// file the import resolves to (in module priority order, see `Resolver.importTargets`). Each
-/// target once; empty when there is no location.
+/// modules: those `file` imports under the same name (`Resolver.moduleAlternatives`), and, for an
+/// alias, those its value refers to (`Resolver.pathAlternatives`), each through its own alias
+/// chain. A declaration `const x = @import(...)` among them is replaced by the start of each file
+/// the import resolves to (in module priority order, see `Resolver.importTargets`). Each target
+/// once; empty when there is no location.
 fn definitionsOf(r: *Resolver, file: FileId, def: Def) resolve.Error![]const Target {
-    var out: std.ArrayList(Target) = .empty;
+    var defs: std.ArrayList(Def) = .empty;
     const end = try r.aliasTarget(def);
-    const alternatives = try r.moduleAlternatives(file, end);
-    for (0..alternatives.len + 1) |i| {
-        const d = if (i == 0) end else try r.aliasTarget(alternatives[i - 1]);
+    try defs.append(r.arena, end);
+    try defs.appendSlice(r.arena, try r.moduleAlternatives(file, end));
+    if (try constValue(r, def)) |v| {
+        try defs.appendSlice(r.arena, try r.pathAlternatives(v.file, v.item, v.body, v.value));
+    }
+    var out: std.ArrayList(Target) = .empty;
+    for (defs.items, 0..) |d0, i| {
+        const d = if (i == 0) d0 else try r.aliasTarget(d0);
         const files = try importedFiles(r, d);
         for (files) |f| try appendNew(r, &out, .{ .file = f, .start = 0, .end = 0 });
         if (files.len == 0) try appendNew(r, &out, try target(r, d) orelse continue);
@@ -67,29 +73,53 @@ fn definitionsOf(r: *Resolver, file: FileId, def: Def) resolve.Error![]const Tar
     return out.items;
 }
 
-/// The files that the value of `def` imports when it is a constant whose value is `@import(...)`
-fn importedFiles(r: *Resolver, def: Def) resolve.Error![]const FileId {
-    const file, const item, const value = switch (def) {
-        .item => |it| blk: {
-            if ((try r.itemTree(it.file)).items[it.item].kind != .@"const") return &.{};
+/// The value of `def` when it is a constant: a container-level `const` or a local constant
+const ConstValue = struct { file: FileId, item: u32, body: *const Body, value: Body.ExprId };
+
+fn constValue(r: *Resolver, def: Def) resolve.Error!?ConstValue {
+    switch (def) {
+        .item => |it| {
+            if ((try r.itemTree(it.file)).items[it.item].kind != .@"const") return null;
             const b = try r.body(it.file, it.item);
-            break :blk .{ it.file, it.item, b.value orelse return &.{} };
+            return .{ .file = it.file, .item = it.item, .body = b, .value = b.value orelse return null };
         },
-        .local => |l| blk: {
+        .local => |l| {
             const b = try r.body(l.file, l.item);
             const bind = b.binding(l.binding);
-            if (bind.kind != .local_const) return &.{};
-            break :blk .{ l.file, l.item, bind.init orelse return &.{} };
+            if (bind.kind != .local_const) return null;
+            return .{ .file = l.file, .item = l.item, .body = b, .value = bind.init orelse return null };
         },
-        .file => return &.{},
-    };
-    const b = try r.body(file, item);
-    const call = switch (b.expr(value)) {
+        .file => return null,
+    }
+}
+
+/// The files that the value of `def` imports when it is a constant whose value is `@import(...)`
+fn importedFiles(r: *Resolver, def: Def) resolve.Error![]const FileId {
+    const v = try constValue(r, def) orelse return &.{};
+    const call = switch (v.body.expr(v.value)) {
         .builtin_call => |call| call,
         else => return &.{},
     };
     if (!std.mem.eql(u8, call.name, "@import")) return &.{};
-    return r.importTargets(file, b, call.args);
+    return r.importTargets(v.file, v.body, call.args);
+}
+
+/// The definitions that the member access whose member name is at the cursor refers to in the
+/// other modules (see `Resolver.pathAlternatives`)
+fn cursorPathAlternatives(r: *Resolver, file: FileId, offset: u32) resolve.Error![]const Def {
+    const tok = try tokenAt(r, file, offset) orelse return &.{};
+    if (tok.kind != .identifier) return &.{};
+    const item = try r.ownerAt(file, tok.offset, false) orelse return &.{};
+    const node = try r.itemNode(file, item) orelse return &.{};
+    const b = try r.body(file, item);
+    const rel = tok.offset - node.offset;
+    const e = b.exprAt(rel) orelse return &.{};
+    const fa = switch (b.expr(e)) {
+        .field_access => |fa| fa,
+        else => return &.{},
+    };
+    if (rel < b.range(fa.lhs).end) return &.{};
+    return r.pathAlternatives(file, item, b, e);
 }
 
 /// What goto finds at the cursor: a definition (`defAt`), or positions that are not one (labels,
@@ -131,21 +161,29 @@ pub fn declarationTargets(r: *Resolver, file: FileId, offset: u32) resolve.Error
 }
 
 /// The result of `find` followed by the definitions of `instanceDefs` and `importedMemberDefs`,
-/// each definition followed by its module alternatives, as targets (through aliases with
-/// `follow_alias`), each target once
+/// each definition followed by its module alternatives (`Resolver.moduleAlternatives`, and for the
+/// definition `find` returns, `Resolver.pathAlternatives` of the member access at the cursor), as
+/// targets (through aliases with `follow_alias`), each target once
 fn allTargets(r: *Resolver, file: FileId, offset: u32, follow_alias: bool) resolve.Error![]const Target {
     var out: std.ArrayList(Target) = .empty;
     var defs: std.ArrayList(Def) = .empty;
+    var found_def = false;
     if (try find(r, file, offset)) |f| switch (f) {
         .targets => |ts| for (ts) |t| try appendNew(r, &out, t),
-        .def => |def| try defs.append(r.arena, def),
+        .def => |def| {
+            try defs.append(r.arena, def);
+            found_def = true;
+        },
     };
     try defs.appendSlice(r.arena, try instanceDefs(r, file, offset));
     try defs.appendSlice(r.arena, try importedMemberDefs(r, file, offset));
-    for (defs.items) |def| {
-        const alternatives = try r.moduleAlternatives(file, def);
-        for (0..alternatives.len + 1) |i| {
-            const d = if (i == 0) def else alternatives[i - 1];
+    for (defs.items, 0..) |def, k| {
+        var alternatives: std.ArrayList(Def) = .empty;
+        try alternatives.appendSlice(r.arena, try r.moduleAlternatives(file, def));
+        // The member access at the cursor names the found definition along a path of names
+        if (k == 0 and found_def) try alternatives.appendSlice(r.arena, try cursorPathAlternatives(r, file, offset));
+        for (0..alternatives.items.len + 1) |i| {
+            const d = if (i == 0) def else alternatives.items[i - 1];
             if (follow_alias) {
                 for (try definitionsOf(r, file, d)) |t| try appendNew(r, &out, t);
             } else {

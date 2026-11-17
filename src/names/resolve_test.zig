@@ -605,6 +605,81 @@ test "definition of an alias through a module import that differs between the mo
     try testing.expectEqualStrings("inner_a.zig:", try w.goto(main, at(text, "inner =")));
 }
 
+test "goto and references on a member path past a module import that differs between the modules of a file" {
+    // Prevents goto and references from taking only the highest-priority module's target when the
+    // member is in a file reached past the import
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:a deps:cfg=cfga module:b deps:cfg=cfgb
+        \\const cfg = @import("cfg");
+        \\const value = cfg.sub.value;
+        \\const sub = cfg.sub;
+        \\test {
+        \\    const local = cfg.sub;
+        \\    _ = .{ value, cfg.sub.value, sub.value, local.value, cfg.direct };
+        \\}
+        \\//- /p/cfg_a.zig module:cfga
+        \\pub const sub = @import("sub_a.zig");
+        \\pub const direct = sub.value;
+        \\//- /p/cfg_b.zig module:cfgb
+        \\pub const sub = @import("sub_b.zig");
+        \\pub const direct = sub.value;
+        \\//- /p/sub_a.zig
+        \\pub const value = 1;
+        \\//- /p/sub_b.zig
+        \\pub const value = 2;
+    );
+    const main = f.file("/p/main.zig");
+    const text = blk: {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        break :blk try w.arena.allocator().dupe(u8, (try ctx.get(database.syntax.SourceText, main)).text);
+    };
+    const at = struct {
+        fn of(t: []const u8, needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, t, needle).?);
+        }
+    }.of;
+    const both = "sub_a.zig:value sub_b.zig:value";
+    for ([_]struct { u32, []const u8, []const u8 }{
+        // The member at the end of the path, directly and through aliases of the path or a prefix
+        .{ at(text, "cfg.sub.value,") + 8, both, both },
+        .{ at(text, "sub.value, local") + 4, both, both },
+        .{ at(text, "local.value") + 6, both, both },
+        .{ at(text, "sub.value;") + 4, both, both },
+        // An alias of the path: definition follows it, declaration stays on it
+        .{ at(text, "value ="), both, "main.zig:value" },
+        .{ at(text, "value, cfg"), both, "main.zig:value" },
+        .{ at(text, "sub ="), "sub_a.zig: sub_b.zig:", "main.zig:sub" },
+        .{ at(text, "direct }"), both, "cfg_a.zig:direct cfg_b.zig:direct" },
+    }) |c| {
+        try testing.expectEqualStrings(c[1], try w.gotoAll(main, c[0], definition.definitionTargets));
+        try testing.expectEqualStrings(c[2], try w.gotoAll(main, c[0], definition.declarationTargets));
+    }
+
+    // Each use of the path is a reference of the member in both files, ambiguous for rename
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    for ([_][]const u8{ "/p/sub_a.zig", "/p/sub_b.zig" }) |path| {
+        const sub = f.file(path);
+        const sub_text = (try ctx.get(database.syntax.SourceText, sub)).text;
+        const def = try definition.defAt(&r, sub, at(sub_text, "value")) orelse return error.NoDefinition;
+        var ambiguous: ?search.Reference = null;
+        const refs = try search.findReferences(&r, def, .{ .scope = f.files, .ambiguous = &ambiguous });
+        var in_main: usize = 0;
+        for (refs) |ref| if (ref.file == main) {
+            in_main += 1;
+            try testing.expectEqualStrings("value", text[ref.start..ref.end]);
+        };
+        // `cfg.sub.value` twice, `sub.value`, `local.value`
+        try testing.expectEqual(4, in_main);
+        try testing.expectEqual(main, ambiguous.?.file);
+    }
+}
+
 test "goto and references on members of a module import that differs between the modules of a file" {
     // Prevents goto from listing only the member in the highest-priority module's target
     var w: World = undefined;
