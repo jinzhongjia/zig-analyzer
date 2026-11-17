@@ -2,7 +2,8 @@
 //! initializers, labels, `@import` strings, and paths to files in `build.zig.zon`.
 //!
 //! Declaration jumps to the declaration that a name resolves to directly; definition additionally
-//! follows container-level aliases (`const A = std.mem.Allocator;`) to the final definition; type
+//! follows container-level aliases (`const A = std.mem.Allocator;`) to the final definition, and
+//! from a declaration whose value is `@import(...)` to the imported file; type
 //! definition jumps to the definition of the type of the symbol at the cursor (with pointers,
 //! optionals, arrays, and error unions stripped).
 
@@ -33,7 +34,10 @@ pub const Target = struct { file: FileId, start: u32, end: u32 };
 pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target {
     return switch (try find(r, file, offset) orelse return null) {
         .targets => |ts| ts[0],
-        .def => |def| target(r, try r.aliasTarget(def)),
+        .def => |def| blk: {
+            const ts = try definitionsOf(r, file, def);
+            break :blk if (ts.len > 0) ts[0] else null;
+        },
     };
 }
 
@@ -42,6 +46,50 @@ pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Targe
         .targets => |ts| ts[0],
         .def => |def| target(r, def),
     };
+}
+
+/// The targets of definition for `def` at a name in `file`: the end of its alias chain
+/// (`Resolver.aliasTarget`), followed by the definitions that correspond to it in the other
+/// modules `file` imports under the same name (`Resolver.moduleAlternatives`), each through its own
+/// alias chain. A declaration `const x = @import(...)` among them is replaced by the start of each
+/// file the import resolves to (in module priority order, see `Resolver.importTargets`). Each
+/// target once; empty when there is no location.
+fn definitionsOf(r: *Resolver, file: FileId, def: Def) resolve.Error![]const Target {
+    var out: std.ArrayList(Target) = .empty;
+    const end = try r.aliasTarget(def);
+    const alternatives = try r.moduleAlternatives(file, end);
+    for (0..alternatives.len + 1) |i| {
+        const d = if (i == 0) end else try r.aliasTarget(alternatives[i - 1]);
+        const files = try importedFiles(r, d);
+        for (files) |f| try appendNew(r, &out, .{ .file = f, .start = 0, .end = 0 });
+        if (files.len == 0) try appendNew(r, &out, try target(r, d) orelse continue);
+    }
+    return out.items;
+}
+
+/// The files that the value of `def` imports when it is a constant whose value is `@import(...)`
+fn importedFiles(r: *Resolver, def: Def) resolve.Error![]const FileId {
+    const file, const item, const value = switch (def) {
+        .item => |it| blk: {
+            if ((try r.itemTree(it.file)).items[it.item].kind != .@"const") return &.{};
+            const b = try r.body(it.file, it.item);
+            break :blk .{ it.file, it.item, b.value orelse return &.{} };
+        },
+        .local => |l| blk: {
+            const b = try r.body(l.file, l.item);
+            const bind = b.binding(l.binding);
+            if (bind.kind != .local_const) return &.{};
+            break :blk .{ l.file, l.item, bind.init orelse return &.{} };
+        },
+        .file => return &.{},
+    };
+    const b = try r.body(file, item);
+    const call = switch (b.expr(value)) {
+        .builtin_call => |call| call,
+        else => return &.{},
+    };
+    if (!std.mem.eql(u8, call.name, "@import")) return &.{};
+    return r.importTargets(file, b, call.args);
 }
 
 /// What goto finds at the cursor: a definition (`defAt`), or positions that are not one (labels,
@@ -98,8 +146,11 @@ fn allTargets(r: *Resolver, file: FileId, offset: u32, follow_alias: bool) resol
         const alternatives = try r.moduleAlternatives(file, def);
         for (0..alternatives.len + 1) |i| {
             const d = if (i == 0) def else alternatives[i - 1];
-            const t = try target(r, if (follow_alias) try r.aliasTarget(d) else d) orelse continue;
-            try appendNew(r, &out, t);
+            if (follow_alias) {
+                for (try definitionsOf(r, file, d)) |t| try appendNew(r, &out, t);
+            } else {
+                try appendNew(r, &out, try target(r, d) orelse continue);
+            }
         }
     }
     return out.items;
