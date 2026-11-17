@@ -31,11 +31,11 @@ The server executable is, in this order:
 2. the release installed by |:ZigAnalyzer-install|;
 3. `zig-analyzer` in PATH.
 The plugin installs nothing unless |:ZigAnalyzer-install| is run. It reads a
-small version file to report a newer release; see |zig_analyzer-updates|.
+small metadata file to report a newer release; see |zig_analyzer-updates|.
 
                                                      *:ZigAnalyzer-install*
 :ZigAnalyzer install [{tag}|latest] [ReleaseSafe|ReleaseFast]
-    Download a release from https://github.com/jinzhongjia/zig-analyzer/releases
+    Download a release from https://releases.zig-analyzer.dev
     (the latest one, or {tag} such as `v0.1.1`; built with ReleaseSafe unless
     ReleaseFast is given) into |g:zig_analyzer_data_dir|, keep it as the
     server, remove the previously installed release, and restart the running
@@ -52,8 +52,8 @@ small version file to report a newer release; see |zig_analyzer-updates|.
 UPDATES                                              *zig_analyzer-updates*
 
 A few seconds after startup, the plugin reads
-https://zig-analyzer.nvimer.org/latest.json once per session. When it names a
-release newer than the running server, the plugin reports it and says to run
+https://releases.zig-analyzer.dev/metadata.json once per session. When its
+latest release is newer than the running server, the plugin reports it and says to run
 |:ZigAnalyzer-install|. It never installs anything by itself. The check is
 silent when the file cannot be read, and a release is reported once per
 session. `:ZigAnalyzer checkUpdates` checks at any time. Set
@@ -70,7 +70,7 @@ OPTIONS                                              *zig_analyzer-options*
                           (`~/.local/share` when unset), or in
                           `%LOCALAPPDATA%` on Windows.
 
-*g:zig_analyzer_check_updates*  Whether to read the version file after
+*g:zig_analyzer_check_updates*  Whether to read the metadata file after
                           startup and report a newer release. `0` turns the
                           automatic check off; `:ZigAnalyzer checkUpdates`
                           still works. Default: `1`. See
@@ -117,7 +117,7 @@ COMMANDS                                             *zig_analyzer-commands*
                              file.
 :ZigAnalyzer install         Install a release of the server: see
                              |:ZigAnalyzer-install|.
-:ZigAnalyzer checkUpdates    Read the version file now and report a newer
+:ZigAnalyzer checkUpdates    Read the release metadata now and report a newer
                              release (|zig_analyzer-updates|).
 
 The views open in a split, which the next run of the same command reuses.

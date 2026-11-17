@@ -1,9 +1,9 @@
-" The version file of the server releases (see docs/features/update-check.md): the plugin reads
+" The metadata file of the server releases (see docs/features/update-check.md): the plugin reads
 " it to learn whether a newer release exists. It never installs one; `:ZigAnalyzer install` is
 " the user's choice.
 
 if !exists('g:zig_analyzer_update_url')
-  let g:zig_analyzer_update_url = 'https://zig-analyzer.nvimer.org/latest.json'
+  let g:zig_analyzer_update_url = 'https://releases.zig-analyzer.dev/metadata.json'
 endif
 
 let s:checking = 0
@@ -138,11 +138,11 @@ function! s:checked(opts, version, status, body) abort
     call s:done(a:opts, '', a:version)
     return
   endtry
-  if type(l:data) != v:t_dict || get(l:data, 'schema', 0) != 1 || type(get(l:data, 'tag', 0)) != v:t_string
+  if type(l:data) != v:t_dict || get(l:data, 'schema', 0) != 1 || type(get(l:data, 'latest', 0)) != v:t_string
     call s:done(a:opts, '', a:version)
     return
   endif
-  let l:tag = l:data.tag
+  let l:tag = l:data.latest
   if l:tag !~# '^v\d\+\.\d\+\.\d\+[0-9A-Za-z.-]*$'
     call s:done(a:opts, '', a:version)
     return
@@ -167,7 +167,7 @@ function! s:checked(opts, version, status, body) abort
   call s:done(a:opts, l:tag, a:version)
 endfunction
 
-" Reads the version file and reports a newer release. `opts.force` checks even when the
+" Reads the metadata file and reports a newer release. `opts.force` checks even when the
 " automatic check is off and reports a tag that was reported before; `opts.version` and
 " `opts.url` are for tests; `opts.notify` replaces the message.
 function! zig_analyzer#update#check(...) abort

@@ -1,4 +1,4 @@
-" `:ZigAnalyzer install`: downloads a release of the server from GitHub into the data directory
+" `:ZigAnalyzer install`: downloads a release of the server from the release server into the data directory
 " (`zig_analyzer#install#dir()`), after checking it. The archive must have the SHA-256 that the
 " release's SHA256SUMS lists for it, and when minisign is installed, SHA256SUMS must carry a
 " minisign signature by the release key below whose trusted comment names the release
@@ -9,7 +9,7 @@
 " Where the releases are downloaded from, and the release signing key (`minisign.pub` at the root
 " of the zig-analyzer repository). Not set when they are already: the tests set them first.
 if !has_key(g:, 'zig_analyzer#install#releases')
-  let g:zig_analyzer#install#releases = 'https://github.com/jinzhongjia/zig-analyzer/releases'
+  let g:zig_analyzer#install#releases = 'https://releases.zig-analyzer.dev'
 endif
 if !has_key(g:, 'zig_analyzer#install#public_key')
   let g:zig_analyzer#install#public_key = 'RWRbma3B4tRgvIsJxiSxTvwoOWB6wvqxTEDgWVaJk0XMSeW9THbHBVj+'

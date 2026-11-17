@@ -69,19 +69,20 @@ The plugin runs `g:zig_analyzer_cmd` when it is set, else the release installed 
 :ZigAnalyzer install v0.1.1 ReleaseFast " a given release and optimize mode
 ```
 
-installs a release from GitHub into `~/.local/share/vim/zig-analyzer` (`g:zig_analyzer_data_dir`)
-and restarts the running server with it. The archive must have the SHA-256 listed in the
+installs a release from `https://releases.zig-analyzer.dev` into
+`~/.local/share/vim/zig-analyzer` (`g:zig_analyzer_data_dir`) and restarts the running server with
+it. The archive must have the SHA-256 listed in the
 release's `SHA256SUMS`, and when [minisign](https://jedisct1.github.io/minisign/) is installed,
 `SHA256SUMS` must be signed by the release key; without minisign the install warns that the
 signature is not checked. Needs `curl`, `tar`, and `sha256sum` or `shasum` (`certutil` on Windows).
 
 ## Updates
 
-A few seconds after startup, the plugin reads a small version file
-(`https://zig-analyzer.nvimer.org/latest.json`) once per session and reports a newer release with
-`:ZigAnalyzer install` as the way to get it. It never installs anything by itself. A failed check
-is silent; `:ZigAnalyzer checkUpdates` checks at any time. `g:zig_analyzer_check_updates = 0`
-turns the automatic check off.
+A few seconds after startup, the plugin reads the release metadata
+(`https://releases.zig-analyzer.dev/metadata.json`) once per session and reports a newer release
+with `:ZigAnalyzer install` as the way to get it. It never installs anything by itself. A failed
+check is silent; `:ZigAnalyzer checkUpdates` checks at any time.
+`g:zig_analyzer_check_updates = 0` turns the automatic check off.
 
 ## Settings
 

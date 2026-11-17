@@ -1,4 +1,4 @@
-" Test of the update check against version files in a temporary directory (file:// URLs):
+" Test of the update check against metadata files in a temporary directory (file:// URLs):
 "   ZA_RESULT=/tmp/result.txt vim -N -u NONE -i NONE --not-a-term -S test/update.vim
 " The results go to the file in ZA_RESULT; the exit code is 0 when every check passes.
 set nocompatible
@@ -58,10 +58,10 @@ for [x, y, want] in s:versions
   call s:check(zig_analyzer#update#compare(x, y) == want, printf('compare(%s, %s) is %s', x, y, want))
 endfor
 
-call s:write('newer.json', '{"schema":1,"tag":"v9.9.9"}')
-call s:write('equal.json', '{"schema":1,"tag":"v0.1.2"}')
-call s:write('schema.json', '{"schema":2,"tag":"v9.9.9"}')
-call s:write('tag.json', '{"schema":1,"tag":"nightly"}')
+call s:write('newer.json', '{"schema":1,"latest":"v9.9.9","versions":[]}')
+call s:write('equal.json', '{"schema":1,"latest":"v0.1.2","versions":[]}')
+call s:write('schema.json', '{"schema":2,"latest":"v9.9.9","versions":[]}')
+call s:write('tag.json', '{"schema":1,"latest":"nightly","versions":[]}')
 call s:write('invalid.json', 'not json')
 
 let s:seen = []
@@ -85,7 +85,7 @@ endfor
 
 let s:seen = []
 let s:result = s:run({'version': '0.1.2', 'url': s:url('missing.json'), 'force': 1, 'notify': function('s:notify')})
-call s:check(!empty(s:result) && s:result.tag ==# '' && empty(s:seen), 'a missing version file gives no update')
+call s:check(!empty(s:result) && s:result.tag ==# '' && empty(s:seen), 'a missing metadata file gives no update')
 
 let s:seen = []
 let s:result = s:run({'version': '0.1.2', 'url': s:url('newer.json'), 'force': 1, 'notify': function('s:notify')})
