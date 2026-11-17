@@ -30,7 +30,8 @@ The server executable is, in this order:
    `cmd = { '/path/to/zig-analyzer' }`;
 2. the release installed by |:ZigAnalyzer-install|;
 3. `zig-analyzer` in PATH.
-The plugin downloads nothing unless |:ZigAnalyzer-install| is run.
+The plugin installs nothing unless |:ZigAnalyzer-install| is run. It reads a
+small version file to report a newer release; see |zig-analyzer-updates|.
 
                                                      *:ZigAnalyzer-install*
 :ZigAnalyzer install [{tag}|latest] [ReleaseSafe|ReleaseFast]
@@ -48,11 +49,24 @@ Lua: `require('zig-analyzer').install({ version = 'v0.1.1', optimize =
 'ReleaseFast' })`.
 
 ==============================================================================
+UPDATES                                            *zig-analyzer-updates*
+
+A few seconds after a server starts, the plugin reads
+https://zig-analyzer.nvimer.org/latest.json once per session. When it names a
+release newer than the running server, the plugin reports it and says to run
+|:ZigAnalyzer-install|. It never installs anything by itself. The check is
+silent when the file cannot be read, and a release is reported once per
+session. `:ZigAnalyzer checkUpdates` checks at any time.
+
+`setup({ check_updates = false })` turns the automatic check off.
+
+==============================================================================
 SETUP                                                *zig-analyzer-setup*
 
 >lua
     require('zig-analyzer').setup({
       -- Any field of |vim.lsp.Config|; see |zig-analyzer-server| for `cmd`
+      check_updates = false, -- do not read the version file automatically
       settings = {
         build = { args = { '-Dtarget=aarch64-linux' } },
         inlay_hints = { parameters = false },
@@ -88,6 +102,8 @@ COMMANDS                                             *zig-analyzer-commands*
 :ZigAnalyzer restart         Restart the server (|:lsp-restart|).
 :ZigAnalyzer log             Open the LSP log.
 :ZigAnalyzer install         Install the server (|:ZigAnalyzer-install|).
+:ZigAnalyzer checkUpdates    Read the version file now and report a newer
+                             release (|zig-analyzer-updates|).
 
 The views open in a split, which the next run of the same command reuses.
 In a view, <CR> follows the line under the cursor: it opens a file, goes to

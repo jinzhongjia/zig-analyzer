@@ -8,6 +8,8 @@ local name = 'zig_analyzer'
 ---@param opts? vim.lsp.Config
 function M.setup(opts)
   opts = vim.deepcopy(opts or {})
+  require('zig-analyzer.update').setup(opts)
+  opts.check_updates = nil
   if opts.settings and opts.settings['zig-analyzer'] == nil then
     opts.settings = { ['zig-analyzer'] = opts.settings }
   end
@@ -109,6 +111,19 @@ M.commands = {
   end,
   install = function(args)
     require('zig-analyzer.install').command_install(args)
+  end,
+  checkUpdates = function()
+    require('zig-analyzer.update').check({ force = true, notify_no_version = true }, function(tag, _, status)
+      if status == 'up to date' then
+        vim.notify(('zig-analyzer: %s is the latest release'):format(tag), vim.log.levels.INFO)
+      elseif status == 'no data' then
+        vim.notify('zig-analyzer: cannot read the version file', vim.log.levels.WARN)
+      elseif status == 'invalid' then
+        vim.notify('zig-analyzer: the version file is not valid', vim.log.levels.WARN)
+      elseif status == 'checking' then
+        vim.notify('zig-analyzer: an update check is already running', vim.log.levels.INFO)
+      end
+    end)
   end,
 }
 

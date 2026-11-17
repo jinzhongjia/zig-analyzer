@@ -39,10 +39,18 @@ require('zig-analyzer').setup()
 `stdpath('data')/zig-analyzer` and restarts the running servers with it
 (`:ZigAnalyzer install v0.1.1 ReleaseFast` picks a release and build mode). It verifies the
 release's minisign signature and the archive's SHA-256 first, and needs `curl` and `tar`. The
-plugin downloads nothing on its own.
+plugin installs nothing on its own.
 
 The server is `cmd` from `setup()` if set, else the installed release, else `zig-analyzer` in
 `PATH`.
+
+## Updates
+
+A few seconds after a server starts, the plugin reads a small version file
+(`https://zig-analyzer.nvimer.org/latest.json`) once per session and reports a newer release with
+`:ZigAnalyzer install` as the way to get it. It never installs anything by itself. A failed check
+is silent; `:ZigAnalyzer checkUpdates` checks at any time. `setup({ check_updates = false })`
+turns the automatic check off.
 
 ## Setup
 
@@ -72,4 +80,5 @@ needs Node, `curl`, and `tar`.
 cd editors/nvim
 XDG_STATE_HOME=$(mktemp -d) ZIG_ANALYZER=/path/to/zig-analyzer nvim --headless --clean -u NONE -l test/smoke.lua
 XDG_DATA_HOME=$(mktemp -d) XDG_STATE_HOME=$(mktemp -d) ZIG_ANALYZER=/path/to/zig-analyzer nvim --headless --clean -u NONE -l test/install.lua
+XDG_STATE_HOME=$(mktemp -d) nvim --headless --clean -u NONE -l test/update.lua
 ```
