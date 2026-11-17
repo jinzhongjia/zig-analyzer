@@ -1554,8 +1554,7 @@ fn indexOnce(server: *Server, generation: u64) Io.Cancelable!void {
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     var basis: u64 = 0;
-    const Files = struct { symbols: []const Vfs.FileId, project: []const Vfs.FileId };
-    const files: Files = while (true) {
+    const files: []const Vfs.FileId = while (true) {
         if (server.isShuttingDown()) return;
         // A canceled read begins again only once the pending writes have the lock (see
         // `Db.waitPendingWrites`)
@@ -1568,21 +1567,19 @@ fn indexOnce(server: *Server, generation: u64) Io.Cancelable!void {
             error.Canceled => continue,
             error.OutOfMemory => return,
         });
-        const symbols = za.ide_db.search.searchFiles(&r) catch |err| switch (err) {
+        break za.ide_db.search.searchFiles(&r) catch |err| switch (err) {
             error.Canceled => continue,
             error.OutOfMemory => return,
         };
-        const project = za.ide_db.search.projectFiles(&r) catch |err| switch (err) {
-            error.Canceled => continue,
-            error.OutOfMemory => return,
-        };
-        break .{ .symbols = symbols, .project = project };
     };
     // Two steps: first the regular index of the searched files (workspace symbols), usable as soon
     // as it is built; then the auto-import index (public closures of the standard library and of
-    // each module, `FileLinks` of project files), during which completion works as usual, only
-    // without auto-import
-    if (!try server.indexBatches(files.symbols, "Indexing", false)) return;
+    // each module, `FileLinks` and `ImportSites` of the searched files), during which completion
+    // works as usual, only without auto-import. The auto-import index covers the workspace files
+    // that are in no module too: completion treats each of them as the root of its own module and
+    // follows the files it reaches, which would otherwise compute their `ImportSites` in the
+    // request.
+    if (!try server.indexBatches(files, "Indexing", false)) return;
     {
         server.index_mutex.lockUncancelable(server.io);
         defer server.index_mutex.unlock(server.io);
@@ -1593,7 +1590,7 @@ fn indexOnce(server: *Server, generation: u64) Io.Cancelable!void {
     // When warming up fails (out of memory), the index is not marked usable: the next completion
     // retries, instead of the closures being expanded synchronously in a request
     if (!server.indexImportRoots()) return;
-    if (!try server.indexBatches(files.project, "Indexing for auto-import", true)) return;
+    if (!try server.indexBatches(files, "Indexing for auto-import", true)) return;
     // The project-level results completion needs are also computed before the index is marked
     // usable, rather than being left to the first completion
     while (true) {
@@ -1688,8 +1685,8 @@ fn hashFile(h: *std.hash.Wyhash, file: ?Vfs.FileId) void {
     h.update(std.mem.asBytes(&id));
 }
 
-/// Workspace symbol index; with `auto_import`, the declaration index for auto-import (only for
-/// Zig source files)
+/// Workspace symbol index; with `auto_import`, the declaration and import-site index for
+/// auto-import (only for Zig source files)
 fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId, auto_import: bool) za.db.Error!void {
     for (files) |f| {
         if (auto_import) {

@@ -60,6 +60,15 @@ fn importQueryKeys(response: std.json.Value) i64 {
     return keys;
 }
 
+/// Number of executions of `ImportSites` in `zig-analyzer/status`
+fn importSitesExecutions(response: std.json.Value) i64 {
+    for (response.object.get("result").?.object.get("queries").?.array.items) |q| {
+        if (!std.mem.endsWith(u8, q.object.get("name").?.string, ".imports.ImportSites")) continue;
+        return q.object.get("executions").?.integer;
+    }
+    return 0;
+}
+
 fn applyCompletion(a: std.mem.Allocator, text: []const u8, item: std.json.Value, encoding: offsets.Encoding) ![]const u8 {
     const Change = struct { start: usize, end: usize, text: []const u8 };
     var changes: std.ArrayList(Change) = .empty;
@@ -791,7 +800,11 @@ fn completeOpened(h: *Harness, project: *const fixture.Project, path: []const u8
     _ = try h.request("zig-analyzer/waitIdle", {});
     const at = try position(text, needle, @intCast(needle.len), .utf16);
     try startAutoImport(h, uri, at);
-    return h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at });
+    // The index covers the files a file in no module reaches: completion only reads its memos
+    const before = importSitesExecutions(try h.request("zig-analyzer/status", {}));
+    const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at });
+    try testing.expectEqual(before, importSitesExecutions(try h.request("zig-analyzer/status", {})));
+    return response;
 }
 
 test "auto-import offers declarations of files reached from a single-file root" {
