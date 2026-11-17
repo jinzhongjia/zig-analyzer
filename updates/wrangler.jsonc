@@ -1,0 +1,16 @@
+// The version file that the editor integrations read (see docs/features/update-check.md).
+// The release workflow writes public/latest.json and deploys it: stable releases only.
+{
+  "name": "zig-analyzer-updates",
+  "compatibility_date": "2026-11-17",
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "none"
+  },
+  "routes": [
+    {
+      "pattern": "zig-analyzer.nvimer.org",
+      "custom_domain": true
+    }
+  ]
+}
