@@ -66,6 +66,7 @@ pub const Db = engine.Engine(*const Env, &.{
     ModuleGraph.StdRoot,
     ModuleGraph.FileContext,
     ModuleGraph.ContextImports,
+    hir.ItemSyntax,
     hir.ItemBody,
     hir.ParamForms,
     sema.TargetAbi,

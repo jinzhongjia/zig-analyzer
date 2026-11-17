@@ -43,6 +43,10 @@
 //! result must be exactly the same as computing from scratch; prev is only used for speed, and
 //! reading prev records no dependency.
 //!
+//! A compute may read a derived query with `Ctx.getUntracked`: it is brought up to date like with
+//! `get` but not recorded as a dependency. Only valid when the result is fully determined by the
+//! dependencies the compute does record.
+//!
 //! A query may declare `pub fn bytes(v: Value) usize`: the number of bytes a value occupies, used
 //! only for statistics (`Db.stats`).
 //!
@@ -1242,7 +1246,21 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 frame.pinned.deinit(gpa);
             }
 
+            /// Reads a derived query inside a compute without recording it as a dependency. Only
+            /// for a compute whose result is fully determined by the dependencies it does record:
+            /// e.g. a value located through a whole-file table whose relevant part is covered by a
+            /// recorded per-key query. Outside a compute it is the same as `get`.
+            pub fn getUntracked(ctx: *Ctx, comptime Q: type, key: Q.Key) Error!Q.Value {
+                comptime std.debug.assert(Q.kind == .derived);
+                if (ctx.stack.items.len == 0) return ctx.get(Q, key);
+                return ctx.getImpl(Q, key, false);
+            }
+
             fn getInner(ctx: *Ctx, comptime Q: type, key: Q.Key) Error!Q.Value {
+                return ctx.getImpl(Q, key, true);
+            }
+
+            fn getImpl(ctx: *Ctx, comptime Q: type, key: Q.Key, comptime record: bool) Error!Q.Value {
                 try ctx.checkCanceled();
                 const qi = comptime queryIndex(Q);
                 const db = ctx.db;
@@ -1294,7 +1312,7 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 };
                 if (Q.kind == .derived and !fresh.executed) _ = db.counters[qi].hits.fetchAdd(1, .monotonic);
                 if (Q.kind == .derived and fresh.in_cycle) return fresh.value;
-                try ctx.recordDep(dep, fresh.durability);
+                if (record) try ctx.recordDep(dep, fresh.durability);
                 return fresh.value;
             }
 

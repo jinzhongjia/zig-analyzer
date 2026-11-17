@@ -65,7 +65,7 @@ lsp/          types generated from metaModel.json · JSON-RPC · transport
 
 ### Verification and early cutoff
 
-A memo records `verified_at` / `changed_at` and its dependencies. After an input changes, dependencies are verified one by one; when a recomputation produces an equal value, the old `changed_at` is kept and nothing downstream is recomputed. A query may declare `computeIncremental(ctx, key, prev)` to receive its previous value (used for local reparse).
+A memo records `verified_at` / `changed_at` and its dependencies. After an input changes, dependencies are verified one by one; when a recomputation produces an equal value, the old `changed_at` is kept and nothing downstream is recomputed. A query may declare `computeIncremental(ctx, key, prev)` to receive its previous value (used for local reparse). A compute may read a derived query with `getUntracked`, which brings it up to date without recording it as a dependency; this is only valid when the result is determined by the dependencies it does record (see HIR).
 
 ### Durability
 
@@ -96,7 +96,7 @@ Read transactions that need the same memo brought up to date do it once: the fir
 
 A query may declare `lru` (count) and `lru_bytes`; eviction deletes the value and keeps the dependencies. Capacities can be changed with `cache.capacity` and `cache.queries`. `resetQueries` clears the type-related queries a generation at a time, together with `InternPool.reset`.
 
-An evicted memo whose dependencies changed cannot compare its new value with the old one, so it counts as changed. A query may therefore declare `fingerprint`, which eviction keeps; values with the same fingerprint must be equal. A recomputed value with the same fingerprint keeps the original changed_at. `FileItemTree` declares a 128-bit hash of what its `eql` compares, and `ItemBody` the source hash and owner it reuses a Body by. Without them, editing or reverting a file whose item tree or bodies were evicted recomputes everything that depends on them, and in a long session that is most of the closures of `AllInstances`, which then read back the evicted syntax trees and inference results.
+An evicted memo whose dependencies changed cannot compare its new value with the old one, so it counts as changed. A query may therefore declare `fingerprint`, which eviction keeps; values with the same fingerprint must be equal. A recomputed value with the same fingerprint keeps the original changed_at. `FileItemTree` declares a 128-bit hash of what its `eql` compares, and `ItemBody` a hash of the `ItemSyntax` it is lowered from. Without them, editing or reverting a file whose item tree or bodies were evicted recomputes everything that depends on them, and in a long session that is most of the closures of `AllInstances`, which then read back the evicted syntax trees and inference results.
 
 Eviction normally waits for a moment without read transactions, but one read transaction can compute a large part of a project under many instances. A query may therefore declare `lru_read_bytes`: above that size, a read evicts the least recently used values that nothing holds. A read pins the value until the compute that read it returns, or until its transaction ends when read outside any query; values store no pointers into the values they read, so nothing else can hold it. Only `Infer` declares it, at 512 MB: recomputing it costs little there, while the syntax trees and bodies are read again so often during such a computation that evicting them dominates its time.
 
@@ -181,7 +181,7 @@ A compilation (`ModuleGraph.Compile`) determines `@import("std")`, `@import("roo
 ### Name resolution and HIR
 
 - **Name resolution**: local scopes, then the chain of enclosing containers; `a.b.c` resolves along `@import`, container definitions, `@This()`, and aliases. An imported `.zon` file is a value, not a namespace.
-- **HIR**: function bodies, initializers, comptime / test blocks, field types and defaults, and the ZON root are BodyOwners, lowered to an error-tolerant IR (not ZIR, which syntax errors prevent) along with local scopes. A member with unchanged source reuses its Body.
+- **HIR**: function bodies, initializers, comptime / test blocks, field types and defaults, and the ZON root are BodyOwners, lowered to an error-tolerant IR (not ZIR, which syntax errors prevent) along with local scopes. A Body records one dependency, `ItemSyntax`: a hash of the member's text and how it is lowered, without its position. Every edit of a file changes `FileAstIdMap`, which holds absolute positions, so `ItemSyntax` runs again for each member read, but a member with unchanged text keeps its value, and its Body is neither lowered again nor, when evicted, restored to be compared. `ItemBody` locates the node through an untracked read (`Ctx.getUntracked`), which is valid because the Body is determined by the member's text and lowering mode.
 
 ---
 

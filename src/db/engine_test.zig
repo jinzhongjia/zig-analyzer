@@ -53,6 +53,26 @@ const Plus = struct {
     }
 };
 
+const Doubled = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = i64;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return try ctx.get(Number, key) * 2;
+    }
+};
+
+/// Reads `Doubled` without recording it: the result depends only on `Tens`
+const TensVia = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = i64;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        _ = try ctx.getUntracked(Doubled, key);
+        return ctx.get(Tens, key);
+    }
+};
+
 const Upper = struct {
     pub const kind: db.Kind = .derived;
     pub const Key = u32;
@@ -544,7 +564,7 @@ fn crossStarted(which: usize) void {
     while (!cross_started[1 - which].load(.acquire)) std.Thread.yield() catch {};
 }
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Prefix, PrefixLen, Gated, CrossA, CrossB, FixA, FixB, OwnedCycleA, OwnedCycleB, OwnedCycleLen, ReadBounded, ReadBoundedLen, ReadBoundedHolder });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Doubled, TensVia, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Prefix, PrefixLen, Gated, CrossA, CrossB, FixA, FixB, OwnedCycleA, OwnedCycleB, OwnedCycleLen, ReadBounded, ReadBoundedLen, ReadBoundedHolder });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions(Q);
@@ -691,6 +711,27 @@ test "early cutoff: upstream not recomputed when intermediate result is unchange
     try testing.expectEqual(6, try read(&d, Plus, 1));
     try testing.expectEqual(3, executions(&d, Tens));
     try testing.expectEqual(2, executions(&d, Plus));
+}
+
+test "getUntracked: the value read is brought up to date but is not a dependency" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 42, .low);
+    try testing.expectEqual(4, try read(&d, TensVia, 1));
+    // 42 → 47: Doubled changes, Tens does not
+    try setNumber(&d, Number, 1, 47, .low);
+    try testing.expectEqual(4, try read(&d, TensVia, 1));
+    try testing.expectEqual(1, executions(&d, TensVia));
+    // Outside a compute it reads the current value
+    {
+        var ctx = d.beginRead(testing.allocator);
+        defer ctx.end();
+        try testing.expectEqual(94, try ctx.getUntracked(Doubled, 1));
+    }
+    // 47 → 51: Tens changes
+    try setNumber(&d, Number, 1, 51, .low);
+    try testing.expectEqual(5, try read(&d, TensVia, 1));
+    try testing.expectEqual(2, executions(&d, TensVia));
 }
 
 test "setting the same input value does not bump revision" {
