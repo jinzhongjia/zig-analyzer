@@ -70,14 +70,6 @@ fn contains(list: []const []const u8, s: []const u8) bool {
     return false;
 }
 
-/// Line of `pub const Allocator = ...` in the standard library
-fn stdAllocatorLine(h: *Harness) !i64 {
-    const env = h.server.zigEnv().?;
-    const path = try std.fs.path.join(h.arena.allocator(), &.{ env.std_dir, "mem.zig" });
-    const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, h.arena.allocator(), .unlimited);
-    return position(text, "pub const Allocator").line;
-}
-
 test "goto definition and completion across modules and into std" {
     var project = try fixture.Project.create(&project_files);
     defer project.deinit();
@@ -93,8 +85,8 @@ test "goto definition and completion across modules and into std" {
 
     try testing.expectEqualStrings("lib.zig:0", try gotoAt(&h, uri, main_text, "hello"));
     try testing.expectEqualStrings("lib.zig:0", try gotoAt(&h, uri, main_text, "\"lib\""));
-    const expected = try std.fmt.allocPrint(h.arena.allocator(), "mem.zig:{d}", .{try stdAllocatorLine(&h)});
-    try testing.expectEqualStrings(expected, try gotoAt(&h, uri, main_text, "Allocator;"));
+    // `pub const Allocator = @import("mem/Allocator.zig")`: definition goes to the file
+    try testing.expectEqualStrings("Allocator.zig:0", try gotoAt(&h, uri, main_text, "Allocator;"));
     try testing.expectEqualStrings("main.zig:4", try gotoAt(&h, uri, main_text, "A;"));
 
     // After `std.mem.`: the pub declarations of the standard library's mem
@@ -126,8 +118,7 @@ test "single-file mode: std is loaded on demand for name resolution" {
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
     _ = try h.request("zig-analyzer/waitIdle", {});
 
-    const expected = try std.fmt.allocPrint(h.arena.allocator(), "mem.zig:{d}", .{try stdAllocatorLine(&h)});
-    try testing.expectEqualStrings(expected, try gotoAt(&h, uri, text, "Allocator"));
+    try testing.expectEqualStrings("Allocator.zig:0", try gotoAt(&h, uri, text, "Allocator"));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
@@ -393,8 +384,9 @@ test "a root file shared by modules with different imports resolves the imports 
     try testing.expectEqualStrings("a.zig:0", try gotoAt(&h, uri, shared_root_main, "fromA"));
     try testing.expectEqualStrings("[a.zig:0 b.zig:0]", try gotoAt(&h, uri, shared_root_main, "\"dep\""));
     try testing.expectEqualStrings("[a.zig:0 b.zig:0]", try gotoWith(&h, "textDocument/declaration", uri, shared_root_main, "\"dep\""));
-    // A use of the alias stops at the declaration
-    try testing.expectEqualStrings("main.zig:0", try gotoAt(&h, uri, shared_root_main, "dep.fromA"));
+    // At a use of the alias, definition goes to the targets in both modules and declaration
+    // stops at the alias
+    try testing.expectEqualStrings("[a.zig:0 b.zig:0]", try gotoAt(&h, uri, shared_root_main, "dep.fromA"));
     try testing.expectEqualStrings("main.zig:0", try gotoWith(&h, "textDocument/declaration", uri, shared_root_main, "dep.fromA"));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});

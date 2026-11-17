@@ -2565,7 +2565,8 @@ test "settings: zig.lib_path: std resolves under it and zig runs with it, removi
     const lib_std = try std.fs.path.join(a, &.{ lib, "std" });
     try testing.expectEqualStrings(try std.fs.path.join(a, &.{ lib_std, "std.zig" }), try stdRoot(&h));
     const lib_mem = try std.fs.path.join(a, &.{ lib_std, "mem.zig" });
-    try testing.expectEqualStrings(lib_mem, try definitionPath(&h, main_uri, lib_path_main, "Allocator"));
+    // `std.mem.Allocator` is `@import("mem/Allocator.zig")`: definition goes to that file
+    try testing.expectEqualStrings(try std.fs.path.join(a, &.{ lib_std, "mem", "Allocator.zig" }), try definitionPath(&h, main_uri, lib_path_main, "Allocator"));
     const status = (try h.request("zig-analyzer/fileStatus", .{ .textDocument = .{ .uri = try za.base.uri.fromPath(a, lib_mem) } })).object.get("result").?.object;
     try testing.expectEqualStrings("zig_lib", status.get("origin").?.string);
     var diags = try h.diagnostics();
@@ -2583,7 +2584,7 @@ test "settings: zig.lib_path: std resolves under it and zig runs with it, removi
     try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .zig = .{ .path = zigw } } });
     try waitIdle(&h);
     try testing.expectEqualStrings(try std.fs.path.join(a, &.{ project.env.std_dir, "std.zig" }), try stdRoot(&h));
-    try testing.expectEqualStrings(try std.fs.path.join(a, &.{ project.env.std_dir, "mem.zig" }), try definitionPath(&h, main_uri, lib_path_main, "Allocator"));
+    try testing.expectEqualStrings(try std.fs.path.join(a, &.{ project.env.std_dir, "mem", "Allocator.zig" }), try definitionPath(&h, main_uri, lib_path_main, "Allocator"));
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = solo_uri, .version = 2 }, .contentChanges = &.{.{ .text = lib_path_main ++ "// edited\n" }} });
     try waitIdle(&h);
     const after = (try zigCalls(&h, calls))[before.len..];
