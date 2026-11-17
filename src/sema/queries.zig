@@ -621,7 +621,7 @@ pub const ZonImports = struct {
             // Only Zig source files can `@import` (the root of a module can also be a `.zon` or
             // another data file)
             if (!std.mem.endsWith(u8, ctx.db.env.vfs.path(importer), ".zig")) continue;
-            const index = try ctx.get(database.FileIndex.Query, importer);
+            const index = try ctx.get(database.FileIndex.ImportStrings, importer);
             const imports = for (index.imports) |spec| {
                 // A path ending in `.zig` names a Zig file, never a `.zon` file
                 if (std.mem.endsWith(u8, spec, ".zig")) continue;

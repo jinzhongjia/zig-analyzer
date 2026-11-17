@@ -407,7 +407,7 @@ pub const FileImports = struct {
 
     pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
         const graph = try ctx.get(Input, {});
-        const index = try ctx.get(FileIndex.Query, file);
+        const index = try ctx.get(FileIndex.ImportStrings, file);
         var arena: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         errdefer arena.deinit();
         const a = arena.allocator();

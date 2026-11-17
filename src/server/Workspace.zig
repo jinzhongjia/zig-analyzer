@@ -1200,7 +1200,7 @@ fn importsHash(list: []const []const u8) u64 {
 /// ZON files import nothing.
 fn syntaxImports(server: *Server, ctx: *database.Db.Ctx, file: FileId) za.db.Error![]const []const u8 {
     if (database.live.modeOf(server.vfs.path(file)) == .zon) return &.{};
-    return (try ctx.get(FileIndex.Query, file)).imports;
+    return (try ctx.get(FileIndex.ImportStrings, file)).imports;
 }
 
 /// Computes the compile set; on encountering files that are not loaded, loads them from disk and

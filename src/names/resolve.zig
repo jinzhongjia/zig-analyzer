@@ -351,7 +351,7 @@ pub const Resolver = struct {
         for (try r.ctx.get(database.inputs.WorkspaceFiles, {})) |f| {
             if (graph.entry(f) == null) try importers.put(r.arena, f, .empty);
         }
-        for (importers.keys()) |f| for ((try r.ctx.get(FileIndex.Query, f)).imports) |s| {
+        for (importers.keys()) |f| for ((try r.ctx.get(FileIndex.ImportStrings, f)).imports) |s| {
             if (!std.mem.endsWith(u8, s, ".zig")) continue;
             const to = importers.getPtr(try r.resolveImport(f, s) orelse continue) orelse continue;
             try to.append(r.arena, f);
@@ -426,7 +426,7 @@ pub const Resolver = struct {
         if ((graph.entry(file) orelse return &.{}).others.len == 0) return &.{};
         var out: std.ArrayList(Def) = .empty;
         var path: ?[]const []const u8 = null;
-        for ((try r.ctx.get(FileIndex.Query, file)).imports) |name| {
+        for ((try r.ctx.get(FileIndex.ImportStrings, file)).imports) |name| {
             const targets = try r.resolveImportTargets(file, name);
             if (targets.len < 2 or targets[0] != def_file) continue;
             const names = path orelse switch (def) {

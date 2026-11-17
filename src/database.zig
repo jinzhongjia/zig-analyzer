@@ -85,6 +85,7 @@ pub const Db = engine.Engine(*const Env, &.{
     sema.ZonImports,
     sema.ZonResultType,
     FileIndex.Query,
+    FileIndex.ImportStrings,
     ErrorSets.Query,
     ide_db.seed.Query,
     ide_db.seed.Instances,

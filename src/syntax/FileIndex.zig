@@ -1,9 +1,10 @@
-//! File index: the identifier names and `@import` strings that appear in a file.
+//! File index: the identifier names that appear in a file, and (`ImportStrings`) its `@import`
+//! strings.
 //!
 //! Find references, call-site seeding, and workspace symbol use it to pre-filter candidate files,
 //! then resolve precisely within the candidates.
 //! Names have the `@"..."` quotes removed. Depends only on the syntax tree: when the content is
-//! unchanged (same names and imports), downstream is not recomputed.
+//! unchanged, downstream is not recomputed.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -20,8 +21,6 @@ const FileIndex = @This();
 arena: std.heap.ArenaAllocator.State,
 /// Deduplicated and sorted lexicographically
 names: []const []const u8,
-/// Strings of `@import("...")` (decoded), in order of appearance
-imports: []const []const u8,
 
 pub fn contains(index: *const FileIndex, name: []const u8) bool {
     return std.sort.binarySearch([]const u8, index.names, name, struct {
@@ -37,8 +36,7 @@ pub fn build(gpa: Allocator, root: SyntaxNode) Allocator.Error!FileIndex {
     const a = arena.allocator();
     var names: std.StringArrayHashMapUnmanaged(void) = .empty;
     defer names.deinit(gpa);
-    var imports: std.ArrayList([]const u8) = .empty;
-    try walk(gpa, a, root, &names, &imports);
+    try walk(gpa, a, root, &names);
 
     const sorted = try a.alloc([]const u8, names.count());
     for (names.keys(), sorted) |k, *s| s.* = try a.dupe(u8, k);
@@ -47,21 +45,33 @@ pub fn build(gpa: Allocator, root: SyntaxNode) Allocator.Error!FileIndex {
             return std.mem.lessThan(u8, x, y);
         }
     }.lt);
-    return .{ .arena = arena.state, .names = sorted, .imports = imports.items };
+    return .{ .arena = arena.state, .names = sorted };
 }
 
-fn walk(gpa: Allocator, a: Allocator, node: SyntaxNode, names: *std.StringArrayHashMapUnmanaged(void), imports: *std.ArrayList([]const u8)) Allocator.Error!void {
-    if (ast.cast(ast.BuiltinCall, node)) |call| if (call.name()) |n| if (std.mem.eql(u8, n.text, "@import")) {
-        var args = call.args();
-        if (args.next()) |arg| if (arg.firstToken()) |t| if (t.kind == .string_literal) {
-            if (std.zig.string_literal.parseAlloc(a, t.text)) |s| try imports.append(a, s) else |_| {}
-        };
-    };
+fn walk(gpa: Allocator, a: Allocator, node: SyntaxNode, names: *std.StringArrayHashMapUnmanaged(void)) Allocator.Error!void {
     var it = node.children();
     while (it.next()) |e| switch (e) {
         .token => |t| if (t.kind == .identifier) try names.put(gpa, try ast.identNameAlloc(a, t.text), {}),
-        .node => |c| try walk(gpa, a, c, names, imports),
+        .node => |c| try walk(gpa, a, c, names),
     };
+}
+
+/// The strings of `@import("...")` in the tree (decoded), in order of appearance, allocated in `a`
+pub fn importStrings(a: Allocator, root: SyntaxNode) Allocator.Error![]const []const u8 {
+    var imports: std.ArrayList([]const u8) = .empty;
+    try walkImports(a, root, &imports);
+    return imports.items;
+}
+
+fn walkImports(a: Allocator, node: SyntaxNode, imports: *std.ArrayList([]const u8)) Allocator.Error!void {
+    if (ast.cast(ast.BuiltinCall, node)) |call| if (call.name()) |n| if (std.mem.eql(u8, n.text, "@import")) {
+        var args = call.args();
+        if (args.next()) |arg| if (arg.firstToken()) |t| if (t.kind == .string_literal) {
+            if (std.zig.string_literal.parseAlloc(a, t.text)) |str| try imports.append(a, str) else |_| {}
+        };
+    };
+    var it = node.children();
+    while (it.nextNode()) |c| try walkImports(a, c, imports);
 }
 
 pub fn deinit(index: *FileIndex, gpa: Allocator) void {
@@ -89,13 +99,54 @@ pub const Query = struct {
     }
 
     pub fn eql(a: Value, b: Value) bool {
-        return deepEql(a.names, b.names) and deepEql(a.imports, b.imports);
+        return deepEql(a.names, b.names);
     }
 
     pub fn deinit(v: *Value, gpa: Allocator) void {
         const i: *FileIndex = @constCast(v.*);
         i.deinit(gpa);
         gpa.destroy(i);
+    }
+};
+
+/// The `@import` strings of a file (see `importStrings`). Kept apart from `Query`: the module
+/// graph and the uses that follow imports read them after every edit of a file, and collecting the
+/// names as well would cost more than twice as much
+pub const ImportStrings = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = Vfs.FileId;
+    pub const Value = *const Strings;
+
+    pub const Strings = struct {
+        arena: std.heap.ArenaAllocator.State,
+        imports: []const []const u8,
+    };
+
+    pub fn bytes(v: Value) usize {
+        return @sizeOf(Strings) + mem.arenaBytes(v.arena);
+    }
+
+    pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
+        const parse = try ctx.get(syntax.ParseFile, file);
+        const gpa = ctx.db.gpa;
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        errdefer arena.deinit();
+        const imports = try importStrings(arena.allocator(), parse.rootNode());
+        const result = try gpa.create(Strings);
+        result.* = .{ .arena = undefined, .imports = imports };
+        result.arena = arena.state;
+        return result;
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return deepEql(a.imports, b.imports);
+    }
+
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        const s: *Strings = @constCast(v.*);
+        var arena = s.arena.promote(gpa);
+        arena.deinit();
+        gpa.destroy(s);
     }
 };
 
@@ -112,6 +163,9 @@ test build {
     try std.testing.expect(index.contains("mem"));
     try std.testing.expect(index.contains("x y"));
     try std.testing.expect(!index.contains("import"));
-    try std.testing.expectEqual(2, index.imports.len);
-    try std.testing.expectEqualStrings("lib/a.zig", index.imports[1]);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const imports = try importStrings(arena.allocator(), p.rootNode());
+    try std.testing.expectEqual(2, imports.len);
+    try std.testing.expectEqualStrings("lib/a.zig", imports[1]);
 }
