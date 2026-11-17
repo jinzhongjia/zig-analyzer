@@ -1,4 +1,4 @@
--- Test of the update check against version files in a temporary directory (file:// URLs):
+-- Test of the update check against metadata files in a temporary directory (file:// URLs):
 --   nvim --headless --clean -u NONE -l test/update.lua
 -- Needs curl, as `:ZigAnalyzer install` does.
 local root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':p:h:h')
@@ -36,10 +36,10 @@ local function write(name, text)
   f:write(text)
   f:close()
 end
-write('newer.json', '{"schema":1,"tag":"v9.9.9"}\n')
-write('equal.json', '{"schema":1,"tag":"v0.1.2"}\n')
-write('schema.json', '{"schema":2,"tag":"v9.9.9"}\n')
-write('tag.json', '{"schema":1,"tag":"nightly"}\n')
+write('newer.json', '{"schema":1,"latest":"v9.9.9","versions":[]}\n')
+write('equal.json', '{"schema":1,"latest":"v0.1.2","versions":[]}\n')
+write('schema.json', '{"schema":2,"latest":"v9.9.9","versions":[]}\n')
+write('tag.json', '{"schema":1,"latest":"nightly","versions":[]}\n')
 write('invalid.json', 'not json\n')
 
 local seen = {}
@@ -75,7 +75,7 @@ end
 
 seen = {}
 r = run({ version = '0.1.2', url = url('missing.json'), force = true, notify = notify })
-check(r and r.status == 'no data' and #seen == 0, 'a missing version file gives no update')
+check(r and r.status == 'no data' and #seen == 0, 'a missing metadata file gives no update')
 
 seen = {}
 r = run({ version = '0.1.2', url = url('newer.json'), force = true, notify = notify })

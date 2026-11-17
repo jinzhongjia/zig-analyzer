@@ -117,9 +117,9 @@ M.commands = {
       if status == 'up to date' then
         vim.notify(('zig-analyzer: %s is the latest release'):format(tag), vim.log.levels.INFO)
       elseif status == 'no data' then
-        vim.notify('zig-analyzer: cannot read the version file', vim.log.levels.WARN)
+        vim.notify('zig-analyzer: cannot read the release metadata', vim.log.levels.WARN)
       elseif status == 'invalid' then
-        vim.notify('zig-analyzer: the version file is not valid', vim.log.levels.WARN)
+        vim.notify('zig-analyzer: the release metadata is not valid', vim.log.levels.WARN)
       elseif status == 'checking' then
         vim.notify('zig-analyzer: an update check is already running', vim.log.levels.INFO)
       end

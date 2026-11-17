@@ -1,10 +1,10 @@
--- The version file of the server releases (see docs/features/update-check.md): the plugin reads
+-- The metadata file of the server releases (see docs/features/update-check.md): the plugin reads
 -- it to learn whether a newer release exists. It never installs one; `:ZigAnalyzer install` is
 -- the user's choice.
 local M = {}
 
---- Where the release version file is served
-M.url = 'https://zig-analyzer.nvimer.org/latest.json'
+--- Where the release metadata is served
+M.url = 'https://releases.zig-analyzer.dev/metadata.json'
 
 --- Whether the automatic check runs; `setup({ check_updates = false })` turns it off
 M.enabled = true
@@ -34,14 +34,14 @@ local function current_version(client)
   return release and release:match('^zig%-analyzer%-(v%d+%.%d+%.%d+[%w.%-]*)%-')
 end
 
---- The release tag in a version file, or nil when it is not one
+--- The latest stable tag in metadata.json, or nil when it is not one
 ---@param body string
 ---@return string?
 local function parse(body)
   local ok, data = pcall(vim.json.decode, body)
-  if not ok or type(data) ~= 'table' or data.schema ~= 1 or type(data.tag) ~= 'string' then return nil end
-  if not data.tag:match('^v%d+%.%d+%.%d+[%w.%-]*$') then return nil end
-  return data.tag
+  if not ok or type(data) ~= 'table' or data.schema ~= 1 or type(data.latest) ~= 'string' then return nil end
+  if not data.latest:match('^v%d+%.%d+%.%d+[%w.%-]*$') then return nil end
+  return data.latest
 end
 
 local function parse_version(v)
@@ -106,7 +106,7 @@ local function notify(message)
   vim.notify('zig-analyzer: ' .. message, vim.log.levels.WARN)
 end
 
---- Checks the version file. `opts.force` checks even when disabled and reports a tag that was
+--- Checks the metadata file. `opts.force` checks even when disabled and reports a tag that was
 --- reported before; `opts.version` and `opts.url` are for tests; `opts.notify` replaces the
 --- notification. `on_done(tag, current, status)` gets the outcome, where `status` is `"newer"`,
 --- `"up to date"`, `"no data"`, `"invalid"`, `"no version"`, `"disabled"`, `"checking"`, or
