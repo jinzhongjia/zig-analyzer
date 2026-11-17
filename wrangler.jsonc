@@ -1,5 +1,6 @@
 // The project website: website/ served as static assets, with no Worker script, at zig-analyzer.dev.
-// Deployed by .github/workflows/website.yml with `wrangler deploy`.
+// Deployed by .github/workflows/website.yml with `wrangler deploy`; pull requests upload a preview
+// version instead, served at a preview URL on workers.dev.
 //
 // Configured on the zone rather than here: the redirect from www.zig-analyzer.dev to the apex (a
 // Redirect Rule, backed by a proxied placeholder AAAA record for www) and Always Use HTTPS.
@@ -9,9 +10,10 @@
   "assets": {
     "directory": "./website"
   },
-  // Served only at its own domain, not at workers.dev or preview URLs.
+  // The production version is served only at its own domain, not at workers.dev; preview versions
+  // of pull requests are served at their preview URLs.
   "workers_dev": false,
-  "preview_urls": false,
+  "preview_urls": true,
   "routes": [
     { "pattern": "zig-analyzer.dev", "custom_domain": true }
   ]

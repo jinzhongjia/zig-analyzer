@@ -1,9 +1,16 @@
 name: Website
 
 # Deploys website/ to zig-analyzer.dev as configured in wrangler.jsonc. The site has no build step.
-# Pull requests that change it run a dry run, which needs no credentials. Pushes to main deploy with
-# the repository secrets CLOUDFLARE_API_TOKEN (the "Edit Cloudflare Workers" template) and
-# CLOUDFLARE_ACCOUNT_ID.
+#
+# - Pushes to main deploy the production version.
+# - Pull requests from this repository upload a preview version that leaves production unchanged,
+#   served at a preview URL that stays the same for the pull request (pr-<number>-zig-analyzer on
+#   workers.dev). The URL appears as the website-preview deployment of the pull request and in the
+#   job summary.
+# - Pull requests from forks get no secrets, so they run a dry run instead.
+#
+# The repository secrets are CLOUDFLARE_API_TOKEN (Workers Scripts: Edit, Workers Routes: Edit, and
+# Zone: Read on zig-analyzer.dev) and CLOUDFLARE_ACCOUNT_ID.
 
 on:
   push:
@@ -32,7 +39,62 @@ env:
 
 jobs:
   deploy:
-    name: ${{ github.event_name == 'pull_request' && 'Check' || 'Deploy' }}
+    name: Deploy
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: website
+      url: https://zig-analyzer.dev
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes "wrangler@$WRANGLER_VERSION" deploy --message "${GITHUB_SHA::7}"
+
+  preview:
+    name: Preview
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: website-preview
+      url: ${{ steps.upload.outputs.url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+      - name: Upload a preview version
+        id: upload
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ALIAS: pr-${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          npx --yes "wrangler@$WRANGLER_VERSION" versions upload \
+            --preview-alias "$ALIAS" --message "$ALIAS ${HEAD_SHA::7}" | tee upload.log
+          url=$(grep -oE "https://$ALIAS-zig-analyzer\.[a-z0-9-]+\.workers\.dev" upload.log | head -n 1)
+          if [ -z "$url" ]; then
+            echo "::error::No preview URL for $ALIAS in the output of wrangler versions upload"
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "Preview of ${HEAD_SHA::7}: $url" >> "$GITHUB_STEP_SUMMARY"
+
+  check:
+    name: Check
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -43,11 +105,4 @@ jobs:
         with:
           node-version: lts/*
       - name: Dry run
-        if: github.event_name == 'pull_request'
         run: npx --yes "wrangler@$WRANGLER_VERSION" deploy --dry-run
-      - name: Deploy
-        if: github.event_name != 'pull_request'
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx --yes "wrangler@$WRANGLER_VERSION" deploy --message "${GITHUB_SHA::7}"
