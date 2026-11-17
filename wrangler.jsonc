@@ -1,0 +1,18 @@
+// The project website: website/ served as static assets, with no Worker script, at zig-analyzer.dev.
+// Deployed by .github/workflows/website.yml with `wrangler deploy`.
+//
+// Configured on the zone rather than here: the redirect from www.zig-analyzer.dev to the apex (a
+// Redirect Rule, backed by a proxied placeholder AAAA record for www) and Always Use HTTPS.
+{
+  "name": "zig-analyzer",
+  "compatibility_date": "2026-11-17",
+  "assets": {
+    "directory": "./website"
+  },
+  // Served only at its own domain, not at workers.dev or preview URLs.
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    { "pattern": "zig-analyzer.dev", "custom_domain": true }
+  ]
+}
