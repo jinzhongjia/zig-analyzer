@@ -213,6 +213,14 @@ check(table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), '\n'):find('\nPr
   ':ZigAnalyzer fileStatus')
 vim.cmd.close()
 
+vim.cmd('ZigAnalyzer packages')
+vim.wait(10000, function() return vim.api.nvim_buf_get_name(0):find('zig%-analyzer://packages') ~= nil end, 50)
+local package_lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+check(package_lines[1] and package_lines[1]:match('^%[1%] ') ~= nil
+  and table.concat(package_lines, '\n'):find('Dependencies [0]:', 1, true) ~= nil,
+  ':ZigAnalyzer packages lists the workspace project')
+vim.cmd.close()
+
 vim.cmd('ZigAnalyzer reloadWorkspace')
 request('zig-analyzer/waitIdle', nil)
 status = request('zig-analyzer/fileStatus', { textDocument = { uri = uri('src/main.zig') } })

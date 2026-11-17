@@ -15,7 +15,7 @@ export interface View {
   targets: Map<number, Target>;
 }
 
-export type Kind = "status" | "fileStatus" | "syntaxTree" | "moduleGraph";
+export type Kind = "status" | "fileStatus" | "syntaxTree" | "moduleGraph" | "packages";
 
 /** How paths and times are shown */
 export interface Format {
@@ -63,7 +63,13 @@ export function bytes(n: number): string {
 const nonempty = (v: unknown): v is string => typeof v === "string" && v !== "";
 
 /** `rows` (lists of cells) as columns, all but the first aligned to the right; the first row is the header */
-function table(b: Builder, rows: string[][], indent: string, styles: (Style | undefined)[] = []): void {
+function table(
+  b: Builder,
+  rows: string[][],
+  indent: string,
+  styles: (Style | undefined)[] = [],
+  targets: (Target | undefined)[] = [],
+): void {
   const widths: number[] = [];
   for (const row of rows) row.forEach((cell, i) => (widths[i] = Math.max(widths[i] ?? 0, cell.length)));
   rows.forEach((row, r) => {
@@ -74,7 +80,7 @@ function table(b: Builder, rows: string[][], indent: string, styles: (Style | un
       chunks.push([cell, r === 0 ? "title" : styles[i]]);
       if (i === 0 && row.length > 1) chunks.push(pad);
     });
-    b.add(chunks);
+    b.add(chunks, targets[r]);
   });
 }
 
@@ -282,6 +288,75 @@ function status(result: StatusResult): View {
   return b;
 }
 
+interface PackagesResult {
+  projects: {
+    root: string;
+    manifest: string;
+    name?: string | null;
+    version?: string | null;
+    fingerprint?: string | null;
+    minimum_zig_version?: string | null;
+    paths?: string[];
+    dependencies?: {
+      name: string;
+      kind: "url" | "path" | "none";
+      url?: string | null;
+      path?: string | null;
+      hash?: string | null;
+      lazy?: boolean | null;
+      root?: string | null;
+      exists: boolean;
+      manifest?: string | null;
+      build_zig?: string | null;
+    }[];
+    parse_error?: string | null;
+  }[];
+}
+
+function packages(result: PackagesResult, f: Format): View {
+  const b = new Builder();
+  if (result.projects.length === 0) {
+    b.add([["No workspace root has a build.zig.zon", "comment"]]);
+    return b;
+  }
+  result.projects.forEach((p, i) => {
+    if (i > 0) b.add([""]);
+    b.add([[`[${i + 1}]`, "number"], " ", [f.path(p.root), "path"]], { file: p.manifest });
+    if (nonempty(p.parse_error)) b.add(["  ", [p.parse_error, "error"]]);
+    const paths = p.paths ?? [];
+    const values: Value[] =
+      paths.length === 1 && paths[0] === ""
+        ? [[[["[every file]", "comment"]]]]
+        : paths.map((path): Value => [[[path, "string"]]]);
+    fields(b, [
+      ["Manifest", [[[[f.path(p.manifest), "path"]], { file: p.manifest }]]],
+      ["Name", p.name ?? "none"],
+      ["Version", p.version ?? "none"],
+      ["Fingerprint", p.fingerprint ?? "none"],
+      ["Minimum Zig version", p.minimum_zig_version ?? "none"],
+      ["Paths", values],
+    ]);
+    const deps = p.dependencies ?? [];
+    b.add([""]);
+    b.add([[`Dependencies [${deps.length}]:`, "title"]]);
+    if (deps.length === 0) {
+      b.add(["  ", ["none", "comment"]]);
+      return;
+    }
+    const rows = [["Dependency", "Kind", "Source", "Hash", "Lazy", "State"]];
+    const targets: (Target | undefined)[] = [undefined];
+    for (const d of deps) {
+      const source = d.kind === "url" ? (d.url ?? "") : (d.path ?? "");
+      const state = !d.exists ? "missing" : d.build_zig ? "present" : "no build.zig";
+      const lazy = d.lazy === null || d.lazy === undefined ? "-" : d.lazy ? "yes" : "no";
+      rows.push([d.name, d.kind, source, d.hash ?? "-", lazy, state]);
+      targets.push(d.manifest ? { file: d.manifest } : d.build_zig ? { file: d.build_zig } : d.exists && d.root ? { file: d.root } : undefined);
+    }
+    table(b, rows, "  ", ["token", "type", "string", "string", "comment", "comment"], targets);
+  });
+  return b;
+}
+
 export function render(kind: Kind, result: unknown, f: Format): View {
   switch (kind) {
     case "syntaxTree":
@@ -290,6 +365,8 @@ export function render(kind: Kind, result: unknown, f: Format): View {
       return moduleGraph(result as ModuleGraphResult, f);
     case "fileStatus":
       return fileStatus(result as FileStatusResult, f);
+    case "packages":
+      return packages(result as PackagesResult, f);
     case "status":
       return status(result as StatusResult);
   }

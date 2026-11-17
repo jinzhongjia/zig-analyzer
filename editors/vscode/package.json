@@ -114,6 +114,11 @@
         "category": "zig-analyzer"
       },
       {
+        "command": "zig-analyzer.showPackages",
+        "title": "Show Packages",
+        "category": "zig-analyzer"
+      },
+      {
         "command": "zig-analyzer.showOutput",
         "title": "Show Output",
         "category": "zig-analyzer"

@@ -13,6 +13,10 @@ String conversion (`refactor.rewrite`) looks only at the syntax tree and source 
 
 In a file already formatted with `zig fmt`, the edit is laid out by `zig fmt`, so the file stays formatted; otherwise only the literal is replaced.
 
+## Dependency hashes in `build.zig.zon`
+
+On a dependency with a `.url`, the server offers **fetch hash for `name`**, or **update hash for `name`** when it already has one (`quickfix`). The action carries the `zig-analyzer/fetchDependencyHash` command, so the network request starts only when the user selects it: the server runs `zig fetch <url>` with the configured `zig.path` (or `zig` in `PATH`), in the manifest's directory, with work-done progress. It then reads the manifest again (the dependency and its URL must be unchanged), replaces the `.hash` string or inserts `.hash = "..."` after `.url`, and applies the edit with `workspace/applyEdit`. The editor must declare `workspace.applyEdit` for the action to be offered; the result is still checked by the compiler.
+
 ## Organize imports (`source.organizeImports`, `ide_db/organize_imports.zig`)
 
 - **Blocks**: consecutive top-level imports and declarations derived from them, with only blank lines between, are organized in place. Attached comments move with their declaration, and a file header stays first. Declarations are never moved between blocks or removed, and nothing is organized with syntax errors.

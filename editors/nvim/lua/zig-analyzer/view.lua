@@ -50,7 +50,7 @@ end
 local function nonempty(v) return v ~= nil and v ~= vim.NIL and v ~= '' end
 
 --- `rows` (lists of cells) as columns, numbers aligned to the right; the first row is the header
-local function table_lines(v, rows, indent, groups)
+local function table_lines(v, rows, indent, groups, targets)
   local widths = {}
   for _, row in ipairs(rows) do
     for i, cell in ipairs(row) do widths[i] = math.max(widths[i] or 0, vim.fn.strdisplaywidth(cell)) end
@@ -63,7 +63,7 @@ local function table_lines(v, rows, indent, groups)
       table.insert(chunks, { cell, r == 1 and 'Title' or (groups and groups[i]) })
       if i == 1 and #row > 1 then table.insert(chunks, pad) end
     end
-    v:add(chunks)
+    v:add(chunks, targets and targets[r])
   end
 end
 
@@ -170,6 +170,52 @@ function renderers.fileStatus(result)
     { 'Projects', projects },
     { 'Single-file roots', roots },
   })
+  return v
+end
+
+function renderers.packages(result)
+  local v = new()
+  local projects = result.projects or {}
+  if #projects == 0 then
+    v:add({ { 'No workspace root has a build.zig.zon', 'Comment' } })
+    return v
+  end
+  for i, p in ipairs(projects) do
+    if i > 1 then v:add({ '' }) end
+    v:add({ { ('[%d]'):format(i), 'Number' }, ' ', { path(p.root), 'Directory' } }, { file = p.manifest })
+    if nonempty(p.parse_error) then v:add({ '  ', { p.parse_error, 'DiagnosticError' } }) end
+    local paths = {}
+    if #(p.paths or {}) == 1 and p.paths[1] == '' then
+      table.insert(paths, { { { '[every file]', 'Comment' } } })
+    else
+      for _, item in ipairs(p.paths or {}) do table.insert(paths, { { { item, 'String' } } }) end
+    end
+    fields(v, {
+      { 'Manifest', { { { { path(p.manifest), 'Directory' } }, { file = p.manifest } } } },
+      { 'Name', p.name or 'none' },
+      { 'Version', p.version or 'none' },
+      { 'Fingerprint', p.fingerprint or 'none' },
+      { 'Minimum Zig version', p.minimum_zig_version or 'none' },
+      { 'Paths', paths },
+    })
+    local deps = p.dependencies or {}
+    v:add({ '' })
+    v:add({ { ('Dependencies [%d]:'):format(#deps), 'Title' } })
+    if #deps == 0 then
+      v:add({ '  ', { 'none', 'Comment' } })
+    else
+      local rows = { { 'Dependency', 'Kind', 'Source', 'Hash', 'Lazy', 'State' } }
+      local targets = {}
+      for _, d in ipairs(deps) do
+        local state = not d.exists and 'missing' or (d.build_zig and 'present' or 'no build.zig')
+        local lazy = d.lazy == nil and '-' or (d.lazy and 'yes' or 'no')
+        table.insert(rows, { d.name, d.kind, d.kind == 'url' and (d.url or '') or (d.path or ''), d.hash or '-', lazy, state })
+        local target = d.manifest and { file = d.manifest } or d.build_zig and { file = d.build_zig } or d.exists and d.root and { file = d.root } or nil
+        targets[#rows] = target
+      end
+      table_lines(v, rows, '  ', { 'Identifier', 'Type', 'String', 'String', 'Comment', 'Comment' }, targets)
+    end
+  end
   return v
 end
 

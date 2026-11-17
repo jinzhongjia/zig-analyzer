@@ -17,7 +17,7 @@ A language server (LSP) for Zig, built on an incremental query engine.
 - **Editing**: completion with auto-import and snippets, hover, signature help, inlay hints, and semantic tokens.
 - **Refactoring**: rename and code actions for unused names, parameters, and captures, `var` to `const`, missing switch prongs and struct fields, extracting constants, converting string literals, and organizing imports.
 - **Formatting**: identical to `zig fmt`, for `.zig` and `.zon`.
-- **ZON files**: highlighting, formatting, and error diagnostics in any `.zon` file; outline; completion, goto, and inlay hints for files imported with a result type and for `build.zig.zon`; completion and option descriptions in `zig-analyzer.zon`.
+- **ZON files**: highlighting, formatting, and error diagnostics in any `.zon` file; outline; completion, goto, and inlay hints for files imported with a result type and for `build.zig.zon`; completion and option descriptions in `zig-analyzer.zon`; a code action that fetches the hash of a dependency URL with `zig fetch`.
 - **Structure**: folding ranges and selection ranges.
 - **Naming checks** (opt-in): hints based on the [Names](https://ziglang.org/documentation/0.17.1/#Names) section of the Zig style guide, with safe rename fixes.
 - **Unused declarations** (opt-in): hints on private declarations that no code in the same file reaches, including helpers used only by other unused declarations.

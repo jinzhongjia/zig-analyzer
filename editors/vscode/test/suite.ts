@@ -189,6 +189,9 @@ export async function run(): Promise<void> {
   await vscode.window.showTextDocument(doc);
   const graph = await view("zig-analyzer.showModuleGraph", "module-graph");
   check(graph.split("\n").some((l) => /^\[\d+\] src\/main\.zig /.test(l)), "Show Module Graph lists the project root module");
+  await vscode.window.showTextDocument(doc);
+  const packages = await view("zig-analyzer.showPackages", "packages");
+  check(/^\[1\] /m.test(packages) && /^Dependencies \[0\]:$/m.test(packages), "Show Packages lists the workspace project");
   check(/^Revision +\d+$/m.test(await view("zig-analyzer.showStatus", "status")), "Show Server Status");
   await vscode.window.showTextDocument(doc);
   check(/^Projects +\S/m.test(await view("zig-analyzer.showFileStatus", "file-status")), "Show File Status");

@@ -92,6 +92,8 @@ COMMANDS                                             *zig_analyzer-commands*
                                                             *:ZigAnalyzer*
 :ZigAnalyzer status          Show the server status (queries, memory).
 :ZigAnalyzer fileStatus      Show how the server treats the current file.
+:ZigAnalyzer packages        Show the `build.zig.zon` of each workspace root,
+                             with its dependencies and their directories.
 :ZigAnalyzer syntaxTree      Show the syntax tree of the current file.
 :ZigAnalyzer moduleGraph     Show the module graph of the projects.
 :ZigAnalyzer reloadWorkspace Rerun `build.zig` and reload the projects.
