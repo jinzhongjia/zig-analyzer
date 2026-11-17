@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>zig-analyzer: a language server for Zig</title>
+  <meta name="description" content="A language server (LSP) for Zig, built on an incremental query engine. Diagnostics from Zig itself, comptime evaluation, build system integration, navigation, completion, and refactoring.">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#121212" media="(prefers-color-scheme: dark)">
+  <meta property="og:title" content="zig-analyzer">
+  <meta property="og:description" content="A language server for Zig, built on an incremental query engine.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://zig-analyzer.dev/">
+  <meta property="og:image" content="https://zig-analyzer.dev/assets/og-light.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+  <link rel="stylesheet" href="style.css">
+  <!-- Applies the stored theme before the first paint, so a dark page never flashes light. -->
+  <script>
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("theme"); } catch (e) {}
+      if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+    })();
+  </script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="nav">
+    <div class="wrap nav-inner">
+      <a class="brand" href="#" aria-label="zig-analyzer home">
+        <img src="assets/logo.svg" alt="" width="30" height="24">
+        <span>zig-analyzer</span>
+      </a>
+      <nav class="nav-links" aria-label="Primary">
+        <a href="#features">Features</a>
+        <a href="#install">Install</a>
+        <a href="#editors">Editors</a>
+        <a href="https://github.com/jinzhongjia/zig-analyzer/blob/main/CHANGELOG.md">Changelog</a>
+      </nav>
+      <div class="nav-actions">
+        <a class="icon-btn" href="https://github.com/jinzhongjia/zig-analyzer" aria-label="GitHub repository">
+          <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        </a>
+        <button class="icon-btn" id="theme-toggle" type="button" aria-label="Toggle color theme">
+          <svg class="i-sun" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+          <svg class="i-moon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="wrap hero-grid">
+        <div class="hero-copy">
+          <a class="eyebrow" href="https://github.com/jinzhongjia/zig-analyzer/releases/latest"><span class="dot"></span>For Zig 0.17 · Latest release →</a>
+          <h1>A language server<br>for <span class="accent">Zig</span>.</h1>
+          <p class="lead">Built on an incremental query engine. Errors come only from Zig itself, comptime is evaluated, and the project model comes from the official build system.</p>
+          <div class="cta">
+            <a class="btn btn-primary" href="#install">Get started</a>
+            <a class="btn btn-ghost" href="https://github.com/jinzhongjia/zig-analyzer">View on GitHub</a>
+          </div>
+          <div class="cmd" data-copy="brew install jinzhongjia/tap/zig-analyzer">
+            <span class="prompt">$</span>
+            <code>brew install jinzhongjia/tap/zig-analyzer</code>
+            <button class="copy" type="button" aria-label="Copy command">Copy</button>
+          </div>
+        </div>
+
+        <figure class="editor" aria-label="An editor showing zig-analyzer's inlay hints and hover">
+          <div class="editor-bar">
+            <span class="lights"><i></i><i></i><i></i></span>
+            <span class="tab">geometry.zig</span>
+          </div>
+<pre class="code"><span class="ln">1</span><span class="kw">const</span> <span class="ty">std</span> = <span class="bi">@import</span>(<span class="str">"std"</span>);
+<span class="ln">2</span>
+<span class="ln">3</span><span class="kw">const</span> <span class="ty">Point</span> = <span class="kw">struct</span> { <span class="fd">x</span>: <span class="ty">i32</span>, <span class="fd">y</span>: <span class="ty">i32</span> };
+<span class="ln">4</span>
+<span class="ln">5</span><span class="kw">fn</span> <span class="fn">manhattan</span>(<span class="pa">a</span>: <span class="ty">Point</span>, <span class="pa">b</span>: <span class="ty">Point</span>) <span class="ty">u32</span> {
+<span class="ln">6</span>    <span class="kw">return</span> <span class="bi">@abs</span>(<span class="pa">a</span>.<span class="fd">x</span> - <span class="pa">b</span>.<span class="fd">x</span>) + <span class="bi">@abs</span>(<span class="pa">a</span>.<span class="fd">y</span> - <span class="pa">b</span>.<span class="fd">y</span>);
+<span class="ln">7</span>}
+<span class="ln">8</span>
+<span class="ln">9</span><span class="kw">test</span> <span class="fn">manhattan</span> {
+<span class="ln">10</span>    <span class="kw">const</span> <span class="va">p</span>: <span class="ty">Point</span> = .{ .<span class="fd">x</span> = <span class="nu">1</span>, .<span class="fd">y</span> = <span class="nu">2</span> };
+<span class="ln">11</span>    <span class="kw">const</span> <span class="va">d</span><span class="hint">: u32</span> = <span class="fn hovered">manhattan</span>(<span class="hint">a:</span><span class="va">p</span>, <span class="hint">b:</span>.{ .<span class="fd">x</span> = <span class="nu">4</span>, .<span class="fd">y</span> = <span class="nu">6</span> });
+<span class="ln">12</span>    <span class="kw">try</span> <span class="ty">std</span>.<span class="ty">testing</span>.<span class="fn">expectEqual</span>(<span class="nu">7</span>, <span class="va">d</span>);
+<span class="ln">13</span>}</pre>
+          <div class="hover-card" role="presentation">
+            <code><span class="kw">fn</span> <span class="fn">manhattan</span>(<span class="pa">a</span>: <span class="ty">Point</span>, <span class="pa">b</span>: <span class="ty">Point</span>) <span class="ty">u32</span></code>
+            <span class="hover-meta">geometry.zig:5</span>
+          </div>
+        </figure>
+      </div>
+    </section>
+
+    <section id="features" class="section">
+      <div class="wrap">
+        <h2 class="section-title"><span class="hash">//</span> Features</h2>
+        <p class="section-lead">Accuracy first: results are correct and complete, never truncated or approximated for speed.</p>
+        <div class="grid">
+          <article class="card">
+            <h3>Diagnostics from Zig</h3>
+            <p>Errors come only from Zig itself: in-process AstGen while typing and <code>zig build</code> on save. Inactive code can optionally be marked.</p>
+          </article>
+          <article class="card">
+            <h3>Comptime evaluation</h3>
+            <p>Generics and type constructors are evaluated, and generic function bodies are analyzed with the instances from their call sites.</p>
+          </article>
+          <article class="card">
+            <h3>Build system integration</h3>
+            <p>The project model comes from the official build system protocol. Files without <code>build.zig</code> use single-file mode.</p>
+          </article>
+          <article class="card">
+            <h3>Navigation</h3>
+            <p>Goto definition, declaration, and type definition; find references; document highlight; document and workspace symbols.</p>
+          </article>
+          <article class="card">
+            <h3>Editing</h3>
+            <p>Completion with auto-import and snippets, hover, signature help, inlay hints, and semantic tokens.</p>
+          </article>
+          <article class="card">
+            <h3>Refactoring</h3>
+            <p>Rename, plus code actions for unused names, <code>var</code> to <code>const</code>, missing switch prongs and struct fields, and organizing imports.</p>
+          </article>
+          <article class="card">
+            <h3>Formatting</h3>
+            <p>Identical to <code>zig fmt</code>, for <code>.zig</code> and <code>.zon</code>, with one edit per changed region.</p>
+          </article>
+          <article class="card">
+            <h3>ZON files</h3>
+            <p>Highlighting, formatting, and diagnostics in any <code>.zon</code>; completion, goto, and inlay hints for typed imports and <code>build.zig.zon</code>.</p>
+          </article>
+          <article class="card">
+            <h3>Opt-in hints</h3>
+            <p>Naming checks from the Zig style guide with safe rename fixes, and unused private declarations. Comments suppress them per line or range.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="install" class="section">
+      <div class="wrap">
+        <h2 class="section-title"><span class="hash">//</span> Install</h2>
+        <p class="section-lead">Each package installs the <code>ReleaseSafe</code> build of the latest release, with its debug information.</p>
+        <div class="tabs" role="tablist" aria-label="Installation method">
+          <button role="tab" aria-selected="true" aria-controls="tab-brew" id="t-brew">Homebrew</button>
+          <button role="tab" aria-selected="false" aria-controls="tab-aur" id="t-aur" tabindex="-1">Arch Linux</button>
+          <button role="tab" aria-selected="false" aria-controls="tab-scoop" id="t-scoop" tabindex="-1">Windows</button>
+          <button role="tab" aria-selected="false" aria-controls="tab-release" id="t-release" tabindex="-1">Archive</button>
+          <button role="tab" aria-selected="false" aria-controls="tab-source" id="t-source" tabindex="-1">Source</button>
+        </div>
+        <div class="panel" role="tabpanel" id="tab-brew" aria-labelledby="t-brew">
+          <p>macOS and Linux, with <a href="https://brew.sh">Homebrew</a>:</p>
+          <div class="block" data-copy="brew install jinzhongjia/tap/zig-analyzer"><pre><code>brew install jinzhongjia/tap/zig-analyzer</code></pre><button class="copy" type="button" aria-label="Copy command">Copy</button></div>
+        </div>
+        <div class="panel" role="tabpanel" id="tab-aur" aria-labelledby="t-aur" hidden>
+          <p>x86_64 and aarch64, from the <a href="https://aur.archlinux.org/packages/zig-analyzer-bin">AUR</a>, with a helper such as yay:</p>
+          <div class="block" data-copy="yay -S zig-analyzer-bin"><pre><code>yay -S zig-analyzer-bin</code></pre><button class="copy" type="button" aria-label="Copy command">Copy</button></div>
+        </div>
+        <div class="panel" role="tabpanel" id="tab-scoop" aria-labelledby="t-scoop" hidden>
+          <p>x86_64 and aarch64, with <a href="https://scoop.sh">Scoop</a>:</p>
+          <div class="block" data-copy="scoop bucket add jin https://github.com/jinzhongjia/scoop-bucket&#10;scoop install jin/zig-analyzer"><pre><code>scoop bucket add jin https://github.com/jinzhongjia/scoop-bucket
+scoop install jin/zig-analyzer</code></pre><button class="copy" type="button" aria-label="Copy command">Copy</button></div>
+        </div>
+        <div class="panel" role="tabpanel" id="tab-release" aria-labelledby="t-release" hidden>
+          <p>Each <a href="https://github.com/jinzhongjia/zig-analyzer/releases">release</a> has an archive for x86_64 and aarch64 on Linux, macOS, and Windows, signed with minisign and with a build provenance attestation. Put <code>zig-analyzer</code> in <code>PATH</code>, and keep the debug information file next to it.</p>
+          <div class="block" data-copy="minisign -Vm zig-analyzer-<version>-<target>-ReleaseSafe.tar.gz -p minisign.pub"><pre><code>minisign -Vm zig-analyzer-&lt;version&gt;-&lt;target&gt;-ReleaseSafe.tar.gz -p minisign.pub</code></pre><button class="copy" type="button" aria-label="Copy command">Copy</button></div>
+        </div>
+        <div class="panel" role="tabpanel" id="tab-source" aria-labelledby="t-source" hidden>
+          <p>Requires Zig <strong>0.17.0</strong> or <strong>0.17.1</strong>:</p>
+          <div class="block" data-copy="git clone https://github.com/jinzhongjia/zig-analyzer&#10;cd zig-analyzer&#10;zig build -Doptimize=ReleaseSafe"><pre><code>git clone https://github.com/jinzhongjia/zig-analyzer
+cd zig-analyzer
+zig build -Doptimize=ReleaseSafe</code></pre><button class="copy" type="button" aria-label="Copy command">Copy</button></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="editors" class="section">
+      <div class="wrap">
+        <h2 class="section-title"><span class="hash">//</span> Editors</h2>
+        <p class="section-lead">The plugins can install the server for you and check its signature.</p>
+        <div class="grid editors">
+          <a class="card link-card" href="https://github.com/jinzhongjia/zig-analyzer/tree/main/editors/vscode">
+            <h3>VS Code</h3>
+            <p>Extension on the Marketplace and Open VSX.</p>
+            <span class="arrow" aria-hidden="true">→</span>
+          </a>
+          <a class="card link-card" href="https://github.com/jinzhongjia/zig-analyzer/tree/main/editors/zed">
+            <h3>Zed</h3>
+            <p>Extension, used together with the Zig extension.</p>
+            <span class="arrow" aria-hidden="true">→</span>
+          </a>
+          <a class="card link-card" href="https://github.com/jinzhongjia/zig-analyzer.nvim">
+            <h3>Neovim 0.12+</h3>
+            <p>Plugin <code>zig-analyzer.nvim</code>, or the built-in client alone.</p>
+            <span class="arrow" aria-hidden="true">→</span>
+          </a>
+          <a class="card link-card" href="https://github.com/jinzhongjia/zig-analyzer.vim">
+            <h3>Vim</h3>
+            <p>Plugin <code>zig-analyzer.vim</code>, for yegappan/lsp or vim-lsp.</p>
+            <span class="arrow" aria-hidden="true">→</span>
+          </a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="wrap footer-inner">
+      <span>zig-analyzer · <a href="https://github.com/jinzhongjia/zig-analyzer/blob/main/LICENSE">MIT License</a></span>
+      <span class="muted">Not affiliated with the Zig Software Foundation.</span>
+    </div>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>

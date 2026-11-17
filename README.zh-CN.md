@@ -6,7 +6,7 @@
 
 [English](README.md) | 简体中文
 
-基于增量查询引擎的 Zig 语言服务器（LSP）。
+基于增量查询引擎的 Zig 语言服务器（LSP）。网站：[zig-analyzer.dev](https://zig-analyzer.dev)。
 
 ## 特性
 

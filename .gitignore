@@ -2,3 +2,4 @@
 zig-out/
 .DS_store
 .manus/
+.wrangler/

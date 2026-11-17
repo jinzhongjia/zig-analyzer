@@ -6,7 +6,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A language server (LSP) for Zig, built on an incremental query engine.
+A language server (LSP) for Zig, built on an incremental query engine. Website: [zig-analyzer.dev](https://zig-analyzer.dev).
 
 ## Features
 
