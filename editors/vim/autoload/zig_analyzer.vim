@@ -135,6 +135,7 @@ endfunction
 let s:commands = {
       \ 'status': ['status', 0],
       \ 'fileStatus': ['file-status', 1],
+      \ 'packages': ['packages', 0],
       \ 'syntaxTree': ['syntax-tree', 1],
       \ 'moduleGraph': ['module-graph', 0],
       \ }

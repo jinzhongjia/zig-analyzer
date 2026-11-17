@@ -35,9 +35,11 @@ These facts constrain every integration and are the baseline of the research.
   required to watch files.
 - Semantic tokens: only standard token types and modifiers, plus the custom modifier `global`;
   full, delta, and range requests.
-- Custom requests: `zig-analyzer/status`, `zig-analyzer/fileStatus`, `zig-analyzer/syntaxTree`,
-  `zig-analyzer/moduleGraph`, `zig-analyzer/reloadWorkspace` (and `zig-analyzer/waitIdle`, used by
-  tests). No `workspace/executeCommand`, code lens, or custom notifications to the client.
+- Custom requests: `zig-analyzer/status`, `zig-analyzer/fileStatus`, `zig-analyzer/packages`,
+  `zig-analyzer/syntaxTree`, `zig-analyzer/moduleGraph`, `zig-analyzer/reloadWorkspace` (and
+  `zig-analyzer/waitIdle`, used by tests). `workspace/executeCommand` runs
+  `zig-analyzer/fetchDependencyHash`, which fetches a manifest dependency hash and applies it with
+  `workspace/applyEdit`. No code lens or custom notifications to the client.
 - Distribution: tagged releases (`.github/workflows/release.yml`) publish archives for x86_64 and
   aarch64 Linux, macOS, and Windows, named `zig-analyzer-<tag>-<arch>-<os>-<optimize>`, with a
   `SHA256SUMS` signed with the key of `minisign.pub`.

@@ -241,6 +241,11 @@ call s:wait('bufname("%") =~# "file-status"', 10000)
 call s:check(!empty(filter(getline(1, '$'), {_, l -> l =~# '^Projects \+' . escape(fnamemodify(s:dir, ':~:.'), '\.~')})), ':ZigAnalyzer fileStatus')
 close
 
+ZigAnalyzer packages
+call s:wait('bufname("%") ==# "zig-analyzer://packages"', 10000)
+call s:check(getline(1) =~# '^\[1\] ' && !empty(filter(getline(1, '$'), {_, l -> l ==# 'Dependencies [0]:'})), ':ZigAnalyzer packages lists the workspace project')
+close
+
 ZigAnalyzer reloadWorkspace
 call s:request('zig-analyzer/waitIdle', v:null)
 let s:status = s:request('zig-analyzer/fileStatus', {'textDocument': s:doc})

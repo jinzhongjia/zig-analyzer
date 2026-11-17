@@ -91,6 +91,9 @@ M.commands = {
   fileStatus = function()
     view('fileStatus', 'file-status', document())
   end,
+  packages = function()
+    view('packages', 'packages')
+  end,
   syntaxTree = function()
     view('syntaxTree', 'syntax-tree', document())
   end,
