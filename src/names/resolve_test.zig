@@ -605,9 +605,9 @@ test "definition of an alias through a module import that differs between the mo
     try testing.expectEqualStrings("inner_a.zig:", try w.goto(main, at(text, "inner =")));
 }
 
-test "goto on a member path past a module import that differs between the modules of a file" {
-    // Prevents goto from taking only the highest-priority module's target when the member is in a
-    // file reached past the import
+test "goto and references on a member path past a module import that differs between the modules of a file" {
+    // Prevents goto and references from taking only the highest-priority module's target when the
+    // member is in a file reached past the import
     var w: World = undefined;
     try w.init();
     defer w.deinit();
@@ -657,6 +657,26 @@ test "goto on a member path past a module import that differs between the module
     }) |c| {
         try testing.expectEqualStrings(c[1], try w.gotoAll(main, c[0], definition.definitionTargets));
         try testing.expectEqualStrings(c[2], try w.gotoAll(main, c[0], definition.declarationTargets));
+    }
+
+    // Each use of the path is a reference of the member in both files, ambiguous for rename
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    for ([_][]const u8{ "/p/sub_a.zig", "/p/sub_b.zig" }) |path| {
+        const sub = f.file(path);
+        const sub_text = (try ctx.get(database.syntax.SourceText, sub)).text;
+        const def = try definition.defAt(&r, sub, at(sub_text, "value")) orelse return error.NoDefinition;
+        var ambiguous: ?search.Reference = null;
+        const refs = try search.findReferences(&r, def, .{ .scope = f.files, .ambiguous = &ambiguous });
+        var in_main: usize = 0;
+        for (refs) |ref| if (ref.file == main) {
+            in_main += 1;
+            try testing.expectEqualStrings("value", text[ref.start..ref.end]);
+        };
+        // `cfg.sub.value` twice, `sub.value`, `local.value`
+        try testing.expectEqual(4, in_main);
+        try testing.expectEqual(main, ambiguous.?.file);
     }
 }
 
