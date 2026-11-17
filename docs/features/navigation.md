@@ -4,7 +4,7 @@ Goto definition, goto declaration, goto type definition, hover, and signature he
 
 ## Definition and declaration
 
-Declaration goes to the declaration a name resolves to. Definition follows container-level aliases (`const A = std.mem.Allocator;`) to the final definition. When that is a constant whose value is `@import(...)`, including a local constant, definition goes to the start of the imported file. If the file belongs to several modules that import different files under the name, definition lists all of them in module priority order, as goto on the `@import` itself does. This matches what other language servers do for a name that denotes a module, and makes definition on an import alias move the cursor. Declaration stays on the alias.
+Declaration goes to the declaration a name resolves to. Definition follows container-level aliases (`const A = std.mem.Allocator;`) to the final definition. When that is a constant whose value is `@import(...)`, including a local constant, definition goes to the start of the imported file. If the file belongs to several modules that import different files under the name, definition lists all of them in module priority order, as goto on the `@import` itself does. An alias through such an import (`const inner = cfg.inner;`) also lists the definition or file reached in each module. This matches what other language servers do for a name that denotes a module, and makes definition on an import alias move the cursor. Declaration stays on the alias.
 
 ## Goto and hover for `error.Foo`
 

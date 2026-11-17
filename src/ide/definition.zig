@@ -35,7 +35,7 @@ pub fn definition(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Target
     return switch (try find(r, file, offset) orelse return null) {
         .targets => |ts| ts[0],
         .def => |def| blk: {
-            const ts = try definitionsOf(r, def);
+            const ts = try definitionsOf(r, file, def);
             break :blk if (ts.len > 0) ts[0] else null;
         },
     };
@@ -48,19 +48,23 @@ pub fn declaration(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Targe
     };
 }
 
-/// The targets of definition for `def`: the end of its alias chain (`Resolver.aliasTarget`), or,
-/// when that is a declaration `const x = @import(...)`, the start of each file the import resolves
-/// to (in module priority order, see `Resolver.importTargets`). Empty when there is no location.
-fn definitionsOf(r: *Resolver, def: Def) resolve.Error![]const Target {
-    const d = try r.aliasTarget(def);
-    const files = try importedFiles(r, d);
-    if (files.len > 0) {
-        const targets = try r.arena.alloc(Target, files.len);
-        for (files, targets) |f, *t| t.* = .{ .file = f, .start = 0, .end = 0 };
-        return targets;
+/// The targets of definition for `def` at a name in `file`: the end of its alias chain
+/// (`Resolver.aliasTarget`), followed by the definitions that correspond to it in the other
+/// modules `file` imports under the same name (`Resolver.moduleAlternatives`), each through its own
+/// alias chain. A declaration `const x = @import(...)` among them is replaced by the start of each
+/// file the import resolves to (in module priority order, see `Resolver.importTargets`). Each
+/// target once; empty when there is no location.
+fn definitionsOf(r: *Resolver, file: FileId, def: Def) resolve.Error![]const Target {
+    var out: std.ArrayList(Target) = .empty;
+    const end = try r.aliasTarget(def);
+    const alternatives = try r.moduleAlternatives(file, end);
+    for (0..alternatives.len + 1) |i| {
+        const d = if (i == 0) end else try r.aliasTarget(alternatives[i - 1]);
+        const files = try importedFiles(r, d);
+        for (files) |f| try appendNew(r, &out, .{ .file = f, .start = 0, .end = 0 });
+        if (files.len == 0) try appendNew(r, &out, try target(r, d) orelse continue);
     }
-    const t = try target(r, d) orelse return &.{};
-    return r.arena.dupe(Target, &.{t});
+    return out.items;
 }
 
 /// The files that the value of `def` imports when it is a constant whose value is `@import(...)`
@@ -143,7 +147,7 @@ fn allTargets(r: *Resolver, file: FileId, offset: u32, follow_alias: bool) resol
         for (0..alternatives.len + 1) |i| {
             const d = if (i == 0) def else alternatives[i - 1];
             if (follow_alias) {
-                for (try definitionsOf(r, d)) |t| try appendNew(r, &out, t);
+                for (try definitionsOf(r, file, d)) |t| try appendNew(r, &out, t);
             } else {
                 try appendNew(r, &out, try target(r, d) orelse continue);
             }

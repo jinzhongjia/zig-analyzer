@@ -557,6 +557,54 @@ test "definition follows an alias of `@import` to the imported file" {
     try testing.expectEqualStrings("inner.zig:", try w.goto(other.file, 10));
 }
 
+test "definition of an alias through a module import that differs between the modules of a file" {
+    // Prevents definition from listing only the target in the highest-priority module when an
+    // alias, rather than a use, goes through the import
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:a deps:cfg=cfga module:b deps:cfg=cfgb
+        \\const cfg = @import("cfg");
+        \\const inner = cfg.inner;
+        \\const value = cfg.value;
+        \\test {
+        \\    _ = .{ inner.x, value };
+        \\}
+        \\//- /p/cfg_a.zig module:cfga
+        \\pub const inner = @import("inner_a.zig");
+        \\pub const value: u32 = 1;
+        \\//- /p/cfg_b.zig module:cfgb
+        \\pub const inner = @import("inner_b.zig");
+        \\pub const value: u32 = 2;
+        \\//- /p/inner_a.zig
+        \\pub const x = 1;
+        \\//- /p/inner_b.zig
+        \\pub const x = 2;
+    );
+    const main = f.file("/p/main.zig");
+    const text = blk: {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        break :blk try w.arena.allocator().dupe(u8, (try ctx.get(database.syntax.SourceText, main)).text);
+    };
+    const at = struct {
+        fn of(t: []const u8, needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, t, needle).?);
+        }
+    }.of;
+    for ([_]struct { []const u8, []const u8, []const u8 }{
+        .{ "inner =", "inner_a.zig: inner_b.zig:", "main.zig:inner" },
+        .{ "inner.x", "inner_a.zig: inner_b.zig:", "main.zig:inner" },
+        .{ "value =", "cfg_a.zig:value cfg_b.zig:value", "main.zig:value" },
+        .{ "value }", "cfg_a.zig:value cfg_b.zig:value", "main.zig:value" },
+    }) |c| {
+        try testing.expectEqualStrings(c[1], try w.gotoAll(main, at(text, c[0]), definition.definitionTargets));
+        try testing.expectEqualStrings(c[2], try w.gotoAll(main, at(text, c[0]), definition.declarationTargets));
+    }
+    try testing.expectEqualStrings("inner_a.zig:", try w.goto(main, at(text, "inner =")));
+}
+
 test "goto and references on members of a module import that differs between the modules of a file" {
     // Prevents goto from listing only the member in the highest-priority module's target
     var w: World = undefined;
