@@ -308,21 +308,30 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
 }
 
 /// Edits at the top level (between declarations, comments at the end of the file, etc., not
-/// inside any `{}`): reparses from the second top-level member before the edit position to the
-/// end of the file, reusing the earlier top-level children as is. Top-level members are parsed
-/// independently one by one, looking ahead at most one or two tokens; backing up one extra member
-/// keeps every token seen by lookahead before the edit. Returns null when the conditions are not
-/// met (the result is the same as a full parse). Does not apply to ZON, whose top level is one
-/// expression rather than container members
+/// inside any `{}`): reparses from the second top-level member before the edit position (the
+/// start of the file when there are fewer members before it), reusing the earlier top-level
+/// children as is. Top-level members are parsed independently one by one, looking ahead at most
+/// one or two tokens; backing up one extra member keeps every token seen by lookahead before the
+/// edit. The fragment ends after the first member that starts after the edit (see `spliceTail`);
+/// the members after it are reused from `old` when that member parses the same as before,
+/// otherwise the fragment runs to the end of the file. Returns null when the
+/// conditions are not met (the result is the same as a full parse). Does not apply to ZON, whose
+/// top level is one expression rather than container members
 pub fn reparseTopLevel(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!?*Parse {
     if (old.mode == .zon) return null;
     const old_text = old.source;
     const edit_start: u32 = @intCast(std.mem.indexOfDiff(u8, old_text, text) orelse return null);
     if (old.chain_bytes > 2 * old.full_bytes) return null;
+    // End of the edit in the old text: the common suffix does not reach into the common prefix
+    const max_suffix = @min(old_text.len, text.len) - edit_start;
+    var suffix: usize = 0;
+    while (suffix < max_suffix and old_text[old_text.len - 1 - suffix] == text[text.len - 1 - suffix]) suffix += 1;
+    const old_edit_end: u32 = @intCast(old_text.len - suffix);
+    const delta: i64 = @as(i64, @intCast(text.len)) - @as(i64, @intCast(old_text.len));
 
     // Top-level member nodes: start two members before the first one that ends after the edit
     const root = old.rootNode();
-    var nodes: std.ArrayList(struct { child: usize, start: u32 }) = .empty;
+    var nodes: std.ArrayList(TopMember) = .empty;
     defer nodes.deinit(gpa);
     var first_after: ?usize = null;
     {
@@ -336,21 +345,88 @@ pub fn reparseTopLevel(gpa: Allocator, old: *Parse, text: []const u8) Allocator.
         }
     }
     const k = first_after orelse nodes.items.len;
-    if (k < 2) return null;
-    const from = nodes.items[k - 2];
+    const from: TopMember = if (k < 2) .{ .child = 0, .start = 0 } else nodes.items[k - 2];
     // An earlier member's error may be reported at the cut point (e.g. a missing `;` is reported
     // at the next token): the reparse would not produce it again
-    for (old.errors) |e| if (e.offset == from.start) return null;
+    if (from.start != 0) for (old.errors) |e| if (e.offset == from.start) return null;
 
+    // The member `after` starts after the edit; the fragment ends where member `after + 1` starts
+    const after: ?usize = for (nodes.items[k..], k..) |n, i| {
+        if (n.start > old_edit_end) break i;
+    } else null;
+    if (after) |e| if (e + 1 < nodes.items.len) {
+        if (try spliceTail(gpa, old, text, from, nodes.items[e], nodes.items[e + 1], delta)) |p| return p;
+    };
+    return reparseFrom(gpa, old, text, from, text.len);
+}
+
+const TopMember = struct { child: usize, start: u32 };
+
+/// The fragment `from` .. `cut` (old positions), followed by the old top-level children from `cut`
+/// on. The members after `cut` parse as before when everything up to `cut` does: the text from
+/// `lookahead` on is unchanged, and when the fragment gives the same children from `lookahead` to
+/// `cut` as before, with no errors there in either parse, every token the parser looked at before
+/// `cut` is the same. Null when that does not hold
+fn spliceTail(gpa: Allocator, old: *Parse, text: []const u8, from: TopMember, lookahead: TopMember, cut: TopMember, delta: i64) Allocator.Error!?*Parse {
+    // An error at `cut` comes from the recovery of an earlier member, which looked past `cut`
+    for (old.errors) |e| if (e.offset >= lookahead.start and e.offset <= cut.start) return null;
+    const new_cut: u32 = @intCast(@as(i64, cut.start) + delta);
+    const new_lookahead: u32 = @intCast(@as(i64, lookahead.start) + delta);
+    const p = try reparseFrom(gpa, old, text, from, new_cut) orelse return null;
+    var ok = true;
+    for (p.errors) |e| if (e.offset >= new_lookahead) {
+        ok = false;
+        break;
+    };
+    const same = old.root.children[lookahead.child..cut.child];
+    const tail = p.root.children[from.child..];
+    if (ok and tail.len >= same.len) {
+        for (tail[tail.len - same.len ..], same) |x, y| if (!elementEql(x, y)) {
+            ok = false;
+            break;
+        };
+    } else ok = false;
+    if (!ok) {
+        p.destroy();
+        return null;
+    }
+    // Append the old children from `cut` on and their errors to the fragment's result
+    const a = p.arena.allocator();
+    const rest = old.root.children[cut.child..];
+    const children = try a.alloc(green.GreenElement, p.root.children.len + rest.len);
+    @memcpy(children[0..p.root.children.len], p.root.children);
+    @memcpy(children[p.root.children.len..], rest);
+    const new_root = try a.create(green.GreenNode);
+    new_root.* = .{ .kind = old.root.kind, .text_len = @intCast(text.len), .children = children };
+    var errors: std.ArrayList(parser.Error) = .empty;
+    try errors.appendSlice(a, p.errors);
+    for (old.errors) |e| if (e.offset > cut.start) try errors.append(a, .{ .offset = @intCast(@as(i64, e.offset) + delta), .message = e.message });
+    p.root = new_root;
+    p.errors = errors.items;
+    p.chain_bytes = old.chain_bytes + p.arena.queryCapacity();
+    return p;
+}
+
+fn elementEql(x: green.GreenElement, y: green.GreenElement) bool {
+    return switch (x.unpack()) {
+        .node => |n| if (y.node()) |m| greenEql(n, m) else false,
+        .token => |t| !y.is_node and t.kind == y.kind() and std.mem.eql(u8, t.text, y.unpack().token.text),
+    };
+}
+
+/// Parses `text[from.start..end]` as top-level members after the old children before `from`
+/// (the root of the result covers only up to `end`; the source is all of `text`); null when the
+/// fragment has a `//!` doc comment that is not at the start of the file
+fn reparseFrom(gpa: Allocator, old: *Parse, text: []const u8, from: TopMember, end: usize) Allocator.Error!?*Parse {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
-    const sub_source = try a.dupeSentinel(u8, text[from.start..], 0);
+    const sub_source = try a.dupeSentinel(u8, text[from.start..end], 0);
     const tokens = try lexer.tokenize(gpa, sub_source);
     defer gpa.free(tokens);
     // `//!` is a container doc comment only at the start of the file: the start of the fragment
     // is not the start of the file
-    for (tokens) |t| if (t.kind == .container_doc_comment) {
+    if (from.start != 0) for (tokens) |t| if (t.kind == .container_doc_comment) {
         arena.deinit();
         return null;
     };
