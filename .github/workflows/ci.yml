@@ -41,8 +41,8 @@ jobs:
           HEAD: ${{ github.sha }}
         run: |
           set -euo pipefail
-          zig=false vscode=false zed=false nvim=false vim=false
-          all() { zig=true vscode=true zed=true nvim=true vim=true; }
+          zig=false vscode=false zed=false nvim=false vim=false updates=false
+          all() { zig=true vscode=true zed=true nvim=true vim=true updates=true; }
 
           if [ "$EVENT" != pull_request ]; then
             all
@@ -69,6 +69,7 @@ jobs:
                 editors/zed/*) zed=true ;;
                 editors/nvim/*) nvim=true ;;
                 editors/vim/*) vim=true ;;
+                updates/*) updates=true ;;
                 docs/*|assets/*|README*|CHANGELOG.md|LICENSE|AGENTS.md|.agents/*|.claude/*|.gitignore) ;;
                 # A path that no rule knows may need anything: run everything
                 *) all ;;
@@ -76,14 +77,29 @@ jobs:
             done < "$changed"
           fi
 
-          printf 'Jobs: zig=%s vscode=%s zed=%s nvim=%s vim=%s\n' "$zig" "$vscode" "$zed" "$nvim" "$vim"
+          printf 'Jobs: zig=%s vscode=%s zed=%s nvim=%s vim=%s updates=%s\n' "$zig" "$vscode" "$zed" "$nvim" "$vim" "$updates"
           {
             printf 'zig=%s\n' "$zig"
             printf 'vscode=%s\n' "$vscode"
             printf 'zed=%s\n' "$zed"
             printf 'nvim=%s\n' "$nvim"
             printf 'vim=%s\n' "$vim"
+            printf 'updates=%s\n' "$updates"
           } >> "$GITHUB_OUTPUT"
+
+  updates:
+    name: Update check
+    needs: changes
+    if: needs.changes.outputs.updates == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The version file is well formed
+        run: |
+          node -e 'const j = require("./updates/public/latest.json"); if (j.schema !== 1 || !/^v\d+\.\d+\.\d+[0-9A-Za-z.-]*$/.test(j.tag)) process.exit(1)'
+      - name: The Worker bundles
+        run: npx --yes wrangler@4.163.0 deploy --dry-run --config updates/wrangler.jsonc
 
   test:
     name: Test (${{ matrix.os }}, Zig ${{ matrix.zig }}, ${{ matrix.optimize }})
@@ -256,6 +272,7 @@ jobs:
           curl -fsSL https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-linux-x86_64.tar.gz | tar -xz -C "$RUNNER_TEMP"
           XDG_STATE_HOME="$RUNNER_TEMP/nvim-state" "$RUNNER_TEMP/nvim-linux-x86_64/bin/nvim" --headless --clean -u NONE -l editors/nvim/test/smoke.lua
           XDG_DATA_HOME="$RUNNER_TEMP/nvim-install-data" XDG_STATE_HOME="$RUNNER_TEMP/nvim-install-state" "$RUNNER_TEMP/nvim-linux-x86_64/bin/nvim" --headless --clean -u NONE -l editors/nvim/test/install.lua
+          XDG_STATE_HOME="$RUNNER_TEMP/nvim-update-state" "$RUNNER_TEMP/nvim-linux-x86_64/bin/nvim" --headless --clean -u NONE -l editors/nvim/test/update.lua
 
   vim:
     name: Vim plugin (yegappan/lsp and vim-lsp)
@@ -305,4 +322,6 @@ jobs:
               timeout 600 "$VIM_EXE" -N -u NONE -i NONE --not-a-term -S editors/vim/test/install.vim > /dev/null || status=1
             cat "$RUNNER_TEMP/vim-install-$client.txt" || status=1
           done
+          ZA_RESULT="$RUNNER_TEMP/vim-update.txt" timeout 60 "$VIM_EXE" -N -u NONE -i NONE --not-a-term -S editors/vim/test/update.vim > /dev/null || status=1
+          cat "$RUNNER_TEMP/vim-update.txt" || status=1
           exit $status
