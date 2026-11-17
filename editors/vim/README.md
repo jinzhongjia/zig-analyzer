@@ -62,7 +62,7 @@ git clone https://github.com/jinzhongjia/zig-analyzer.vim ~/.vim/pack/plugins/st
 ## The server
 
 The plugin runs `g:zig_analyzer_cmd` when it is set, else the release installed by
-`:ZigAnalyzer install`, else `zig-analyzer` from `PATH`. It downloads nothing by itself:
+`:ZigAnalyzer install`, else `zig-analyzer` from `PATH`. It installs nothing by itself:
 
 ```vim
 :ZigAnalyzer install                    " the latest release, built with ReleaseSafe
@@ -74,6 +74,14 @@ and restarts the running server with it. The archive must have the SHA-256 liste
 release's `SHA256SUMS`, and when [minisign](https://jedisct1.github.io/minisign/) is installed,
 `SHA256SUMS` must be signed by the release key; without minisign the install warns that the
 signature is not checked. Needs `curl`, `tar`, and `sha256sum` or `shasum` (`certutil` on Windows).
+
+## Updates
+
+A few seconds after startup, the plugin reads a small version file
+(`https://zig-analyzer.nvimer.org/latest.json`) once per session and reports a newer release with
+`:ZigAnalyzer install` as the way to get it. It never installs anything by itself. A failed check
+is silent; `:ZigAnalyzer checkUpdates` checks at any time. `g:zig_analyzer_check_updates = 0`
+turns the automatic check off.
 
 ## Settings
 
@@ -101,3 +109,9 @@ ZIG_ANALYZER=/path/to/zig-analyzer ZA_CLIENT=yegappan ZA_CLIENT_DIR=/path/to/yeg
 `test/install.vim` tests `:ZigAnalyzer install` the same way, on fake releases in a local
 directory signed by `test/release.mjs`; it also needs `node`, `minisign`, `curl`, `tar`, and
 `sha256sum` or `shasum`.
+
+`test/update.vim` needs only `curl`:
+
+```sh
+ZA_RESULT=/tmp/update.txt vim -N -u NONE -i NONE --not-a-term -S test/update.vim; cat /tmp/update.txt
+```

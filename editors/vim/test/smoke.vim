@@ -12,6 +12,7 @@ filetype plugin on
 syntax on
 
 let g:zig_analyzer_cmd = [empty($ZIG_ANALYZER) ? 'zig-analyzer' : $ZIG_ANALYZER]
+let g:zig_analyzer_check_updates = 0
 let g:zig_analyzer_settings = {'inlay_hints': {'exclude_single_argument': v:false}}
 
 runtime! plugin/*.vim

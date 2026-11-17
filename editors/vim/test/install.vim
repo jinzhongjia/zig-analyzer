@@ -13,6 +13,7 @@ let s:client = $ZA_CLIENT
 execute 'set runtimepath^=' . fnameescape($ZA_CLIENT_DIR)
 execute 'set runtimepath^=' . fnameescape(s:root)
 filetype plugin on
+let g:zig_analyzer_check_updates = 0
 
 let s:results = []
 let s:failures = 0
