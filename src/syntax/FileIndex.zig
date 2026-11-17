@@ -15,6 +15,8 @@ const ast = @import("ast.zig");
 const SyntaxNode = ast.SyntaxNode;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
 const mem = @import("../util/mem.zig");
+const Parse = @import("Parse.zig");
+const green = @import("green.zig");
 
 const FileIndex = @This();
 
@@ -120,20 +122,66 @@ pub const ImportStrings = struct {
     pub const Strings = struct {
         arena: std.heap.ArenaAllocator.State,
         imports: []const []const u8,
+        /// Per child node of the root, the end of the strings found in it
+        node_ends: []const u32,
+        /// Id of a parse result whose tree has these strings in these nodes (`Parse.id`): the
+        /// tree they were collected from or one with the same strings in each node; not compared
+        /// by `eql`
+        basis: std.atomic.Value(u64) = .init(0),
     };
 
     pub fn bytes(v: Value) usize {
         return @sizeOf(Strings) + mem.arenaBytes(v.arena);
     }
 
-    pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
+    /// After an incremental parse, copies the strings of the child nodes of the root the new tree
+    /// shares with the tree `prev` describes
+    pub fn computeIncremental(ctx: anytype, file: Key, prev: ?Value) engine.Error!Value {
         const parse = try ctx.get(syntax.ParseFile, file);
-        const gpa = ctx.db.gpa;
+        const old: ?*const Parse = if (prev) |p| parse.inChain(p.basis.load(.monotonic)) else null;
+        const result = try collect(ctx.db.gpa, parse.rootNode(), if (old) |o| .{ .prev = prev.?, .old_root = o.rootNode() } else null);
+        result.basis.store(parse.id, .monotonic);
+        if (prev) |p| if (eql(p, result) and std.mem.eql(u32, p.node_ends, result.node_ends)) {
+            @constCast(p).basis.store(parse.id, .monotonic);
+        };
+        return result;
+    }
+
+    pub const Reuse = struct {
+        prev: *const Strings,
+        /// The root of the tree `prev` describes; must still be alive
+        old_root: SyntaxNode,
+    };
+
+    /// The strings of `root` (see `importStrings`). With `reuse`, those of each child node of the
+    /// root that is the same green node as in `reuse.old_root` are copied
+    pub fn collect(gpa: Allocator, root: SyntaxNode, reuse: ?Reuse) Allocator.Error!*Strings {
         var arena: std.heap.ArenaAllocator = .init(gpa);
         errdefer arena.deinit();
-        const imports = try importStrings(arena.allocator(), parse.rootNode());
+        const a = arena.allocator();
+        var old_nodes: std.AutoHashMapUnmanaged(*const green.GreenNode, [2]u32) = .empty;
+        defer old_nodes.deinit(gpa);
+        if (reuse) |r| {
+            var it = r.old_root.children();
+            var k: usize = 0;
+            var start: u32 = 0;
+            while (it.nextNode()) |n| : (k += 1) {
+                if (k == r.prev.node_ends.len) break;
+                try old_nodes.put(gpa, n.green, .{ start, r.prev.node_ends[k] });
+                start = r.prev.node_ends[k];
+            }
+        }
+        var imports: std.ArrayList([]const u8) = .empty;
+        var node_ends: std.ArrayList(u32) = .empty;
+        var it = root.children();
+        while (it.nextNode()) |n| {
+            if (old_nodes.get(n.green)) |range| {
+                for (reuse.?.prev.imports[range[0]..range[1]]) |str| try imports.append(a, try a.dupe(u8, str));
+            } else try walkImports(a, n, &imports);
+            try node_ends.append(a, @intCast(imports.items.len));
+        }
         const result = try gpa.create(Strings);
-        result.* = .{ .arena = undefined, .imports = imports };
+        result.* = .{ .arena = undefined, .imports = imports.items, .node_ends = node_ends.items };
         result.arena = arena.state;
         return result;
     }
@@ -151,7 +199,6 @@ pub const ImportStrings = struct {
 };
 
 test build {
-    const Parse = @import("Parse.zig");
     const p = try Parse.create(std.testing.allocator,
         \\const std = @import("std");
         \\const lib = @import("lib/a.zig");

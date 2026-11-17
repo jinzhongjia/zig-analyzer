@@ -32,6 +32,9 @@ const Stats = struct {
     reparse_edits: usize = 0,
     reparse_incremental: usize = 0,
     reparse_mismatches: usize = 0,
+    /// Edits after which an incrementally rebuilt syntax-layer value differs from the one built
+    /// from scratch
+    derived_mismatches: usize = 0,
     reparse_full_ns: u64 = 0,
     reparse_inc_ns: u64 = 0,
     /// Counts only edits that took the local reparse path
@@ -93,23 +96,25 @@ pub fn main(init: std.process.Init) !u8 {
         \\ItemTree: {d} members, {d} mapping failures, build time {d:.2}s
         \\HIR: {d} exprs, {d} failures, lowering time {d:.2}s
         \\incremental reparse: {d} random edits, {d} block reparses, {d} mismatches with full parse; time incremental {d:.2}s / full {d:.2}s
+        \\incremental syntax-layer values: {d} mismatches with values built from scratch
         \\  block-reparse edits only: incremental {d:.3}s / full parse of same text {d:.3}s ({d:.1}x)
         \\
     , .{
-        stats.files,                                         mb,
-        stats.std_errors,                                    stats.std_skipped,
-        stats.lossless_failures,                             stats.false_errors,
-        stats.structure_mismatches,                          stats.truncations,
-        secs,                                                mb / secs,
-        stats.items,                                         stats.item_failures,
-        @as(f64, @floatFromInt(stats.item_tree_ns)) / ns,    stats.hir_exprs,
-        stats.hir_failures,                                  @as(f64, @floatFromInt(stats.hir_ns)) / ns,
-        stats.reparse_edits,                                 stats.reparse_incremental,
-        stats.reparse_mismatches,                            @as(f64, @floatFromInt(stats.reparse_inc_ns)) / ns,
-        @as(f64, @floatFromInt(stats.reparse_full_ns)) / ns, @as(f64, @floatFromInt(stats.local_inc_ns)) / ns,
-        @as(f64, @floatFromInt(stats.local_full_ns)) / ns,   @as(f64, @floatFromInt(stats.local_full_ns)) / @as(f64, @floatFromInt(@max(stats.local_inc_ns, 1))),
+        stats.files,                                                                                         mb,
+        stats.std_errors,                                                                                    stats.std_skipped,
+        stats.lossless_failures,                                                                             stats.false_errors,
+        stats.structure_mismatches,                                                                          stats.truncations,
+        secs,                                                                                                mb / secs,
+        stats.items,                                                                                         stats.item_failures,
+        @as(f64, @floatFromInt(stats.item_tree_ns)) / ns,                                                    stats.hir_exprs,
+        stats.hir_failures,                                                                                  @as(f64, @floatFromInt(stats.hir_ns)) / ns,
+        stats.reparse_edits,                                                                                 stats.reparse_incremental,
+        stats.reparse_mismatches,                                                                            @as(f64, @floatFromInt(stats.reparse_inc_ns)) / ns,
+        @as(f64, @floatFromInt(stats.reparse_full_ns)) / ns,                                                 stats.derived_mismatches,
+        @as(f64, @floatFromInt(stats.local_inc_ns)) / ns,                                                    @as(f64, @floatFromInt(stats.local_full_ns)) / ns,
+        @as(f64, @floatFromInt(stats.local_full_ns)) / @as(f64, @floatFromInt(@max(stats.local_inc_ns, 1))),
     });
-    const failed = stats.lossless_failures + stats.false_errors + stats.structure_mismatches + stats.item_failures + stats.reparse_mismatches + stats.hir_failures;
+    const failed = stats.lossless_failures + stats.false_errors + stats.structure_mismatches + stats.item_failures + stats.reparse_mismatches + stats.derived_mismatches + stats.hir_failures;
     return if (failed == 0) 0 else 1;
 }
 
@@ -276,6 +281,8 @@ fn checkReparse(gpa: Allocator, io: std.Io, path: []const u8, source: []const u8
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
     try text.appendSlice(gpa, source);
+    var derived: syntax.incremental_check.Derived = try .init(gpa, chain);
+    defer derived.deinit(gpa);
 
     const edits = 12;
     for (0..edits) |_| {
@@ -303,6 +310,10 @@ fn checkReparse(gpa: Allocator, io: std.Io, path: []const u8, source: []const u8
         if (!inc.sameAs(full)) {
             stats.reparse_mismatches += 1;
             report(stats, "[incremental mismatch] {s}: at {d} deleted {d} bytes and inserted \"{s}\"", .{ path, at, del, ins });
+        }
+        if (!try derived.advance(gpa, inc)) {
+            stats.derived_mismatches += 1;
+            report(stats, "[incremental derived mismatch] {s}: at {d} deleted {d} bytes and inserted \"{s}\"", .{ path, at, del, ins });
         }
         chain.destroy();
         chain = inc;

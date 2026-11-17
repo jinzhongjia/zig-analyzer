@@ -57,6 +57,23 @@ base: ?*Parse = null,
 chain_bytes: usize,
 /// Arena capacity of the full parse at the bottom of the chain
 full_bytes: usize,
+/// Unique among all parse results of the process (never reused), so that a value derived from one
+/// result can tell whether that result is still alive in another result's chain (see `inChain`)
+id: u64,
+
+var next_id: std.atomic.Value(u64) = .init(1);
+
+fn newId() u64 {
+    return next_id.fetchAdd(1, .monotonic);
+}
+
+/// The result with id `id` among `self` and the results it was built on (`base`), which it keeps
+/// alive: the green nodes of that result can be compared with those of `self` by pointer
+pub fn inChain(self: *const Parse, id: u64) ?*const Parse {
+    var p: ?*const Parse = self;
+    while (p) |x| : (p = x.base) if (x.id == id) return x;
+    return null;
+}
 
 pub fn create(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Parse {
     return createIn(gpa, text, mode, .latest);
@@ -94,6 +111,7 @@ pub fn createIn(gpa: Allocator, text: []const u8, mode: Mode, dialect: Dialect) 
         .root = root,
         .errors = errors,
         .chain_bytes = 0,
+        .id = newId(),
         .full_bytes = 0,
     };
     result.arena = arena;
@@ -299,6 +317,7 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
         .errors = errors.items,
         .base = old,
         .chain_bytes = 0,
+        .id = newId(),
         .full_bytes = old.full_bytes,
     };
     result.arena = arena;
@@ -461,6 +480,7 @@ fn reparseFrom(gpa: Allocator, old: *Parse, text: []const u8, from: TopMember, e
         .errors = errors.items,
         .base = old,
         .chain_bytes = 0,
+        .id = newId(),
         .full_bytes = old.full_bytes,
     };
     result.arena = arena;
