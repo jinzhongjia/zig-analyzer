@@ -2,14 +2,14 @@
 // fetches it to learn whether a newer release exists. Installing is always the user's choice.
 import { download } from "./install";
 
-/** Where the release version file is served */
-export const latestUrl = "https://zig-analyzer.nvimer.org/latest.json";
+/** Where the release metadata is served */
+export const metadataUrl = "https://releases.zig-analyzer.dev/metadata.json";
 
 /** A release tag, as `Install Server` accepts it */
 const tagPattern = /^v\d+\.\d+\.\d+[0-9A-Za-z.-]*$/;
 
-/** The release tag in the version file, or undefined when it is not one */
-export function parseLatest(body: string): string | undefined {
+/** The latest stable release tag in metadata.json, or undefined when it is not one */
+export function parseMetadata(body: string): string | undefined {
   let data: unknown;
   try {
     data = JSON.parse(body);
@@ -17,14 +17,14 @@ export function parseLatest(body: string): string | undefined {
     return undefined;
   }
   if (typeof data !== "object" || data === null) return undefined;
-  const { schema, tag } = data as { schema?: unknown; tag?: unknown };
-  return schema === 1 && typeof tag === "string" && tagPattern.test(tag) ? tag : undefined;
+  const { schema, latest } = data as { schema?: unknown; latest?: unknown };
+  return schema === 1 && typeof latest === "string" && tagPattern.test(latest) ? latest : undefined;
 }
 
-/** The release tag in the version file at `url`, or undefined when it cannot be read */
+/** The latest stable release tag in the metadata at `url`, or undefined when it cannot be read */
 export async function fetchLatest(url: string, signal?: AbortSignal): Promise<string | undefined> {
   try {
-    return parseLatest((await download(url, signal)).toString("utf8"));
+    return parseMetadata((await download(url, signal)).toString("utf8"));
   } catch {
     return undefined;
   }

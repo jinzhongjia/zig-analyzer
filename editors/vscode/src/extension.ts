@@ -30,8 +30,8 @@ const viewChanged = new vscode.EventEmitter<vscode.Uri>();
 const viewStyles = new Map<views.Style, vscode.TextEditorDecorationType>();
 /** The range of the syntax tree line under the cursor, in the source document */
 let rangeDecoration: vscode.TextEditorDecorationType;
-let releaseSource = installer.github;
-let updateUrl = update.latestUrl;
+let releaseSource = installer.releases;
+let updateUrl = update.metadataUrl;
 let installing = false;
 /** Where the running server comes from; a setting is the user's own server */
 let clientSource: "setting" | "install" | "path" = "path";
@@ -244,7 +244,7 @@ async function pickRelease(): Promise<installer.InstallOptions | undefined> {
       { label: "Latest release", description: "ReleaseFast", detail: modes[1].detail, options: { optimize: "ReleaseFast" } },
       { label: "Another release...", detail: "A release tag, such as v0.1.1" },
     ],
-    { placeHolder: "zig-analyzer: the release to download from GitHub" },
+    { placeHolder: "zig-analyzer: the release to download" },
   );
   if (picked === undefined || picked.options !== undefined) return picked?.options;
   const version = await vscode.window.showInputBox({
@@ -340,7 +340,7 @@ function updateStatus(state: State): void {
 async function showMenu(): Promise<void> {
   const items: (vscode.QuickPickItem & { command: string })[] = [
     { label: "$(debug-restart) Restart Server", command: "zig-analyzer.restartServer" },
-    { label: "$(cloud-download) Install Server", detail: "Download a release from GitHub", command: "zig-analyzer.installServer" },
+    { label: "$(cloud-download) Install Server", detail: "Download a release from releases.zig-analyzer.dev", command: "zig-analyzer.installServer" },
     { label: "$(refresh) Reload Workspace", detail: "Rerun build.zig", command: "zig-analyzer.reloadWorkspace" },
     { label: "$(info) Show Server Status", command: "zig-analyzer.showStatus" },
     { label: "$(file) Show File Status", command: "zig-analyzer.showFileStatus" },

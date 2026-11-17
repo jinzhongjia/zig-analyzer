@@ -15,16 +15,15 @@ for `.zig` and `.zon` files; and running, debugging, and testing with `zig`.
 The extension runs `zig-analyzer.server.path` when it is set, else the release installed by
 **zig-analyzer: Install Server**, else `zig-analyzer` from `PATH`. It installs nothing by itself:
 **Install Server** asks for the latest release (built with ReleaseSafe or ReleaseFast) or a tag
-such as `v0.1.1`, downloads it from
-[GitHub](https://github.com/jinzhongjia/zig-analyzer/releases) into the extension's global storage,
-and restarts the running server with it. When the server cannot start, the error message offers to
-run it.
+such as `v0.1.1`, downloads it from the zig-analyzer release server
+(`https://releases.zig-analyzer.dev`) into the extension's global storage, and restarts the running
+server with it. When the server cannot start, the error message offers to run it.
 
 ## Updates
 
-Once a day, after the server starts, the extension reads a small version file
-(`https://zig-analyzer.nvimer.org/latest.json`). When it names a release newer than the running
-server, a message says so and offers the release notes and **Install Server**; nothing is
+Once a day, after the server starts, the extension reads the release metadata
+(`https://releases.zig-analyzer.dev/metadata.json`). When its latest release is newer than the
+running server, a message says so and offers the release notes and **Install Server**; nothing is
 downloaded or installed unless you choose it. A failed check is silent. Set
 `zig-analyzer.server.checkUpdates` to `false` to turn the check off.
 

@@ -1,4 +1,4 @@
-// Installs a release of the server from GitHub into a directory: `<dir>/<release>/zig-analyzer`,
+// Installs a release of the server from the release server into a directory: `<dir>/<release>/zig-analyzer`,
 // with `<dir>/current` naming the release in use. A release is installed only when the minisign
 // signature of its SHA256SUMS verifies with the release key, the trusted comment of the signature
 // names the release (`zig-analyzer <tag>`), and the archive has the SHA-256 that SHA256SUMS lists
@@ -23,9 +23,9 @@ export interface ReleaseSource {
   publicKey: string;
 }
 
-/** The zig-analyzer releases, signed with the key of `minisign.pub` in the repository root */
-export const github: ReleaseSource = {
-  releases: "https://github.com/jinzhongjia/zig-analyzer/releases",
+/** The zig-analyzer releases, served by the release Worker and signed with `minisign.pub` */
+export const releases: ReleaseSource = {
+  releases: "https://releases.zig-analyzer.dev",
   publicKey: "RWRbma3B4tRgvIsJxiSxTvwoOWB6wvqxTEDgWVaJk0XMSeW9THbHBVj+",
 };
 
