@@ -537,6 +537,11 @@
           },
           "additionalProperties": false
         },
+        "zig-analyzer.unused.enable": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Hint private declarations that no code in the same file uses. Only open files of your own code are checked."
+        },
         "zig-analyzer.files.watcher": {
           "type": "string",
           "enum": [

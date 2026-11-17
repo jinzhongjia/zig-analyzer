@@ -19,6 +19,7 @@
 //!       "cache": { "capacity": 64, "queries": { "Infer": { "count": 16384, "mb": 48 } } },
 //!       "workspace_symbol": { "dependencies": false, "limit": 256 },
 //!       "naming": { "enable": false, "ignore": ["SDL_*"], "exclude": ["src/c/*"], "rules": { "field": false } },
+//!       "unused": { "enable": false },
 //!       "files": { "watcher": "auto" },
 //!       "log": { "level": "info", "file": "/tmp/zig-analyzer.log", "slow_request_ms": 100 } }
 //!
@@ -34,6 +35,7 @@
 //!     .{
 //!         .build = .{ .args = .{"-Dtarget=aarch64-linux"} },
 //!         .naming = .{ .enable = true, .rules = .{ .field = false } },
+//!         .unused = .{ .enable = true },
 //!     }
 
 const std = @import("std");
@@ -160,6 +162,9 @@ naming_ignore: []const []const u8 = &.{},
 naming_exclude: []const []const u8 = &.{},
 /// Whether each rule of the naming check is enabled
 naming_rules: NamingRules = .{},
+/// Unused-declaration check: whether to report private declarations of open files that no code in
+/// the same file uses
+unused_enable: bool = false,
 /// Who detects external changes on disk (see `Watcher`)
 files_watcher: Watcher = .auto,
 /// Log level (err / warn / info / debug)
@@ -279,6 +284,7 @@ const settings = [_]Setting{
     .{ .section = "naming", .key = "ignore", .field = "naming_ignore" },
     .{ .section = "naming", .key = "exclude", .field = "naming_exclude" },
     .{ .section = "naming", .key = "rules", .field = "naming_rules" },
+    .{ .section = "unused", .key = "enable", .field = "unused_enable" },
     .{ .section = "files", .key = "watcher", .field = "files_watcher" },
     .{ .section = "log", .key = "level", .field = "log_level" },
     .{ .section = "log", .key = "file", .field = "log_file" },
@@ -289,7 +295,8 @@ const settings = [_]Setting{
 const project_settings = [_][]const u8{
     "build_args",    "diagnostics_steps", "compiler_diagnostics",
     "naming_enable", "naming_ignore",     "naming_exclude",
-    "naming_rules",  "imports_derived",   "imports_sort",
+    "naming_rules",  "unused_enable",     "imports_derived",
+    "imports_sort",
 };
 
 fn isProjectSetting(comptime field: []const u8) bool {
@@ -863,4 +870,28 @@ test "naming settings: client and project file" {
     try testing.expect(client.naming_enable and client.naming_rules.field and !client.naming_rules.value);
     try testing.expectEqualStrings("src/c/*", client.naming_exclude[0]);
     try testing.expectEqualStrings("SDL_*", client.naming_ignore[0]);
+}
+
+test "unused settings: client and project file" {
+    var empty = try parseText("{}");
+    defer empty.deinit(testing.allocator);
+    try testing.expect(!empty.unused_enable);
+
+    var client = try parseText(
+        \\{"unused": {"enable": true}}
+    );
+    defer client.deinit(testing.allocator);
+    try testing.expectEqual(0, client.warnings.len);
+    try testing.expect(client.unused_enable);
+
+    // The project configuration turns it on for the whole team
+    var project = try parseProject(testing.allocator,
+        \\.{ .unused = .{ .enable = true } }
+    );
+    defer project.deinit(testing.allocator);
+    try testing.expectEqual(0, project.warnings.len);
+    var overlaid = try parseText("{}");
+    defer overlaid.deinit(testing.allocator);
+    try overlaid.overlayProject(testing.allocator, &project);
+    try testing.expect(overlaid.unused_enable);
 }
