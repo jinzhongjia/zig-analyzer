@@ -131,9 +131,7 @@ pub const DeclType = struct {
         defer scope.leave();
         const ip = ctx.db.env.ip;
         const tree = try r.itemTree(key.file);
-        const item: u32 = for (tree.items, 0..) |it, i| {
-            if (it.ast_id == key.item) break @intCast(i);
-        } else return .unknown;
+        const item: u32 = tree.itemOf(key.item) orelse return .unknown;
         const b = try ctx.get(hir.ItemBody, key);
         switch (tree.items[item].kind) {
             .@"fn" => {
@@ -497,8 +495,8 @@ pub fn errorSetOf(r: *Resolver, t: Index) resolve.Error!?InternPool.ErrorSet {
 /// Whether the return type of the function is `!T` (an inferred error set)
 fn inferredErrorSet(r: *Resolver, owner: hir.OwnerKey) resolve.Error!bool {
     const tree = try r.itemTree(owner.file);
-    for (tree.items) |it| if (it.ast_id == owner.item) return it.flags.inferred_error_set;
-    return false;
+    const i = tree.itemOf(owner.item) orelse return false;
+    return tree.items[i].flags.inferred_error_set;
 }
 
 /// Whether a type can exist only at comptime (see `eval.computeComptimeOnly`), cached per type.
@@ -926,7 +924,7 @@ fn isMemberInstOf(tree: *const ItemTree, item: u32, k: InternPool.Instance) bool
 pub fn isMemberInst(r: *Resolver, k: InternPool.Instance) resolve.Error!bool {
     if (k.captured.len == 0 or k.iteration != null) return false;
     const tree = try r.itemTree(k.file);
-    for (tree.items, 0..) |it, i| if (it.ast_id == k.decl) return isMemberInstOf(tree, @intCast(i), k);
+    if (tree.itemOf(k.decl)) |i| return isMemberInstOf(tree, i, k);
     return false;
 }
 
@@ -1102,9 +1100,7 @@ pub const SignatureInst = struct {
         const scope = try enterContext(&r, key.owner.file, key.inst);
         defer scope.leave();
         const tree = try r.itemTree(key.owner.file);
-        const f: u32 = for (tree.items, 0..) |it, i| {
-            if (it.ast_id == key.owner.item) break @intCast(i);
-        } else return key.inst;
+        const f: u32 = tree.itemOf(key.owner.item) orelse return key.inst;
         return functionInst(&r, key.owner.file, f, key.inst);
     }
 
@@ -1154,7 +1150,7 @@ pub fn namespaceOfType(r: *Resolver, t: Index) resolve.Error!?Namespace {
         else => return null,
     };
     const tree = try r.itemTree(c.file);
-    for (tree.containers, 0..) |x, i| if (x.ast_id == c.ast_id) return .{ .file = c.file, .container = @intCast(i) };
+    if (tree.containerOf(c.ast_id)) |i| return .{ .file = c.file, .container = i };
     return null;
 }
 

@@ -151,24 +151,28 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
         if (options.auto_import) {
             const found = try imports.complete(r, file, offset, owner, n.prefix, limit, options.imports);
             result.is_incomplete = result.is_incomplete or found.is_incomplete;
+            // The first visible item with each label
+            var visible_labels: std.StringHashMapUnmanaged(u32) = .empty;
+            if (found.items.len != 0) for (items.items[0..base.len], 0..) |it, i| {
+                const gop = try visible_labels.getOrPut(r.arena, it.label);
+                if (!gop.found_existing) gop.value_ptr.* = @intCast(i);
+            };
             for (found.items) |candidate| {
                 // The core (`imports.complete`) has already rendered the path segment by segment;
                 // the whole qualified expression must not be escaped as an identifier again.
                 const filter = try completionFilter(r.arena, n, candidate.filter);
-                var duplicate = false;
-                for (items.items[0..base.len]) |*visible_item| if (std.mem.eql(u8, visible_item.label, candidate.label)) {
+                if (visible_labels.get(candidate.label)) |i| {
                     // Only visible bindings are merged; auto-import items with the same name from
                     // different sources must remain separate choices.
                     if (candidate.import_edit == null) {
+                        const visible_item = &items.items[i];
                         visible_item.replace = n.range;
                         visible_item.filter = filter;
                         visible_item.qualifier = candidate.qualifier;
                         visible_item.target = candidate.target;
                     }
-                    duplicate = true;
-                    break;
-                };
-                if (duplicate) continue;
+                    continue;
+                }
                 try extra.append(r.arena, .{
                     .label = candidate.label,
                     .kind = switch (candidate.kind) {

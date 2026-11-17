@@ -114,10 +114,38 @@ test "top-level edits reparse from shortly before the edit" {
     // Insert a new declaration between declarations, introducing syntax errors
     try expectTopLevel(base, "const a = 1;\nconst b = 2;\nfn f() void {}\nconst x = ;\nconst c = 3;\n// end\n", true);
     try expectTopLevel(base, "const a = 1;\nconst b = 2;\nfn f() void {}\nconst c = 3\n// end\n", true);
-    // Fewer than two members before the edit: full parse
-    try expectTopLevel(base, "const a = 10;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n// end\n", false);
+    // Fewer than two members before the edit: reparses from the start of the file
+    try expectTopLevel(base, "const a = 10;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n// end\n", true);
+    try expectTopLevel("//! doc\n" ++ base, "//! doc\n" ++ "const a = 10;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n// end\n", true);
     // `//!` in the fragment: full parse
     try expectTopLevel(base, "const a = 1;\nconst b = 2;\nfn f() void {}\nconst c = 3;\n//! doc\n", false);
+}
+
+/// Whether the top-level child `from_end` places from the end is the old one reused as is (the
+/// members after the edit were not parsed again); the result matches a full parse either way
+fn expectTailReused(old_text: []const u8, new_text: []const u8, from_end: usize, reused: bool) !void {
+    const old = try Parse.create(testing.allocator, old_text, .zig);
+    defer old.destroy();
+    const full = try Parse.create(testing.allocator, new_text, .zig);
+    defer full.destroy();
+    const inc = (try Parse.reparseTopLevel(testing.allocator, old, new_text)).?;
+    defer inc.destroy();
+    try testing.expect(inc.sameAs(full));
+    const x = old.root.children[old.root.children.len - from_end];
+    const y = inc.root.children[inc.root.children.len - from_end];
+    try testing.expectEqual(reused, x.ptr == y.ptr);
+}
+
+test "top-level edits reuse the members after the edit" {
+    const base = "const a = 1;\nconst b = 2;\nfn f() void {}\nconst c = 3;\nconst d = 4;\nconst e = 5;\n";
+    // The last member is reused after an edit at the start, in the middle, and with new errors
+    try expectTailReused(base, "const a = 10;\nconst b = 2;\nfn f() void {}\nconst c = 3;\nconst d = 4;\nconst e = 5;\n", 2, true);
+    try expectTailReused(base, "const a = 1;\nconst b = 2;\nfn g() void {}\nconst c = 3;\nconst d = 4;\nconst e = 5;\n", 2, true);
+    try expectTailReused(base, "const a = 1;\nconst b = 2;\nfn f() void {}\nconst x = ;\nconst c = 3;\nconst d = 4;\nconst e = 5;\n", 2, true);
+    // An unclosed `{`: the members after it become statements of the function body
+    try expectTailReused(base, "const a = 1;\nconst b = 2;\nfn f() void {\nconst c = 3;\nconst d = 4;\nconst e = 5;\n", 2, false);
+    // Errors of the reused members are kept, shifted
+    try expectTailReused("const a = 1;\nconst b = 2;\nconst c = 3;\nconst d = 4;\nconst e = 5\nconst f = 6;\n", "const a = 11;\nconst b = 2;\nconst c = 3;\nconst d = 4;\nconst e = 5\nconst f = 6;\n", 2, true);
 }
 
 test "top-level reparse falls back when an earlier error sits at the cut" {

@@ -33,6 +33,19 @@ member_list: []const u32,
 /// The `//!` doc at the start of the file (with the `//!` prefix removed), lines joined with `\n`;
 /// kept here so that showing it does not need the syntax tree of the file
 file_doc: ?[]const u8,
+/// Lookup tables derived from the fields above, so that `eql` and `fingerprint` do not compare
+/// them: the items and the containers by AstId (AstIds are unique in a file), each entry
+/// `AstId << 32 | index`, ascending
+item_ids: []const u64,
+container_ids: []const u64,
+/// The named `fn` / `const` / `var` members of each container ordered by name, members with the
+/// same name in member order; split by `decl_starts` (one more entry than `containers`)
+decl_order: []const u32,
+decl_starts: []const u32,
+/// The containers each item declares (`Container.is_value` with that `parent_item`), in container
+/// order; split by `value_starts` (one more entry than `items`)
+value_containers: []const u32,
+value_starts: []const u32,
 
 /// Node ID stable within the file: hashed from the parent node ID, kind, name, and ordinal among
 /// same-named nodes; stays the same across edits as long as the node is not renamed or moved.
@@ -110,6 +123,54 @@ pub fn deinit(self: *ItemTree, gpa: Allocator) void {
 /// position of the type expression
 pub fn bareFieldNames(kind: Container.Kind) bool {
     return kind == .@"enum" or kind == .@"union";
+}
+
+/// The index of the item with AstId `id`
+pub fn itemOf(self: *const ItemTree, id: AstId) ?u32 {
+    return findId(self.item_ids, id);
+}
+
+/// The index of the container with AstId `id`
+pub fn containerOf(self: *const ItemTree, id: AstId) ?u32 {
+    return findId(self.container_ids, id);
+}
+
+/// The lowest index with AstId `id` in `ids` (see `item_ids`)
+fn findId(ids: []const u64, id: AstId) ?u32 {
+    const key = @as(u64, @backingInt(id)) << 32;
+    const i = std.sort.lowerBound(u64, ids, key, struct {
+        fn order(k: u64, x: u64) std.math.Order {
+            return std.math.order(k, x);
+        }
+    }.order);
+    return if (i < ids.len and ids[i] >> 32 == @backingInt(id)) @truncate(ids[i]) else null;
+}
+
+fn sortedIds(a: Allocator, ids: anytype) Allocator.Error![]const u64 {
+    const out = try a.alloc(u64, ids.len);
+    for (ids, out, 0..) |x, *o, i| o.* = @as(u64, @backingInt(x.ast_id)) << 32 | i;
+    std.sort.pdq(u64, out, {}, std.sort.asc(u64));
+    return out;
+}
+
+/// The first `fn` / `const` / `var` member of `container` (in member order) named `name`
+pub fn lookupDecl(self: *const ItemTree, container: u32, name: []const u8) ?u32 {
+    const decls = self.decl_order[self.decl_starts[container]..self.decl_starts[container + 1]];
+    const Ctx = struct {
+        items: []const Item,
+        name: []const u8,
+        fn order(ctx: @This(), m: u32) std.math.Order {
+            return std.mem.order(u8, ctx.name, ctx.items[m].name.?);
+        }
+    };
+    const i = std.sort.lowerBound(u32, decls, Ctx{ .items = self.items, .name = name }, Ctx.order);
+    if (i == decls.len or !std.mem.eql(u8, self.items[decls[i]].name.?, name)) return null;
+    return decls[i];
+}
+
+/// The containers item `item` declares (see `Container.is_value`), in container order
+pub fn valueContainers(self: *const ItemTree, item: u32) []const u32 {
+    return self.value_containers[self.value_starts[item]..self.value_starts[item + 1]];
 }
 
 pub fn containerMembers(self: *const ItemTree, container: u32) []const u32 {
@@ -227,7 +288,58 @@ pub fn build(gpa: Allocator, root: SyntaxNode, mode: Mode) Allocator.Error!ItemT
     const containers = try b.arena.dupe(Container, b.containers.items);
     const items = try b.arena.dupe(Item, b.items.items);
     const file_doc = try docLines(b.arena, root, .container_doc_comment);
-    return .{ .arena = arena.state, .containers = containers, .items = items, .member_list = member_list.items, .file_doc = file_doc };
+
+    var decl_order: std.ArrayList(u32) = .empty;
+    const decl_starts = try b.arena.alloc(u32, containers.len + 1);
+    for (containers, 0..) |c, ci| {
+        decl_starts[ci] = @intCast(decl_order.items.len);
+        const start = decl_order.items.len;
+        for (member_list.items[c.members.start..][0..c.members.len]) |m| switch (items[m].kind) {
+            .@"fn", .@"const", .@"var" => if (items[m].name != null) try decl_order.append(b.arena, m),
+            else => {},
+        };
+        // The item indices of a container's members increase in member order
+        std.sort.pdq(u32, decl_order.items[start..], items, struct {
+            fn lt(its: []const Item, x: u32, y: u32) bool {
+                return switch (std.mem.order(u8, its[x].name.?, its[y].name.?)) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => x < y,
+                };
+            }
+        }.lt);
+    }
+    decl_starts[containers.len] = @intCast(decl_order.items.len);
+    // Counting sort of the value containers by parent item, keeping container order
+    const value_starts = try b.arena.alloc(u32, items.len + 1);
+    @memset(value_starts, 0);
+    for (containers) |c| if (c.is_value) if (c.parent_item) |p| {
+        value_starts[p + 1] += 1;
+    };
+    for (1..value_starts.len) |i| value_starts[i] += value_starts[i - 1];
+    const value_containers = try b.arena.alloc(u32, value_starts[items.len]);
+    const fill = try b.gpa.dupe(u32, value_starts[0..items.len]);
+    defer b.gpa.free(fill);
+    for (containers, 0..) |c, ci| if (c.is_value) if (c.parent_item) |p| {
+        value_containers[fill[p]] = @intCast(ci);
+        fill[p] += 1;
+    };
+    const item_ids = try sortedIds(b.arena, items);
+    const container_ids = try sortedIds(b.arena, containers);
+    // Everything is allocated before the arena state is copied
+    return .{
+        .arena = arena.state,
+        .containers = containers,
+        .items = items,
+        .member_list = member_list.items,
+        .file_doc = file_doc,
+        .item_ids = item_ids,
+        .container_ids = container_ids,
+        .decl_order = decl_order.items,
+        .decl_starts = decl_starts,
+        .value_containers = value_containers,
+        .value_starts = value_starts,
+    };
 }
 
 const Builder = struct {

@@ -597,8 +597,7 @@ pub const DeclTarget = struct {
 };
 
 fn itemOf(r: *Resolver, key: hir.OwnerKey) resolve.Error!?u32 {
-    for ((try r.itemTree(key.file)).items, 0..) |it, i| if (it.ast_id == key.item) return @intCast(i);
-    return null;
+    return (try r.itemTree(key.file)).itemOf(key.item);
 }
 
 fn computeNamespace(r: *Resolver, file: FileId, item: u32) resolve.Error!?Namespace {

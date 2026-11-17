@@ -205,9 +205,7 @@ const Collector = struct {
     fn collect(c: *Collector, key: hir.OwnerKey) resolve.Error!void {
         const r = c.r;
         const tree = try r.itemTree(key.file);
-        const index = for (tree.items, 0..) |it, i| {
-            if (it.ast_id == key.item) break i;
-        } else return;
+        const index = tree.itemOf(key.item) orelse return;
         const item = tree.items[index];
         // External symbols: both the name and the parameter names follow the external spelling
         if (item.flags.is_extern or item.flags.is_export) return;

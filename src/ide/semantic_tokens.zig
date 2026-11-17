@@ -144,8 +144,6 @@ const Builder = struct {
     names: std.AutoHashMapUnmanaged(u32, Class) = .empty,
     visible_names: std.AutoHashMapUnmanaged(u32, void) = .empty,
     classes: std.AutoHashMapUnmanaged(OwnerKey, Class) = .empty,
-    items: std.AutoHashMapUnmanaged(OwnerKey, u32) = .empty,
-    indexed: std.AutoHashMapUnmanaged(FileId, void) = .empty,
     used: std.AutoHashMapUnmanaged(BindingKey, void) = .empty,
     declarations: std.ArrayList(BindingDecl) = .empty,
     data: std.ArrayList(u32) = .empty,
@@ -209,17 +207,9 @@ const Builder = struct {
         }
     }
 
-    fn indexFile(b: *Builder, file: FileId) resolve.Error!void {
-        if (b.indexed.contains(file)) return;
-        const items = (try b.r.itemTree(file)).items;
-        for (items, 0..) |item, i| try b.items.put(b.r.arena, .{ .file = file, .item = item.ast_id }, @intCast(i));
-        try b.indexed.put(b.r.arena, file, {});
-    }
-
     fn itemClass(b: *Builder, key: OwnerKey) resolve.Error!Class {
         if (b.classes.get(key)) |c| return c;
-        try b.indexFile(key.file);
-        const index = b.items.get(key) orelse return .{ .type = .variable };
+        const index = (try b.r.itemTree(key.file)).itemOf(key.item) orelse return .{ .type = .variable };
         const symbol = try symbol_kind.ofDecl(b.r, key.file, index);
         // ItemTree members are all container-level
         const global = b.options.global_var and (try b.r.itemTree(key.file)).items[index].kind == .@"var";
@@ -294,7 +284,6 @@ const Builder = struct {
     }
 
     fn collect(b: *Builder, file: FileId, root: SyntaxNode) resolve.Error!void {
-        try b.indexFile(file);
         const itree = try b.r.itemTree(file);
         const ast_ids = try b.r.ctx.get(database.syntax.FileAstIdMap, file);
         const indexed_len = if (b.visible != null) itree.items.len else 0;

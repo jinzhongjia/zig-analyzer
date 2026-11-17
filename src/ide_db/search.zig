@@ -28,6 +28,7 @@ const ErrorSets = @import("../syntax/ErrorSets.zig");
 const Vfs = @import("../base/Vfs.zig");
 const FileId = Vfs.FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
+const mem = @import("../util/mem.zig");
 const seed = @import("seed.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const value = @import("../sema/value.zig");
@@ -613,39 +614,82 @@ pub fn reachable(r: *Resolver, from: []const FileId) resolve.Error![]const FileI
 /// files reachable from the files in scope are collected by following imports, and reverse edges
 /// are built over them; files outside the scope other than `target` are not in the result
 pub fn importers(r: *Resolver, target: FileId, scope: []const FileId) resolve.Error![]const FileId {
-    // Files in scope come first (indices below `scope_len`), followed by the reachable files
-    // outside the scope
-    var nodes: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
-    for (scope) |f| try nodes.put(r.arena, f, {});
-    const scope_len = nodes.count();
-    // Reverse edges: imported file → the files importing it
-    var reverse: std.AutoHashMapUnmanaged(FileId, std.ArrayList(FileId)) = .empty;
-    var n: usize = 0;
-    while (n < nodes.count()) : (n += 1) {
-        const f = nodes.keys()[n];
-        const index = try r.ctx.get(FileIndex.Query, f);
-        // Every module the file belongs to may import a different file under a name
-        for (index.imports) |s| for (try r.resolveImportTargets(f, s)) |to| {
-            const gop = try reverse.getOrPut(r.arena, to);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(r.arena, f);
-            try nodes.put(r.arena, to, {});
-        };
-    }
-    var seen: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
-    try seen.put(r.arena, target, {});
-    var i: usize = 0;
-    while (i < seen.count()) : (i += 1) {
-        const f = seen.keys()[i];
-        const from = reverse.get(f) orelse continue;
-        for (from.items) |x| try seen.put(r.arena, x, {});
-    }
-    var out: std.ArrayList(FileId) = .empty;
-    for (seen.keys()) |f| {
-        if (f == target or nodes.getIndex(f).? < scope_len) try out.append(r.arena, f);
-    }
-    return out.items;
+    const graph = try ImportGraph.build(r.arena, r, scope);
+    return graph.importersOf(r.arena, target);
 }
+
+/// Reverse `@import` edges over the files in a scope and the files they reach (see `importers`).
+/// Does not depend on the target, so the importers of every file in one scope can share it
+pub const ImportGraph = struct {
+    /// Files in scope first (indices below `scope_len`), followed by the reachable files outside
+    /// the scope
+    nodes: []const FileId,
+    scope_len: u32,
+    /// Importers of `nodes[i]`: `edges[edge_starts[i]..edge_starts[i + 1]]`, in the order the
+    /// imports were found
+    edge_starts: []const u32,
+    edges: []const FileId,
+    /// Index of each file in `nodes`
+    index: std.AutoHashMapUnmanaged(FileId, u32),
+
+    /// The graph is allocated with `a`; temporary data with `r.arena`
+    pub fn build(a: std.mem.Allocator, r: *Resolver, scope: []const FileId) resolve.Error!ImportGraph {
+        const temp = r.arena;
+        var nodes: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+        for (scope) |f| try nodes.put(temp, f, {});
+        const scope_len: u32 = @intCast(nodes.count());
+        // Imported file → the files importing it
+        var reverse: std.AutoHashMapUnmanaged(FileId, std.ArrayList(FileId)) = .empty;
+        var n: usize = 0;
+        while (n < nodes.count()) : (n += 1) {
+            const f = nodes.keys()[n];
+            const file_index = try r.ctx.get(FileIndex.Query, f);
+            // Every module the file belongs to may import a different file under a name
+            for (file_index.imports) |s| for (try r.resolveImportTargets(f, s)) |to| {
+                const gop = try reverse.getOrPut(temp, to);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(temp, f);
+                try nodes.put(temp, to, {});
+            };
+        }
+        const keys = try a.dupe(FileId, nodes.keys());
+        const edge_starts = try a.alloc(u32, keys.len + 1);
+        var edge_count: usize = 0;
+        var it = reverse.valueIterator();
+        while (it.next()) |from| edge_count += from.items.len;
+        var edges: std.ArrayList(FileId) = try .initCapacity(a, edge_count);
+        var index: std.AutoHashMapUnmanaged(FileId, u32) = .empty;
+        try index.ensureTotalCapacity(a, @intCast(keys.len));
+        for (keys, 0..) |f, i| {
+            edge_starts[i] = @intCast(edges.items.len);
+            if (reverse.get(f)) |from| edges.appendSliceAssumeCapacity(from.items);
+            index.putAssumeCapacity(f, @intCast(i));
+        }
+        edge_starts[keys.len] = @intCast(edges.items.len);
+        return .{ .nodes = keys, .scope_len = scope_len, .edge_starts = edge_starts, .edges = edges.items, .index = index };
+    }
+
+    /// See `importers`
+    pub fn importersOf(g: *const ImportGraph, a: std.mem.Allocator, target: FileId) std.mem.Allocator.Error![]const FileId {
+        var seen: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+        try seen.put(a, target, {});
+        var i: usize = 0;
+        while (i < seen.count()) : (i += 1) {
+            const n = g.index.get(seen.keys()[i]) orelse continue;
+            for (g.edges[g.edge_starts[n]..g.edge_starts[n + 1]]) |x| try seen.put(a, x, {});
+        }
+        var out: std.ArrayList(FileId) = .empty;
+        for (seen.keys()) |f| {
+            if (f == target or g.index.get(f).? < g.scope_len) try out.append(a, f);
+        }
+        return out.items;
+    }
+
+    pub fn eql(a: *const ImportGraph, b: *const ImportGraph) bool {
+        return a.scope_len == b.scope_len and std.mem.eql(FileId, a.nodes, b.nodes) and
+            std.mem.eql(u32, a.edge_starts, b.edge_starts) and std.mem.eql(FileId, a.edges, b.edges);
+    }
+};
 
 /// Whether `from` can reach `target` through an `@import` chain (through any files)
 pub fn reaches(r: *Resolver, from: FileId, target: FileId) resolve.Error!bool {
@@ -664,6 +708,47 @@ pub fn reaches(r: *Resolver, from: FileId, target: FileId) resolve.Error!bool {
     return false;
 }
 
+/// The import graph of the searched files (see `searchFiles`), ordered by path (see `byPath`):
+/// shared by the `ProjectImporters` of all targets. Its dependencies are the file indexes and the
+/// module configuration; an unchanged graph (`eql`) does not invalidate them
+pub const ProjectImportGraph = struct {
+    pub const kind: @import("../db/engine.zig").Kind = .derived;
+    pub const Key = void;
+    pub const Value = *const Owned;
+
+    pub const Owned = struct {
+        arena: std.heap.ArenaAllocator.State,
+        graph: ImportGraph,
+    };
+
+    pub fn compute(ctx: *database.Db.Ctx, _: Key) @import("../db/engine.zig").Error!Value {
+        const gpa = ctx.db.gpa;
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        errdefer arena.deinit();
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        const graph = try ImportGraph.build(arena.allocator(), &r, try byPath(&r, try searchFiles(&r)));
+        const out = try arena.allocator().create(Owned);
+        out.* = .{ .arena = undefined, .graph = graph };
+        out.arena = arena.state;
+        return out;
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return a.graph.eql(&b.graph);
+    }
+
+    pub fn bytes(v: Value) usize {
+        return mem.arenaBytes(v.arena);
+    }
+
+    pub fn deinit(v: *Value, gpa: std.mem.Allocator) void {
+        var arena = v.*.arena.promote(gpa);
+        arena.deinit();
+    }
+};
+
 /// The reverse import closure over the searched files (see `searchFiles`) is shared between the
 /// seed lookups of all members; the file indexes and the module configuration are still the
 /// actual dependencies. Files at the same import distance from the target come in path order
@@ -676,8 +761,8 @@ pub const ProjectImporters = struct {
     pub fn compute(ctx: *database.Db.Ctx, target: Key) @import("../db/engine.zig").Error!Value {
         var scratch: std.heap.ArenaAllocator = .init(ctx.db.gpa);
         defer scratch.deinit();
-        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
-        return ctx.db.gpa.dupe(FileId, try importers(&r, target, try byPath(&r, try searchFiles(&r))));
+        const graph = &(try ctx.get(ProjectImportGraph, {})).graph;
+        return ctx.db.gpa.dupe(FileId, try graph.importersOf(scratch.allocator(), target));
     }
 
     pub fn eql(a: Value, b: Value) bool {
@@ -1195,7 +1280,7 @@ test lastNameStart {
 
 fn keyDef(r: *Resolver, key: hir.OwnerKey) resolve.Error!?Def {
     const tree = try r.itemTree(key.file);
-    for (tree.items, 0..) |it, i| if (it.ast_id == key.item) return .{ .item = .{ .file = key.file, .item = @intCast(i) } };
+    if (tree.itemOf(key.item)) |i| return .{ .item = .{ .file = key.file, .item = i } };
     return null;
 }
 
