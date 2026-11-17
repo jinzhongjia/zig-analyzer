@@ -1,4 +1,4 @@
-//! Installs a release of the server from GitHub into a directory: `<dir>/<release>/zig-analyzer`,
+//! Installs a release of the server from the release server into a directory: `<dir>/<release>/zig-analyzer`,
 //! with `<dir>/current` naming the release in use. A release is installed only when the minisign
 //! signature of its SHA256SUMS verifies with the release key, the trusted comment of the signature
 //! names the release (`zig-analyzer <tag>`), and the archive has the SHA-256 that SHA256SUMS lists
@@ -19,8 +19,8 @@ pub struct Source<'a> {
 }
 
 /// The zig-analyzer releases, signed with the key of `minisign.pub` in the repository root
-pub const GITHUB: Source<'static> = Source {
-    releases: "https://github.com/jinzhongjia/zig-analyzer/releases",
+pub const DEFAULT_SOURCE: Source<'static> = Source {
+    releases: "https://releases.zig-analyzer.dev",
     public_key: "RWRbma3B4tRgvIsJxiSxTvwoOWB6wvqxTEDgWVaJk0XMSeW9THbHBVj+",
 };
 
@@ -548,17 +548,17 @@ mod tests {
     fn the_real_v0_1_1_sha256sums_verifies_with_the_release_key() {
         let sums = include_bytes!("../test/fixtures/SHA256SUMS");
         let signature = include_bytes!("../test/fixtures/SHA256SUMS.minisig");
-        assert_eq!(signed_tag(sums, signature, GITHUB.public_key).unwrap(), "v0.1.1");
+        assert_eq!(signed_tag(sums, signature, DEFAULT_SOURCE.public_key).unwrap(), "v0.1.1");
         let mut edited = sums.to_vec();
         edited[0] ^= 1;
-        assert!(signed_tag(&edited, signature, GITHUB.public_key)
+        assert!(signed_tag(&edited, signature, DEFAULT_SOURCE.public_key)
             .unwrap_err()
             .contains("does not verify"));
         // An edited trusted comment fails the global signature
         let edited = String::from_utf8(signature.to_vec())
             .unwrap()
             .replace("zig-analyzer v0.1.1", "zig-analyzer v0.1.2");
-        assert!(signed_tag(sums, edited.as_bytes(), GITHUB.public_key)
+        assert!(signed_tag(sums, edited.as_bytes(), DEFAULT_SOURCE.public_key)
             .unwrap_err()
             .contains("does not verify"));
         assert!(signed_tag(sums, signature, &Key::new().public())
@@ -574,7 +574,7 @@ mod tests {
     #[test]
     fn the_release_key_is_that_of_minisign_pub() {
         let file = include_str!("../../../minisign.pub");
-        assert_eq!(file.lines().nth(1), Some(GITHUB.public_key));
+        assert_eq!(file.lines().nth(1), Some(DEFAULT_SOURCE.public_key));
     }
 
     #[test]

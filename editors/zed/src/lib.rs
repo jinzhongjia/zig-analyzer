@@ -97,7 +97,7 @@ impl ZigAnalyzerExtension {
         let target = target().ok_or_else(|| {
             format!("there is no zig-analyzer release for this system: build it from source and set `lsp.{SERVER}.binary.path`")
         })?;
-        let result = install::install(&mut ZedHost { id }, dir, options, &install::GITHUB, target);
+        let result = install::install(&mut ZedHost { id }, dir, options, &install::DEFAULT_SOURCE, target);
         zed::set_language_server_installation_status(id, &LanguageServerInstallationStatus::None);
         match result {
             Ok(outcome) => {
