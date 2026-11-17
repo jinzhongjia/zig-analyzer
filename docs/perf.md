@@ -14,7 +14,7 @@ Benchmark project: the Zig 0.17.0 compiler source (540k lines + standard library
 | | completion p95 | < 100 ms | 2.5 ms (slowest in the first round: 20 ms) | ✅ |
 | | edit → live diagnostics | < 30 ms (excluding debounce) | ordinary files ≤ 9 ms; `Sema.zig` (35k lines) p50 73-76 ms including the 50 ms debounce (23-26 ms without) with the in-process AstGen, 109-133 ms with `zig ast-check` as a subprocess | ⚠️ very large files with a subprocess |
 | | keystroke → hover (continuous typing) | — | `Sema.zig` p50 13-14 ms (11-15 ms in a function body); other projects 5-21 ms | — |
-| | keystroke → name completion (typing words in a method) | — | `Sema.zig`: auto-import on p50 72-84 ms, p95 160-181 ms; off p50 43-45 ms, p95 67-73 ms (see below) | — |
+| | keystroke → name completion (typing words in a method) | — | `Sema.zig`: auto-import on p50 79 ms; off p50 29 ms, p95 40 ms (see below) | — |
 | | save → compiler diagnostics (`check` step) | < 1 s | small projects about 120 ms; Zig compiler 5.2 s | ⚠️ limited by the compiler |
 | | resident memory (long session) | does not grow over the session | Zig compiler source: heap 1.7-1.8 GB and RSS 2.3-2.4 GB from round 120 on, the same after 240 rounds (macOS, see below) | ✅ |
 | Cold start | process start → `initialize` | < 100 ms | 1-9 ms | ✅ |
@@ -70,12 +70,14 @@ On `Sema.zig` with auto-import off, completion p50 is 12.5 ms and p95 30.7 ms, w
 
 ### Typing in a method
 
-`BENCH_TYPE_WORDS` on `zirSliceStart` in `Sema.zig`, where each completion returns about 820 candidates:
+`BENCH_QUICK=1 BENCH_TYPE_WORDS=9796:length,items` on `zirSliceStart` in `Sema.zig`, where each completion returns 750-770 candidates (Linux x86_64, ReleaseSafe, 11 keystrokes):
 
 | Auto-import | completion p50 | completion p95 | Resident memory |
 |---|---|---|---|
-| on | 72-84 ms | 160-181 ms | about 470 MB |
-| off | 43-45 ms | 67-73 ms | about 310 MB |
+| on | 79 ms | 1.1 s (one keystroke: the first evaluation of the auto-import candidates) | about 410 MB |
+| off | 29 ms | 40 ms | about 320 MB |
+
+After a keystroke, the syntax layer of the file costs about 5 ms in an engine-only probe: an incremental reparse of the function body, the item tree, AstId map, summaries and import strings rebuilt from their previous values, and one `ItemSyntax` per member read; no Body of an unedited member is lowered again.
 
 Completion after `.` has p50 2.0-2.6 ms. An expected type changes the latency only within measurement noise.
 

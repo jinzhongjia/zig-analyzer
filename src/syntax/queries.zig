@@ -102,7 +102,7 @@ pub const ParseFile = struct {
     /// An incremental parse result reuses the previous tree's nodes and holds a reference to it:
     /// count the arenas of the whole chain
     pub fn bytes(v: Value) usize {
-        return @sizeOf(Parse) + v.chain_bytes;
+        return @sizeOf(Parse) + v.chain_bytes + v.sourceBytes();
     }
 
     /// Picks the parse mode by path (`.zon` is ZON). When there is a previous result of the same
@@ -418,7 +418,7 @@ pub const FileAstIdMap = struct {
     /// `ParseFile` is evicted)
     pub fn bytes(v: Value) usize {
         const owned: *const Owned = @fieldParentPtr("map", v);
-        return owned.map.bytes() + owned.parse.chain_bytes;
+        return owned.map.bytes() + owned.parse.chain_bytes + owned.parse.sourceBytes();
     }
 
     /// The parse result the nodes of `v` point into
