@@ -197,6 +197,11 @@
           "scope": "machine-overridable",
           "markdownDescription": "Extra environment variables of the server process. Takes effect after restarting the server."
         },
+        "zig-analyzer.server.checkUpdates": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Check once a day whether a newer server release is available, and say so. The check reads a small version file; installing a release is always your choice."
+        },
         "zig-analyzer.trace.server": {
           "type": "string",
           "enum": [

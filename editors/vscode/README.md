@@ -13,12 +13,20 @@ for `.zig` and `.zon` files; and running, debugging, and testing with `zig`.
 ## The server
 
 The extension runs `zig-analyzer.server.path` when it is set, else the release installed by
-**zig-analyzer: Install Server**, else `zig-analyzer` from `PATH`. It downloads nothing by itself:
+**zig-analyzer: Install Server**, else `zig-analyzer` from `PATH`. It installs nothing by itself:
 **Install Server** asks for the latest release (built with ReleaseSafe or ReleaseFast) or a tag
 such as `v0.1.1`, downloads it from
 [GitHub](https://github.com/jinzhongjia/zig-analyzer/releases) into the extension's global storage,
 and restarts the running server with it. When the server cannot start, the error message offers to
 run it.
+
+## Updates
+
+Once a day, after the server starts, the extension reads a small version file
+(`https://zig-analyzer.nvimer.org/latest.json`). When it names a release newer than the running
+server, a message says so and offers the release notes and **Install Server**; nothing is
+downloaded or installed unless you choose it. A failed check is silent. Set
+`zig-analyzer.server.checkUpdates` to `false` to turn the check off.
 
 Before an install, the minisign signature of the release's `SHA256SUMS` must verify with the
 zig-analyzer release key and its trusted comment must name the release, and the archive must have
@@ -58,6 +66,7 @@ Settings of the extension itself:
 
 - `zig-analyzer.server.path`: the server executable.
 - `zig-analyzer.server.extraEnv`: extra environment variables of the server.
+- `zig-analyzer.server.checkUpdates`: check for a newer server release once a day.
 - `zig-analyzer.trace.server`: log the LSP messages to the `zig-analyzer` output channel.
 - `zig-analyzer.debug.adapter`: the debugger type to launch; `lldb` is the CodeLLDB extension.
 
