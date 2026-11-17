@@ -157,7 +157,7 @@ jobs:
     name: Publish the release
     needs: [ci, smoke]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     environment: release
     permissions:
       contents: write
@@ -207,6 +207,53 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/SHA256SUMS
+      # The editor integrations read metadata.json and download the archives from the Worker,
+      # not from GitHub. The objects are written before the GitHub release is published.
+      - name: Deploy the release Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes wrangler@4.163.0 deploy --config updates/wrangler.jsonc
+      - name: Upload the release to the Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          for file in dist/*; do
+            name=$(basename "$file")
+            case "$name" in
+              *.tar.gz) type=application/gzip ;;
+              *.zip) type=application/zip ;;
+              *) type=text/plain ;;
+            esac
+            npx --yes wrangler@4.163.0 r2 object put "zig-analyzer-releases/releases/$GITHUB_REF_NAME/$name" \
+              --file "$file" --content-type "$type" \
+              --cache-control "public, max-age=31536000, immutable" --remote
+          done
+      - name: Update metadata.json
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # A 404 means this is the first release; any other failure must not replace the
+          # versions that the file already has.
+          code=$(curl -sS -o "$RUNNER_TEMP/metadata-existing.json" -w '%{http_code}' \
+            "https://releases.zig-analyzer.dev/metadata.json?release=$GITHUB_REF_NAME" || true)
+          case "$code" in
+            200) ;;
+            404) rm -f "$RUNNER_TEMP/metadata-existing.json" ;;
+            *) echo "::error::cannot read metadata.json: HTTP $code"; exit 1 ;;
+          esac
+          node updates/metadata.mjs \
+            --tag "$GITHUB_REF_NAME" \
+            --released "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --packaging-zig "$ZIG_VERSION" \
+            --artifacts dist \
+            --existing "$RUNNER_TEMP/metadata-existing.json" \
+            --output "$RUNNER_TEMP/metadata.json"
+          npx --yes wrangler@4.163.0 r2 object put "zig-analyzer-releases/metadata.json" \
+            --file "$RUNNER_TEMP/metadata.json" --content-type application/json \
+            --cache-control "public, max-age=300" --remote
       # The notes are the version's section of CHANGELOG.md. The release is created as a draft
       # with all its assets, then published: releases are immutable once published
       - name: Create the GitHub release
@@ -219,28 +266,6 @@ jobs:
           case "$version" in *-*) prerelease=(--prerelease) ;; esac
           gh release create "$GITHUB_REF_NAME" --verify-tag --draft "${prerelease[@]}" --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" dist/*
           gh release edit "$GITHUB_REF_NAME" --draft=false
-
-  # The version file that the editor integrations read (see docs/features/update-check.md); a
-  # pre-release does not change it
-  updates:
-    name: Deploy the update check
-    needs: [release]
-    if: ${{ !contains(github.ref_name, '-') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    environment: release
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Write the version file
-        run: |
-          mkdir -p updates/public
-          printf '{"schema":1,"tag":"%s"}\n' "$GITHUB_REF_NAME" > updates/public/latest.json
-          node -e 'const fs = require("fs"); const j = JSON.parse(fs.readFileSync("updates/public/latest.json", "utf8")); if (j.schema !== 1 || j.tag !== process.env.GITHUB_REF_NAME) process.exit(1)'
-      - name: Deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx --yes wrangler@4.163.0 deploy --config updates/wrangler.jsonc
 
   # The formula of the tap jinzhongjia/homebrew-tap installs the latest release; a pre-release
   # does not change it

@@ -95,9 +95,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: The version file is well formed
-        run: |
-          node -e 'const j = require("./updates/public/latest.json"); if (j.schema !== 1 || !/^v\d+\.\d+\.\d+[0-9A-Za-z.-]*$/.test(j.tag)) process.exit(1)'
+      - name: The metadata generator
+        run: node updates/test/metadata.test.mjs
+      - name: The Worker routes
+        run: node updates/test/worker.test.mjs
       - name: The Worker bundles
         run: npx --yes wrangler@4.163.0 deploy --dry-run --config updates/wrangler.jsonc
 
