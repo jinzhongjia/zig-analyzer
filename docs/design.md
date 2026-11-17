@@ -401,7 +401,7 @@ Results follow the capabilities: `rename.prepareSupport`, `codeActionLiteralSupp
 
 ### Observability
 
-Slow requests are logged (`log.slow_request_ms`), and `-Dtracy=<dir>` enables tracy. Custom requests are prefixed with `zig-analyzer/`, with result fields in `server/Server.zig`: `status` (query execution counts, hit rates, time, and memory; InternPool and heap usage), `fileStatus`, `syntaxTree`, `moduleGraph`, `reloadWorkspace`, and `waitIdle` (returns once background tasks have finished; used by tests and benchmarks).
+Slow requests are logged (`log.slow_request_ms`), and `-Dtracy=<dir>` enables tracy. Custom requests are prefixed with `zig-analyzer/`, with result fields in `server/Server.zig`: `status` (query execution counts, hit rates, time, and memory; InternPool and heap usage), `fileStatus`, `packages` (the `build.zig.zon` of each workspace root and the directories its dependencies resolve to), `syntaxTree`, `moduleGraph`, `reloadWorkspace`, and `waitIdle` (returns once background tasks have finished; used by tests and benchmarks). `workspace/executeCommand` runs `zig-analyzer/fetchDependencyHash` (a code action's command that runs `zig fetch` and applies the hash with `workspace/applyEdit`).
 
 ### Crashes
 

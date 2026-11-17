@@ -29,6 +29,8 @@ const WorkspaceFiles = database.inputs.WorkspaceFiles;
 const syntax_q = database.syntax;
 const live = database.live;
 const ide = za.ide;
+const package_manifest = za.project.manifest;
+const dependency_packages = za.project.packages;
 const compiler = za.diagnostics.compiler;
 const ZigEnv = za.project.ZigEnv;
 const Workspace = @import("Workspace.zig");
@@ -293,6 +295,11 @@ code_action_disabled: bool = false,
 /// The client supports edits with change annotations in `documentChanges`: renaming a public name
 /// requires confirmation from the user
 change_annotations: bool = false,
+/// The client supports `workspace/applyEdit` (`workspace.applyEdit`): the server can apply the
+/// edit that a dependency hash command computes
+apply_edit: bool = false,
+/// ID of the next `workspace/applyEdit` request (the request IDs are `apply_edit_prefix` + this)
+next_apply_edit: std.atomic.Value(u64) = .init(0),
 /// The client supports snippets in completion items (`completionItem.snippetSupport`)
 snippet_support: bool = false,
 /// The client supports insert and replace ranges in completion items
@@ -669,6 +676,8 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
                 .integer => |i| _ = server.progress.handleResponse(server, i, !resp.failed),
                 .string => |s| if (std.mem.startsWith(u8, s, config_request_prefix)) {
                     try server.handleConfigResponse(s, resp.result, resp.failed);
+                } else if (std.mem.startsWith(u8, s, apply_edit_prefix)) {
+                    server.applyEditResponse(resp.result, resp.failed);
                 } else if (std.mem.eql(u8, s, semantic_refresh_id)) {
                     server.semanticRefreshFinished();
                 } else if (std.mem.eql(u8, s, inlay_refresh_id)) {
@@ -727,15 +736,23 @@ const Mode = enum {
     syntax,
 };
 
+/// The command of a code action on a `build.zig.zon` dependency: runs `zig fetch` and applies the
+/// hash to the manifest
+const fetch_hash_command = "zig-analyzer/fetchDependencyHash";
+/// IDs of the `workspace/applyEdit` requests (a string, so that no progress request ID is reused)
+const apply_edit_prefix = "zig-analyzer/apply-edit/";
+
 const request_handlers = .{
     .{ "initialize", Mode.sync, initialize },
     .{ "shutdown", Mode.sync, shutdown },
     .{ "zig-analyzer/waitIdle", Mode.background, waitIdleRequest },
     .{ "zig-analyzer/status", Mode.read, status },
     .{ "zig-analyzer/fileStatus", Mode.read, fileStatus },
+    .{ "zig-analyzer/packages", Mode.read, packagesRequest },
     .{ "zig-analyzer/syntaxTree", Mode.syntax, syntaxTree },
     .{ "zig-analyzer/moduleGraph", Mode.read, moduleGraph },
     .{ "zig-analyzer/reloadWorkspace", Mode.sync, reloadWorkspace },
+    .{ "workspace/executeCommand", Mode.background, executeCommand },
     .{ "textDocument/formatting", Mode.syntax, formatting },
     .{ "textDocument/documentSymbol", Mode.syntax, documentSymbol },
     .{ "textDocument/foldingRange", Mode.syntax, foldingRange },
@@ -6275,6 +6292,7 @@ fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams)
         if (ws.inlayHint) |ih| server.inlay_refresh = ih.refreshSupport orelse false;
         if (ws.semanticTokens) |st| server.semantic_refresh = st.refreshSupport orelse false;
         if (ws.workspaceEdit) |we| server.change_annotations = (we.documentChanges orelse false) and we.changeAnnotationSupport != null;
+        server.apply_edit = ws.applyEdit orelse false;
         if (ws.symbol) |s| if (s.symbolKind) |k| {
             server.workspace_symbol_kinds = k.valueSet != null;
         };
@@ -6361,8 +6379,10 @@ fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams)
             .documentHighlightProvider = .{ .boolean = true },
             .renameProvider = if (server.prepare_rename) .{ .RenameOptions = .{ .prepareProvider = true } } else .{ .boolean = true },
             .workspaceSymbolProvider = .{ .boolean = true },
+            .executeCommandProvider = if (server.apply_edit) .{ .commands = &.{fetch_hash_command} } else null,
             .workspace = .{ .workspaceFolders = .{ .supported = true, .changeNotifications = .{ .boolean = true } } },
-            // Every action carries an edit, which only `CodeAction` literals can hold
+            // Every action is a `CodeAction` literal: most carry an edit, and the dependency hash
+            // action carries a command
             .codeActionProvider = if (server.code_action_literals) .{ .CodeActionOptions = .{
                 .codeActionKinds = &.{ types.CodeActionKind.QuickFix, types.CodeActionKind.RefactorExtract, types.CodeActionKind.RefactorRewrite, types.CodeActionKind.SourceOrganizeImports, types.CodeActionKind.SourceFixAll },
                 .resolveProvider = true,
@@ -7411,7 +7431,8 @@ fn wantsKind(only: ?[]const []const u8, kind: []const u8) bool {
 }
 
 fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.CodeActionParams) HandlerError!types.ResultType("textDocument/codeAction") {
-    // Every action carries an edit, which only `CodeAction` literals can hold
+    // Every action is a `CodeAction` literal: most carry an edit, and the dependency hash action
+    // carries a command
     if (!server.code_action_literals) return null;
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const lines = try sourceLines(r.ctx, file);
@@ -7432,7 +7453,7 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
         if (try ide.code_actions.fixAll(r, file)) |a| try actions.append(arena, a);
     }
     const doc_uri = try server.uriFor(arena, file);
-    const Item = @typeInfo(@typeInfo(types.ResultType("textDocument/codeAction")).optional.child).pointer.child;
+    const Item = CodeActionItem;
     var out: std.ArrayList(Item) = .empty;
     for (actions.items) |a| {
         const kind = switch (a.kind) {
@@ -7479,7 +7500,48 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
             if (try server.namingAction(r, arena, doc_uri, range, f, params.context.diagnostics)) |action| try out.append(arena, .{ .CodeAction = action });
         }
     };
+    if (server.apply_edit and wantsKind(only, types.CodeActionKind.QuickFix)) try server.dependencyHashActions(arena, file, doc_uri, text, start, end, &out);
     return out.items;
+}
+
+/// A code action result item (`CodeAction` or `Command`)
+const CodeActionItem = @typeInfo(@typeInfo(types.ResultType("textDocument/codeAction")).optional.child).pointer.child;
+
+/// Code actions that fetch the hash of a `build.zig.zon` dependency with `zig fetch`. Each action
+/// carries the command that runs the fetch, so the network request starts only when the user picks
+/// it; the edit is computed from the manifest as it is then (see `executeCommand`).
+fn dependencyHashActions(
+    server: *Server,
+    arena: Allocator,
+    file: Vfs.FileId,
+    doc_uri: []const u8,
+    text: []const u8,
+    start: u32,
+    end: u32,
+    out: *std.ArrayList(CodeActionItem),
+) !void {
+    if (!std.mem.eql(u8, std.fs.path.basename(server.vfs.path(file)), "build.zig.zon")) return;
+    const manifest = (try package_manifest.parse(arena, text)) orelse return;
+    const dep = package_manifest.dependencyAt(&manifest, start, end) orelse return;
+    const url = dep.url orelse return;
+    const title = if (dep.hash != null)
+        try std.fmt.allocPrint(arena, "update hash for `{s}`", .{dep.name})
+    else
+        try std.fmt.allocPrint(arena, "fetch hash for `{s}`", .{dep.name});
+    const arguments: std.json.ObjectMap = try .init(arena, &.{ "uri", "dependency", "url" }, &.{
+        .{ .string = doc_uri },
+        .{ .string = dep.name },
+        .{ .string = url },
+    });
+    try out.append(arena, .{ .CodeAction = .{
+        .title = title,
+        .kind = types.CodeActionKind.QuickFix,
+        .command = .{
+            .title = title,
+            .command = fetch_hash_command,
+            .arguments = try arena.dupe(types.LSPAny, &.{.{ .object = arguments }}),
+        },
+    } });
 }
 
 /// Data kept between `textDocument/codeAction` and `codeAction/resolve` (`CodeAction.data`) for
@@ -7579,6 +7641,140 @@ fn codeActionResolve(server: *Server, r: *Resolver, arena: Allocator, params: ty
         }
     }
     return .{ .ok = action };
+}
+
+/// The argument of `fetch_hash_command`: the manifest and the dependency the action was offered on
+const FetchHashArgs = struct {
+    uri: []const u8,
+    dependency: []const u8,
+    url: []const u8,
+};
+
+/// Runs `zig fetch <url>` for a dependency and applies the hash to the manifest with
+/// `workspace/applyEdit`. Runs on a background task, outside any read transaction, because the
+/// download can take a long time; the edit is computed after it, against the manifest as it is then.
+fn executeCommand(server: *Server, arena: Allocator, params: types.ExecuteCommandParams) HandlerError!types.ResultType("workspace/executeCommand") {
+    if (!std.mem.eql(u8, params.command, fetch_hash_command)) return error.InvalidParams;
+    const arguments = params.arguments orelse return error.InvalidParams;
+    if (arguments.len == 0) return error.InvalidParams;
+    const args = std.json.parseFromValueLeaky(FetchHashArgs, arena, arguments[0], .{ .ignore_unknown_fields = true }) catch return error.InvalidParams;
+    if (!server.apply_edit) return error.InvalidParams;
+    const path = (try server.documentPath(arena, args.uri)) orelse return error.InvalidParams;
+    const dir = std.fs.path.dirname(path) orelse return error.InvalidParams;
+
+    const title = try std.fmt.allocPrint(arena, "fetching hash for `{s}`", .{args.dependency});
+    var progress = server.progress.begin(server, title, false);
+    defer if (progress) |p| server.progress.end(server, p, "failed");
+
+    var config = server.configSnapshot() catch |err| return err;
+    defer config.deinit(server.gpa);
+    const argv = [_][]const u8{ config.zig_path orelse "zig", "fetch", args.url };
+    const result = std.process.run(server.gpa, server.io, .{
+        .argv = &argv,
+        .cwd = .{ .path = dir },
+        .environ_map = server.zig_environ.load(.acquire),
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+        // A wrapper script (asdf, mise) or a large download may take a while; a hung one must end
+        .timeout = .{ .duration = .{ .raw = Io.Duration.fromSeconds(120), .clock = .awake } },
+    }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        try server.warnFetch(arena, args.dependency, switch (err) {
+            error.FileNotFound, error.AccessDenied, error.InvalidExe => "the zig executable cannot be run",
+            error.Timeout => "zig fetch timed out",
+            else => @errorName(err),
+        });
+        return null;
+    };
+    defer server.gpa.free(result.stdout);
+    defer server.gpa.free(result.stderr);
+    const code: u8 = switch (result.term) {
+        .exited => |c| c,
+        else => {
+            try server.warnFetch(arena, args.dependency, "zig fetch ended without an exit code");
+            return null;
+        },
+    };
+    if (code != 0) {
+        try server.warnFetch(arena, args.dependency, errorLine(result.stderr) orelse "zig fetch failed");
+        return null;
+    }
+    const hash = fetchedHash(result.stdout) orelse {
+        try server.warnFetch(arena, args.dependency, "zig fetch printed no hash");
+        return null;
+    };
+
+    const edit = blk: {
+        var ctx = server.db.beginRead(arena);
+        defer ctx.end();
+        const file = (try server.lookupFile(arena, args.uri)) orelse try server.vfs.intern(path);
+        const lines = try sourceLines(&ctx, file);
+        const manifest = (try package_manifest.parse(arena, lines.text)) orelse break :blk null;
+        const hash_edit = (try package_manifest.hashEdit(arena, &manifest, args.dependency, args.url, hash)) orelse break :blk null;
+        break :blk .{ .range = lines.range(hash_edit.start, hash_edit.end, server.encoding), .newText = hash_edit.text };
+    } orelse {
+        try server.warnFetch(arena, args.dependency, "the dependency changed since the action was offered");
+        return null;
+    };
+
+    var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
+    try changes.map.put(arena, args.uri, try arena.dupe(types.TextEdit, &.{.{ .range = edit.range, .newText = edit.newText }}));
+    const label = try std.fmt.allocPrint(arena, "zig-analyzer: hash of `{s}`", .{args.dependency});
+    const id = try std.fmt.allocPrint(arena, "{s}{d}", .{ apply_edit_prefix, server.next_apply_edit.fetchAdd(1, .monotonic) });
+    server.sendRequest(.{ .string = id }, "workspace/applyEdit", types.ApplyWorkspaceEditParams{
+        .label = label,
+        .edit = .{ .changes = changes },
+    });
+    server.progress.end(server, progress, "fetched");
+    progress = null;
+    return null;
+}
+
+/// Reports why a dependency hash could not be computed or applied
+fn warnFetch(server: *Server, arena: Allocator, dependency: []const u8, reason: []const u8) Allocator.Error!void {
+    server.showWarning(try std.fmt.allocPrint(arena, "cannot fetch the hash of `{s}`: {s}", .{ dependency, reason }));
+}
+
+/// The hash `zig fetch` prints: its last non-empty line, when it has no whitespace or quote
+fn fetchedHash(stdout: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, stdout, '\n');
+    var last: ?[]const u8 = null;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len != 0) last = trimmed;
+    }
+    const hash = last orelse return null;
+    for (hash) |c| if (std.ascii.isWhitespace(c) or c == '"' or c == '\\') return null;
+    return hash;
+}
+
+/// The last non-empty line of `stderr`, as the reason shown to the user
+fn errorLine(stderr: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, stderr, '\n');
+    var last: ?[]const u8 = null;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len != 0) last = trimmed;
+    }
+    return last;
+}
+
+/// The client's answer to `workspace/applyEdit`: says so when it did not apply the edit
+fn applyEditResponse(server: *Server, result: json.Value, failed: bool) void {
+    if (failed) {
+        log.warn("the client rejected workspace/applyEdit", .{});
+        server.showWarning("cannot apply the dependency hash: the client rejected the edit");
+        return;
+    }
+    if (result != .object) return;
+    const applied = result.object.get("applied") orelse return;
+    if (applied == .bool and applied.bool) return;
+    const reason = if (result.object.get("failureReason")) |r| switch (r) {
+        .string => |s| s,
+        else => "the client did not apply the edit",
+    } else "the client did not apply the edit";
+    var buf: [1024]u8 = undefined;
+    server.showWarning(std.fmt.bufPrint(&buf, "cannot apply the dependency hash: {s}", .{reason}) catch "cannot apply the dependency hash");
 }
 
 /// Renames a name that violates the naming conventions to the suggested spelling. Returns only
@@ -7694,6 +7890,41 @@ const FileStatusResult = struct {
     single_file_roots: []const []const u8,
 };
 
+/// The packages of each workspace root: the `build.zig.zon` fields, and for each dependency
+/// whether its directory is on disk and where its manifest and build script are
+const PackagesResult = struct {
+    projects: []const Project,
+
+    const Project = struct {
+        root: []const u8,
+        manifest: []const u8,
+        name: ?[]const u8,
+        version: ?[]const u8,
+        fingerprint: ?[]const u8,
+        minimum_zig_version: ?[]const u8,
+        /// `[""]` means every file is included
+        paths: []const []const u8,
+        dependencies: []const Dependency,
+        /// Why the manifest could not be read; the other fields are then empty
+        parse_error: ?[]const u8,
+    };
+
+    const Dependency = struct {
+        name: []const u8,
+        kind: enum { url, path, none },
+        url: ?[]const u8,
+        path: ?[]const u8,
+        hash: ?[]const u8,
+        lazy: ?bool,
+        /// Where the dependency is expected: the `.path` resolved against the project, or the
+        /// package directory entry of a `.hash`
+        root: ?[]const u8,
+        exists: bool,
+        manifest: ?[]const u8,
+        build_zig: ?[]const u8,
+    };
+};
+
 /// How the file is treated: origin, compile context, the modules and
 /// projects it belongs to, the related single-file compiles. Used to
 /// diagnose problems that users report with diagnostics or name resolution.
@@ -7739,6 +7970,100 @@ fn moduleName(server: *Server, g: *const ModuleGraph, module: u32) []const u8 {
     if (module == ModuleGraph.std_module) return "std";
     const root = g.modules[module].root orelse return "";
     return server.vfs.path(root);
+}
+
+/// The `build.zig.zon` of each workspace root, with its dependencies and the directories they
+/// resolve to. The manifest text is the open buffer when there is one, the file on disk otherwise.
+fn packagesRequest(server: *Server, ctx: *Db.Ctx, arena: Allocator, _: void) HandlerError!PackagesResult {
+    const roots = try server.rootsAlloc(arena);
+    const workspaces = try server.workspaceList(arena);
+    defer server.releaseList(arena, workspaces);
+    var projects: std.ArrayList(PackagesResult.Project) = .empty;
+    var config = try server.configSnapshot();
+    defer config.deinit(server.gpa);
+    const env_pkg_dir: ?[]const u8 = if (server.zig_environ.load(.acquire)) |m| m.get("ZIG_LOCAL_PKG_DIR") else server.environ.getAlloc(arena, "ZIG_LOCAL_PKG_DIR") catch null;
+    for (roots) |root| {
+        // A project's `zig-analyzer.zon` can set `build.args` (such as `--pkg-dir`) and its
+        // environment can name the package directory
+        var build_args: []const []const u8 = config.build_args;
+        var pkg_env = env_pkg_dir;
+        for (workspaces) |ws| if (server.vfs.samePath(ws.root, root)) {
+            build_args = ws.config.build_args;
+            if (ws.env.childEnviron()) |m| pkg_env = m.get("ZIG_LOCAL_PKG_DIR");
+            break;
+        };
+        const manifest_path = try std.fs.path.join(arena, &.{ root, "build.zig.zon" });
+        const known = try server.vfs.lookup(manifest_path);
+        if (known == null and accessible(server.io, manifest_path) == null) continue;
+        const file = known orelse try server.vfs.intern(manifest_path);
+        const lines = try sourceLines(ctx, file);
+        var project: PackagesResult.Project = .{
+            .root = root,
+            .manifest = manifest_path,
+            .name = null,
+            .version = null,
+            .fingerprint = null,
+            .minimum_zig_version = null,
+            .paths = &.{},
+            .dependencies = &.{},
+            .parse_error = null,
+        };
+        const manifest = try package_manifest.parse(arena, lines.text) orelse {
+            project.parse_error = "cannot parse build.zig.zon";
+            try projects.append(arena, project);
+            continue;
+        };
+        project.name = manifest.name;
+        project.version = manifest.version;
+        project.fingerprint = manifest.fingerprint;
+        project.minimum_zig_version = manifest.minimum_zig_version;
+        project.paths = manifest.paths;
+        const pkg_dir = try dependency_packages.packageDir(arena, root, build_args, pkg_env);
+        const dependencies = try arena.alloc(PackagesResult.Dependency, manifest.dependencies.len);
+        for (manifest.dependencies, dependencies) |dep, *out| {
+            const kind: @FieldType(PackagesResult.Dependency, "kind") = if (dep.url != null) .url else if (dep.path != null) .path else .none;
+            const resolved: ?[]const u8 = if (dep.path) |p|
+                try std.fs.path.resolveAlloc(arena, &.{ root, p })
+            else if (dep.url != null and dep.hash != null)
+                try std.fs.path.join(arena, &.{ pkg_dir, dep.hash.? })
+            else
+                null;
+            out.* = .{
+                .name = dep.name,
+                .kind = kind,
+                .url = dep.url,
+                .path = dep.path,
+                .hash = dep.hash,
+                .lazy = dep.lazy,
+                .root = resolved,
+                .exists = false,
+                .manifest = null,
+                .build_zig = null,
+            };
+            if (resolved) |dir| {
+                out.exists = accessible(server.io, dir) != null;
+                if (out.exists) {
+                    out.manifest = try existingPath(server.io, arena, dir, "build.zig.zon");
+                    out.build_zig = try existingPath(server.io, arena, dir, "build.zig");
+                }
+            }
+        }
+        project.dependencies = dependencies;
+        try projects.append(arena, project);
+    }
+    return .{ .projects = projects.items };
+}
+
+fn accessible(io: Io, path: []const u8) ?void {
+    Io.Dir.cwd().access(io, path, .{}) catch return null;
+    return {};
+}
+
+/// `<dir>/<name>` when it exists, null otherwise
+fn existingPath(io: Io, arena: Allocator, dir: []const u8, name: []const u8) Allocator.Error!?[]const u8 {
+    const path = try std.fs.path.join(arena, &.{ dir, name });
+    if (accessible(io, path) == null) return null;
+    return path;
 }
 
 /// Syntax tree of the document: indented nodes and tokens (without trivia) with their byte ranges,
@@ -7924,6 +8249,7 @@ test {
     _ = @import("Server_test.zig");
     _ = @import("semantic_tokens_test.zig");
     _ = @import("build_e2e_test.zig");
+    _ = @import("packages_e2e_test.zig");
     _ = @import("compiler_e2e_test.zig");
     _ = @import("names_e2e_test.zig");
     _ = @import("refs_e2e_test.zig");
