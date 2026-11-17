@@ -1108,6 +1108,10 @@ const Evaluator = struct {
     /// `.unknown` when pointers into it record no place (see `constantRoot`). Anonymous constants
     /// cannot be written, so it is computed once.
     frozen_constants: std.AutoHashMapUnmanaged(*const Val, Index) = .empty,
+    /// The fields of each container type (see `fieldsOf`), read while the result was not
+    /// incomplete: the `DeclType` memos they come from do not change within a read transaction.
+    /// Allocated in `a`
+    container_fields: std.AutoHashMapUnmanaged(Index, []const Field) = .empty,
 
     fn deinit(ev: *Evaluator) void {
         if (!ev.owns_calls) return;
@@ -1714,6 +1718,7 @@ const Evaluator = struct {
         switch (ip.key(t)) {
             .container_type => |c| {
                 if (c.kind == .@"enum" or c.kind == .@"opaque") return &.{};
+                if (ev.container_fields.get(t)) |fields| return fields;
                 const ns = try queries.namespaceOfType(ev.r, t) orelse return null;
                 const tree = try ev.r.itemTree(ns.file);
                 var out: std.ArrayList(Field) = .empty;
@@ -1723,6 +1728,7 @@ const Evaluator = struct {
                     const ty = (try queries.defType(ev.r, .{ .item = .{ .file = ns.file, .item = m } }, null, c.inst)).ty;
                     try out.append(ev.a, .{ .name = it.name orelse "", .ty = ty, .item = m });
                 }
+                if (!ev.r.ctx.incomplete()) try ev.container_fields.put(ev.a, t, out.items);
                 return out.items;
             },
             .tuple_type => |tt| {
