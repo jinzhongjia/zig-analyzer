@@ -2,22 +2,26 @@
 //!
 //! 1. Any byte input parses into a lossless syntax tree without crashing or hanging;
 //! 2. For any edit to any text, local reparse gives exactly the same result as a full parse
-//!    (including reuse chains formed by consecutive edits), including deeply nested text.
+//!    (including reuse chains formed by consecutive edits), including deeply nested text;
+//! 3. The values rebuilt incrementally from the previous ones after a reparse (ItemTree, AstIdMap,
+//!    item summaries, import strings) equal those built from scratch.
 
 const std = @import("std");
 const testing = std.testing;
 const Parse = @import("Parse.zig");
 const Entropy = @import("../util/Entropy.zig");
+const incremental = @import("incremental_check.zig");
 
 /// Pieces favor structural tokens of Zig syntax, which more readily trigger the various
 /// recovery and reparse paths
 const pieces = [_][]const u8{
-    "{",      "}",   "(",      ")",      "[",     "]",     ";",        ",",     ".",      ":",
-    "=",      "\n",  " ",      "\"",     "'",     "//",    "///",      "\\\\",  "fn",     "f",
-    "const",  "var", "pub",    "struct", "enum",  "union", "if",       "else",  "while",  "for",
-    "switch", "=>",  "return", "try",    "catch", "|x|",   "comptime", "test",  "error",  "!",
-    "?",      "*",   "&",      "..",     "...",   "@as",   "1",        "0x1p3", "blk:",   "break",
-    ".{",     "a.b", "x()",    "u32",    "\t",    "\r\n",  "\xff",     "\x00",  "extern", "packed",
+    "{",                  "}",   "(",      ")",      "[",     "]",     ";",        ",",     ".",      ":",
+    "=",                  "\n",  " ",      "\"",     "'",     "//",    "///",      "\\\\",  "fn",     "f",
+    "const",              "var", "pub",    "struct", "enum",  "union", "if",       "else",  "while",  "for",
+    "switch",             "=>",  "return", "try",    "catch", "|x|",   "comptime", "test",  "error",  "!",
+    "?",                  "*",   "&",      "..",     "...",   "@as",   "1",        "0x1p3", "blk:",   "break",
+    ".{",                 "a.b", "x()",    "u32",    "\t",    "\r\n",  "\xff",     "\x00",  "extern", "packed",
+    "@import(\"a.zig\")",
 };
 
 fn repeat(comptime s: []const u8, comptime n: usize) []const u8 {
@@ -84,6 +88,8 @@ fn checkEdits(input: []const u8, deep: bool) !void {
     var chain = try Parse.create(a, text.items, .zig);
     defer chain.destroy();
     try expectLossless(chain, text.items);
+    var derived: incremental.Derived = try .init(a, chain);
+    defer derived.deinit(a);
 
     const edits = e.below(6);
     for (0..edits) |_| {
@@ -102,6 +108,10 @@ fn checkEdits(input: []const u8, deep: bool) !void {
             return error.TestUnexpectedResult;
         }
         try expectLossless(inc, text.items);
+        if (!try derived.advance(a, inc)) {
+            std.debug.print("incremental and full derived values differ:\n---\n{s}\n---\n", .{text.items});
+            return error.TestUnexpectedResult;
+        }
     }
 }
 

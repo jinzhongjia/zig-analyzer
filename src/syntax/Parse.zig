@@ -51,12 +51,37 @@ root: *const green.GreenNode,
 errors: []const parser.Error,
 /// Reference count: the query engine holds one; each incremental result built on this one holds one
 refs: std.atomic.Value(u32) = .init(1),
+/// The references that may read `source` (all but those of the results built on this one)
+users: std.atomic.Value(u32) = .init(1),
+/// `source` is allocated on its own and freed with the last user: the tokens of an incremental
+/// result point into the reparsed fragments, never into `source`, so the results built on it
+/// need only its arena. Otherwise every result along a chain would keep a copy of the whole text.
+/// A full parse's tokens point into its `source`, which then lives in the arena
+owns_source: bool = false,
 /// The previous result whose nodes the incremental reparse reused
 base: ?*Parse = null,
 /// Total capacity of all arenas along the chain (including this one)
 chain_bytes: usize,
 /// Arena capacity of the full parse at the bottom of the chain
 full_bytes: usize,
+/// Unique among all parse results of the process (never reused), so that a value derived from one
+/// result can tell whether that result is still alive in another result's chain (see `inChain`)
+id: u64,
+
+var next_id: std.atomic.Value(u64) = .init(1);
+
+fn newId() u64 {
+    return next_id.fetchAdd(1, .monotonic);
+}
+
+/// The result with id `id` among `self` and the results it was built on (`base`), which it keeps
+/// alive: the green nodes of that result can be compared with those of `self` by pointer. Only
+/// its tree may be read: the `source` of a result built on may already be freed
+pub fn inChain(self: *const Parse, id: u64) ?*const Parse {
+    var p: ?*const Parse = self;
+    while (p) |x| : (p = x.base) if (x.id == id) return x;
+    return null;
+}
 
 pub fn create(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Parse {
     return createIn(gpa, text, mode, .latest);
@@ -94,6 +119,7 @@ pub fn createIn(gpa: Allocator, text: []const u8, mode: Mode, dialect: Dialect) 
         .root = root,
         .errors = errors,
         .chain_bytes = 0,
+        .id = newId(),
         .full_bytes = 0,
     };
     result.arena = arena;
@@ -104,17 +130,35 @@ pub fn createIn(gpa: Allocator, text: []const u8, mode: Mode, dialect: Dialect) 
 
 /// Adds a reference (paired with `destroy`)
 pub fn retain(self: *Parse) *Parse {
+    _ = self.users.fetchAdd(1, .monotonic);
     _ = self.refs.fetchAdd(1, .monotonic);
     return self;
 }
 
-/// Releases a reference; the last release destroys the arena and releases the reference to base.
+/// Releases a reference; the last one frees the source of an incremental result, and the arena
+/// is destroyed once the results built on this one are gone too.
 pub fn destroy(self: *Parse) void {
+    if (self.users.fetchSub(1, .acq_rel) == 1 and self.owns_source) self.gpa.free(self.source);
+    self.release();
+}
+
+/// The reference an incremental result holds on the result it was built on
+fn retainBase(self: *Parse) void {
+    _ = self.refs.fetchAdd(1, .monotonic);
+}
+
+/// Releases a reference; the last release destroys the arena and releases the reference to base.
+fn release(self: *Parse) void {
     if (self.refs.fetchSub(1, .acq_rel) != 1) return;
     const base = self.base;
     var arena = self.arena;
     arena.deinit();
-    if (base) |b| b.destroy();
+    if (base) |b| b.release();
+}
+
+/// Bytes of the source when it is not in the arena (see `owns_source`)
+pub fn sourceBytes(self: *const Parse) usize {
+    return if (self.owns_source) self.source.len + 1 else 0;
 }
 
 pub fn rootNode(self: *const Parse) tree.SyntaxNode {
@@ -288,22 +332,26 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
     for (events.errors) |e| try errors.append(a, .{ .offset = e.offset + old_range.start, .message = e.message });
     sortErrors(errors.items);
 
+    const source = try gpa.dupeSentinel(u8, text, 0);
+    errdefer gpa.free(source);
     const result = try a.create(Parse);
     result.* = .{
         .arena = undefined,
         .gpa = gpa,
         .mode = old.mode,
         .dialect = old.dialect,
-        .source = try a.dupeSentinel(u8, text, 0),
+        .source = source,
+        .owns_source = true,
         .root = new_node,
         .errors = errors.items,
         .base = old,
         .chain_bytes = 0,
+        .id = newId(),
         .full_bytes = old.full_bytes,
     };
     result.arena = arena;
     result.chain_bytes = old.chain_bytes + result.arena.queryCapacity();
-    _ = old.retain();
+    old.retainBase();
     return result;
 }
 
@@ -450,22 +498,26 @@ fn reparseFrom(gpa: Allocator, old: *Parse, text: []const u8, from: TopMember, e
     for (events.errors) |e| try errors.append(a, .{ .offset = e.offset + from.start, .message = e.message });
     sortErrors(errors.items);
 
+    const source = try gpa.dupeSentinel(u8, text, 0);
+    errdefer gpa.free(source);
     const result = try a.create(Parse);
     result.* = .{
         .arena = undefined,
         .gpa = gpa,
         .mode = old.mode,
         .dialect = old.dialect,
-        .source = try a.dupeSentinel(u8, text, 0),
+        .source = source,
+        .owns_source = true,
         .root = new_root,
         .errors = errors.items,
         .base = old,
         .chain_bytes = 0,
+        .id = newId(),
         .full_bytes = old.full_bytes,
     };
     result.arena = arena;
     result.chain_bytes = old.chain_bytes + result.arena.queryCapacity();
-    _ = old.retain();
+    old.retainBase();
     return result;
 }
 

@@ -71,7 +71,7 @@ test "ParseFile bytes include the incremental chain" {
     defer inc.destroy();
     try testing.expect(inc.base != null);
     try testing.expect(inc.chain_bytes > inc.arena.queryCapacity());
-    try testing.expectEqual(@sizeOf(Parse) + inc.chain_bytes, q.ParseFile.bytes(inc));
+    try testing.expectEqual(@sizeOf(Parse) + inc.chain_bytes + inc.source.len + 1, q.ParseFile.bytes(inc));
 }
 
 test "changing the dialect parses files again by its rules" {

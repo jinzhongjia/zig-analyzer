@@ -18,6 +18,8 @@ pub const syntax = struct {
     pub const FileIndex = @import("syntax/FileIndex.zig");
     pub const ErrorSets = @import("syntax/ErrorSets.zig");
     pub const nesting = @import("syntax/nesting.zig");
+    /// Test-only: checks the incremental syntax-layer values against those built from scratch
+    pub const incremental_check = @import("syntax/incremental_check.zig");
     pub const SyntaxKind = @import("syntax/kind.zig").SyntaxKind;
     pub const SyntaxNode = tree.SyntaxNode;
     pub const SyntaxToken = tree.SyntaxToken;

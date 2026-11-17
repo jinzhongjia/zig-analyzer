@@ -37,6 +37,41 @@ pub const OwnerKey = struct {
     item: ItemTree.AstId,
 };
 
+/// The syntax a member's Body is lowered from, without its position: a hash of the member's
+/// text and how it is lowered. Any edit in a file changes `FileAstIdMap` (compared by pointer and
+/// holding absolute positions), so this query runs for every member after each edit; it is cheap,
+/// and an unchanged member keeps its value, so its `ItemBody` (in memory or evicted) is not
+/// lowered again.
+pub const ItemSyntax = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = OwnerKey;
+    pub const Value = Source;
+
+    pub const Source = struct {
+        /// Wyhash of the text of the member node under two seeds (of the root node when
+        /// the member is not found)
+        hash: [2]u64,
+        len: u32,
+        owner: lower_mod.Owner,
+    };
+
+    pub fn compute(ctx: anytype, key: Key) engine.Error!Value {
+        const parse = try ctx.get(syntax.ParseFile, key.file);
+        const found = (try ctx.get(syntax.FileAstIdMap, key.file)).get(key.item);
+        const node = found orelse parse.rootNode();
+        const text = node.text(parse.source);
+        return .{
+            .hash = .{ std.hash.Wyhash.hash(0, text), std.hash.Wyhash.hash(0x9e3779b97f4a7c15, text) },
+            .len = @intCast(text.len),
+            .owner = if (found != null) try ownerOf(ctx, key, node) else .member,
+        };
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return a.hash[0] == b.hash[0] and a.hash[1] == b.hash[1] and a.len == b.len and a.owner == b.owner;
+    }
+};
+
 /// HIR of a member. When the contents of the Body (positions relative to the owner) are
 /// unchanged, it counts as unchanged and downstream queries are not recomputed
 pub const ItemBody = struct {
@@ -53,46 +88,28 @@ pub const ItemBody = struct {
         return @sizeOf(Owned) + mem.arenaBytes(v.arena);
     }
 
-    /// A Body together with the source of the member it was lowered from: when the text is
-    /// unchanged, the next computation reuses it directly (reference counted, the same way
-    /// `ParseFile` reuses an old result)
     const Owned = struct {
         body: Body,
-        refs: std.atomic.Value(u32) = .init(1),
-        source_hash: u64,
-        owner: lower_mod.Owner,
+        source: ItemSyntax.Source,
 
         fn of(v: Value) *Owned {
             return @alignCast(@fieldParentPtr("body", @constCast(v)));
         }
     };
 
-    /// Any edit in a file changes `FileAstIdMap` (compared by pointer), so the Body of every
-    /// member is recomputed: when the source text of the member and the lowering parameters are
-    /// unchanged, the previous Body is reused (lowering reads only the member's own syntax tree,
-    /// and positions are relative to the start of the member) instead of lowering again.
-    /// Features that need every member of the file, such as inactive code, would otherwise
-    /// re-lower thousands of members on every edit in a large file
-    pub fn computeIncremental(ctx: anytype, key: Key, prev: ?Value) engine.Error!Value {
-        const map = try ctx.get(syntax.FileAstIdMap, key.file);
-        const parse = try ctx.get(syntax.ParseFile, key.file);
-        // When it is not found (the member was deleted), lower the root node as a member: it is
-        // not a member, so the Body is empty
-        const found = map.get(key.item);
-        const node = found orelse parse.rootNode();
-        const owner: lower_mod.Owner = if (found != null) try ownerOf(ctx, key, node) else .member;
-        const source_hash = std.hash.Wyhash.hash(0, node.text(parse.source));
-        if (prev) |p| {
-            const o = Owned.of(p);
-            if (o.source_hash == source_hash and o.owner == owner) {
-                _ = o.refs.fetchAdd(1, .monotonic);
-                return p;
-            }
-        }
+    /// Lowering reads only the member's own syntax tree, and positions in the Body are relative to
+    /// the start of the member, so the Body is determined by `ItemSyntax`: that is the only
+    /// recorded dependency, and the node itself is located through an untracked read of
+    /// `FileAstIdMap`. When the member is not found (it was deleted), the root node is lowered as
+    /// a member: it is not a member, so the Body is empty
+    pub fn compute(ctx: anytype, key: Key) engine.Error!Value {
+        const source = try ctx.get(ItemSyntax, key);
+        const parse = try ctx.getUntracked(syntax.ParseFile, key.file);
+        const node = (try ctx.getUntracked(syntax.FileAstIdMap, key.file)).get(key.item) orelse parse.rootNode();
         const gpa = ctx.db.gpa;
         const result = try gpa.create(Owned);
         errdefer gpa.destroy(result);
-        result.* = .{ .body = try lower(gpa, node, owner), .source_hash = source_hash, .owner = owner };
+        result.* = .{ .body = try lower(gpa, node, source.owner), .source = source };
         return &result.body;
     }
 
@@ -100,16 +117,19 @@ pub const ItemBody = struct {
         return a == b or a.eql(b);
     }
 
-    /// What `computeIncremental` reuses a Body by: when the file is edited elsewhere while the
-    /// Body is evicted, the recomputed Body keeps its changed_at, as a Body in memory is reused
+    /// What the Body is lowered from (see `ItemSyntax`): when the member's text changes and then
+    /// changes back while the Body is evicted, the recomputed Body keeps its changed_at
     pub fn fingerprint(v: Value) u128 {
-        const o = Owned.of(v);
-        return @as(u128, o.source_hash) << 64 | @backingInt(o.owner);
+        const s = Owned.of(v).source;
+        var h: std.crypto.auth.siphash.SipHash128(1, 3) = .init(&@splat(0));
+        h.update(std.mem.sliceAsBytes(&s.hash));
+        h.update(std.mem.asBytes(&s.len));
+        h.update(&.{@as(u8, @backingInt(s.owner))});
+        return h.finalInt();
     }
 
     pub fn deinit(v: *Value, gpa: Allocator) void {
         const o = Owned.of(v.*);
-        if (o.refs.fetchSub(1, .acq_rel) != 1) return;
         o.body.deinit(gpa);
         gpa.destroy(o);
     }

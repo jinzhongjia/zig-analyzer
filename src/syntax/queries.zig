@@ -102,7 +102,7 @@ pub const ParseFile = struct {
     /// An incremental parse result reuses the previous tree's nodes and holds a reference to it:
     /// count the arenas of the whole chain
     pub fn bytes(v: Value) usize {
-        return @sizeOf(Parse) + v.chain_bytes;
+        return @sizeOf(Parse) + v.chain_bytes + v.sourceBytes();
     }
 
     /// Picks the parse mode by path (`.zon` is ZON). When there is a previous result of the same
@@ -147,12 +147,22 @@ pub const FileItemTree = struct {
         return @sizeOf(ItemTree) + mem.arenaBytes(v.arena);
     }
 
-    pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
+    /// After an incremental parse, copies the members whose top-level node the new tree shares
+    /// with the tree of `prev` (see `ItemTree.buildIncremental`)
+    pub fn computeIncremental(ctx: anytype, file: Key, prev: ?Value) engine.Error!Value {
         const parse = try ctx.get(ParseFile, file);
         const gpa = ctx.db.gpa;
         const result = try gpa.create(ItemTree);
         errdefer gpa.destroy(result);
-        result.* = try ItemTree.build(gpa, parse.rootNode(), parse.mode);
+        const old: ?*const Parse = if (prev) |p| (if (parse.mode == .zig) parse.inChain(p.basis.load(.monotonic)) else null) else null;
+        result.* = if (old) |o|
+            try ItemTree.buildIncremental(gpa, parse.rootNode(), prev.?, o.rootNode())
+        else
+            try ItemTree.build(gpa, parse.rootNode(), parse.mode);
+        result.basis.store(parse.id, .monotonic);
+        // An equal tree replaces nothing (early cutoff keeps `prev`): `prev` now describes this
+        // parse result too, so the next edit can copy from it
+        if (prev) |p| if (p.eql(result)) @constCast(p).basis.store(parse.id, .monotonic);
         return result;
     }
 
@@ -217,40 +227,100 @@ pub const ItemSummaries = struct {
     pub const Value = *const Summaries;
 
     pub fn bytes(v: Value) usize {
-        return @sizeOf(Summaries) + v.items.len * @sizeOf(ItemSummary) + v.container_offsets.len * @sizeOf(?u32);
+        return @sizeOf(Summaries) + v.items.len * @sizeOf(ItemSummary) + v.container_offsets.len * @sizeOf(?u32) + v.top_item_ends.len * @sizeOf(u32);
     }
 
     pub const Summaries = struct {
         items: []ItemSummary,
         /// Start offset of the container node in the file; null when the node is not found
         container_offsets: []?u32,
+        /// The end of the item range of each top-level member (see `AstIdMap.top_item_ends`)
+        top_item_ends: []const u32,
+        /// Id of a parse result whose tree has the names of `items` (`Parse.id`), the tree these
+        /// summaries were built from or one with equal summaries; not compared by `eql`
+        basis: std.atomic.Value(u64) = .init(0),
+
+        fn deinit(s: *Summaries, gpa: Allocator) void {
+            gpa.free(s.items);
+            gpa.free(s.container_offsets);
+            gpa.free(s.top_item_ends);
+            gpa.destroy(s);
+        }
     };
 
-    pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
+    /// After an incremental parse, copies from `prev` the names of the top-level members whose
+    /// node the new tree shares with the tree `prev` describes (see `build`)
+    pub fn computeIncremental(ctx: anytype, file: Key, prev: ?Value) engine.Error!Value {
         const items = try ctx.get(FileItemTree, file);
         const map = try ctx.get(FileAstIdMap, file);
-        const gpa = ctx.db.gpa;
+        const parse = FileAstIdMap.parseOf(map);
+        const old: ?*const Parse = if (prev) |p| parse.inChain(p.basis.load(.monotonic)) else null;
+        const result = try build(ctx.db.gpa, items, map, if (old) |o| .{ .prev = prev.?, .old_root = o.rootNode() } else null);
+        result.basis.store(parse.id, .monotonic);
+        if (prev) |p| if (eql(p, result) and std.mem.eql(u32, p.top_item_ends, result.top_item_ends)) {
+            @constCast(p).basis.store(parse.id, .monotonic);
+        };
+        return result;
+    }
+
+    pub const Reuse = struct {
+        prev: *const Summaries,
+        /// The root of the tree `prev` describes; must still be alive
+        old_root: ast.SyntaxNode,
+    };
+
+    /// The summaries of `items` with the nodes of `map`. With `reuse`, the name filter of each
+    /// top-level member whose node is the same green node as in `reuse.old_root` is copied: it
+    /// depends only on the member's subtree
+    pub fn build(gpa: Allocator, items: *const ItemTree, map: *const ItemTree.AstIdMap, reuse: ?Reuse) Allocator.Error!*Summaries {
         const out = try gpa.create(Summaries);
         errdefer gpa.destroy(out);
+        out.* = .{ .items = &.{}, .container_offsets = &.{}, .top_item_ends = &.{} };
         out.items = try gpa.alloc(ItemSummary, items.items.len);
         errdefer gpa.free(out.items);
         out.container_offsets = try gpa.alloc(?u32, items.containers.len);
+        errdefer gpa.free(out.container_offsets);
+        out.top_item_ends = try gpa.dupe(u32, map.top_item_ends);
+        errdefer gpa.free(out.top_item_ends);
+        // Old top-level member by green node, with the start of its item range
+        var old_tops: std.AutoHashMapUnmanaged(*const @import("green.zig").GreenNode, [2]u32) = .empty;
+        defer old_tops.deinit(gpa);
+        if (reuse) |r| {
+            var it = r.old_root.children();
+            var k: usize = 0;
+            var start: u32 = 0;
+            while (it.nextNode()) |member| {
+                if (!ItemTree.isMemberKind(member.kind())) continue;
+                if (k == r.prev.top_item_ends.len) break;
+                try old_tops.put(gpa, member.green, .{ start, r.prev.top_item_ends[k] });
+                start = r.prev.top_item_ends[k];
+                k += 1;
+            }
+        }
         // Decoded names are only hashed; temporary allocations are freed after this computation
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
-        for (items.items, out.items) |it, *o| {
-            const node = map.get(it.ast_id) orelse {
-                o.* = .{ .offset = null };
-                continue;
-            };
+        for (items.items, out.items, map.items) |it, *o, node| {
             o.* = .{ .offset = node.offset };
             if (ast.memberName(node, ItemTree.bareFieldNames(items.containers[it.container].kind))) |t| {
                 o.name_offset = t.offset;
                 o.name_len = @intCast(t.text.len);
             }
-            try collectNames(scratch.allocator(), node, o);
         }
-        for (items.containers, out.container_offsets) |c, *o| o.* = if (map.get(c.ast_id)) |n| n.offset else null;
+        var start: u32 = 0;
+        for (map.top_item_ends) |end| {
+            const member = map.items[start];
+            if (old_tops.get(member.green)) |range| if (range[1] - range[0] == end - start) {
+                for (out.items[start..end], reuse.?.prev.items[range[0]..range[1]]) |*o, old| o.names = old.names;
+                start = end;
+                continue;
+            };
+            for (out.items[start..end], map.items[start..end]) |*o, node| try collectNames(scratch.allocator(), node, o);
+            start = end;
+        }
+        // Items outside the top-level members (the root expression of a ZON file)
+        for (out.items[start..], map.items[start..]) |*o, node| try collectNames(scratch.allocator(), node, o);
+        for (out.container_offsets, map.containers) |*o, n| o.* = n.offset;
         return out;
     }
 
@@ -262,16 +332,15 @@ pub const ItemSummaries = struct {
         };
     }
 
+    /// Compares fields, not bytes: the padding of `?u32` is undefined
     pub fn eql(a: Value, b: Value) bool {
-        return std.mem.eql(u8, std.mem.sliceAsBytes(a.items), std.mem.sliceAsBytes(b.items)) and
-            std.mem.eql(?u32, a.container_offsets, b.container_offsets);
+        if (a.items.len != b.items.len) return false;
+        for (a.items, b.items) |x, y| if (!std.meta.eql(x, y)) return false;
+        return std.mem.eql(?u32, a.container_offsets, b.container_offsets);
     }
 
     pub fn deinit(v: *Value, gpa: Allocator) void {
-        const s: *Summaries = @constCast(v.*);
-        gpa.free(s.items);
-        gpa.free(s.container_offsets);
-        gpa.destroy(s);
+        @constCast(v.*).deinit(gpa);
     }
 };
 
@@ -349,16 +418,28 @@ pub const FileAstIdMap = struct {
     /// `ParseFile` is evicted)
     pub fn bytes(v: Value) usize {
         const owned: *const Owned = @fieldParentPtr("map", v);
-        return owned.map.bytes() + owned.parse.chain_bytes;
+        return owned.map.bytes() + owned.parse.chain_bytes + owned.parse.sourceBytes();
     }
 
-    pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
+    /// The parse result the nodes of `v` point into
+    pub fn parseOf(v: Value) *const Parse {
+        const owned: *const Owned = @fieldParentPtr("map", v);
+        return owned.parse;
+    }
+
+    /// `prev` holds its parse result, so its nodes can be compared with the new ones by pointer:
+    /// the nodes of the top-level members the new tree shares with it are shifted, not found again
+    pub fn computeIncremental(ctx: anytype, file: Key, prev: ?Value) engine.Error!Value {
         const parse = try ctx.get(ParseFile, file);
         const items = try ctx.get(FileItemTree, file);
         const gpa = ctx.db.gpa;
         const result = try gpa.create(Owned);
         errdefer gpa.destroy(result);
-        result.* = .{ .map = try ItemTree.AstIdMap.build(gpa, items, parse.rootNode()), .parse = parse.retain() };
+        const map = if (prev) |p|
+            try ItemTree.AstIdMap.buildIncremental(gpa, items, parse.rootNode(), p)
+        else
+            try ItemTree.AstIdMap.build(gpa, items, parse.rootNode());
+        result.* = .{ .map = map, .parse = parse.retain() };
         return &result.map;
     }
 

@@ -601,7 +601,7 @@ pub fn reachable(r: *Resolver, from: []const FileId) resolve.Error![]const FileI
     var i: usize = 0;
     while (i < seen.count()) : (i += 1) {
         const f = seen.keys()[i];
-        const index = try r.ctx.get(FileIndex.Query, f);
+        const index = try r.ctx.get(FileIndex.ImportStrings, f);
         // Every module the file belongs to may import a different file under a name
         for (index.imports) |s| for (try r.resolveImportTargets(f, s)) |to| try seen.put(r.arena, to, {});
     }
@@ -643,7 +643,7 @@ pub const ImportGraph = struct {
         var n: usize = 0;
         while (n < nodes.count()) : (n += 1) {
             const f = nodes.keys()[n];
-            const file_index = try r.ctx.get(FileIndex.Query, f);
+            const file_index = try r.ctx.get(FileIndex.ImportStrings, f);
             // Every module the file belongs to may import a different file under a name
             for (file_index.imports) |s| for (try r.resolveImportTargets(f, s)) |to| {
                 const gop = try reverse.getOrPut(temp, to);
@@ -698,7 +698,7 @@ pub fn reaches(r: *Resolver, from: FileId, target: FileId) resolve.Error!bool {
     var i: usize = 0;
     while (i < seen.count()) : (i += 1) {
         const f = seen.keys()[i];
-        const index = try r.ctx.get(FileIndex.Query, f);
+        const index = try r.ctx.get(FileIndex.ImportStrings, f);
         for (index.imports) |s| {
             const to = try r.resolveImport(f, s) orelse continue;
             if (to == target) return true;

@@ -16,6 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const tree = @import("tree.zig");
+const green = @import("green.zig");
 const SyntaxNode = tree.SyntaxNode;
 const SyntaxKind = @import("kind.zig").SyntaxKind;
 const isTrivia = @import("kind.zig").isTrivia;
@@ -46,6 +47,10 @@ decl_starts: []const u32,
 /// order; split by `value_starts` (one more entry than `items`)
 value_containers: []const u32,
 value_starts: []const u32,
+/// Id of a parse result (`Parse.id`) whose syntax tree this tree was built from, or one with an
+/// equal tree: `buildIncremental` copies the members whose top-level node that result shares with
+/// a new one. Not compared by `eql`; may be advanced to a newer result that yields an equal tree
+basis: std.atomic.Value(u64) = .init(0),
 
 /// Node ID stable within the file: hashed from the parent node ID, kind, name, and ordinal among
 /// same-named nodes; stays the same across edits as long as the node is not renamed or moved.
@@ -266,9 +271,100 @@ pub fn zonRoot(root: SyntaxNode) ?SyntaxNode {
 }
 
 pub fn build(gpa: Allocator, root: SyntaxNode, mode: Mode) Allocator.Error!ItemTree {
+    return buildWith(gpa, root, mode, null);
+}
+
+/// The same tree as `build(gpa, root, .zig)`, copying from `prev` the members whose top-level node
+/// is the same green node as in `old_root`, which `prev` was built from (or a tree that yields an
+/// equal ItemTree): a member's items and containers depend only on its own subtree, and its
+/// AstIds are assigned again in the same order as `build` assigns them
+pub fn buildIncremental(gpa: Allocator, root: SyntaxNode, prev: *const ItemTree, old_root: SyntaxNode) Allocator.Error!ItemTree {
+    var reuse = try Reuse.init(gpa, prev, old_root) orelse return build(gpa, root, .zig);
+    defer reuse.deinit(gpa);
+    return buildWith(gpa, root, .zig, &reuse);
+}
+
+/// The top-level members of `prev` by the green node they were built from, with the items and
+/// containers each produced
+const Reuse = struct {
+    prev: *const ItemTree,
+    by_node: std.AutoHashMapUnmanaged(*const green.GreenNode, u32) = .empty,
+    /// Per top-level member: its item (the first of its range) and the end of its container
+    /// range; the item ranges end at the next member's item
+    tops: []const u32,
+    container_ends: []const u32,
+
+    fn init(gpa: Allocator, prev: *const ItemTree, old_root: SyntaxNode) Allocator.Error!?Reuse {
+        var tops: std.ArrayList(u32) = .empty;
+        errdefer tops.deinit(gpa);
+        const item_top = try gpa.alloc(u32, prev.items.len);
+        defer gpa.free(item_top);
+        for (prev.items, item_top, 0..) |it, *t, i| {
+            if (it.container == 0) {
+                t.* = @intCast(tops.items.len);
+                try tops.append(gpa, @intCast(i));
+            } else t.* = item_top[prev.containers[it.container].parent_item.?];
+        }
+        const container_ends = try gpa.alloc(u32, tops.items.len);
+        errdefer gpa.free(container_ends);
+        @memset(container_ends, 1);
+        // The containers of a member follow those of the members before it
+        var last: u32 = 0;
+        for (prev.containers[1..], 1..) |c, ci| {
+            const top = item_top[c.parent_item.?];
+            if (top < last) {
+                gpa.free(container_ends);
+                tops.deinit(gpa);
+                return null;
+            }
+            last = top;
+            container_ends[top] = @intCast(ci + 1);
+        }
+        for (1..@max(container_ends.len, 1)) |k| container_ends[k] = @max(container_ends[k], container_ends[k - 1]);
+        var r: Reuse = .{ .prev = prev, .tops = try tops.toOwnedSlice(gpa), .container_ends = container_ends };
+        errdefer r.deinit(gpa);
+        var it = old_root.children();
+        var k: u32 = 0;
+        while (it.nextNode()) |member| {
+            if (!isMemberKind(member.kind())) continue;
+            if (k < r.tops.len) try r.by_node.put(gpa, member.green, k);
+            k += 1;
+        }
+        // Each member node of the file is a top-level item; otherwise `prev` was not built from
+        // this tree
+        if (k != r.tops.len) {
+            r.deinit(gpa);
+            return null;
+        }
+        return r;
+    }
+
+    fn deinit(r: *Reuse, gpa: Allocator) void {
+        r.by_node.deinit(gpa);
+        gpa.free(r.tops);
+        gpa.free(r.container_ends);
+    }
+
+    fn itemEnd(r: *const Reuse, k: u32) u32 {
+        return if (k + 1 < r.tops.len) r.tops[k + 1] else @intCast(r.prev.items.len);
+    }
+
+    fn containerStart(r: *const Reuse, k: u32) u32 {
+        return if (k == 0) 1 else r.container_ends[k - 1];
+    }
+};
+
+pub fn isMemberKind(kind: SyntaxKind) bool {
+    return switch (kind) {
+        .fn_decl, .var_decl, .container_field, .test_decl, .comptime_decl => true,
+        else => false,
+    };
+}
+
+fn buildWith(gpa: Allocator, root: SyntaxNode, mode: Mode, reuse: ?*const Reuse) Allocator.Error!ItemTree {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
-    var b: Builder = .{ .gpa = gpa, .arena = arena.allocator() };
+    var b: Builder = .{ .gpa = gpa, .arena = arena.allocator(), .reuse = reuse };
     defer b.deinit();
 
     const file_id = mixId(0, "file", "", 0);
@@ -352,6 +448,8 @@ const Builder = struct {
     taken: std.AutoHashMapUnmanaged(AstId, void) = .empty,
     /// Visiting the prototype of a function member (see `Container.in_signature`)
     in_signature: bool = false,
+    /// Members to copy instead of visiting (top-level members only)
+    reuse: ?*const Reuse = null,
 
     fn deinit(b: *Builder) void {
         b.containers.deinit(b.gpa);
@@ -366,6 +464,10 @@ const Builder = struct {
         const container_id = b.containers.items[index].ast_id;
         var it = node.children();
         while (it.nextNode()) |member| {
+            if (index == 0) if (b.reuse) |r| if (r.by_node.get(member.green)) |k| {
+                try b.copyMember(r, k);
+                continue;
+            };
             const kind: Item.Kind = switch (member.kind()) {
                 .fn_decl => .@"fn",
                 .var_decl => if (member.childToken(.keyword_var) != null) .@"var" else .@"const",
@@ -391,6 +493,73 @@ const Builder = struct {
             try b.pending_members.items[index].append(b.arena, item_index);
             try b.visitNested(member, item_index, valueOffset(member));
         }
+    }
+
+    /// Appends the items and containers of top-level member `k` of `r.prev` in the order
+    /// `visitContainer` creates them, assigning their AstIds in that order
+    fn copyMember(b: *Builder, r: *const Reuse, k: u32) Allocator.Error!void {
+        const span: Span = .{
+            .item_start = r.tops[k],
+            .item_base = @intCast(b.items.items.len),
+            .container_start = r.containerStart(k),
+            .container_end = r.container_ends[k],
+            .container_base = @intCast(b.containers.items.len),
+        };
+        try b.copyItem(r.prev, span, r.tops[k]);
+        std.debug.assert(b.items.items.len - span.item_base == r.itemEnd(k) - r.tops[k]);
+        std.debug.assert(b.containers.items.len - span.container_base == span.container_end - span.container_start);
+    }
+
+    /// Old and new index bases of the items and containers of a copied member
+    const Span = struct {
+        item_start: u32,
+        item_base: u32,
+        container_start: u32,
+        container_end: u32,
+        container_base: u32,
+
+        fn item(s: Span, old: u32) u32 {
+            return old - s.item_start + s.item_base;
+        }
+
+        fn container(s: Span, old: u32) u32 {
+            return if (old == 0) 0 else old - s.container_start + s.container_base;
+        }
+    };
+
+    fn copyItem(b: *Builder, prev: *const ItemTree, span: Span, old: u32) Allocator.Error!void {
+        const it = prev.items[old];
+        const container = span.container(it.container);
+        const item_index: u32 = @intCast(b.items.items.len);
+        std.debug.assert(item_index == span.item(old));
+        try b.items.append(b.gpa, .{
+            .ast_id = try b.uniqueId(b.containers.items[container].ast_id, @tagName(it.kind), it.name orelse ""),
+            .kind = it.kind,
+            .name = if (it.name) |n| try b.arena.dupe(u8, n) else null,
+            .container = container,
+            .flags = it.flags,
+            .sig_hash = it.sig_hash,
+            .doc = if (it.doc) |d| try b.arena.dupe(u8, d) else null,
+        });
+        try b.pending_members.items[container].append(b.arena, item_index);
+        // The containers lexically in the item, in the order `visitNested` finds them
+        for (prev.containers[span.container_start..span.container_end], span.container_start..) |c, ci| {
+            if (c.parent_item == old) try b.copyContainer(prev, span, @intCast(ci));
+        }
+    }
+
+    fn copyContainer(b: *Builder, prev: *const ItemTree, span: Span, old: u32) Allocator.Error!void {
+        var c = prev.containers[old];
+        const index: u32 = @intCast(b.containers.items.len);
+        std.debug.assert(index == span.container(old));
+        const parent = span.item(c.parent_item.?);
+        c.ast_id = try b.uniqueId(b.items.items[parent].ast_id, "container", "");
+        c.parent_item = parent;
+        c.members = undefined;
+        if (c.name) |n| c.name = try b.arena.dupe(u8, n);
+        try b.containers.append(b.gpa, c);
+        while (b.pending_members.items.len <= index) try b.pending_members.append(b.gpa, .empty);
+        for (prev.containerMembers(old)) |m| try b.copyItem(prev, span, m);
     }
 
     /// A ZON file: the root expression is the only member of the file; container definitions inside
@@ -635,18 +804,30 @@ fn hashTokens(h: *std.hash.Wyhash, node: SyntaxNode) void {
 
 // ── AstId → node ─────────────────────────────────────────────────────
 
-/// Mapping from AstId to node in one parse result. Rebuilt (cheaply) after every reparse; maps
-/// stable IDs back to nodes in the current tree.
+/// Mapping from AstId to node in one parse result. Rebuilt after every reparse; maps stable IDs
+/// back to nodes in the current tree.
 pub const AstIdMap = struct {
-    map: std.AutoArrayHashMapUnmanaged(AstId, SyntaxNode) = .empty,
+    map: std.AutoHashMapUnmanaged(AstId, SyntaxNode) = .empty,
+    /// The nodes by item and container index of the ItemTree the map was built with
+    items: []const SyntaxNode = &.{},
+    containers: []const SyntaxNode = &.{},
+    /// Per top-level member of a Zig file, in order: the end of its item and container ranges
+    /// (empty for a ZON file)
+    top_item_ends: []const u32 = &.{},
+    top_container_ends: []const u32 = &.{},
 
     pub fn deinit(m: *AstIdMap, gpa: Allocator) void {
         m.map.deinit(gpa);
+        gpa.free(m.items);
+        gpa.free(m.containers);
+        gpa.free(m.top_item_ends);
+        gpa.free(m.top_container_ends);
     }
 
-    /// Bytes used by the hash table (the nodes belong to the syntax tree and are not counted)
+    /// Bytes used by the tables (the nodes belong to the syntax tree and are not counted)
     pub fn bytes(m: *const AstIdMap) usize {
-        return m.map.capacity() * (@sizeOf(AstId) + @sizeOf(SyntaxNode) + @sizeOf(u32));
+        return m.map.capacity() * (@sizeOf(AstId) + @sizeOf(SyntaxNode) + @sizeOf(u32)) +
+            (m.items.len + m.containers.len) * @sizeOf(SyntaxNode) + (m.top_item_ends.len + m.top_container_ends.len) * @sizeOf(u32);
     }
 
     pub fn get(m: *const AstIdMap, id: AstId) ?SyntaxNode {
@@ -655,48 +836,127 @@ pub const AstIdMap = struct {
 
     /// `item_tree` must have been built from the same syntax tree
     pub fn build(gpa: Allocator, item_tree: *const ItemTree, root: SyntaxNode) Allocator.Error!AstIdMap {
-        var result: AstIdMap = .{};
-        errdefer result.deinit(gpa);
-        try result.map.ensureTotalCapacity(gpa, item_tree.items.len + item_tree.containers.len);
+        return buildMap(gpa, item_tree, root, null);
+    }
+
+    /// The same map as `build`, shifting the nodes of `prev` for the top-level members whose
+    /// node is the same green node as in the tree `prev` was built from: the items and
+    /// containers of a member are found in its own subtree. The tree of `prev` must still be
+    /// alive, so that equal pointers mean the same node
+    pub fn buildIncremental(gpa: Allocator, item_tree: *const ItemTree, root: SyntaxNode, prev: *const AstIdMap) Allocator.Error!AstIdMap {
+        if (item_tree.items.len != 0 and item_tree.items[0].kind == .zon) return AstIdMap.build(gpa, item_tree, root);
+        var by_node: std.AutoHashMapUnmanaged(*const green.GreenNode, u32) = .empty;
+        defer by_node.deinit(gpa);
+        try by_node.ensureTotalCapacity(gpa, @intCast(prev.top_item_ends.len));
+        var start: u32 = 0;
+        for (prev.top_item_ends, 0..) |end, k| {
+            by_node.putAssumeCapacity(prev.items[start].green, @intCast(k));
+            start = end;
+        }
+        return buildMap(gpa, item_tree, root, .{ .prev = prev, .by_node = &by_node });
+    }
+
+    const Reused = struct {
+        prev: *const AstIdMap,
+        by_node: *const std.AutoHashMapUnmanaged(*const green.GreenNode, u32),
+    };
+
+    const Walker = struct {
+        item_tree: *const ItemTree,
+        items: []SyntaxNode,
+        containers: []SyntaxNode,
+        c_index: u32 = 0,
+        i_index: u32 = 0,
+        top_item_ends: std.ArrayList(u32) = .empty,
+        top_container_ends: std.ArrayList(u32) = .empty,
+        reused: ?Reused,
+    };
+
+    fn buildMap(gpa: Allocator, item_tree: *const ItemTree, root: SyntaxNode, reused: ?Reused) Allocator.Error!AstIdMap {
+        var w: Walker = .{
+            .item_tree = item_tree,
+            .items = try gpa.alloc(SyntaxNode, item_tree.items.len),
+            .containers = undefined,
+            .reused = reused,
+        };
+        defer w.top_item_ends.deinit(gpa);
+        defer w.top_container_ends.deinit(gpa);
+        errdefer gpa.free(w.items);
+        w.containers = try gpa.alloc(SyntaxNode, item_tree.containers.len);
+        errdefer gpa.free(w.containers);
         // Same traversal order as Builder: number containers and members in order of appearance
-        var c_index: u32 = 0;
-        var i_index: u32 = 0;
-        result.map.putAssumeCapacity(item_tree.containers[0].ast_id, root);
-        c_index += 1;
+        w.containers[0] = root;
+        w.c_index = 1;
+        // One entry per top-level member at most
+        const tops = root.green.children.len;
+        try w.top_item_ends.ensureTotalCapacity(gpa, tops);
+        try w.top_container_ends.ensureTotalCapacity(gpa, tops);
         if (item_tree.items.len != 0 and item_tree.items[0].kind == .zon) {
-            result.map.putAssumeCapacity(item_tree.items[0].ast_id, zonRoot(root).?);
-            i_index += 1;
-            walkNested(item_tree, root, &result, &c_index, &i_index);
-        } else walk(item_tree, root, &result, &c_index, &i_index, 0);
+            w.items[0] = zonRoot(root).?;
+            w.i_index = 1;
+            walkNested(&w, root);
+        } else walk(&w, root, 0);
+        std.debug.assert(w.i_index == w.items.len and w.c_index == w.containers.len);
+
+        var result: AstIdMap = .{ .items = w.items, .containers = w.containers };
+        errdefer {
+            result.map.deinit(gpa);
+            gpa.free(result.top_item_ends);
+        }
+        try result.map.ensureTotalCapacity(gpa, @intCast(item_tree.items.len + item_tree.containers.len));
+        for (item_tree.containers, w.containers) |c, n| result.map.putAssumeCapacity(c.ast_id, n);
+        for (item_tree.items, w.items) |it, n| result.map.putAssumeCapacity(it.ast_id, n);
+        result.top_item_ends = try w.top_item_ends.toOwnedSlice(gpa);
+        result.top_container_ends = try w.top_container_ends.toOwnedSlice(gpa);
         return result;
     }
 
     /// `container` is the index of the container `node`
-    fn walk(item_tree: *const ItemTree, node: SyntaxNode, m: *AstIdMap, c_index: *u32, i_index: *u32, container: u32) void {
+    fn walk(w: *Walker, node: SyntaxNode, container: u32) void {
         var it = node.children();
         while (it.nextNode()) |member| {
             switch (member.kind()) {
                 .fn_decl, .var_decl, .test_decl, .comptime_decl => {},
-                .container_field => if (isUnderscoreMarker(member, item_tree.containers[container].kind)) continue,
+                .container_field => if (isUnderscoreMarker(member, w.item_tree.containers[container].kind)) continue,
                 else => continue,
             }
-            m.map.putAssumeCapacity(item_tree.items[i_index.*].ast_id, member);
-            i_index.* += 1;
-            walkNested(item_tree, member, m, c_index, i_index);
+            if (container == 0) if (w.reused) |r| if (r.by_node.get(member.green)) |k| {
+                const prev = r.prev;
+                const item_start = if (k == 0) 0 else prev.top_item_ends[k - 1];
+                const container_start = if (k == 0) 1 else prev.top_container_ends[k - 1];
+                const old_items = prev.items[item_start..prev.top_item_ends[k]];
+                const old_containers = prev.containers[container_start..prev.top_container_ends[k]];
+                // Both nodes are the same green node: everything in it moves by the same amount
+                const old_offset = prev.items[item_start].offset;
+                for (old_items, w.items[w.i_index..][0..old_items.len]) |o, *n| n.* = .{ .green = o.green, .offset = o.offset - old_offset + member.offset };
+                for (old_containers, w.containers[w.c_index..][0..old_containers.len]) |o, *n| n.* = .{ .green = o.green, .offset = o.offset - old_offset + member.offset };
+                w.i_index += @intCast(old_items.len);
+                w.c_index += @intCast(old_containers.len);
+                w.top_item_ends.appendAssumeCapacity(w.i_index);
+                w.top_container_ends.appendAssumeCapacity(w.c_index);
+                continue;
+            };
+            w.items[w.i_index] = member;
+            w.i_index += 1;
+            walkNested(w, member);
+            if (container == 0) {
+                w.top_item_ends.appendAssumeCapacity(w.i_index);
+                w.top_container_ends.appendAssumeCapacity(w.c_index);
+            }
         }
     }
 
-    fn walkNested(item_tree: *const ItemTree, node: SyntaxNode, m: *AstIdMap, c_index: *u32, i_index: *u32) void {
+    fn walkNested(w: *Walker, node: SyntaxNode) void {
         var it = node.children();
         while (it.nextNode()) |c| {
             if (c.kind() != .container_decl) {
-                walkNested(item_tree, c, m, c_index, i_index);
+                walkNested(w, c);
                 continue;
             }
-            const container = c_index.*;
-            m.map.putAssumeCapacity(item_tree.containers[container].ast_id, c);
-            c_index.* += 1;
-            walk(item_tree, c, m, c_index, i_index, container);
+            const container = w.c_index;
+            w.containers[container] = c;
+            w.c_index += 1;
+            walk(w, c, container);
         }
     }
 };

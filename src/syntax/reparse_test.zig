@@ -18,6 +18,32 @@ fn expectReparse(old_text: []const u8, new_text: []const u8, expect_incremental:
     }
 }
 
+test "a chain of block reparses does not keep a copy of the text per edit" {
+    // Each result used to copy the whole text into its arena, which the results built on it keep:
+    // a large file reached the chain limit after a few edits and was parsed in full again
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try text.appendSlice(testing.allocator, "fn g() void {\n    _ = 0;\n}\n");
+    for (0..40) |i| {
+        try text.print(testing.allocator, "fn f{d}() void {{\n", .{i});
+        for (0..100) |k| try text.print(testing.allocator, "    _ = {d};\n", .{k});
+        try text.appendSlice(testing.allocator, "}\n");
+    }
+    var chain = try Parse.create(testing.allocator, text.items, .zig);
+    defer chain.destroy();
+    const at = std.mem.indexOf(u8, text.items, "_ = 0;").?;
+    const edits = 10;
+    for (0..edits) |_| {
+        try text.insert(testing.allocator, at, 'x');
+        const inc = try Parse.reparse(testing.allocator, chain, text.items);
+        chain.destroy();
+        chain = inc;
+        try testing.expect(chain.base != null);
+    }
+    try testing.expect((chain.chain_bytes - chain.full_bytes) / edits < text.items.len / 2);
+    try testing.expectEqualStrings(text.items, chain.source);
+}
+
 test "edits inside a function body use block reparse" {
     const base = "const a = 1;\nfn f() void {\n    g();\n}\nconst b = 2;\n";
     try expectReparse(base, "const a = 1;\nfn f() void {\n    g(1, 2);\n}\nconst b = 2;\n", true);

@@ -897,7 +897,7 @@ pub fn errorValueDecl(r: *Resolver, file: FileId, offset: u32, imports: bool) re
         const f = files.keys()[i];
         const index = try r.ctx.get(FileIndex.Query, f);
         if (i > 0 and index.contains(name)) try findErrorDecl(r, f, name, expected, &best);
-        for (index.imports) |s| if (try r.resolveImport(f, s)) |to| try files.put(r.arena, to, {});
+        for ((try r.ctx.get(FileIndex.ImportStrings, f)).imports) |s| if (try r.resolveImport(f, s)) |to| try files.put(r.arena, to, {});
     }
     return if (best) |c| c.decl else null;
 }

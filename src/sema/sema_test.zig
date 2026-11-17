@@ -9075,7 +9075,7 @@ test "member bodies are reused when their source is unchanged" {
     try testing.expect(before.b != after.b);
 }
 
-test "an evicted member body with unchanged source does not invalidate its dependents" {
+test "an evicted member body with unchanged source is not lowered again after an edit elsewhere" {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
@@ -9094,6 +9094,7 @@ test "an evicted member body with unchanged source does not invalidate its depen
         }
     }
     const forms_runs = w.db.executions(database.hir.ParamForms);
+    const body_runs = w.db.executions(database.hir.ItemBody);
     // Capacity 1 with two bodies: the next write transaction evicts both
     w.db.setLru(database.hir.ItemBody, 1, null);
     _ = try w.add("/p/main.zig", v2);
@@ -9103,7 +9104,9 @@ test "an evicted member body with unchanged source does not invalidate its depen
         try testing.expect(ctx.memoized(database.hir.ItemBody, owner_a) == .evicted);
         _ = try ctx.get(database.hir.ParamForms, owner_a);
     }
-    // The Body of a is lowered again from the same source: ParamForms(a) is not recomputed
+    // The source of a is unchanged: its evicted Body is not lowered again, and ParamForms(a) is
+    // not recomputed
+    try testing.expectEqual(body_runs, w.db.executions(database.hir.ItemBody));
     try testing.expectEqual(forms_runs, w.db.executions(database.hir.ParamForms));
 }
 
