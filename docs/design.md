@@ -161,7 +161,7 @@ The graph comes from the build graph, plus:
 When modules import different targets under the same name, name resolution uses the highest-priority module: diagnostics steps first (native-target ones first), then other compile steps in build graph order (`diagnostics.steps` changes it). Position makes no difference.
 
 - Goto on an `@import` returns all targets in that order.
-- A member reached through such an import corresponds to the member at the same name path in each other target (`Resolver.moduleAlternatives`): goto lists them all, and the use is a reference of each, recorded as ambiguous since renaming it would break the other modules.
+- A member reached through such an import corresponds to the member at the same name path in each other target: goto lists them all, and the use is a reference of each, recorded as ambiguous since renaming it would break the other modules. `Resolver.moduleAlternatives` maps a definition in a file the import reaches directly; `Resolver.pathAlternatives` evaluates the name path of a use or alias (`cfg.sub.value`, through constants) in each other target, so the member may also be in a file reached past the import.
 - In a test compilation, `@import("root")` is the test runner.
 
 ### Files in no module
