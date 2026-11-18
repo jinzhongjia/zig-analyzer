@@ -31,6 +31,15 @@
 | Zed | 扩展，见 [`editors/zed`](editors/zed)（需同时安装 Zig 扩展） |
 | Neovim 0.12+ | 插件 [zig-analyzer.nvim](https://github.com/jinzhongjia/zig-analyzer.nvim)，在 [`editors/nvim`](editors/nvim) 中开发 |
 | Vim | 插件 [zig-analyzer.vim](https://github.com/jinzhongjia/zig-analyzer.vim)，在 [`editors/vim`](editors/vim) 中开发，支持 yegappan/lsp 和 vim-lsp |
+| Helix | `languages.toml`，见 [docs/editors.md](docs/editors.md#helix) |
+| Emacs | 插件，见 [`editors/emacs`](editors/emacs)（eglot） |
+| Sublime Text | LSP 插件，见 [docs/editors.md](docs/editors.md#sublime-text) |
+| Kate | 内置 LSP 客户端，见 [docs/editors.md](docs/editors.md#kate) |
+| JetBrains IDE | LSP4IJ，见 [docs/editors.md](docs/editors.md#jetbrains-ides-lsp4ij) |
+| coc.nvim | `coc-settings.json`，见 [docs/editors.md](docs/editors.md#cocnvim) |
+
+这些编辑器各自的设置方法、共用的设置项，以及其他 LSP 客户端需要满足的条件，见
+[`docs/editors.md`](docs/editors.md)。
 
 不使用 Neovim 插件时，Neovim 0.12+ 只需：
 
@@ -70,7 +79,7 @@ scoop bucket add jin https://github.com/jinzhongjia/scoop-bucket
 scoop install jin/zig-analyzer
 ```
 
-它们都安装最新 release 的 ReleaseSafe 构建及其调试信息，用 `brew upgrade`、`yay -Syu` 或 `scoop update zig-analyzer` 更新。tap 和 AUR 包在 release 发布时更新，Scoop bucket 在几小时内更新。预发布版本都不收录。
+它们都安装最新 release 的 ReleaseSafe 构建及其调试信息，用 `brew upgrade`、`yay -Syu` 或 `scoop update zig-analyzer` 更新。tap 和 AUR 包在 release 发布时更新，Scoop bucket 在几小时内更新。预发布版本都不收录。Emacs 插件可以用 `M-x zig-analyzer-install-server` 安装经过校验的 release，见 [`editors/emacs`](editors/emacs)。
 
 每个 [release](https://github.com/jinzhongjia/zig-analyzer/releases) 都为每个平台（Linux、macOS、Windows 的 x86_64 和 aarch64）提供两种构建：
 
