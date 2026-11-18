@@ -76,8 +76,12 @@ jobs:
                 docs/*|assets/*|README*|CHANGELOG.md|LICENSE|AGENTS.md|.agents/*|.claude/*|.gitignore|.github/workflows/mirror.yml) ;;
                 # The website has a workflow of its own (website.yml) and nothing here tests it
                 website/*|wrangler.jsonc|.github/workflows/website.yml) ;;
-                # A path that no rule knows may need anything: run everything
-                *) all ;;
+                # A path that no rule knows may need anything: run everything, and say so on the
+                # pull request so that the path gets a rule
+                *)
+                  echo "::warning file=.github/workflows/ci.yml,title=No CI path rule::$path matches no rule in the Changed paths job, so every job runs; add a rule for it"
+                  all
+                  ;;
               esac
             done < "$changed"
           fi
