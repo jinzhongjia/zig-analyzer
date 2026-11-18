@@ -32,7 +32,7 @@ A language server (LSP) for Zig, built on an incremental query engine. Website: 
 | Neovim 0.12+ | Plugin [zig-analyzer.nvim](https://github.com/jinzhongjia/zig-analyzer.nvim), developed in [`editors/nvim`](editors/nvim) |
 | Vim | Plugin [zig-analyzer.vim](https://github.com/jinzhongjia/zig-analyzer.vim), developed in [`editors/vim`](editors/vim), for yegappan/lsp or vim-lsp |
 | Helix | `languages.toml`, see [docs/editors.md](docs/editors.md#helix) |
-| Emacs | Package in [`editors/emacs`](editors/emacs) (eglot) |
+| Emacs | Package [zig-analyzer.el](https://github.com/jinzhongjia/zig-analyzer.el), developed in [`editors/emacs`](editors/emacs) (eglot) |
 | Sublime Text | LSP package, see [docs/editors.md](docs/editors.md#sublime-text) |
 | Kate | Built-in LSP client, see [docs/editors.md](docs/editors.md#kate) |
 | JetBrains IDEs | LSP4IJ, see [docs/editors.md](docs/editors.md#jetbrains-ides-lsp4ij) |

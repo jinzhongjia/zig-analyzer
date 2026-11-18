@@ -73,7 +73,7 @@ jobs:
                 editors/vim/*) vim=true ;;
                 updates/*) updates=true ;;
                 editors/emacs/*) emacs=true ;;
-                docs/*|assets/*|README*|CHANGELOG.md|LICENSE|AGENTS.md|.agents/*|.claude/*|.gitignore) ;;
+                docs/*|assets/*|README*|CHANGELOG.md|LICENSE|AGENTS.md|.agents/*|.claude/*|.gitignore|.github/workflows/mirror.yml) ;;
                 # A path that no rule knows may need anything: run everything
                 *) all ;;
               esac
