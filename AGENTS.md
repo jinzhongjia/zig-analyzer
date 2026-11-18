@@ -4,6 +4,7 @@
 
 - No LLM co-author information in commit messages (`Co-authored-by: ...`, `Generated with ...`).
 - Split work into commits by content; keep unrelated changes apart.
+- A new top-level directory, root file, or workflow gets a rule in the `Changed paths` job of `.github/workflows/ci.yml` (which jobs it runs, or none); a path without a rule runs every CI job.
 - Give each pull request one changelog label (`zig build changelog` sorts the release notes by them): `breaking` (users must act on it), `enhancement`, `bug`, `performance`, or `internal` (not visible to users).
 
 ## Language
