@@ -1,9 +1,10 @@
 name: Mirror editor plugins
 
-# The Neovim and Vim plugins are developed in editors/nvim and editors/vim, and published as
-# repositories of their own, so that plugin managers install them by name. Each push to main that
-# changes them pushes the history of the directory (`git subtree split`) to the mirror repository.
-# The mirrors are read-only: their history is only ever extended by this workflow.
+# The Neovim and Vim plugins are developed in editors/nvim and editors/vim, and the Emacs package
+# in editors/emacs, and published as repositories of their own, so that plugin managers install
+# them by name. Each push to main that changes them pushes the history of the directory
+# (`git subtree split`) to the mirror repository. The mirrors are read-only: their history is only
+# ever extended by this workflow.
 
 on:
   push:
@@ -11,6 +12,7 @@ on:
     paths:
       - editors/nvim/**
       - editors/vim/**
+      - editors/emacs/**
       - .github/workflows/mirror.yml
   workflow_dispatch:
 
@@ -33,6 +35,9 @@ jobs:
           - dir: editors/vim
             repo: jinzhongjia/zig-analyzer.vim
             secret: VIM_MIRROR_DEPLOY_KEY
+          - dir: editors/emacs
+            repo: jinzhongjia/zig-analyzer.el
+            secret: EMACS_MIRROR_DEPLOY_KEY
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
