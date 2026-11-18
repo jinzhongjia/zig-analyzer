@@ -12,7 +12,7 @@
 //!                        "builtin_parameters": true, "exclude_single_argument": true, "hide_redundant_param_names": true,
 //!                        "max_length": 25 },
 //!       "semantic_tokens": { "mode": "full", "global_var": false },
-//!       "hover": { "instances": "list" },
+//!       "hover": { "instances": "count" },
 //!       "imports": { "derived": "with_import", "sort": "path" },
 //!       "completion": { "auto_import": true, "max_auto_imports": 128, "snippets": true, "argument_placeholders": true },
 //!       "sema": { "callsite_seeding": true, "wait_for_project": false },
@@ -109,7 +109,7 @@ semantic_tokens_mode: SemanticTokensMode = .full,
 semantic_tokens_global_var: bool = false,
 /// Hover in a generic function body: how the declarations that a member name refers to under the
 /// other instances are shown, when they differ from the one shown
-hover_instances: HoverInstances = .list,
+hover_instances: HoverInstances = .count,
 /// Placement of derived declarations (`const Allocator = std.mem.Allocator;`) in the import
 /// block: both organize imports and auto-import follow it
 imports_derived: ImportOptions.Derived = .with_import,
@@ -684,7 +684,7 @@ test "parse: nested fields, optional wrapper" {
     defer partial.deinit(testing.allocator);
     try testing.expect(partial.semantic_tokens_mode == .partial and partial.semantic_tokens_global_var);
     try testing.expectEqual(0, partial.warnings.len);
-    try testing.expectEqual(HoverInstances.list, empty.hover_instances);
+    try testing.expectEqual(HoverInstances.count, empty.hover_instances);
     var full_hover = try parseText(
         \\{"hover": {"instances": "full"}}
     );

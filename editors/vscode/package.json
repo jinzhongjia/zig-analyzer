@@ -362,14 +362,14 @@
         "zig-analyzer.hover.instances": {
           "type": "string",
           "enum": [
-            "list",
+            "count",
             "full"
           ],
           "enumDescriptions": [
-            "One line for each other instance, with its type, location, and the call it comes from.",
-            "The complete hover of each other instance (signature, value, documentation)."
+            "Only how many other declarations there are; go to definition lists them.",
+            "The location and complete hover (signature, value, documentation) of each other declaration."
           ],
-          "default": "list",
+          "default": "count",
           "markdownDescription": "In a generic function body, how hover shows the declarations a member name refers to under the other instances."
         },
         "zig-analyzer.completion.auto_import": {
