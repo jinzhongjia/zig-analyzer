@@ -31,6 +31,15 @@ A language server (LSP) for Zig, built on an incremental query engine. Website: 
 | Zed | Extension in [`editors/zed`](editors/zed) (with the Zig extension) |
 | Neovim 0.12+ | Plugin [zig-analyzer.nvim](https://github.com/jinzhongjia/zig-analyzer.nvim), developed in [`editors/nvim`](editors/nvim) |
 | Vim | Plugin [zig-analyzer.vim](https://github.com/jinzhongjia/zig-analyzer.vim), developed in [`editors/vim`](editors/vim), for yegappan/lsp or vim-lsp |
+| Helix | `languages.toml`, see [docs/editors.md](docs/editors.md#helix) |
+| Emacs | Package in [`editors/emacs`](editors/emacs) (eglot) |
+| Sublime Text | LSP package, see [docs/editors.md](docs/editors.md#sublime-text) |
+| Kate | Built-in LSP client, see [docs/editors.md](docs/editors.md#kate) |
+| JetBrains IDEs | LSP4IJ, see [docs/editors.md](docs/editors.md#jetbrains-ides-lsp4ij) |
+| coc.nvim | `coc-settings.json`, see [docs/editors.md](docs/editors.md#cocnvim) |
+
+Setup for these editors, the settings they share, and the requirements for any other LSP client is
+in [`docs/editors.md`](docs/editors.md).
 
 Without the Neovim plugin, Neovim 0.12+ needs only:
 
@@ -70,7 +79,7 @@ scoop bucket add jin https://github.com/jinzhongjia/scoop-bucket
 scoop install jin/zig-analyzer
 ```
 
-Each installs the ReleaseSafe build of the latest release, with its debug information; `brew upgrade`, `yay -Syu`, or `scoop update zig-analyzer` updates it. The tap and the AUR package are updated when a release is published, the Scoop bucket within a few hours. Pre-releases are in none of them.
+Each installs the ReleaseSafe build of the latest release, with its debug information; `brew upgrade`, `yay -Syu`, or `scoop update zig-analyzer` updates it. The tap and the AUR package are updated when a release is published, the Scoop bucket within a few hours. Pre-releases are in none of them. The Emacs package can install a checked release with `M-x zig-analyzer-install-server`; see [`editors/emacs`](editors/emacs).
 
 Each [release](https://github.com/jinzhongjia/zig-analyzer/releases) has an archive per platform (x86_64 and aarch64 on Linux, macOS, and Windows) in two builds:
 

@@ -28,6 +28,7 @@ jobs:
       nvim: ${{ steps.detect.outputs.nvim }}
       vim: ${{ steps.detect.outputs.vim }}
       updates: ${{ steps.detect.outputs.updates }}
+      emacs: ${{ steps.detect.outputs.emacs }}
     steps:
       # The three-dot diff of a pull request needs the base commit and the merge base
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,8 +43,8 @@ jobs:
           HEAD: ${{ github.sha }}
         run: |
           set -euo pipefail
-          zig=false vscode=false zed=false nvim=false vim=false updates=false
-          all() { zig=true vscode=true zed=true nvim=true vim=true updates=true; }
+          zig=false vscode=false zed=false nvim=false vim=false updates=false emacs=false
+          all() { zig=true vscode=true zed=true nvim=true vim=true updates=true emacs=true; }
 
           if [ "$EVENT" != pull_request ]; then
             all
@@ -63,14 +64,15 @@ jobs:
                 src/server/Config.zig) zig=true; vscode=true ;;
                 src/*|tools/*|build.zig|build.zig.zon|zig-analyzer.default.zon) zig=true ;;
                 # Every editor checks its release key against the repository's
-                minisign.pub) vscode=true; zed=true; nvim=true; vim=true ;;
-                # The VS Code, Neovim, and Vim tests open a copy of the shared test project
-                editors/test-project/*) vscode=true; nvim=true; vim=true ;;
+                minisign.pub) vscode=true; zed=true; nvim=true; vim=true; emacs=true ;;
+                # The VS Code, Neovim, Vim, and Emacs tests open a copy of the shared test project
+                editors/test-project/*) vscode=true; nvim=true; vim=true; emacs=true ;;
                 editors/vscode/*) vscode=true ;;
                 editors/zed/*) zed=true ;;
                 editors/nvim/*) nvim=true ;;
                 editors/vim/*) vim=true ;;
                 updates/*) updates=true ;;
+                editors/emacs/*) emacs=true ;;
                 docs/*|assets/*|README*|CHANGELOG.md|LICENSE|AGENTS.md|.agents/*|.claude/*|.gitignore) ;;
                 # A path that no rule knows may need anything: run everything
                 *) all ;;
@@ -78,7 +80,7 @@ jobs:
             done < "$changed"
           fi
 
-          printf 'Jobs: zig=%s vscode=%s zed=%s nvim=%s vim=%s updates=%s\n' "$zig" "$vscode" "$zed" "$nvim" "$vim" "$updates"
+          printf 'Jobs: zig=%s vscode=%s zed=%s nvim=%s vim=%s updates=%s emacs=%s\n' "$zig" "$vscode" "$zed" "$nvim" "$vim" "$updates" "$emacs"
           {
             printf 'zig=%s\n' "$zig"
             printf 'vscode=%s\n' "$vscode"
@@ -86,6 +88,7 @@ jobs:
             printf 'nvim=%s\n' "$nvim"
             printf 'vim=%s\n' "$vim"
             printf 'updates=%s\n' "$updates"
+            printf 'emacs=%s\n' "$emacs"
           } >> "$GITHUB_OUTPUT"
 
   updates:
@@ -327,3 +330,36 @@ jobs:
           ZA_RESULT="$RUNNER_TEMP/vim-update.txt" timeout 60 "$VIM_EXE" -N -u NONE -i NONE --not-a-term -S editors/vim/test/update.vim > /dev/null || status=1
           cat "$RUNNER_TEMP/vim-update.txt" || status=1
           exit $status
+
+  emacs:
+    name: Emacs package
+    needs: changes
+    if: needs.changes.outputs.emacs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      ZIG_ANALYZER: ${{ github.workspace }}/zig-out/bin/zig-analyzer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: emacs
+      # The smoke test opens editors/test-project, which the server loads with the zig in PATH
+      - name: Build the server
+        run: zig build
+      - name: Install Emacs and minisign
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q emacs-nox minisign
+          emacs --version | head -n 1
+      # The install test signs its fake releases with Node
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Emacs package
+        working-directory: editors/emacs
+        run: |
+          emacs -Q --batch -L . -l test/zig-analyzer-test.el -f ert-run-tests-batch-and-exit
+          emacs -Q --batch -L . -l test/install.el
+          timeout 900 emacs -Q --batch -L . -l test/smoke.el

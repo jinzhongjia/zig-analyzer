@@ -52,7 +52,7 @@ These facts constrain every integration and are the baseline of the research.
 | Neovim 0.12+ | `vim.lsp.config` | Built-in filetype | Documentation only (no plugin planned); evaluate an `nvim-lspconfig` config entry |
 | Zed | Extension (Rust compiled to WASM) | `zed-industries/zed` Zig extension, starts ZLS | Needs an extension or an upstream change to the Zig extension |
 | Helix | `languages.toml` | Built-in Zig language, ZLS default | Documentation; evaluate an upstream `languages.toml` server entry |
-| Emacs | eglot (built in) / lsp-mode | `zig-mode`, `zig-ts-mode` | Documentation for eglot; evaluate an lsp-mode client |
+| Emacs | eglot (built in) / lsp-mode | `zig-mode`, `zig-ts-mode` | Package (`editors/emacs`) for eglot; lsp-mode not supported |
 | JetBrains IDEs | LSP4IJ (all IDEs) or the platform LSP API | ZigBrains (bundles ZLS) | Evaluate LSP4IJ user-defined server vs. a plugin |
 | Sublime Text | `LSP` package client config | `Zig Language` package | Documentation; evaluate an `LSP-zig-analyzer` helper package |
 | Kate, Vim (vim-lsp / coc.nvim / ALE) | Configuration | Varies | Documentation only |
@@ -125,9 +125,10 @@ For each editor in scope, answer the following and record the answers in a singl
 - [x] Zed extension (`editors/zed`), tried in Zed 1.27 with the Zig extension 0.4.2.
 - [x] Neovim plugin (`editors/nvim`), with a headless smoke test.
 - [x] Vim plugin (`editors/vim`) for yegappan/lsp and vim-lsp; with a smoke test for each client.
-- [x] Shared test project (`editors/test-project`); the VS Code, Neovim, and Vim smoke tests run
-      the same checks on it in CI (`VS Code extension`, `Neovim plugin`, and `Vim plugin` jobs).
-      Zed is tried by hand.
+- [x] Emacs package (`editors/emacs`) for eglot; with unit, install, and smoke tests.
+- [x] Shared test project (`editors/test-project`); the VS Code, Neovim, Vim, and Emacs smoke
+      tests run the same checks on it in CI (`VS Code extension`, `Neovim plugin`, `Vim plugin`,
+      and `Emacs package` jobs). Zed is tried by hand.
 - [ ] Prepare the sample project and a debug build with logging.
 - [ ] Capture `initialize` and walk through features in VS Code.
 - [ ] Same for Zed.
@@ -137,10 +138,13 @@ For each editor in scope, answer the following and record the answers in a singl
 - [ ] Same for Sublime Text and Kate.
 - [ ] Re-check Neovim 0.12 against the same checklist (documentation only).
 - [ ] Review how existing Zig extensions manage ZLS; decide coexistence strategy per editor.
+- [x] Write the per-editor setup instructions for editors that need no plugin
+      (`docs/editors.md`).
 - [ ] Write the matrix and recommendations; list server-side prerequisites.
 - [ ] Decide which plugins to build and open a plan for each, starting with the release
       pipeline if any plugin downloads binaries.
-- [x] Release install in each integration (#324), only on the user's request.
+- [x] Release install in each integration (VS Code, Zed, Neovim, Vim, and Emacs), only on the
+      user's request.
 
 ## Open questions
 
