@@ -9771,3 +9771,54 @@ test "captures of inline prongs on tagged unions take the payload of each item" 
     const t = (try definition.definition(&r, file, @intCast(std.mem.indexOf(u8, text, "s.x").? + 2))) orelse return error.NoDefinition;
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "x: u8 }").?)), t.start);
 }
+
+test "goto and hover at a call on an abstract parameter in a branch inactive under every instance" {
+    // Prevents an empty result where references list the call: the branch on `windows` executes
+    // under no instance, while the branch on `System` executes only under `Testing`
+    const text =
+        \\const windows = false;
+        \\const Default = struct {
+        \\    pub fn getenv(s: *Default) u8 { _ = s; return 0; }
+        \\};
+        \\const Testing = struct {
+        \\    pub fn getenv(s: *Testing) u8 { _ = s; return 1; }
+        \\};
+        \\fn inner(comptime System: type, system: *System) u8 {
+        \\    if (windows) {
+        \\        return system.getenv(); // inactive
+        \\    }
+        \\    if (System == Testing) {
+        \\        return system.getenv(); // testing
+        \\    }
+        \\    return system.getenv(); // active
+        \\}
+        \\test {
+        \\    var d: Default = .{};
+        \\    var t: Testing = .{};
+        \\    _ = inner(Default, &d);
+        \\    _ = inner(Testing, &t);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const default_decl: u32 = @intCast(std.mem.indexOf(u8, text, "getenv(s: *Default)").?);
+    const testing_decl: u32 = @intCast(std.mem.indexOf(u8, text, "getenv(s: *Testing)").?);
+    for ([_]struct { []const u8, []const u32, []const u8 }{
+        .{ "getenv(); // inactive", &.{ default_decl, testing_decl }, "```zig\npub fn getenv(s: *Default) u8\n```\n\ninferred from the call at main.zig:20" },
+        .{ "getenv(); // testing", &.{testing_decl}, "```zig\npub fn getenv(s: *Testing) u8\n```\n\ninferred from the call at main.zig:21" },
+        .{ "getenv(); // active", &.{default_decl}, "```zig\npub fn getenv(s: *Default) u8\n```\n\ninferred from the call at main.zig:20" },
+    }) |c| {
+        const at: u32 = @intCast(std.mem.indexOf(u8, text, c[0]).?);
+        const targets = try definition.declarationTargets(&r, file, at);
+        try testing.expectEqual(c[1].len, targets.len);
+        for (c[1], targets) |want, t| try testing.expectEqual(want, t.start);
+        const info = try hover.hover(&r, file, at, &.{}, .count) orelse return error.NoHover;
+        try testing.expect(std.mem.startsWith(u8, info.text, c[2]));
+    }
+}
