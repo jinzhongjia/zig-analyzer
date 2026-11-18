@@ -5,6 +5,14 @@ language server: diagnostics from the Zig compiler, comptime-aware completion, h
 references, rename, code actions, inlay hints, semantic highlighting, and `zig fmt` formatting,
 for `.zig` and `.zon` files; and running, debugging, and testing with `zig`.
 
+## Install
+
+Search for `zig-analyzer` in the Extensions view (Ctrl/Cmd+Shift+X) and install it. It is on the
+[Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=jinzhongjia.zig-analyzer)
+and [Open VSX](https://open-vsx.org/extension/jinzhongjia/zig-analyzer), which serves editors that
+do not use the Microsoft marketplace, such as VSCodium and Cursor. Then install the server with
+**zig-analyzer: Install Server** (see [The server](#the-server)).
+
 ## Requirements
 
 - The server: see below.
