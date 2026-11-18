@@ -62,7 +62,10 @@ export function bytes(n: number): string {
 
 const nonempty = (v: unknown): v is string => typeof v === "string" && v !== "";
 
-/** `rows` (lists of cells) as columns, all but the first aligned to the right; the first row is the header */
+/**
+ * `rows` (lists of cells) as columns; the first row is the header. A column whose cells (below the
+ * header) all start with a number is aligned to the right, every other column to the left.
+ */
 function table(
   b: Builder,
   rows: string[][],
@@ -71,14 +74,21 @@ function table(
   targets: (Target | undefined)[] = [],
 ): void {
   const widths: number[] = [];
-  for (const row of rows) row.forEach((cell, i) => (widths[i] = Math.max(widths[i] ?? 0, cell.length)));
+  const numeric: boolean[] = [];
+  rows.forEach((row, r) =>
+    row.forEach((cell, i) => {
+      widths[i] = Math.max(widths[i] ?? 0, cell.length);
+      if (r > 0) numeric[i] = (numeric[i] ?? true) && /^-?\d/.test(cell);
+    }),
+  );
   rows.forEach((row, r) => {
     const chunks: Chunk[] = [indent];
     row.forEach((cell, i) => {
       const pad = " ".repeat(widths[i] - cell.length);
-      if (i > 0) chunks.push("  " + pad);
+      if (i > 0) chunks.push("  ");
+      if (numeric[i]) chunks.push(pad);
       chunks.push([cell, r === 0 ? "title" : styles[i]]);
-      if (i === 0 && row.length > 1) chunks.push(pad);
+      if (!numeric[i] && i < row.length - 1) chunks.push(pad);
     });
     b.add(chunks, targets[r]);
   });

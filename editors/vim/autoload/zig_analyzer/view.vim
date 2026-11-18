@@ -49,17 +49,24 @@ function! s:bytes(n) abort
   return l:i == 0 ? printf('%d B', a:n) : printf('%.1f %s', l:n, l:units[l:i])
 endfunction
 
-" `rows` (lists of cells) as columns, all but the first aligned to the right; the first row is the
-" header. `targets` (optional) has the target of each row, `{}` for none.
+" `rows` (lists of cells) as columns; the first row is the header. A column whose cells (below the
+" header) all start with a number is aligned to the right, every other column to the left.
+" `targets` (optional) has the target of each row, `{}` for none.
 function! s:table(v, rows, indent, groups, ...) abort
   let l:targets = a:0 ? a:1 : []
   let l:widths = []
-  for l:row in a:rows
+  let l:numeric = []
+  for l:r in range(len(a:rows))
+    let l:row = a:rows[l:r]
     for l:i in range(len(l:row))
       if l:i >= len(l:widths)
         call add(l:widths, 0)
+        call add(l:numeric, 1)
       endif
       let l:widths[l:i] = max([l:widths[l:i], strdisplaywidth(l:row[l:i])])
+      if l:r > 0 && l:row[l:i] !~# '^-\=\d'
+        let l:numeric[l:i] = 0
+      endif
     endfor
   endfor
   for l:r in range(len(a:rows))
@@ -68,10 +75,13 @@ function! s:table(v, rows, indent, groups, ...) abort
     for l:i in range(len(l:row))
       let l:pad = repeat(' ', l:widths[l:i] - strdisplaywidth(l:row[l:i]))
       if l:i > 0
-        call add(l:chunks, '  ' . l:pad)
+        call add(l:chunks, '  ')
+      endif
+      if l:numeric[l:i]
+        call add(l:chunks, l:pad)
       endif
       call add(l:chunks, [l:row[l:i], l:r == 0 ? 'Title' : get(a:groups, l:i, '')])
-      if l:i == 0 && len(l:row) > 1
+      if !l:numeric[l:i] && l:i < len(l:row) - 1
         call add(l:chunks, l:pad)
       endif
     endfor
