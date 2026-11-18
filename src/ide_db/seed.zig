@@ -85,7 +85,7 @@ pub const Refiner = struct {
 
     pub fn at(f: *Refiner, rel: u32, subject: ?Subject) resolve.Error!?Seed {
         if (!f.r.ctx.db.env.callsite_seeding.load(.monotonic)) return null;
-        if (subject != null and fits(f.r.ctx.db.env.ip, f.body, f.abstract.res.?, rel, subject)) return null;
+        if (subject != null and fits(f.r.ctx.db.env.ip, f.body, f.abstract.res.?, f.abstract.res.?, rel, subject)) return null;
         var fallback: ?Seed = null;
         if (try f.tryVariant(&f.abstract, rel, subject, &fallback)) |s| return s;
         var checked: usize = 0;
@@ -140,7 +140,7 @@ pub const Refiner = struct {
             candidate.res = inferred;
             break :blk inferred;
         };
-        if (fits(ip, f.body, res, rel, subject) and candidate.origin != null) return f.presented(candidate);
+        if (fits(ip, f.body, f.abstract.res.?, res, rel, subject) and candidate.origin != null) return f.presented(candidate);
         // The compiler analyzes the body of a loop nested in other loops inferred per iteration
         // once per combination of their iterations: in an iteration of the innermost loop alone,
         // the captures of the enclosing loops have no value
@@ -190,10 +190,10 @@ pub const Refiner = struct {
                 .offset = f.node_offset + f.body.range(loop.expr).start,
                 .iteration = @intCast(idx),
             };
-            if (fits(ip, f.body, s.res, rel, subject)) return s;
-            if (fallback.* == null and !inactiveAt(f.body, s.res, rel)) fallback.* = s;
+            if (fits(ip, f.body, f.abstract.res.?, s.res, rel, subject)) return s;
+            if (fallback.* == null and !inactiveUnder(f.body, f.abstract.res.?, s.res, rel)) fallback.* = s;
         };
-        if (fallback.* == null and !inactiveAt(f.body, res, rel)) {
+        if (fallback.* == null and !inactiveUnder(f.body, f.abstract.res.?, res, rel)) {
             fallback.* = try f.presented(candidate);
         }
         return null;
@@ -212,7 +212,7 @@ pub const Refiner = struct {
             rel: u32,
             subject: ?Subject,
             fn visit(c: @This(), node: *const infer.Result) bool {
-                return fits(c.f.r.ctx.db.env.ip, c.f.body, node, c.rel, c.subject);
+                return fits(c.f.r.ctx.db.env.ip, c.f.body, c.f.abstract.res.?, node, c.rel, c.subject);
             }
         };
         const found = try combos.find(res, Check{ .f = f, .rel = rel, .subject = subject }) orelse return null;
@@ -364,12 +364,12 @@ pub fn allSeeds(r: *Resolver, file: FileId, item: u32, body: *const Body, res: *
     }
     for (instances.items) |instance| {
         const inst_res = if (instance) |s| s.res else res;
-        if (instance) |s| if (!inactiveAt(body, s.res, rel)) try out.append(r.arena, s);
+        if (instance) |s| if (!inactiveUnder(body, res, s.res, rel)) try out.append(r.arena, s);
         if (inst_res.exprs.len != body.exprs.len) continue;
         const inst = if (instance) |s| s.inst else null;
         const per = try iterationCombinations(r, owner, body, inst_res, inst, rel);
         for (per.found) |it| {
-            if (inactiveAt(body, it.res, rel)) continue;
+            if (inactiveUnder(body, res, it.res, rel)) continue;
             try out.append(r.arena, try per.combos.seed(it, node_offset));
         }
     }
@@ -521,12 +521,12 @@ fn mentionsWithin(body: *const Body, e: Body.ExprId, names: []const []const u8) 
     return false;
 }
 
-/// In the instance's inference result `res`, the code at `rel` executes and `subject` has a
-/// concrete type. An enum literal not yet coerced to an enum (`.input =>` in `switch (Q.kind)`,
-/// whose type is still `@Type(.enum_literal)`) does not know yet which member it refers to, so it
-/// does not count.
-fn fits(ip: *InternPool, body: *const Body, res: *const infer.Result, rel: u32, subject: ?Subject) bool {
-    if (inactiveAt(body, res, rel)) return false;
+/// In the instance's inference result `res`, the code at `rel` executes (see `inactiveUnder`;
+/// `abstract` is the abstract inference) and `subject` has a concrete type. An enum literal not yet
+/// coerced to an enum (`.input =>` in `switch (Q.kind)`, whose type is still `@Type(.enum_literal)`)
+/// does not know yet which member it refers to, so it does not count.
+fn fits(ip: *InternPool, body: *const Body, abstract: *const infer.Result, res: *const infer.Result, rel: u32, subject: ?Subject) bool {
+    if (inactiveUnder(body, abstract, res, rel)) return false;
     const tv = switch (subject orelse return true) {
         .expr => |e| if (@backingInt(e) < res.exprs.len) res.exprs[@backingInt(e)] else return false,
         .binding => |b| if (@backingInt(b) < res.bindings.len) res.bindings[@backingInt(b)] else return false,
@@ -536,15 +536,28 @@ fn fits(ip: *InternPool, body: *const Body, res: *const infer.Result, rel: u32, 
     return !wanted(ip, tv) and tv.ty != .enum_literal_type and tv.ty != .noreturn_type;
 }
 
-/// The relative position `rel` falls in an inactive branch of the inference result. The end of the
-/// branch counts too: the completion position is often right after a just-typed `a.`, i.e. at the
-/// end of the branch.
-fn inactiveAt(body: *const Body, res: *const infer.Result, rel: u32) bool {
+/// The relative position `rel` falls in inactive code of `res` (an inference under an instance or
+/// iteration) that is not inactive in the abstract inference `abstract`: code that another instance
+/// may execute. Code inactive in the abstract inference (a branch on the target, as in
+/// `if (builtin.os.tag == .windows)`) is inactive under every instance, so it does not reject one.
+/// The end of a branch counts too: the completion position is often right after a just-typed `a.`,
+/// i.e. at the end of the branch.
+fn inactiveUnder(body: *const Body, abstract: *const infer.Result, res: *const infer.Result, rel: u32) bool {
     for (res.inactive) |e| {
         const rg = body.range(e);
-        if (rg.start <= rel and rel <= rg.end) return true;
+        if (rg.start <= rel and rel <= rg.end and !coveredInactive(body, abstract, rg)) return true;
     }
-    for (res.dead_spans) |rg| if (rg.start <= rel and rel <= rg.end) return true;
+    for (res.dead_spans) |rg| if (rg.start <= rel and rel <= rg.end and !coveredInactive(body, abstract, rg)) return true;
+    return false;
+}
+
+/// The range `rg` lies entirely in inactive code of inference result `res`
+fn coveredInactive(body: *const Body, res: *const infer.Result, rg: Body.Range) bool {
+    for (res.inactive) |x| {
+        const xr = body.range(x);
+        if (xr.start <= rg.start and rg.end <= xr.end) return true;
+    }
+    for (res.dead_spans) |xr| if (xr.start <= rg.start and rg.end <= xr.end) return true;
     return false;
 }
 
