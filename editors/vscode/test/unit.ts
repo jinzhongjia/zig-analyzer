@@ -11,6 +11,7 @@ import { crc32, tarEntries, unpack, zipEntries } from "../src/archive";
 import * as entries from "../src/entries";
 import * as installer from "../src/install";
 import * as minisign from "../src/minisign";
+import * as update from "../src/update";
 import * as views from "../src/views";
 import { newKey, serve, sign, writeRelease } from "./release";
 
@@ -68,9 +69,9 @@ async function signatures(): Promise<void> {
   );
   check(crypto.verify(null, Buffer.alloc(0), rfcKey.key, rfcSig), "the Ed25519 key of RFC 8032 test 1 verifies its signature");
 
-  const key = minisign.publicKey(installer.github.publicKey);
+  const key = minisign.publicKey(installer.releases.publicKey);
   const repoKey = fs.readFileSync(path.join(__dirname, "../../../../minisign.pub"), "utf8").split("\n")[1];
-  check(repoKey === installer.github.publicKey, "the release key is that of minisign.pub");
+  check(repoKey === installer.releases.publicKey, "the release key is that of minisign.pub");
   const sums = fs.readFileSync(path.join(fixtures, "SHA256SUMS"));
   const sig = fs.readFileSync(path.join(fixtures, "SHA256SUMS.minisig"), "utf8");
   check(minisign.verify(sums, sig, key) === "zig-analyzer v0.1.1", "the v0.1.1 SHA256SUMS verifies, signed for v0.1.1");
@@ -325,6 +326,8 @@ async function installs(): Promise<void> {
   writeRelease(releases, "v9.9.9", base);
   server.latest = "v9.9.9";
   server.requests.length = 0;
+  check((await update.fetchLatest(`${server.url}/metadata.json`)) === "v9.9.9", "the update check reads the latest release tag");
+  check((await update.fetchLatest(`${server.url}/missing.json`)) === undefined, "a missing metadata file gives no update");
   const latest = await installer.install(dir, {}, source, progress);
   const name = `zig-analyzer-v9.9.9-${target}-ReleaseSafe`;
   check(latest.tag === "v9.9.9" && latest.release === name && latest.downloaded, "the latest release installs");
@@ -348,6 +351,28 @@ async function installs(): Promise<void> {
   check(!again.downloaded && again.exe === fast.exe, "reinstalling the installed release needs no download");
   check(!leftovers(), "installs leave no temporary directory");
   await server.close();
+}
+
+function updateChecks(): void {
+  const versions: [string, string, number | undefined][] = [
+    ["v0.2.0", "0.1.2", 1],
+    ["0.1.10", "0.1.9", 1],
+    ["0.1.2", "0.1.2+3.gabc1234", 0],
+    ["v0.1.2", "0.1.2", 0],
+    ["0.1.2", "0.1.2-dev+d8b0905", 1],
+    ["0.1.2-rc.1", "0.1.2", -1],
+    ["0.1.2-alpha", "0.1.2-alpha.1", -1],
+    ["0.1.2-alpha.2", "0.1.2-alpha.10", -1],
+    ["nightly", "0.1.2", undefined],
+  ];
+  for (const [a, b, want] of versions) {
+    check(update.compareVersions(a, b) === want, `compareVersions(${a}, ${b}) is ${want}`);
+  }
+  check(update.parseMetadata('{"schema":1,"latest":"v0.2.0"}') === "v0.2.0", "the metadata gives its latest tag");
+  check(update.parseMetadata('{"schema":2,"latest":"v0.2.0"}') === undefined, "another schema is ignored");
+  check(update.parseMetadata('{"schema":1,"latest":"nightly"}') === undefined, "a tag that is no release tag is ignored");
+  check(update.parseMetadata('{"schema":1,"latest":"v0.2.0","versions":[]}') === "v0.2.0", "the versions array is ignored");
+  check(update.parseMetadata("not json") === undefined, "metadata that is no JSON is ignored");
 }
 
 function inspectionViews(): void {
@@ -433,6 +458,7 @@ function runnableEntries(): void {
 async function main(): Promise<void> {
   try {
     runnableEntries();
+    updateChecks();
     inspectionViews();
     blake2b();
     await signatures();

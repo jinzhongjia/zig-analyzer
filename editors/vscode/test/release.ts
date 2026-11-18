@@ -98,6 +98,9 @@ export async function serve(root: string): Promise<ReleaseServer> {
     } else if ((m = /^\/objects\/([^/]+)\/([^/]+)$/.exec(url)) && fs.existsSync(path.join(root, "download", m[1], m[2]))) {
       const data = fs.readFileSync(path.join(root, "download", m[1], m[2]));
       res.writeHead(200, { "Content-Length": data.length }).end(data);
+    } else if (url === "/metadata.json") {
+      const data = Buffer.from(JSON.stringify({ schema: 1, latest: state.latest, versions: [] }) + "\n");
+      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": data.length }).end(data);
     } else {
       res.writeHead(404).end();
     }

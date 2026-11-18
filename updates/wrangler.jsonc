@@ -1,0 +1,20 @@
+// The release Worker (see updates/README.md and docs/features/update-check.md). The bucket
+// holds metadata.json and releases/<tag>/<file>; the Worker serves them from
+// releases.zig-analyzer.dev and resolves the latest release.
+{
+  "name": "zig-analyzer-releases",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-11-17",
+  "r2_buckets": [
+    {
+      "binding": "RELEASES",
+      "bucket_name": "zig-analyzer-releases"
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "releases.zig-analyzer.dev",
+      "custom_domain": true
+    }
+  ]
+}

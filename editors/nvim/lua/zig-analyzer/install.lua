@@ -1,4 +1,4 @@
--- `:ZigAnalyzer install`: downloads a release of the server from GitHub into
+-- `:ZigAnalyzer install`: downloads a release of the server from the release server into
 -- `stdpath('data')/zig-analyzer`, after verifying it. The release's SHA256SUMS must carry a
 -- minisign signature by the release key below, whose trusted comment names the release
 -- (`zig-analyzer <tag>`), and the archive must have the SHA-256 listed there. Needs `curl` and
@@ -11,7 +11,7 @@ local M = {}
 local name = 'zig_analyzer'
 
 --- Where the releases are downloaded from
-M.releases = 'https://github.com/jinzhongjia/zig-analyzer/releases'
+M.releases = 'https://releases.zig-analyzer.dev'
 
 --- The release signing key (`minisign.pub` at the root of the zig-analyzer repository)
 M.public_key = 'RWRbma3B4tRgvIsJxiSxTvwoOWB6wvqxTEDgWVaJk0XMSeW9THbHBVj+'

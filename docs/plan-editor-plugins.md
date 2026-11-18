@@ -6,7 +6,7 @@ release process must provide for it.
 
 Integrations in `editors/`: VS Code, Zed, Neovim, and Vim (yegappan/lsp and vim-lsp). VS Code,
 Neovim, and Vim start a configured path first, then a release they installed, then `zig-analyzer`
-in PATH, and install a GitHub release only when the user runs a command. Zed starts a configured
+in PATH, and install a release from the release server only when the user runs a command. Zed starts a configured
 path, then `zig-analyzer` in PATH, then a release it installs (the `download` setting selects it or
 turns it off). Each verifies the minisign signature of the release's `SHA256SUMS` and the SHA-256 of
 the archive. None manages the Zig toolchain.

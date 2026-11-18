@@ -183,7 +183,7 @@ check(select(2, install.command()) == 'PATH', 'without an install the server is 
 local project = tmp .. '/project'
 vim.fn.mkdir(project, 'p')
 sh({ 'cp', '-R', root .. '/../test-project/.', project })
-require('zig-analyzer').setup({})
+require('zig-analyzer').setup({ check_updates = false })
 vim.cmd.edit(project .. '/src/main.zig')
 
 --- The command line of the server process of the client attached to the current buffer, once that
@@ -241,7 +241,7 @@ local completion = vim.fn.getcompletion('ZigAnalyzer install ', 'cmdline')
 check(vim.tbl_contains(completion, 'ReleaseFast') and vim.tbl_contains(completion, 'latest'), 'install arguments complete')
 
 -- A configured `cmd` stays in use
-require('zig-analyzer').setup({ cmd = { server } })
+require('zig-analyzer').setup({ cmd = { server }, check_updates = false })
 messages = {}
 check(run({ version = 'v9.9.8' }) == nil, 'install works with `cmd` set')
 check(notified('stays in use'), 'install says that the configured `cmd` stays in use')
@@ -259,7 +259,7 @@ vim.env.PATH = table.concat(path, ':')
 check(install.command() == nil, 'without an install and PATH entry there is no server')
 -- setup() already tries to start a client for the open buffer of the project
 messages = {}
-require('zig-analyzer').setup({ cmd = install.cmd })
+require('zig-analyzer').setup({ cmd = install.cmd, check_updates = false })
 vim.cmd.edit(project .. '/build.zig')
 vim.wait(5000, function() return notified('not installed') end, 50)
 check(notified(':ZigAnalyzer install'), 'without a server, opening a Zig file says how to install one')

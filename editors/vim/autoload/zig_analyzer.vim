@@ -147,7 +147,7 @@ function! zig_analyzer#complete(lead, line, pos) abort
     call remove(l:words, -1)
   endif
   if empty(l:words)
-    let l:names = sort(keys(s:commands) + ['install', 'reloadWorkspace', 'restart'])
+    let l:names = sort(keys(s:commands) + ['install', 'checkUpdates', 'reloadWorkspace', 'restart'])
   elseif l:words[0] ==# 'install'
     let l:names = ['latest'] + copy(g:zig_analyzer#install#optimize_modes)
   else
@@ -159,6 +159,14 @@ endfunction
 function! zig_analyzer#command(name, ...) abort
   if a:name ==# 'install'
     call zig_analyzer#install#command(a:000)
+    return
+  endif
+  if a:name ==# 'checkUpdates'
+    if a:0 > 0
+      call s:error('checkUpdates takes no arguments')
+      return
+    endif
+    call zig_analyzer#update#check({'force': 1, 'notify_no_version': 1})
     return
   endif
   if a:0 > 0

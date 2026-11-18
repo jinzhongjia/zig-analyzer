@@ -38,6 +38,8 @@ async function main(): Promise<void> {
   const smoke = workspace({
     ...(server ? { "zig-analyzer.server.path": server } : {}),
     "zig-analyzer.inlay_hints.exclude_single_argument": false,
+    // The update check would read the real version file
+    "zig-analyzer.server.checkUpdates": false,
   });
   try {
     await launch("suite", smoke);
@@ -54,7 +56,7 @@ async function main(): Promise<void> {
   writeRelease(releases, "v9.9.6", { exe, target: t, key, comment: "v9.9.5" });
   const http = await serve(releases);
   http.latest = "v9.9.9";
-  const dir = workspace({ "zig-analyzer.build.enable": false });
+  const dir = workspace({ "zig-analyzer.build.enable": false, "zig-analyzer.server.checkUpdates": false });
   try {
     await launch("install-suite", dir, {
       ZA_TEST_RELEASES: http.url,

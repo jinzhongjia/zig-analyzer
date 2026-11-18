@@ -32,6 +32,7 @@ end
 
 require('zig-analyzer').setup({
   cmd = { os.getenv('ZIG_ANALYZER') or 'zig-analyzer' },
+  check_updates = false,
   settings = { inlay_hints = { exclude_single_argument = false } },
 })
 

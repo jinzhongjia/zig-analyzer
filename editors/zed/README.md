@@ -45,9 +45,9 @@ another one, where `version` is `"latest"` (the default) or a release tag, and `
 `binary.path` and `PATH`. The extension reads the setting itself and does not send it to the
 server.
 
-The release is installed when the server starts (when a Zig file is opened, or on
-`editor: restart language server`); Zed shows "Checking for updates to zig-analyzer" and
-"Downloading zig-analyzer" meanwhile:
+The release is installed from `https://releases.zig-analyzer.dev` when the server starts (when a
+Zig file is opened, or on `editor: restart language server`); Zed shows "Checking for updates to
+zig-analyzer" and "Downloading zig-analyzer" meanwhile:
 
 - For the latest release, the extension downloads its `SHA256SUMS` at the first server start of a
   Zed session to learn which release it is, and installs it when that is not the installed one.
@@ -65,13 +65,18 @@ When an install fails, the server does not start and Zed shows the error, so tha
 does not verify is never passed over. The exception is a latest release that cannot be downloaded
 (when offline, say): then the installed release starts.
 
+Zed is the only integration that updates the server without asking first: the VS Code, Neovim, and
+Vim plugins only report a newer release (see
+[`docs/features/update-check.md`](../../docs/features/update-check.md)). To pin a release here,
+set `download.version` to its tag.
+
 Releases go into the extension's work directory, `server/<release>/` with `server/current` naming
 the one in use; the others are removed after an install. The work directory is
 `~/Library/Application Support/Zed/extensions/work/zig-analyzer` on macOS,
 `$XDG_DATA_HOME/zed/extensions/work/zig-analyzer` (`~/.local/share/zed/...`) on Linux, and
 `%LOCALAPPDATA%\Zed\extensions\work\zig-analyzer` on Windows. Downloads go through Zed, with its
 proxy settings; the `granted_extension_capabilities` setting must allow `download_file` from
-`github.com` (the default allows all downloads).
+`releases.zig-analyzer.dev` (the default allows all downloads).
 
 ## Settings
 

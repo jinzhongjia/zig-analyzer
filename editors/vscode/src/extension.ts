@@ -9,6 +9,7 @@ import {
 } from "vscode-languageclient/node";
 import * as installer from "./install";
 import * as runner from "./run";
+import * as update from "./update";
 import { configuredServer, section, serverEnv, serverSettings } from "./settings";
 import * as views from "./views";
 
@@ -29,8 +30,11 @@ const viewChanged = new vscode.EventEmitter<vscode.Uri>();
 const viewStyles = new Map<views.Style, vscode.TextEditorDecorationType>();
 /** The range of the syntax tree line under the cursor, in the source document */
 let rangeDecoration: vscode.TextEditorDecorationType;
-let releaseSource = installer.github;
+let releaseSource = installer.releases;
+let updateUrl = update.metadataUrl;
 let installing = false;
+/** Where the running server comes from; a setting is the user's own server */
+let clientSource: "setting" | "install" | "path" = "path";
 
 /** The API returned to other extensions and tests */
 export interface Api {
@@ -43,6 +47,8 @@ export interface Api {
   install(options: installer.InstallOptions): Promise<installer.Result>;
   /** Where releases are installed from (the tests install fake releases) */
   setReleaseSource(source: installer.ReleaseSource): void;
+  /** Where the update check reads the latest release from (the tests serve a fake one) */
+  setUpdateUrl(url: string): void;
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<Api> {
@@ -88,6 +94,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
     setReleaseSource: (source) => {
       releaseSource = source;
     },
+    setUpdateUrl: (url) => {
+      updateUrl = url;
+    },
   };
 }
 
@@ -114,6 +123,7 @@ function serverCommand(context: vscode.ExtensionContext): { command: string; sou
 
 async function start(context: vscode.ExtensionContext): Promise<void> {
   const { command, source } = serverCommand(context);
+  clientSource = source;
   const serverOptions: ServerOptions = { command, options: { env: serverEnv() } };
   const clientOptions: LanguageClientOptions = {
     documentSelector: [
@@ -143,6 +153,7 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
   updateStatus(State.Starting);
   try {
     await c.start();
+    void checkForUpdate(context);
   } catch (err) {
     updateStatus(State.Stopped);
     const message = err instanceof Error ? err.message : String(err);
@@ -171,6 +182,45 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
   }
 }
 
+/** At most one check a day, and a tag is reported once */
+const updateCheckInterval = 24 * 60 * 60 * 1000;
+
+/**
+ * Reads the release version file after the server starts and reports a newer release. It never
+ * installs one: **Install Server** in the message is the user's choice, and the install verifies
+ * the release as always. A failed check is silent, and a reported tag is not reported again.
+ */
+async function checkForUpdate(context: vscode.ExtensionContext): Promise<void> {
+  try {
+    if (!vscode.workspace.getConfiguration(section).get<boolean>("server.checkUpdates", true)) return;
+    const current = client?.initializeResult?.serverInfo?.version;
+    if (current === undefined) return;
+    const now = Date.now();
+    if (now - context.globalState.get<number>("updateCheck.last", 0) < updateCheckInterval) return;
+    await context.globalState.update("updateCheck.last", now);
+    const tag = await update.fetchLatest(updateUrl, AbortSignal.timeout(5000));
+    if (tag === undefined) return;
+    const order = update.compareVersions(tag, current);
+    if (order === undefined || order <= 0) return;
+    if (context.globalState.get<string>("updateCheck.prompted") === tag) return;
+    await context.globalState.update("updateCheck.prompted", tag);
+    output.appendLine(`update check: ${tag} is available (running ${current})`);
+    // A server from `zig-analyzer.server.path` is the user's own: never offer to replace it
+    const actions = clientSource === "setting" ? ["Release Notes"] : ["Release Notes", "Install Server"];
+    const choice = await vscode.window.showInformationMessage(
+      `zig-analyzer ${tag} is available (running ${current}).`,
+      ...actions,
+    );
+    if (choice === "Release Notes") {
+      await vscode.env.openExternal(vscode.Uri.parse(update.releaseUrl(tag)));
+    } else if (choice === "Install Server") {
+      await vscode.commands.executeCommand("zig-analyzer.installServer");
+    }
+  } catch {
+    // The version file is a convenience: a failure must not affect the server
+  }
+}
+
 async function restart(context: vscode.ExtensionContext): Promise<void> {
   const old = client;
   client = undefined;
@@ -195,7 +245,7 @@ async function pickRelease(): Promise<installer.InstallOptions | undefined> {
       { label: "Latest release", description: "ReleaseFast", detail: modes[1].detail, options: { optimize: "ReleaseFast" } },
       { label: "Another release...", detail: "A release tag, such as v0.1.1" },
     ],
-    { placeHolder: "zig-analyzer: the release to download from GitHub" },
+    { placeHolder: "zig-analyzer: the release to download" },
   );
   if (picked === undefined || picked.options !== undefined) return picked?.options;
   const version = await vscode.window.showInputBox({
@@ -291,7 +341,7 @@ function updateStatus(state: State): void {
 async function showMenu(): Promise<void> {
   const items: (vscode.QuickPickItem & { command: string })[] = [
     { label: "$(debug-restart) Restart Server", command: "zig-analyzer.restartServer" },
-    { label: "$(cloud-download) Install Server", detail: "Download a release from GitHub", command: "zig-analyzer.installServer" },
+    { label: "$(cloud-download) Install Server", detail: "Download a release from releases.zig-analyzer.dev", command: "zig-analyzer.installServer" },
     { label: "$(refresh) Reload Workspace", detail: "Rerun build.zig", command: "zig-analyzer.reloadWorkspace" },
     { label: "$(info) Show Server Status", command: "zig-analyzer.showStatus" },
     { label: "$(file) Show File Status", command: "zig-analyzer.showFileStatus" },
