@@ -71,6 +71,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Api> {
     vscode.commands.registerCommand("zig-analyzer.showFileStatus", () => withEditor((doc) => showView("fileStatus", "file-status", doc))),
     vscode.commands.registerCommand("zig-analyzer.showSyntaxTree", () => withEditor((doc) => showView("syntaxTree", "syntax-tree", doc))),
     vscode.commands.registerCommand("zig-analyzer.showModuleGraph", () => showView("moduleGraph", "module-graph")),
+    vscode.commands.registerCommand("zig-analyzer.showPackages", () => showView("packages", "packages")),
     vscode.commands.registerCommand("zig-analyzer.showOutput", () => output.show(true)),
     vscode.workspace.onDidChangeConfiguration(async (e) => {
       if (!e.affectsConfiguration(`${section}.server`)) return;

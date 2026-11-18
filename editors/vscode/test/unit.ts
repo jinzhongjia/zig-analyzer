@@ -411,6 +411,24 @@ function inspectionViews(): void {
   check(status.lines[0] === "Revision            1" && status.lines.includes("Max RSS             1.0 MiB") && rows[0].startsWith("  b ") && rows[0].includes("2.0 KiB"),
     "status: fields, sizes, and queries by total time");
 
+  const packages = views.render("packages", {
+    projects: [{
+      root: "/p/app", manifest: "/p/app/build.zig.zon", name: "app", version: "1.0.0", fingerprint: "0x1", minimum_zig_version: "0.17.0",
+      paths: ["src"],
+      dependencies: [{
+        name: "lib", kind: "url", url: "https://example.com/lib.tar.gz", hash: "lib-0.1.0-A", lazy: null,
+        root: "/p/app/zig-pkg/lib-0.1.0-A", exists: true,
+        manifest: "/p/app/zig-pkg/lib-0.1.0-A/build.zig.zon", build_zig: "/p/app/zig-pkg/lib-0.1.0-A/build.zig",
+      }],
+    }],
+  }, format);
+  const depLine = packages.lines.findIndex((l) => l.includes("lib") && l.includes("https://example.com/lib.tar.gz"));
+  check(packages.lines[0] === "[1] app" && packages.lines.includes("Dependencies [1]:") && depLine > 0
+    && packages.lines[depLine].includes("present")
+    && JSON.stringify(packages.targets.get(0)) === '{"file":"/p/app/build.zig.zon"}'
+    && JSON.stringify(packages.targets.get(depLine)) === '{"file":"/p/app/zig-pkg/lib-0.1.0-A/build.zig.zon"}',
+  "packages: the project, its dependencies, and where they lead");
+
   const index = new views.ByteIndex("aé\r\n𝄞x\n");
   check(JSON.stringify(index.position(3)) === '{"line":0,"character":2}' && JSON.stringify(index.position(9)) === '{"line":1,"character":2}'
     && JSON.stringify(index.position(11)) === '{"line":2,"character":0}', "byte offsets to UTF-16 positions");

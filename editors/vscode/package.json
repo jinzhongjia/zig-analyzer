@@ -114,6 +114,11 @@
         "category": "zig-analyzer"
       },
       {
+        "command": "zig-analyzer.showPackages",
+        "title": "Show Packages",
+        "category": "zig-analyzer"
+      },
+      {
         "command": "zig-analyzer.showOutput",
         "title": "Show Output",
         "category": "zig-analyzer"
@@ -200,7 +205,7 @@
         "zig-analyzer.server.checkUpdates": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Check once a day whether a newer server release is available, and say so. The check reads a small version file; installing a release is always your choice."
+          "markdownDescription": "Check once a day whether a newer server release is available, and say so. The check reads the release metadata; installing a release is always your choice."
         },
         "zig-analyzer.trace.server": {
           "type": "string",

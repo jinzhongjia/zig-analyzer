@@ -447,6 +447,74 @@ pub const Resolver = struct {
         return out.items;
     }
 
+    /// The definitions that the name or member access `e` (an expression in `b`, the body of
+    /// member `item` in `file`) refers to in the other modules: when `e`, through constants, is a
+    /// path of member names on an `@import` whose targets differ between the modules of the file
+    /// containing that import (`cfg.sub.value` with `const cfg = @import("cfg")`), the member at
+    /// the same path in each other target, in module priority order; the other targets themselves
+    /// for a path that is only the import. Unlike `moduleAlternatives`, which starts from the
+    /// definition, the path is taken from the expression, so the member may be in a file reached
+    /// past the import (`sub` importing a different file in each target). Empty when `e` is not
+    /// such a path. Like `resolveImportTargets`, meant for requests such as goto, and must not be
+    /// used in inference.
+    pub fn pathAlternatives(r: *Resolver, file: FileId, item: u32, b: *const Body, e: Body.ExprId) Error![]const Def {
+        var names: std.ArrayList([]const u8) = .empty;
+        var cur_file = file;
+        var cur_item = item;
+        var cur_body = b;
+        var cur = e;
+        for (0..max_depth) |_| switch (cur_body.expr(cur)) {
+            .field_access => |fa| {
+                try names.append(r.arena, fa.field orelse return &.{});
+                cur = fa.lhs;
+            },
+            .name_ref => |n| {
+                if (cur_body.nameRefIsBuiltin(cur)) return &.{};
+                switch (try r.resolveName(cur_file, cur_item, cur_body, cur_body.expr_scopes[@backingInt(cur)], n) orelse return &.{}) {
+                    .item => |it| {
+                        if ((try r.itemTree(it.file)).items[it.item].kind != .@"const") return &.{};
+                        cur_file = it.file;
+                        cur_item = it.item;
+                        cur_body = try r.body(it.file, it.item);
+                        cur = cur_body.value orelse return &.{};
+                    },
+                    .local => |l| {
+                        cur_file = l.file;
+                        cur_item = l.item;
+                        cur_body = try r.body(l.file, l.item);
+                        const bind = cur_body.binding(l.binding);
+                        if (bind.kind != .local_const) return &.{};
+                        cur = bind.init orelse return &.{};
+                    },
+                    .file => return &.{},
+                }
+            },
+            .builtin_call => |call| {
+                if (!std.mem.eql(u8, call.name, "@import")) return &.{};
+                // A file in a single module imports one target under each name
+                const graph = try r.ctx.get(ModuleGraph.Input, {}) orelse return &.{};
+                if ((graph.entry(cur_file) orelse return &.{}).others.len == 0) return &.{};
+                const targets = try r.importTargets(cur_file, cur_body, call.args);
+                if (targets.len < 2) return &.{};
+                std.mem.reverse([]const u8, names.items);
+                var out: std.ArrayList(Def) = .empty;
+                for (targets[1..]) |t| {
+                    // A container cannot have a field and a declaration of the same name
+                    const alt: Def = if (names.items.len == 0)
+                        .{ .file = t }
+                    else
+                        try r.memberAtPath(t, names.items, false) orelse try r.memberAtPath(t, names.items, true) orelse continue;
+                    for (out.items) |x| {
+                        if (std.meta.eql(x, alt)) break;
+                    } else try out.append(r.arena, alt);
+                }
+                return out.items;
+            },
+            else => return &.{},
+        };
+        return &.{};
+    }
+
     /// The names leading from the root of the file to member `item`, outermost first; null when a
     /// container on the way is not the value of a `const` declaration (`const S = struct {...}`)
     fn memberPath(r: *Resolver, file: FileId, item: u32) Error!?[]const []const u8 {

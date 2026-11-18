@@ -842,7 +842,7 @@ const Finder = struct {
                     // Either way, a namespace chosen per build configuration has the member of
                     // each choice
                     const ns_def = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns| try r.memberDef(ns, f.name) else null;
-                    var current: Target = if (ns_def) |d| try f.matches(file, d, at) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
+                    var current: Target = if (ns_def) |d| try f.matches(file, d, try r.pathAlternatives(file, item_index, body, id), at) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
                     if (current == .unknown) current = try f.importedMember(file, item_index, body, fa.lhs, at);
                     if (current != .hit and f.is_field and try f.zonFieldIsDef(file, item_index, body, try f.inferred(&res, file, item_index), fa.lhs, range.start)) current = .hit;
                     const target = if (current == .unknown) current else try f.configurations(file, item_index, body, fa.lhs, current == .hit, at);
@@ -1059,14 +1059,18 @@ const Finder = struct {
     }
 
     /// Whether `d`, which a use in `file` resolves to, is `def` in some module of `file`: `def`
-    /// itself, or its counterpart in another module that `file` imports under the same name (see
-    /// `Resolver.moduleAlternatives`). When it refers to `def` in some modules and to other
-    /// definitions in others, it is recorded as ambiguous (`at`): renaming it would break the
-    /// build of those modules.
-    fn matches(f: *Finder, file: FileId, d: Def, at: Reference) resolve.Error!Target {
+    /// itself, its counterpart in another module that `file` imports under the same name (see
+    /// `Resolver.moduleAlternatives`), or one of `path_alternatives`, the definitions the use
+    /// refers to in the other modules along its path of names (see `Resolver.pathAlternatives`).
+    /// When it refers to `def` in some modules and to other definitions in others, it is recorded
+    /// as ambiguous (`at`): renaming it would break the build of those modules.
+    fn matches(f: *Finder, file: FileId, d: Def, path_alternatives: []const Def, at: Reference) resolve.Error!Target {
         var hit = deepEql(d, f.def);
         var miss = !hit;
         for (try f.r.moduleAlternatives(file, d)) |alt| {
+            if (deepEql(alt, f.def)) hit = true else miss = true;
+        }
+        for (path_alternatives) |alt| {
             if (deepEql(alt, f.def)) hit = true else miss = true;
         }
         if (hit and miss) if (f.ambiguous) |a| if (a.* == null) {
@@ -1086,7 +1090,7 @@ const Finder = struct {
         const abstract = try f.inferred(res, file, item_index);
         if (l.member(abstract)) |m| {
             const d = try keyDef(f.r, m) orelse return .miss;
-            return f.matches(file, d, at);
+            return f.matches(file, d, &.{}, at);
         }
         const owner = try f.r.ownerKey(file, item_index);
         var hit = false;

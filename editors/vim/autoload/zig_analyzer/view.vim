@@ -50,8 +50,9 @@ function! s:bytes(n) abort
 endfunction
 
 " `rows` (lists of cells) as columns, all but the first aligned to the right; the first row is the
-" header
-function! s:table(v, rows, indent, groups) abort
+" header. `targets` (optional) has the target of each row, `{}` for none.
+function! s:table(v, rows, indent, groups, ...) abort
+  let l:targets = a:0 ? a:1 : []
   let l:widths = []
   for l:row in a:rows
     for l:i in range(len(l:row))
@@ -74,7 +75,7 @@ function! s:table(v, rows, indent, groups) abort
         call add(l:chunks, l:pad)
       endif
     endfor
-    call s:add(a:v, l:chunks)
+    call s:add(a:v, l:chunks, get(l:targets, l:r, {}))
   endfor
 endfunction
 
@@ -197,6 +198,67 @@ function! s:by_total(a, b) abort
     return a:a.total_ms > a:b.total_ms ? -1 : 1
   endif
   return a:a.name ==# a:b.name ? 0 : a:a.name ># a:b.name ? 1 : -1
+endfunction
+
+function! s:packages(result) abort
+  let l:v = s:new()
+  if empty(a:result.projects)
+    call s:add(l:v, [['No workspace root has a build.zig.zon', 'Comment']])
+    return l:v
+  endif
+  for l:i in range(len(a:result.projects))
+    let l:p = a:result.projects[l:i]
+    if l:i > 0
+      call s:add(l:v, [''])
+    endif
+    call s:add(l:v, [[printf('[%d]', l:i + 1), 'Number'], ' ', [s:path(l:p.root), 'Directory']], {'file': l:p.manifest})
+    if s:nonempty(get(l:p, 'parse_error', v:null))
+      call s:add(l:v, ['  ', [l:p.parse_error, 'WarningMsg']])
+    endif
+    let l:paths = []
+    if len(get(l:p, 'paths', [])) == 1 && l:p.paths[0] ==# ''
+      call add(l:paths, [[['[every file]', 'Comment']], {}])
+    else
+      for l:item in get(l:p, 'paths', [])
+        call add(l:paths, [[[l:item, 'String']], {}])
+      endfor
+    endif
+    call s:fields(l:v, [
+          \ ['Manifest', [[[[s:path(l:p.manifest), 'Directory']], {'file': l:p.manifest}]]],
+          \ ['Name', s:nonempty(get(l:p, 'name', v:null)) ? l:p.name : 'none'],
+          \ ['Version', s:nonempty(get(l:p, 'version', v:null)) ? l:p.version : 'none'],
+          \ ['Fingerprint', s:nonempty(get(l:p, 'fingerprint', v:null)) ? l:p.fingerprint : 'none'],
+          \ ['Minimum Zig version', s:nonempty(get(l:p, 'minimum_zig_version', v:null)) ? l:p.minimum_zig_version : 'none'],
+          \ ['Paths', l:paths],
+          \ ])
+    let l:deps = get(l:p, 'dependencies', [])
+    call s:add(l:v, [''])
+    call s:add(l:v, [[printf('Dependencies [%d]:', len(l:deps)), 'Title']])
+    if empty(l:deps)
+      call s:add(l:v, ['  ', ['none', 'Comment']])
+    else
+      let l:rows = [['Dependency', 'Kind', 'Source', 'Hash', 'Lazy', 'State']]
+      let l:targets = [{}]
+      for l:d in l:deps
+        let l:source = l:d.kind ==# 'url' ? get(l:d, 'url', '') : get(l:d, 'path', '')
+        let l:state = !l:d.exists ? 'missing' : (s:nonempty(get(l:d, 'build_zig', v:null)) ? 'present' : 'no build.zig')
+        let l:lazy = get(l:d, 'lazy', v:null)
+        let l:lazy_text = l:lazy is v:null ? '-' : (l:lazy ? 'yes' : 'no')
+        call add(l:rows, [l:d.name, l:d.kind, l:source, get(l:d, 'hash', v:null) is v:null ? '-' : l:d.hash, l:lazy_text, l:state])
+        let l:target = {}
+        if s:nonempty(get(l:d, 'manifest', v:null))
+          let l:target = {'file': l:d.manifest}
+        elseif s:nonempty(get(l:d, 'build_zig', v:null))
+          let l:target = {'file': l:d.build_zig}
+        elseif l:d.exists && s:nonempty(get(l:d, 'root', v:null))
+          let l:target = {'file': l:d.root}
+        endif
+        call add(l:targets, l:target)
+      endfor
+      call s:table(l:v, l:rows, '  ', ['Identifier', 'Type', 'String', 'String', 'Comment', 'Comment'], l:targets)
+    endif
+  endfor
+  return l:v
 endfunction
 
 function! s:status(result) abort
