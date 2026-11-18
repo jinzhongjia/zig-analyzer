@@ -32,7 +32,7 @@
 | Neovim 0.12+ | 插件 [zig-analyzer.nvim](https://github.com/jinzhongjia/zig-analyzer.nvim)，在 [`editors/nvim`](editors/nvim) 中开发 |
 | Vim | 插件 [zig-analyzer.vim](https://github.com/jinzhongjia/zig-analyzer.vim)，在 [`editors/vim`](editors/vim) 中开发，支持 yegappan/lsp 和 vim-lsp |
 | Helix | `languages.toml`，见 [docs/editors.md](docs/editors.md#helix) |
-| Emacs | 插件，见 [`editors/emacs`](editors/emacs)（eglot） |
+| Emacs | 插件 [zig-analyzer.el](https://github.com/jinzhongjia/zig-analyzer.el)，在 [`editors/emacs`](editors/emacs) 中开发（eglot） |
 | Sublime Text | LSP 插件，见 [docs/editors.md](docs/editors.md#sublime-text) |
 | Kate | 内置 LSP 客户端，见 [docs/editors.md](docs/editors.md#kate) |
 | JetBrains IDE | LSP4IJ，见 [docs/editors.md](docs/editors.md#jetbrains-ides-lsp4ij) |

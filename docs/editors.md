@@ -11,7 +11,7 @@ arguments. It handles `.zig` and `.zon` files, and needs Zig 0.17.0 or 0.17.1 in
 | Neovim 0.12+ | [Plugin](https://github.com/jinzhongjia/zig-analyzer.nvim), or `vim.lsp.config` below |
 | Vim | [Plugin](https://github.com/jinzhongjia/zig-analyzer.vim) for yegappan/lsp or vim-lsp |
 | Helix | [`languages.toml`](#helix) |
-| Emacs | [Package](../editors/emacs/README.md) (eglot) |
+| Emacs | [Package](https://github.com/jinzhongjia/zig-analyzer.el) (eglot) |
 | Sublime Text | [LSP package](#sublime-text) |
 | Kate | [built-in LSP client](#kate) |
 | JetBrains IDEs | [LSP4IJ](#jetbrains-ides-lsp4ij) |
@@ -185,12 +185,16 @@ The package in [`editors/emacs`](../editors/emacs/README.md) registers the serve
 adds commands for the server's own requests:
 
 ```elisp
-(add-to-list 'load-path "/path/to/zig-analyzer/editors/emacs")
+(package-vc-install
+ '(zig-analyzer . (:url "https://github.com/jinzhongjia/zig-analyzer.el")))
 (require 'zig-analyzer)
 (setq zig-analyzer-settings
       '(:build (:args ["-Dtarget=aarch64-linux"])))
 (zig-analyzer-mode 1)
 ```
+
+The repository is a read-only mirror; the package is developed in `editors/emacs`. For a local
+checkout, add `editors/emacs` to `load-path` instead of `package-vc-install`.
 
 Install [`zig-mode`](https://melpa.org/#/zig-mode) (covers `.zig` and `.zon`) or
 [`zig-ts-mode`](https://melpa.org/#/zig-ts-mode) (Emacs 30.1+ with a tree-sitter Zig grammar)

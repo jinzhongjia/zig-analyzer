@@ -5,8 +5,10 @@ server: registers it with [Eglot](https://www.gnu.org/software/emacs/manual/html
 `.zig` and `.zon` files, starts Eglot automatically, and adds commands for the server's own
 requests.
 
-This directory is part of the [zig-analyzer repository](https://github.com/jinzhongjia/zig-analyzer);
-report issues and send pull requests there.
+This repository is a read-only mirror of
+[`editors/emacs`](https://github.com/jinzhongjia/zig-analyzer/tree/main/editors/emacs) in the
+zig-analyzer repository, where the package is developed and tested: report issues and send pull
+requests there.
 
 ## Requirements
 
@@ -21,7 +23,16 @@ report issues and send pull requests there.
 
 ## Installation
 
-Put this directory on `load-path` and enable the global minor mode:
+With `package-vc-install`, which clones the mirror:
+
+```elisp
+(package-vc-install
+ '(zig-analyzer . (:url "https://github.com/jinzhongjia/zig-analyzer.el")))
+(require 'zig-analyzer)
+(zig-analyzer-mode 1)
+```
+
+To use a local checkout instead, put this directory on `load-path`:
 
 ```elisp
 (add-to-list 'load-path "/path/to/zig-analyzer/editors/emacs")
@@ -29,7 +40,7 @@ Put this directory on `load-path` and enable the global minor mode:
 (zig-analyzer-mode 1)
 ```
 
-With `use-package`:
+With `use-package` and a local checkout:
 
 ```elisp
 (use-package zig-analyzer
