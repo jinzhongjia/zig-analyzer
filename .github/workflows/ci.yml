@@ -74,6 +74,8 @@ jobs:
                 updates/*) updates=true ;;
                 editors/emacs/*) emacs=true ;;
                 docs/*|assets/*|README*|CHANGELOG.md|LICENSE|AGENTS.md|.agents/*|.claude/*|.gitignore|.github/workflows/mirror.yml) ;;
+                # The website has a workflow of its own (website.yml) and nothing here tests it
+                website/*|wrangler.jsonc|.github/workflows/website.yml) ;;
                 # A path that no rule knows may need anything: run everything
                 *) all ;;
               esac
