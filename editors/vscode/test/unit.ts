@@ -404,11 +404,11 @@ function inspectionViews(): void {
 
   const q = (name: string, total: number) => ({ name, executions: 1, hits: 0, cutoffs: 0, total_ms: total, self_ms: 0, max_ms: 0, memos: 0, keys: 0, bytes: 2048, deps: 0, incomplete: 0 });
   const status = views.render("status", {
-    revision: 1, files: 2, deep_verifications: 0, writes: 0, max_rss_kb: 1024, intern_pool_items: 0, intern_pool_bytes: 0, heap_bytes: 0,
+    version: "0.2.1", revision: 1, files: 2, deep_verifications: 0, writes: 0, max_rss_kb: 1024, intern_pool_items: 0, intern_pool_bytes: 0, heap_bytes: 0,
     allocator: null, queries: [q("a", 1), q("b", 5)],
   }, format);
   const rows = status.lines.filter((l) => /^ {2}[ab] /.test(l));
-  check(status.lines[0] === "Revision            1" && status.lines.includes("Max RSS             1.0 MiB") && rows[0].startsWith("  b ") && rows[0].includes("2.0 KiB"),
+  check(status.lines[0] === "Version             0.2.1" && status.lines[1] === "Revision            1" && status.lines.includes("Max RSS             1.0 MiB") && rows[0].startsWith("  b ") && rows[0].includes("2.0 KiB"),
     "status: fields, sizes, and queries by total time");
 
   const packages = views.render("packages", {
