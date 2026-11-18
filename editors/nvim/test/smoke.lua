@@ -205,7 +205,8 @@ vim.cmd.close()
 
 vim.cmd('ZigAnalyzer status')
 vim.wait(10000, function() return vim.api.nvim_buf_get_name(0):find('zig%-analyzer://status') ~= nil end, 50)
-check(vim.api.nvim_buf_get_lines(0, 0, 1, false)[1]:match('^Revision ') ~= nil, ':ZigAnalyzer status')
+local status_lines = vim.api.nvim_buf_get_lines(0, 0, 2, false)
+check(status_lines[1]:match('^Version +%S') ~= nil and status_lines[2]:match('^Revision ') ~= nil, ':ZigAnalyzer status')
 vim.cmd.close()
 
 vim.cmd('ZigAnalyzer fileStatus')

@@ -6460,6 +6460,8 @@ fn shutdown(server: *Server, _: Allocator, _: void) HandlerError!void {
 }
 
 const StatusResult = struct {
+    /// Version of the server executable (as in `serverInfo.version` and `--version`)
+    version: []const u8,
     revision: u64,
     files: usize,
     deep_verifications: u64,
@@ -8152,6 +8154,7 @@ fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!S
         };
     }
     return .{
+        .version = za.version,
         .revision = summary.revision,
         .files = server.vfs.count(),
         .deep_verifications = summary.deep_verifications,

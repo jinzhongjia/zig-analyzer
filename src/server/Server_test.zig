@@ -103,6 +103,7 @@ test "full lifecycle: initialize, document sync, read requests, shutdown" {
     try testing.expectEqual(2, msgs[1].object.get("id").?.integer);
     try testing.expectEqual(1, st.get("files").?.integer);
     try testing.expectEqual(3, st.get("revision").?.integer);
+    try testing.expectEqualStrings(za.version, st.get("version").?.string);
 
     try testing.expectEqual(3, msgs[2].object.get("id").?.integer);
     try testing.expect(msgs[2].object.get("result").? == .null);

@@ -153,6 +153,8 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
   updateStatus(State.Starting);
   try {
     await c.start();
+    // The tooltip names the version from the initialize result
+    if (client === c) updateStatus(c.state);
     void checkForUpdate(context);
   } catch (err) {
     updateStatus(State.Stopped);
@@ -326,7 +328,7 @@ function updateStatus(state: State): void {
       break;
     case State.Running:
       statusItem.text = "$(check) zig-analyzer";
-      statusItem.tooltip = "zig-analyzer is running";
+      statusItem.tooltip = `zig-analyzer ${client?.initializeResult?.serverInfo?.version ?? "(unknown version)"} is running`;
       statusItem.backgroundColor = undefined;
       break;
     case State.Stopped:

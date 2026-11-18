@@ -223,6 +223,8 @@ interface Query {
 }
 
 interface StatusResult {
+  /** Absent from older servers */
+  version?: string;
   revision: number;
   files: number;
   deep_verifications: number;
@@ -253,6 +255,7 @@ function status(result: StatusResult): View {
   const b = new Builder();
   const causes = result.incomplete_causes ?? { cycle: 0, stack: 0 };
   fields(b, [
+    ["Version", result.version ?? "unknown"],
     ["Revision", String(result.revision)],
     ["Files", String(result.files)],
     ["Writes", String(result.writes)],

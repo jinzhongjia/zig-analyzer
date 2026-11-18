@@ -228,6 +228,7 @@ function renderers.status(result)
   local v = new()
   local causes = result.incomplete_causes or {}
   fields(v, {
+    { 'Version', result.version or 'unknown' },
     { 'Revision', tostring(result.revision) },
     { 'Files', tostring(result.files) },
     { 'Writes', tostring(result.writes) },
