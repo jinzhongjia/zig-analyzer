@@ -14,12 +14,12 @@ The lookup searches `error{ ... }` declarations, preferring one whose members eq
 
 A generic function body is inferred with the instance of a call site, and hover names the call (`inferred from the call at main.zig:4`). This includes an enum literal or an initializer field whose result type is a parameter (`return .empty` and `.{ .len = 3 }` in a function returning `T`), which name a declaration or field only under an instance.
 
-A member name can refer to a different declaration under each instance. Goto lists the declaration under the selected instance first, then the one under every other instance; find references and document highlight cover all of them. Hover shows the declaration under the selected instance, followed by the others, each once and in goto order, as set by `hover.instances`:
+A member name can refer to a different declaration under each instance. Goto lists the declaration under the selected instance first, then the one under every other instance; find references and document highlight cover all of them. Hover shows the declaration under the selected instance, followed by the others as set by `hover.instances`:
 
-- `"list"` (default): one line per other declaration, with its signature (without the value), its location, and the call that selects it.
-- `"full"`: the complete hover of each other declaration (code, value, call, documentation), separated by rules.
+- `"count"` (default): how many other declarations there are (`Refers to 29 other declarations under other instances; go to definition lists them`). A loop over a list of types can select dozens, which goto lists better than a hover.
+- `"full"`: each other declaration once and in goto order, with its location and complete hover (code, value, call, documentation), separated by rules.
 
-A name that refers to the same declaration under every instance is shown as before. Finding the other declarations infers the body under every instance; its cost is described under Hover in generic function bodies in `docs/perf.md`.
+A name that refers to the same declaration under every instance shows only that declaration. Finding the other declarations infers the body under every instance; its cost is described under Hover in generic function bodies in `docs/perf.md`.
 
 ## Type display
 

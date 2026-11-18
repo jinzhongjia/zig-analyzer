@@ -30,10 +30,9 @@ pub const Info = struct {
 /// generic function containing it, when they differ from the one shown (see
 /// `definition.instanceDefsAt`)
 pub const Instances = enum {
-    /// One line per declaration: its signature without the value (except a type), its location,
-    /// and the instance it comes from
-    list,
-    /// The complete hover of each declaration, as for the one shown
+    /// Only how many there are; goto lists them
+    count,
+    /// The location and complete hover of each declaration
     full,
 };
 
@@ -138,7 +137,7 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, 
 
     var out: std.Io.Writer.Allocating = .init(r.arena);
     const w = &out.writer;
-    if (!try writeBlock(w, r, a, def, tv, expr_id, seeded_from, roots)) return null;
+    if (!try writeBlock(w, r, a, def, tv, expr_id, seeded_from, false, roots)) return null;
     if (expr_id) |e| switch (b.expr(e)) {
         .field_access, .enum_literal => try writeOtherInstances(w, r, def, seeded_from, try definition.instanceDefsAt(r, file, offset), .{ .expr = e }, instances, roots),
         else => {},
@@ -148,8 +147,9 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, 
 
 /// The hover of `def`, or of the expression `e` when there is no definition, whose value is `tv`
 /// at `a`: the signature or value, the embedded file it comes from, the instance it is inferred
-/// under (`seeded`), and the documentation. False when there is nothing to show.
-fn writeBlock(w: *std.Io.Writer, r: *Resolver, a: context.At, def: ?Def, tv: TypedValue, e: ?Body.ExprId, seeded: ?seed.Seed, roots: []const []const u8) resolve.Error!bool {
+/// under (`seeded`), preceded by the location of `def` when `located`, and the documentation. False
+/// when there is nothing to show.
+fn writeBlock(w: *std.Io.Writer, r: *Resolver, a: context.At, def: ?Def, tv: TypedValue, e: ?Body.ExprId, seeded: ?seed.Seed, located: bool, roots: []const []const u8) resolve.Error!bool {
     if (tv.ty == .unknown and def == null) return false;
     // A value that is directly the result of `@embedFile`: the call instead of the content
     const embed = if (def) |d| try context.embedOf(r, d, tv) else if (tv.val != null) try context.embedCall(r, a, e.?) else null;
@@ -162,7 +162,13 @@ fn writeBlock(w: *std.Io.Writer, r: *Resolver, a: context.At, def: ?Def, tv: Typ
     w.print("```zig\n{s}\n```", .{code}) catch return error.OutOfMemory;
     if (embed) |x| writeEmbedded(w, r.ctx.db.env.vfs.shownPath(roots, r.ctx.db.env.vfs.path(x.file)), x.text) catch return error.OutOfMemory;
     if (seeded) |s| {
-        w.writeAll("\n\ninferred from ") catch return error.OutOfMemory;
+        w.writeAll("\n\n") catch return error.OutOfMemory;
+        if (located) if (try r.location(def.?)) |loc| {
+            const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, loc.file)).text;
+            const line = std.mem.count(u8, text[0..@min(loc.start, text.len)], "\n") + 1;
+            w.print("at {s}:{d}, ", .{ std.fs.path.basename(r.ctx.db.env.vfs.path(loc.file)), line }) catch return error.OutOfMemory;
+        };
+        w.writeAll("inferred from ") catch return error.OutOfMemory;
         try writeSource(w, r, s);
     }
     if (def) |d| if (try context.docOf(r, d, tv)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
@@ -212,8 +218,8 @@ fn sameInstance(x: seed.Seed, y: seed.Seed) bool {
 /// The declarations that the name refers to under the other instances of the generic function
 /// containing it (`all`, see `definition.instanceDefsAt`), except the one shown: `shown`, or when
 /// the hover shows no declaration (a decl literal shows its value), the one under the instance
-/// the hover is inferred under (`shown_seed`). Each once, with the first instance that refers to
-/// it, in the order goto lists them.
+/// the hover is inferred under (`shown_seed`). `.count` shows how many there are; `.full` shows
+/// each once, with the first instance that refers to it, in the order goto lists them.
 fn writeOtherInstances(w: *std.Io.Writer, r: *Resolver, shown: ?Def, shown_seed: ?seed.Seed, all: []const definition.InstanceDef, name: Name, instances: Instances, roots: []const []const u8) resolve.Error!void {
     var seen: std.ArrayList(Def) = .empty;
     if (shown) |d| {
@@ -222,63 +228,25 @@ fn writeOtherInstances(w: *std.Io.Writer, r: *Resolver, shown: ?Def, shown_seed:
         try seen.append(r.arena, x.def);
         break;
     };
-    var listed: usize = 0;
+    var others: usize = 0;
     for (all) |x| {
         const s = x.at.seeded orelse continue;
         if (for (seen.items) |d| {
             if (std.meta.eql(d, x.def)) break true;
         } else false) continue;
         try seen.append(r.arena, x.def);
-        const tv = try nameType(r, x.at, name);
-        switch (instances) {
-            .list => {
-                const loc = try r.location(x.def) orelse continue;
-                const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, loc.file)).text;
-                const line = std.mem.count(u8, text[0..@min(loc.start, text.len)], "\n") + 1;
-                // The value is left out to keep each entry on one line, except a type, which is
-                // what the declaration is
-                const shown_tv: TypedValue = if (tv.asType() != null) tv else .{ .ty = tv.ty };
-                const signature = try oneLine(r, try context.signature(r, x.def, shown_tv, .single_line));
-                if (listed == 0) w.writeAll("\n\nUnder other instances:\n") catch return error.OutOfMemory;
-                w.print("\n- `{s}` at {s}:{d}, inferred from ", .{ signature, std.fs.path.basename(r.ctx.db.env.vfs.path(loc.file)), line }) catch return error.OutOfMemory;
-                try writeSource(w, r, s);
-            },
-            .full => {
-                w.writeAll("\n\n---\n\n") catch return error.OutOfMemory;
-                const e = switch (name) {
-                    .expr => |e| e,
-                    .init_field => null,
-                };
-                _ = try writeBlock(w, r, x.at, x.def, tv, e, s, roots);
-            },
-        }
-        listed += 1;
+        others += 1;
+        if (instances == .count) continue;
+        w.writeAll("\n\n---\n\n") catch return error.OutOfMemory;
+        const e = switch (name) {
+            .expr => |e| e,
+            .init_field => null,
+        };
+        _ = try writeBlock(w, r, x.at, x.def, try nameType(r, x.at, name), e, s, true, roots);
     }
-}
-
-/// `text` with each run of whitespace that contains a line break replaced by one space (a
-/// function prototype written across lines)
-fn oneLine(r: *Resolver, text: []const u8) resolve.Error![]const u8 {
-    if (std.mem.indexOfScalar(u8, text, '\n') == null) return text;
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < text.len) {
-        if (!std.ascii.isWhitespace(text[i])) {
-            try out.append(r.arena, text[i]);
-            i += 1;
-            continue;
-        }
-        const start = i;
-        while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
-        if (std.mem.indexOfScalar(u8, text[start..i], '\n') != null) {
-            // No space after an opening or before a closing parenthesis, and no trailing comma
-            const after_open = out.items.len > 0 and out.items[out.items.len - 1] == '(';
-            const before_close = i < text.len and text[i] == ')';
-            if (before_close and out.items.len > 0 and out.items[out.items.len - 1] == ',') out.items.len -= 1;
-            if (!after_open and !before_close) try out.append(r.arena, ' ');
-        } else try out.appendSlice(r.arena, text[start..i]);
+    if (instances == .count and others > 0) {
+        w.print("\n\nRefers to {d} other declaration{s} under other instances; go to definition lists them", .{ others, if (others == 1) "" else "s" }) catch return error.OutOfMemory;
     }
-    return out.items;
 }
 
 /// The file a value comes from with `@embedFile` and its size; its content when it is text of at

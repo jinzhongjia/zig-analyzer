@@ -125,9 +125,9 @@
     //       // In a generic function body, a member name can refer to a different declaration
     //       // under each instance (each set of comptime arguments at the call sites). Hover shows
     //       // the declaration under one instance; the others follow it:
-    //       // .list: one line each, with its type, location, and the call it comes from.
-    //       // .full: the complete hover of each (signature, value, documentation).
-    //       .instances = .list,
+    //       // .count: only how many there are; go to definition lists them.
+    //       // .full: the location and complete hover of each (signature, value, documentation).
+    //       .instances = .count,
     //   },
 
     // Completion (editor only):

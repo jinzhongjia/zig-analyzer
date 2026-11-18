@@ -98,9 +98,9 @@ Requests convert positions with the cached line table of the file (`LineStarts`)
 
 ### Hover in generic function bodies
 
-`BENCH_INSTANCE_HOVER=2000` on the Zig 0.17.0 compiler (`src` and `lib/std`, ReleaseSafe, project loaded) samples 2000 of the 37908 names in generic function bodies whose declaration can depend on the instance, in 276 files. Each file is opened and its names hovered, then goto is requested at every name, then hover again. "Instance only" is hover without the other instances; `"list"` is the default of `hover.instances`. Each configuration is one run, on macOS (arm64, 18 cores) and in a Linux container (arm64, 8 CPUs); Windows is not measured.
+`BENCH_INSTANCE_HOVER=2000` on the Zig 0.17.0 compiler (`src` and `lib/std`, ReleaseSafe, project loaded) samples 2000 of the 37908 names in generic function bodies whose declaration can depend on the instance, in 276 files. Each file is opened and its names hovered, then goto is requested at every name, then hover again. "Instance only" is hover without the other instances; The `"count"` column (the default of `hover.instances`) was measured with each other declaration rendered on one line; `"count"` finds the same declarations and renders none, so it costs at most as much. Each configuration is one run, on macOS (arm64, 18 cores) and in a Linux container (arm64, 8 CPUs); Windows is not measured.
 
-| | Instance only | `"list"` | `"full"` |
+| | Instance only | `"count"` | `"full"` |
 |---|---|---|---|
 | macOS, first hover total | 45.6 s | 80.9 s | 82.9 s |
 | macOS, first hover p95 | 10.5 ms | 105.1 ms | 119.6 ms |
@@ -112,7 +112,7 @@ Requests convert positions with the cached line table of the file (`LineStarts`)
 | Linux, first hover p95 | 11.9 ms | 148.7 ms | — |
 | Linux, goto afterwards total | 52.7 s | 11.2 s | — |
 
-The added time is the inference of each body under every instance, which goto also performs: after the hovers, goto at the same names takes 18-26% of its time with instance-only hover. The time concentrates in a few names. Per name, the difference has p50 0 ms; 0.5% of names take more than 1 s longer (0.2% with semantic tokens first, 0.6% on Linux), 80% of the added time comes from 1.2-1.4% of the names (0.8% with semantic tokens first), and the slowest takes 5.5 s longer on macOS and 7.2 s on Linux. With semantic tokens requested first, as an editor does on open, whose last stage also covers every instance, 21 s is added in total, and the semantic tokens take about the same time. `"full"` costs as much as `"list"`, since both find the same declarations. The peak resident memory of the server between files is about 3.4 GB in every configuration on macOS (not measured on Linux).
+The added time is the inference of each body under every instance, which goto also performs: after the hovers, goto at the same names takes 18-26% of its time with instance-only hover. The time concentrates in a few names. Per name, the difference has p50 0 ms; 0.5% of names take more than 1 s longer (0.2% with semantic tokens first, 0.6% on Linux), 80% of the added time comes from 1.2-1.4% of the names (0.8% with semantic tokens first), and the slowest takes 5.5 s longer on macOS and 7.2 s on Linux. With semantic tokens requested first, as an editor does on open, whose last stage also covers every instance, 21 s is added in total, and the semantic tokens take about the same time. `"full"` costs as much as `"count"`, since both find the same declarations. The peak resident memory of the server between files is about 3.4 GB in every configuration on macOS (not measured on Linux).
 
 ## Known gaps
 
