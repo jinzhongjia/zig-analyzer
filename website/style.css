@@ -310,7 +310,6 @@ h1 {
 .section-lead { margin: 0 0 36px; color: var(--fg-muted); max-width: 44em; }
 
 .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-.grid.editors { grid-template-columns: repeat(4, 1fr); }
 .card {
   position: relative;
   padding: 22px 22px 20px;
@@ -374,13 +373,12 @@ h1 {
   .hero { padding: 56px 0 72px; }
   .hero-grid { grid-template-columns: 1fr; gap: 44px; }
   .grid { grid-template-columns: repeat(2, 1fr); }
-  .grid.editors { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 640px) {
   .wrap { width: calc(100% - 32px); }
   .nav-links { display: none; }
   .nav-actions { margin-left: auto; }
-  .grid, .grid.editors { grid-template-columns: 1fr; }
+  .grid { grid-template-columns: 1fr; }
   .section { padding: 64px 0; }
   .code { font-size: 12px; }
   .hover-card { display: none; }
