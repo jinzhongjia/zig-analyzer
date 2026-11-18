@@ -275,6 +275,7 @@ function! s:status(result) abort
   let l:v = s:new()
   let l:causes = get(a:result, 'incomplete_causes', {})
   call s:fields(l:v, [
+        \ ['Version', get(a:result, 'version', 'unknown')],
         \ ['Revision', string(a:result.revision)],
         \ ['Files', string(a:result.files)],
         \ ['Writes', string(a:result.writes)],

@@ -234,7 +234,7 @@ close
 
 ZigAnalyzer status
 call s:wait('bufname("%") ==# "zig-analyzer://status"', 10000)
-call s:check(getline(1) =~# '^Revision ', ':ZigAnalyzer status')
+call s:check(getline(1) =~# '^Version \+\S' && getline(2) =~# '^Revision ', ':ZigAnalyzer status')
 close
 
 ZigAnalyzer fileStatus
