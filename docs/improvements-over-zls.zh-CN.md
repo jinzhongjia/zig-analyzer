@@ -1,44 +1,51 @@
-# zig-analyzer 比 ZLS 好在哪
+# zig-analyzer 与 ZLS 对比
 
 [English](improvements-over-zls.md) | 简体中文
 
-ZLS 是成熟的 Zig 语言服务器。我们在两个真实项目和一个小 fixture 上对比了 ZLS 0.17.0 和 zig-analyzer。下面的数字是 3 轮中位数，Zig 0.17.1，两个服务端都用 ReleaseSafe 构建。项目是 ZLS 自己的源码（37.6k 行，测 `src/analysis.zig`）和 zig-analyzer 的源码（138.8k 行，测 `src/sema/infer.zig`）。
+版本：ZLS 0.17.0（[`542462c`][zls]）和 zig-analyzer 0.2.1，都用 ReleaseSafe 构建，Zig 0.17.1。测量用了两个项目和一个小 fixture：项目 A 是 ZLS 源码（37.6k 行，在 `src/analysis.zig` 上测），项目 B 是 zig-analyzer 源码（138.8k 行，在 `src/sema/infer.zig` 上测）。数字取 3 轮中位数。关于 ZLS 行为的说法都链接到该提交的源码。
+
+[zls]: https://github.com/zigtools/zls/tree/542462c4ddf045493fa9ca028ee6bc3f38b2754a
 
 ## 诊断
 
-ZLS 的实时诊断只到 AstGen。Sema 错误要靠 build-on-save，而 build-on-save 只有在 `build.zig` 声明 `check` 步骤时才自动启动；否则要用户手动开启，没有 `check` 步骤时只能跑默认步骤或者不构建。
+ZLS 的实时诊断只跑 AstGen（[`diagnostics.zig:30-58`][zls-diag]），Sema 错误来自 build-on-save。Zig 支持文件监听时 build-on-save 默认开启（[`Server.zig:781`][zls-bos]），但没有显式设置 `enable_build_on_save` 时只跑 `check` 步骤；`build.zig` 里没有 `check` 就不构建（[`bsp.zig:1088-1094`][zls-check]）。
 
-zig-analyzer 通过构建系统协议拿编译器诊断（没有 `build.zig` 的文件走单文件模式），不依赖 `check` 步骤。在一个没有 `check` 步骤的项目里写入 `const n: u32 = "not a number";`，zig-analyzer 在 1.31 s 后报错，ZLS 10 s 内没有任何诊断。有 `check` 步骤时两者都能报，ZLS 更快（383 ms vs 684 ms），但这条路径取决于项目的构建文件。
+zig-analyzer 通过 `zig build --listen=-` 拿编译器诊断（构建之外的文件走单文件模式），有没有 `check` 步骤都一样。发布的诊断在相同内容、Zig 版本、步骤和参数下与 `zig build` 一致：文件、位置、severity、消息、notes 和 reference traces（[`diagnostics.md`](diagnostics.md)）。
 
-zig-analyzer 的诊断还有明确的一致性定义：相同内容、Zig 版本、步骤和参数下，文件、位置、severity、消息、notes 和 reference traces 与 `zig build` 逐项相同。ZLS 没有同等定义；它的诊断 source 是 `zls`，编译器诊断走 build-on-save。
+在项目里写入 `const n: u32 = "not a number";`：
 
-类型错误或缺失字段正是用户保存后最需要看到的东西。默认只看 AstGen 是不够的。
+| | zig-analyzer | ZLS |
+|---|---|---|
+| 没有 `check` 步骤 | 1.31 s 后报错 | 10 s 内无诊断 |
+| 有 `check` 步骤 | 684 ms | 383 ms |
+
+[zls-diag]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/features/diagnostics.zig#L30-L58
+[zls-bos]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/Server.zig#L780-L784
+[zls-check]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/bsp.zig#L1088-L1094
 
 ## comptime 与泛型
 
-fixture 里 `show(x: anytype)` 被 `Box(u64)` 调用，并读取 `x.value`：
+fixture：`show(x: anytype)` 以 `Box(u64)` 调用，读取 `x.value`。
 
-| 查询 | zig-analyzer | ZLS 0.17.0 |
+| 查询 | zig-analyzer | ZLS |
 |---|---|---|
 | `x.value` 的 hover | `value: u64`，带调用点 | `null` |
-| `x.` 后的补全 | `get`、`value` | 只有 `get` |
+| `x.` 后的补全 | `get`、`value` | `get` |
 | `value` 的 goto | `Box` 里的字段声明 | `null` |
 | `Box.get` 里 `self.value` 的 hover | `value: u64` | `value: T` |
-| `Chosen = if (builtin.os.tag == .linux) u32 else u64` 的 hover | `type = u32` | 同时显示 `u32` 和 `u64` |
+| `Chosen = if (builtin.os.tag == .linux) u32 else u64` 的 hover | `type = u32` | `u32` 和 `u64` 都显示 |
 
-ZLS 并非完全没有调用点推断：`identity(x: anytype)` 以 `u32` 调用时，它会显示 `x: anytype` 加 `(type = u32)`。差距在 `anytype` 值的成员访问、泛型容器字段、comptime 分支选择。这些在标准库、allocator、序列化和编译期配置里很常见。
+ZLS 有部分调用点推断：`identity(x: anytype)` 以 `u32` 调用时显示 `x: anytype` 和 `(type = u32)`。它处理不了 `anytype` 值的成员访问、泛型容器的字段和 comptime 分支选择。
 
 ## 重命名与引用
 
-`widget.zig` 声明 `pub fn resize(...)`，`main.zig` 调用 `w.resize(4)`。在声明处请求 references/rename：
+`widget.zig` 声明 `pub fn resize(...)`，`main.zig` 调用 `w.resize(4)`。在声明处请求 references 和 rename：
 
-| 指标 | zig-analyzer | ZLS |
+| | zig-analyzer | ZLS |
 |---|---|---|
 | references（含声明） | 2 | 1 |
-| rename 编辑的文件数 | 2 | 1 |
+| rename 修改的文件数 | 2 | 1 |
 | rename 后 `zig build check` | 通过 | 失败 |
-
-ZLS 的失败信息：
 
 ```text
 src/main.zig:38:6: error: no field or member function named 'resize' in 'widget.Widget'
@@ -46,86 +53,99 @@ src/main.zig:38:6: error: no field or member function named 'resize' in 'widget.
     ~^~~~~~~
 ```
 
-即使 `main.zig` 已经打开、给服务器 5 s 稳定时间，结果也一样。为隔离 rename，测试副本把无关的 `var never_mutated` 改成了 `const`，两个服务端同样处理。ZLS 没找到跨文件方法调用，却仍然返回 rename 编辑，而不是拒绝。
+`main.zig` 已打开并等待 5 s 后结果相同。测试副本把无关的 `var never_mutated` 改成了 `const`，保证构建只会因 rename 失败；两个服务端用的是同一份副本。
 
-zig-analyzer 在引用无法确认或新名字有歧义时拒绝 rename，并用 AstGen 校验重命名后的文件。rename 静默漏掉调用点，就把重构变成了构建失败。
+zig-analyzer 在引用无法确认或新名字冲突时拒绝 rename，并用 AstGen 检查改名后的文件（[`features/references-rename.md`](features/references-rename.md)）。
 
 ## 补全与自动导入
 
-zig-analyzer 的补全基于推断和名称解析：作用域内名字、本地值成员（包括 `sema.gpa` 这样的路径）、带 import 编辑的自动导入候选、片段，以及选中时再计算签名和文档的 `completionItem/resolve`。
-
-ZLS 有语义补全和片段，但没有符号级自动导入。它的 completion item 不带 `additionalTextEdits`；运行时测试里，未导入的 `add` 从未出现，zig-analyzer 在后台索引就绪后提供了它，并附上 import 编辑。
+ZLS 的补全项不带 `additionalTextEdits`（它的 `src/` 里没有这个字段名），因此无法插入 import。运行时测试里，ZLS 始终没有给出未导入的 `add`；zig-analyzer 在后台索引就绪后给出了它，并附带 import 编辑（[`features/auto-import.md`](features/auto-import.md)）。
 
 成员访问补全召回率：
 
 | 项目 | zig-analyzer | ZLS |
 |---|---|---|
-| A（ZLS 源码） | 90/90 = 100% | 90/90 = 100% |
-| B（zig-analyzer 源码） | 70/70 = 100% | 64/70 = 91.4% |
+| A | 90/90（100%） | 90/90（100%） |
+| B | 70/70（100%） | 64/70（91.4%） |
 
-ZLS 在 B 上的未命中都是需要跨调用/容器类型推断的成员访问。样本不大，但上面的确定性 fixture 是同一方向。
+ZLS 在 B 上漏掉的 6 处都需要跨调用或经过容器的类型推断。
 
 ## ZON
 
-zig-analyzer 把 `.zon` 当一等文件类型：任意 `.zon` 文件的解析、格式化和诊断；根表达式大纲；对带结果类型导入的 `.zon` 文件提供类型化补全、goto 和 inlay hints；`build.zig.zon` 的 manifest schema 补全；`zig-analyzer.zon` 的设置补全和选项说明；以及对依赖 URL 运行 `zig fetch` 并写入 hash 的 code action。
+ZLS 对 `.zon` 文件的 hover、goto、补全、references、signature help、inlay hints、文档符号和 code action 都返回 `null`（[`hover.zig:506`][zon-hover]、[`goto.zig:292`][zon-goto]、[`completions.zig:1042`][zon-comp]、[`references.zig:741`][zon-refs]、[`signature_help.zig:29`][zon-sig]、[`inlay_hints.zig:163`][zon-inlay]、[`document_symbol.zig:26`][zon-sym]、[`code_actions.zig:39`][zon-ca]）。它能格式化 `.zon`，也提供 semantic tokens。
 
-ZLS 能格式化 `.zon`，也有基本语法支持，但多处语义功能对 `.zon` 返回 `null`（signature help、inlay hints、references）。测试中，一个有效的 `build.zig.zon` 在 ZLS 里有 0 个文档符号，zig-analyzer 有 5 个（`name`、`version`、`fingerprint`、`minimum_zig_version`、`paths`）。两者的格式化输出都与 `zig fmt` 逐字节一致，所以格式化不是差异点。
+zig-analyzer 对 `.zon` 提供：任意文件的诊断、格式化和大纲；带结果类型导入的文件的类型化补全、goto 和 inlay hints；`build.zig.zon` 和 `zig-analyzer.zon` 的 schema 补全；对依赖 URL 运行 `zig fetch` 并写入 hash 的 code action。一个有效的 `build.zig.zon` 有 5 个文档符号（`name`、`version`、`fingerprint`、`minimum_zig_version`、`paths`）。
 
-`build.zig.zon` 是项目清单。没有 schema 补全、大纲和 hash 辅助，编辑它更慢，也更容易出错。
+两者的格式化输出在测试用的 `.zig` 和 `.zon` 文件上都与 `zig fmt` 逐字节一致。
+
+[zon-hover]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/features/hover.zig#L506
+[zon-goto]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/features/goto.zig#L292
+[zon-comp]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/features/completions.zig#L1042
+[zon-refs]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/features/references.zig#L741
+[zon-sig]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/features/signature_help.zig#L29
+[zon-inlay]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/features/inlay_hints.zig#L163
+[zon-sym]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/features/document_symbol.zig#L26
+[zon-ca]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/features/code_actions.zig#L39
 
 ## 构建系统
 
-zig-analyzer 用 `zig build --listen=-` 拿构建图、编译步骤、模块、生成文件和编译器诊断。它维护编译集合，按编译上下文分析共享文件，按实际缓存解析生成路径，并加载子项目（带自己的 `build.zig`、通过 `.path` 依赖根项目的 examples/benchmarks）。
+ZLS 会合并根文件相同的模块，源码注释写着："All modules with the same root source file are merged. This limitation may be lifted in the future."（[`bsp.zig:25`][zls-merge]）。一个文件同时被 host 工具和交叉编译目标编译，或者在不同模块里有不同 import 时，只按合并后的一个上下文分析。
 
-ZLS 也集成构建系统，但它的构建配置会合并根文件相同的模块；源码注释自己承认这是限制。评测版本里没有等价的子项目加载机制。在同时有 host tool 和交叉编译 target 的项目里，或者带 examples 的库里，同一个文件可能在不同 `builtin`/模块设置下编译；合并这些上下文会给出不完整或错误的导航。
+zig-analyzer 分开保留每个编译，按编译分析共享文件，按实际缓存解析生成文件，并按需加载子项目（有自己的 `build.zig`、通过 `.path` 依赖根项目的目录，比如 examples）（[`design.md`](design.md#sub-projects)）。ZLS 0.17.0 没有对应的子项目加载。
+
+[zls-merge]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/bsp.zig#L25
 
 ## 性能
 
-暖态中位数，每个单元格 3 轮。项目 A 是 ZLS 的 `src/analysis.zig`，项目 B 是 zig-analyzer 的 `src/sema/infer.zig`。
+暖态，每格 3 轮中位数：
 
-| 指标 | A：zig-analyzer | A：ZLS | B：zig-analyzer | B：ZLS |
+| | A：zig-analyzer | A：ZLS | B：zig-analyzer | B：ZLS |
 |---|---|---|---|---|
 | `initialize` | 0.67 ms | 19.1 ms | 0.83 ms | 48.1 ms |
 | hover p50 / p95 | 0.37 / 1.91 ms | 0.58 / 1.31 ms | 0.52 / 3.42 ms | 0.52 / 1.18 ms |
 | completion p50 / p95 | 0.44 / 3.85 ms | 0.79 / 4.16 ms | 0.91 / 2.71 ms | 1.88 / 6.89 ms |
 | goto p50 / p95 | 0.23 / 0.46 ms | 0.52 / 1.04 ms | 0.37 / 0.54 ms | 0.40 / 0.92 ms |
 | 编辑 → 诊断 p50 | 56.2 ms | 6.0 ms | 58.2 ms | 5.4 ms |
+| semantic tokens | | | 38.6 ms | 32.0 ms |
 | RSS | 127.1 MiB | 60.9 MiB | 127.8 MiB | 66.5 MiB |
 
-项目 A 上固定 250 个请求的 CPU 探针：
+A 上固定 250 个请求：
 
-| 指标 | zig-analyzer | ZLS |
+| | zig-analyzer | ZLS |
 |---|---|---|
 | 墙钟时间 | 244 ms | 341 ms |
 | CPU 时间 | 190 ms | 250 ms |
 | 每请求 CPU | 0.76 ms | 1.00 ms |
 
-zig-analyzer 不是所有指标都更快。ZLS 在两个项目上的 hover 尾延迟都更好，默认诊断也快得多。zig-analyzer 的优势在初始化握手、goto/completion 的 p50（通常还有 p95）和每请求 CPU。
-
-56–58 ms 的诊断主要是默认 50 ms 防抖。设 `diagnostics.debounce_ms = 0` 后，项目 A 实测约 7 ms，接近 ZLS 的 6 ms。ZLS 没有等价的防抖设置。
+zig-analyzer 的编辑 → 诊断时间主要是默认 50 ms 防抖（`diagnostics.debounce_ms`），设为 0 后 A 上约 7 ms。ZLS 没有防抖。
 
 ## 协议与配置
 
-zig-analyzer 还提供 `completionItem/resolve`、semantic token delta、code action resolve、`zig-analyzer/packages` 检查请求，以及获取依赖 hash 的 `executeCommand`（客户端支持 `workspace/applyEdit` 时）。它约有 44 项设置，嵌套 JSON/ZON，项目设置放 `zig-analyzer.zon`；ZLS 是 22 项扁平设置和 `zls.json`。
+zig-analyzer 还实现了 `completionItem/resolve`、semantic token delta、`codeAction/resolve`、`zig-analyzer/packages` 请求，以及获取依赖 hash 的 `executeCommand`。它有 44 项分节设置，来自编辑器设置或 `zig-analyzer.zon`（[`src/server/Config.zig`](../src/server/Config.zig)）。ZLS 有 22 项扁平设置，放在 `zls.json`（[`Config.zig`][zls-config]）。
 
-看起来像 ZLS 优势的 `willSaveWaitUntil`，其实只是 `force_autofix` 的兜底：默认关闭，只处理手动保存，只应用 `source.fixAll`。zig-analyzer 改为暴露 `source.fixAll` 和 `source.organizeImports`，由编辑器在保存时调用。
+ZLS 声明了 `willSaveWaitUntil`，但只在开启 `force_autofix`（默认关闭）时使用，只处理手动保存，只应用 AstGen 修复（[`Server.zig:268-283`][zls-autofix]、[`Server.zig:1210-1219`][zls-wswu]）。zig-analyzer 提供 `source.fixAll` 和 `source.organizeImports` code action，由编辑器在保存时调用。
 
-## ZLS 更强的地方
+[zls-config]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/Config.zig
+[zls-autofix]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/Server.zig#L268-L283
+[zls-wswu]: https://github.com/zigtools/zls/blob/542462c4ddf045493fa9ca028ee6bc3f38b2754a/src/Server.zig#L1210-L1219
 
-- **内存：** A 上 60.9 MiB vs 127.1 MiB，B 上 66.5 MiB vs 127.8 MiB，约为一半。40 行 fixture 上是 14.4 MiB vs 49.0 MiB。
-- **二进制：** 完整文件 20.1 MB vs 48.6 MB；stripped 3.5 MB vs 7.7 MB。
-- **默认诊断：** 5–6 ms vs 50 ms 防抖下的 56–58 ms。
-- **大项目 hover 尾延迟：** B 上 p95 1.18 ms vs 3.42 ms。
-- **B 的 semantic tokens：** 32.0 ms vs 38.6 ms。
-- **简单与成熟：** 22 项扁平设置 vs 约 44 项嵌套设置；长期部署；学习和运维面更小。
-- **Zig master：** ZLS master 面向 Zig 0.18.0-dev；zig-analyzer 0.2.1 面向 Zig 0.17.0/0.17.1。
+## ZLS 更好的地方
 
-## 测量方法与限制
+- 内存：约一半（A 上 60.9 vs 127.1 MiB，B 上 66.5 vs 127.8 MiB，40 行 fixture 上 14.4 vs 49.0 MiB）。
+- 二进制大小：20.1 vs 48.6 MB，strip 后 3.5 vs 7.7 MB。
+- 实时 AstGen 诊断：5-6 ms，zig-analyzer 默认防抖下 56-58 ms。
+- hover p95：A 上 1.31 vs 1.91 ms，B 上 1.18 vs 3.42 ms。
+- B 上的 semantic tokens：32.0 vs 38.6 ms。
+- 设置更少（22 vs 44），部署历史更长。
+- Zig master：ZLS master 要求 Zig 0.18.0-dev（[`build.zig.zon`](https://github.com/zigtools/zls/blob/master/build.zig.zon)）；zig-analyzer 0.2.1 支持 Zig 0.17.x。
 
-每个服务端在每个项目上跑 3 轮。客户端是自建的 stdio LSP 客户端，时延是端到端的，包含 JSON 序列化和客户端解析。暖态测量前有 6 s 稳定期和一轮预热。RSS 是工作负载后的 `VmRSS`，不是峰值。编辑到诊断每轮插入 2–3 次语法错误。
+## 测量方法
 
-限制也要说清楚：只在 Linux x86-64 上测；两个项目都是语言服务器/编译器基础设施代码，泛型密集；每个指标 30–180 个样本；每轮固定先跑 zig-analyzer、后跑 ZLS，ZLS 的文件缓存可能更暖。ZLS 用的是 0.17.0 tag，不是 0.17.x 最新提交。性能测试关闭了 ZLS build-on-save，而 zig-analyzer 的编译器诊断开着。zig-analyzer 文档里的 15/15 诊断、97 库、10,305 文件语料和 372/372 格式化是项目自报，没有在本机独立复现。
+用专门的 LSP 客户端通过 stdio 驱动服务端；时延是端到端的，包含 JSON 编解码。暖态测量在 6 s 稳定期和一轮预热之后开始。RSS 是负载结束后的 `VmRSS`，不是峰值。编辑 → 诊断每轮插入 2-3 个语法错误。每个指标 30-180 个样本。
 
-## 怎么选
+局限：
 
-需要编译器一致诊断、comptime/泛型解析、安全 rename、自动导入、ZON 和构建模型准确性时，选 zig-analyzer。更在意低内存、小二进制、简单成熟的服务器、即时 AstGen 诊断或 Zig master 时，选 ZLS。
+- 只在 Linux x86-64 上测。
+- 两个项目都是编译器/语言服务器代码，泛型用得多。
+- 每轮都先跑 zig-analyzer，ZLS 的文件缓存可能更暖。
+- 性能测试中 ZLS 的 build-on-save 关闭，zig-analyzer 的编译器诊断开启。
