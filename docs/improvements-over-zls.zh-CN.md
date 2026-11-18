@@ -24,6 +24,21 @@
 6. **构建模型更深。** zig-analyzer 使用编译集合、按编译上下文分析、生成文件路径和子项目。ZLS 的构建配置会把根文件相同的模块合并，这是其源码注释承认的限制。
 7. **暖态延迟通常更低。** 在 ZLS 源码项目上，zig-analyzer 的 goto p50 为 0.23 ms vs 0.52 ms，completion p50 为 0.44 ms vs 0.79 ms，初始化 0.67 ms vs 19.1 ms。在 zig-analyzer 源码项目上，goto p95 与 completion p50/p95 也更优。
 
+### 1.1 结论与证据：zig-analyzer 更好的地方
+
+| 领域 | 结论 | 具体证据 |
+|---|---|---|
+| 编译器诊断 | **覆盖更全、一致性更强** | 在没有 `check` 步骤的项目中，语义类型错误在 zig-analyzer 中 **1.31 s** 后出现（source `zig`）；ZLS 在 **10 s 内没有诊断**。有 `check` 步骤时两者都能报告（ZLS 更快：383 ms vs 684 ms），但 zig-analyzer 的诊断来自编译器 `ErrorBundle`，并有一致性定义。 |
+| comptime 与泛型 | **更好** | `fn show(x: anytype)` 以 `Box(u64)` 调用时，`x.value`：zig-analyzer hover `value: u64`、goto 到字段、补全 `get` 和 `value`；ZLS hover/goto `null`、补全只有 `get`。`Chosen = if (builtin.os.tag == .linux) u32 else u64`：zig-analyzer 为 `u32`；ZLS 同时显示两种类型。 |
+| 重构安全 | **更好** | 跨文件 `Widget.resize`：zig-analyzer **2** 个引用、编辑 **2** 个文件、`zig build check` 通过；ZLS **1** 个引用、编辑 **1** 个文件、构建失败，错误为 `no field or member function named 'resize'`。即使 `main.zig` 已打开，结果相同。 |
+| 自动导入 | **更好** | ZLS 的 completion item 不带 `additionalTextEdits`，从未提供未导入的 `add`；zig-analyzer 在索引就绪后提供了它，并附带 import 编辑。 |
+| ZON | **更好** | 有效的 `build.zig.zon`：zig-analyzer **5** 个文档符号，ZLS **0**。ZLS 对 `.zon` 的 signature help、inlay hints、references 返回 `null`。 |
+| 构建模型 | **更好** | zig-analyzer 有编译集合、按编译上下文分析、生成文件路径和子项目；ZLS 源码说明根文件相同的模块会被合并。 |
+| 暖态性能 | **在测量的关键路径上更好** | 项目 A：初始化 **0.67 ms** vs 19.1 ms，goto p50 **0.23 ms** vs 0.52 ms，completion p50 **0.44 ms** vs 0.79 ms。项目 B：completion p50 **0.91 ms** vs 1.88 ms，goto p95 **0.54 ms** vs 0.92 ms。每请求 CPU **0.76 ms** vs 1.00 ms。 |
+| 协议、配置、可观测性 | **更好** | `completionItem/resolve`、semantic token delta、code action resolve、`zig-analyzer/packages`、约 44 项设置 vs 22 项，以及查询级慢请求日志。 |
+
+这些不是风格差异：在诊断、comptime、重构、自动导入和 ZON 上，zig-analyzer 要么给出了 ZLS 给不出的结果，要么完成了 ZLS 会留下破坏的编辑；性能和协议行则是量化差异或功能面差异。代价见下。
+
 主要代价是内存、二进制体积、默认诊断延迟（50 ms 防抖）、泛型代码的 hover 尾延迟，以及项目年龄。第 5–6 节给出量化。
 
 ---

@@ -24,6 +24,21 @@ The main improvements are:
 6. **The build model is deeper.** zig-analyzer uses compile sets, per-compilation analysis, generated paths, and sub-projects. ZLS's build configuration merges modules with the same root file, a limitation documented in its own source.
 7. **Warm-path latency is often lower.** On the ZLS source tree, zig-analyzer's goto p50 was 0.23 ms vs 0.52 ms, completion p50 0.44 ms vs 0.79 ms, and initialization 0.67 ms vs 19.1 ms. On the zig-analyzer source tree, goto p95 and completion p50/p95 also favored zig-analyzer.
 
+### 1.1 Verdict and evidence: where zig-analyzer is better
+
+| Area | Verdict | Concrete evidence |
+|---|---|---|
+| Compiler diagnostics | **Better coverage and consistency** | On a project without a `check` step, a semantic type error appeared in zig-analyzer after **1.31 s** (source `zig`); ZLS reported nothing within **10 s**. With a `check` step both reported it (ZLS was faster: 383 ms vs 684 ms), but zig-analyzer's diagnostics come from the compiler `ErrorBundle` and have a documented consistency definition. |
+| Comptime and generic code | **Better** | `x.value` inside `fn show(x: anytype)` called with `Box(u64)`: zig-analyzer hover `value: u64`, goto to the field, completion `get` and `value`; ZLS hover/goto `null`, completion only `get`. `Chosen = if (builtin.os.tag == .linux) u32 else u64`: zig-analyzer `u32`; ZLS shows both types. |
+| Refactoring safety | **Better** | Cross-file `Widget.resize`: zig-analyzer **2** references, edits **2** files, `zig build check` passes; ZLS **1** reference, edits **1** file, build fails with `no field or member function named 'resize'`. Same result with `main.zig` open. |
+| Auto-import | **Better** | ZLS completion items carry no `additionalTextEdits` and never offered an unimported `add`; zig-analyzer offered it with the import edit once its index was ready. |
+| ZON | **Better** | Valid `build.zig.zon`: zig-analyzer **5** document symbols, ZLS **0**. ZLS returns `null` for `.zon` signature help, inlay hints, and references. |
+| Build model | **Better** | zig-analyzer has compile sets, per-compilation analysis, generated paths, and sub-projects; ZLS's source documents that modules with the same root file are merged. |
+| Warm performance | **Better in the measured key paths** | Project A: init **0.67 ms** vs 19.1 ms, goto p50 **0.23 ms** vs 0.52 ms, completion p50 **0.44 ms** vs 0.79 ms. Project B: completion p50 **0.91 ms** vs 1.88 ms, goto p95 **0.54 ms** vs 0.92 ms. CPU per request **0.76 ms** vs 1.00 ms. |
+| Protocol, configuration, observability | **Better** | `completionItem/resolve`, semantic-token delta, code-action resolve, `zig-analyzer/packages`, ~44 settings vs 22, and query-level slow-request logs. |
+
+These are not style differences: for diagnostics, comptime, refactoring, auto-import, and ZON, zig-analyzer either returns a result ZLS does not or completes an edit that ZLS leaves broken. The performance and protocol rows are quantitative or feature-surface differences. The trade-offs follow.
+
 The main costs are memory, binary size, default diagnostic latency (50 ms debounce), hover tail latency in generic code, and project age. These are quantified in sections 5–6.
 
 ---
