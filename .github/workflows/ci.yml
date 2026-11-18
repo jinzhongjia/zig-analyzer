@@ -27,6 +27,7 @@ jobs:
       zed: ${{ steps.detect.outputs.zed }}
       nvim: ${{ steps.detect.outputs.nvim }}
       vim: ${{ steps.detect.outputs.vim }}
+      updates: ${{ steps.detect.outputs.updates }}
     steps:
       # The three-dot diff of a pull request needs the base commit and the merge base
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
