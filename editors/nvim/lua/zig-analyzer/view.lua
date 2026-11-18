@@ -49,19 +49,24 @@ end
 
 local function nonempty(v) return v ~= nil and v ~= vim.NIL and v ~= '' end
 
---- `rows` (lists of cells) as columns, numbers aligned to the right; the first row is the header
+--- `rows` (lists of cells) as columns; the first row is the header. A column whose cells (below
+--- the header) all start with a number is aligned to the right, every other column to the left.
 local function table_lines(v, rows, indent, groups, targets)
-  local widths = {}
-  for _, row in ipairs(rows) do
-    for i, cell in ipairs(row) do widths[i] = math.max(widths[i] or 0, vim.fn.strdisplaywidth(cell)) end
+  local widths, numeric = {}, {}
+  for r, row in ipairs(rows) do
+    for i, cell in ipairs(row) do
+      widths[i] = math.max(widths[i] or 0, vim.fn.strdisplaywidth(cell))
+      if r > 1 then numeric[i] = numeric[i] ~= false and cell:match('^%-?%d') ~= nil end
+    end
   end
   for r, row in ipairs(rows) do
     local chunks = { indent }
     for i, cell in ipairs(row) do
       local pad = (' '):rep(widths[i] - vim.fn.strdisplaywidth(cell))
-      if i > 1 then table.insert(chunks, '  ' .. pad) end
+      if i > 1 then table.insert(chunks, '  ') end
+      if numeric[i] then table.insert(chunks, pad) end
       table.insert(chunks, { cell, r == 1 and 'Title' or (groups and groups[i]) })
-      if i == 1 and #row > 1 then table.insert(chunks, pad) end
+      if not numeric[i] and i < #row then table.insert(chunks, pad) end
     end
     v:add(chunks, targets and targets[r])
   end
