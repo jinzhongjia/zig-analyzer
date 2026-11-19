@@ -6657,6 +6657,31 @@ test "concatenation in comptime keeps a sentinel that only one side has" {
     });
 }
 
+test "concatenation of comptime-known slices gives a pointer to an array" {
+    try expectTypes(
+        \\const a: []const u8 = "ab";
+        \\const z: [:0]const u8 = "xyz";
+        \\const c = a ++ a;
+        \\const d = a ++ "y";
+        \\const e = "y" ++ a;
+        \\const h = z ++ a;
+        \\const j = a ++ .{'q'};
+        \\fn f(s: []const u8) void {
+        \\    const r = s ++ "x";
+        \\    _ = r;
+        \\}
+    , &.{
+        .{ "c", "*const [4]u8 = \"abab\"" },
+        .{ "d", "*const [3:0]u8 = \"aby\"" },
+        .{ "e", "*const [3:0]u8 = \"yab\"" },
+        // The sentinel of a sentinel-terminated slice is kept
+        .{ "h", "*const [5:0]u8 = \"xyzab\"" },
+        .{ "j", "*const [3]u8" },
+        // A runtime slice has no comptime-known length
+        .{ "r", "unknown" },
+    });
+}
+
 test "unnamed parameters of extern functions are inferred" {
     try expectTypes(
         \\extern fn ext(*const u32, n: u32) bool;

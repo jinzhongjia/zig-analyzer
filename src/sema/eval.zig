@@ -3641,8 +3641,8 @@ const Evaluator = struct {
         const elems = try ev.allocElems(total);
         for (0..n) |i| elems[i] = try ev.elemAt(lhs, i);
         for (0..m) |i| elems[n + i] = try ev.elemAt(rhs, i);
-        const lt = ev.arrayOf(lhs.ty);
-        const rt = ev.arrayOf(rhs.ty);
+        const lt = try ev.concatArrayOf(lhs.ty, n);
+        const rt = try ev.concatArrayOf(rhs.ty, m);
         var ty: Index = undefined;
         if (ip.key(lt) == .array_type and ip.key(rt) == .array_type) {
             const la = ip.key(lt).array_type;
@@ -3679,6 +3679,19 @@ const Evaluator = struct {
             return p;
         }
         return ev.makeAgg(ty, elems);
+    }
+
+    /// Array type of a `++` operand of type `t` with `len` elements: a pointer to an array yields
+    /// the array it points to, and a slice an array of its element type and sentinel
+    fn concatArrayOf(ev: *Evaluator, t: Index, len: usize) Error!Index {
+        return switch (ev.ip.key(t)) {
+            .ptr_type => |p| switch (p.size) {
+                .one => p.child,
+                .slice => ev.ip.get(.{ .array_type = .{ .len = std.math.cast(u64, len) orelse return .unknown, .child = p.child, .sentinel = p.sentinel } }),
+                .many, .c => t,
+            },
+            else => t,
+        };
     }
 
     /// Pointer to a new storage cell (holding `target`); the cell is reachable only through this

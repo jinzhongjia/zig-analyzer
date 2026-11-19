@@ -3283,11 +3283,12 @@ const Inferrer = struct {
     }
 
     /// `++` (matches the compiler's `zirArrayCat`): concatenating tuples gives a tuple;
-    /// concatenating arrays and pointers to arrays gives an array, whose element type is the
-    /// peer of both sides' element types, or `*const [N]T` when either side is a pointer. When
+    /// concatenating arrays, pointers to arrays, and comptime-known slices gives an array, whose
+    /// element type is the peer of both sides' element types, or `*const [N]T` when either side
+    /// is a pointer. When
     /// the values of both sides are known, the interpreter evaluates the result.
     fn concat(inf: *Inferrer, e: ExprId, lhs: TypedValue, rhs: TypedValue) Error!TypedValue {
-        const ty = try inf.concatType(lhs.ty, rhs.ty);
+        const ty = try inf.concatType(lhs, rhs);
         if (ty == .unknown) return .unknown;
         if (lhs.val != null and rhs.val != null and inf.dead == 0 and !inf.r.ctx.incomplete()) {
             const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
@@ -3304,8 +3305,10 @@ const Inferrer = struct {
         return if (tv.val != null and tv.ty == ty) tv else null;
     }
 
-    fn concatType(inf: *Inferrer, a: Index, b: Index) Error!Index {
+    fn concatType(inf: *Inferrer, lhs: TypedValue, rhs: TypedValue) Error!Index {
         const ip = inf.ip;
+        const a = lhs.ty;
+        const b = rhs.ty;
         if (ip.key(a) == .tuple_type and ip.key(b) == .tuple_type) {
             // comptime fields stay comptime fields
             const x = ip.key(a).tuple_type;
@@ -3317,8 +3320,8 @@ const Inferrer = struct {
         }
         // When concatenating a tuple with an array, the tuple is treated as an array with the
         // element type of the other side
-        const x = concatOperand(ip, a, b) orelse return .unknown;
-        const y = concatOperand(ip, b, a) orelse return .unknown;
+        const x = concatOperand(ip, a, b, try inf.sliceLen(lhs)) orelse return .unknown;
+        const y = concatOperand(ip, b, a, try inf.sliceLen(rhs)) orelse return .unknown;
         const elem = try inf.peer(&.{ x.elem, y.elem });
         if (elem == .unknown) return .unknown;
         // Sentinels are converted to the result's element type before being compared
@@ -3328,6 +3331,16 @@ const Inferrer = struct {
         const len = std.math.add(u64, x.len, y.len) catch return .unknown;
         const array = try ip.get(.{ .array_type = .{ .len = len, .child = elem, .sentinel = eval.concatSentinel(xs, ys) } });
         return if (x.is_ptr or y.is_ptr) ip.ptrTo(array, .one, true) else array;
+    }
+
+    /// Length of a slice whose value is known; null for other operands
+    fn sliceLen(inf: *Inferrer, tv: TypedValue) Error!?u64 {
+        switch (inf.ip.key(tv.ty)) {
+            .ptr_type => |p| if (p.size != .slice) return null,
+            else => return null,
+        }
+        if (tv.val == null) return null;
+        return try eval.elemCount(inf.r, tv);
     }
 
     /// Integer operations: the result type is `ty`; it carries a value when the values of both
@@ -4822,14 +4835,18 @@ fn isNonSlicePtr(ip: *InternPool, t: Index) bool {
 
 const ConcatOperand = struct { elem: Index, len: u64, sentinel: ?Index, is_ptr: bool };
 
-/// One side of `++`: an array, a pointer to an array, or a tuple when the other side is indexable
-/// (taking the element type of the other side)
-fn concatOperand(ip: *InternPool, t: Index, other: Index) ?ConcatOperand {
+/// One side of `++`: an array, a pointer to an array, a slice of known length `slice_len`, or a
+/// tuple when the other side is indexable (taking the element type of the other side)
+fn concatOperand(ip: *InternPool, t: Index, other: Index, slice_len: ?u64) ?ConcatOperand {
     switch (ip.key(t)) {
         .array_type => |a| return .{ .elem = a.child, .len = a.len, .sentinel = a.sentinel, .is_ptr = false },
-        .ptr_type => |p| if (p.size == .one) switch (ip.key(p.child)) {
-            .array_type => |a| return .{ .elem = a.child, .len = a.len, .sentinel = a.sentinel, .is_ptr = true },
-            else => {},
+        .ptr_type => |p| switch (p.size) {
+            .one => switch (ip.key(p.child)) {
+                .array_type => |a| return .{ .elem = a.child, .len = a.len, .sentinel = a.sentinel, .is_ptr = true },
+                else => {},
+            },
+            .slice => if (slice_len) |n| return .{ .elem = p.child, .len = n, .sentinel = p.sentinel, .is_ptr = true },
+            .many, .c => {},
         },
         .tuple_type => |tt| {
             const elem: Index = switch (ip.key(other)) {
