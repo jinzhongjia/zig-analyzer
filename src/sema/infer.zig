@@ -3799,7 +3799,10 @@ const Inferrer = struct {
                     // A pointer to a single element is sliced as an array of length 1
                     else => .{ .elem = p.child, .len = 1, .is_const = p.is_const, .attrs = p.attrs },
                 },
-                .slice, .many, .c => .{ .elem = p.child, .sentinel = p.sentinel, .is_const = p.is_const, .attrs = p.attrs },
+                // A comptime-known slice has a comptime-known length, which the compiler uses as
+                // the end of an open slice and to tell whether the end is the full length
+                .slice => .{ .elem = p.child, .sentinel = p.sentinel, .len = if (lhs.val != null) try eval.elemCount(inf.r, lhs) else null, .is_const = p.is_const, .attrs = p.attrs },
+                .many, .c => .{ .elem = p.child, .sentinel = p.sentinel, .is_const = p.is_const, .attrs = p.attrs },
             },
             else => .{ .elem = .unknown },
         };

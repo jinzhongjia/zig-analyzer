@@ -9002,6 +9002,32 @@ test "slicing an outer function's local from a container in the body" {
     });
 }
 
+test "slicing a comptime-known slice gives a pointer to an array" {
+    // An open end or the full length used to give a runtime slice and drop the sentinel
+    try expectTypes(
+        \\const s: []const u8 = "abcd";
+        \\const tail = s[1..];
+        \\const whole = s[0..];
+        \\const cs: [:0]const u8 = "abcd";
+        \\const wlen = cs[0..cs.len];
+        \\const cw = cs[0..];
+        \\const mid = cs[1..3];
+        \\fn h(rt: []const u8, rz: [:0]const u8) void {
+        \\    const r = rt[1..];
+        \\    const rzt = rz[1..];
+        \\    _ = .{ r, rzt };
+        \\}
+    , &.{
+        .{ "tail", "*const [3]u8 = \"bcd\"" },
+        .{ "whole", "*const [4]u8 = \"abcd\"" },
+        .{ "wlen", "*const [4:0]u8 = \"abcd\"" },
+        .{ "cw", "*const [4:0]u8 = \"abcd\"" },
+        .{ "mid", "*const [2]u8 = \"bc\"" },
+        .{ "r", "[]const u8" },
+        .{ "rzt", "[:0]const u8" },
+    });
+}
+
 test "union(enum) without a tag expression: field names are not lowered as expressions" {
     // `union(enum) { unneeded, ... }` has no expression in the parentheses; previously the first
     // member was taken, so `unneeded` was resolved as a name reference to the outer declaration of
