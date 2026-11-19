@@ -5,9 +5,11 @@ const testing = std.testing;
 const resolve = @import("../names/resolve.zig");
 const World = @import("../names/resolve_test.zig").World;
 const database = @import("../database.zig");
+const offsets = @import("../util/offsets.zig");
 const hover = @import("hover.zig");
 const completion = @import("completion.zig");
 const definition = @import("definition.zig");
+const document_symbol = @import("document_symbol.zig");
 const signature_help = @import("signature_help.zig");
 const inlay_hints = @import("inlay_hints.zig");
 const inactive = @import("inactive.zig");
@@ -9821,4 +9823,55 @@ test "goto and hover at a call on an abstract parameter in a branch inactive und
         const info = try hover.hover(&r, file, at, &.{}, .count) orelse return error.NoHover;
         try testing.expect(std.mem.startsWith(u8, info.text, c[2]));
     }
+}
+
+test "the outline classifies functions by receiver like semantic tokens" {
+    const SymbolKind = @import("../lsp/types.zig").SymbolKind;
+    const text =
+        \\const S = struct {
+        \\    fn helper(v: u32) u32 { return v; }
+        \\    fn dist(self: S) u32 { _ = self; return 0; }
+        \\};
+        \\fn add(a: u32) u32 { return a; }
+        \\const callback = add;
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const items = try r.itemTree(file);
+    const map = try ctx.get(database.syntax.FileAstIdMap, file);
+    const lines = try offsets.LineIndex.init(w.arena.allocator(), text);
+    const syms = try document_symbol.documentSymbolsWithResolver(
+        w.arena.allocator(),
+        &r,
+        file,
+        items,
+        map,
+        lines,
+        .utf16,
+    );
+    try testing.expectEqual(3, syms.len);
+    try testing.expectEqualStrings("S", syms[0].name);
+    try testing.expectEqual(SymbolKind.Struct, syms[0].kind);
+    const members = syms[0].children.?;
+    try testing.expectEqualStrings("helper", members[0].name);
+    try testing.expectEqual(SymbolKind.Function, members[0].kind);
+    try testing.expectEqualStrings("dist", members[1].name);
+    try testing.expectEqual(SymbolKind.Method, members[1].kind);
+    try testing.expectEqualStrings("add", syms[1].name);
+    try testing.expectEqual(SymbolKind.Function, syms[1].kind);
+    try testing.expectEqualStrings("callback", syms[2].name);
+    try testing.expectEqual(SymbolKind.Function, syms[2].kind);
+
+    // Without type information, the outline keeps the syntax-only classification
+    const syntax = try document_symbol.documentSymbols(w.arena.allocator(), items, map, lines, .utf16);
+    try testing.expectEqual(SymbolKind.Method, syntax[0].children.?[0].kind);
+    try testing.expectEqual(SymbolKind.Method, syntax[0].children.?[1].kind);
+    try testing.expectEqual(SymbolKind.Function, syntax[1].kind);
+    try testing.expectEqual(SymbolKind.Constant, syntax[2].kind);
 }

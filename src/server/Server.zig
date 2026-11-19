@@ -754,7 +754,7 @@ const request_handlers = .{
     .{ "zig-analyzer/reloadWorkspace", Mode.sync, reloadWorkspace },
     .{ "workspace/executeCommand", Mode.background, executeCommand },
     .{ "textDocument/formatting", Mode.syntax, formatting },
-    .{ "textDocument/documentSymbol", Mode.syntax, documentSymbol },
+    .{ "textDocument/documentSymbol", Mode.semantic, documentSymbol },
     .{ "textDocument/foldingRange", Mode.syntax, foldingRange },
     .{ "textDocument/selectionRange", Mode.syntax, selectionRange },
     .{ "textDocument/semanticTokens/full", Mode.semantic, semanticTokensFull },
@@ -6180,14 +6180,15 @@ fn formatting(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.Doc
     return ide.format.format(arena, lines, mode, server.encoding, try ctx.get(ide.format.ZigFmtRenderer, {}));
 }
 
-fn documentSymbol(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentSymbolParams) HandlerError!types.ResultType("textDocument/documentSymbol") {
+fn documentSymbol(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentSymbolParams) HandlerError!types.ResultType("textDocument/documentSymbol") {
+    const ctx = r.ctx;
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const parse = try ctx.get(syntax_q.ParseFile, file);
     const lines = try fileLines(ctx, arena, file);
     const symbols = if (parse.mode == .zon)
         try ide.document_symbol.zonSymbols(arena, parse.rootNode(), lines, server.encoding)
     else
-        try ide.document_symbol.documentSymbols(arena, try ctx.get(syntax_q.FileItemTree, file), try ctx.get(syntax_q.FileAstIdMap, file), lines, server.encoding);
+        try ide.document_symbol.documentSymbolsWithResolver(arena, r, file, try ctx.get(syntax_q.FileItemTree, file), try ctx.get(syntax_q.FileAstIdMap, file), lines, server.encoding);
     if (server.hierarchical_symbols) return .{ .array_of_DocumentSymbol = try server.clientSymbolTree(arena, symbols) };
     var flat: std.ArrayList(types.SymbolInformation) = .empty;
     try server.flattenSymbols(arena, params.textDocument.uri, symbols, null, &flat);
