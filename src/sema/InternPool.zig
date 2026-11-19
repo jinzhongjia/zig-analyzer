@@ -393,6 +393,11 @@ pub const Key = union(enum) {
     /// whatever the values. Neither a type nor a value: only the `base` of pointer values refers
     /// to it.
     ptr_base: PtrBase,
+    /// Pointer of pointer type `ty` to the integer address `addr`, made by `@ptrFromInt` (the
+    /// compiler's `int` base address). It points to no comptime memory: it cannot be
+    /// dereferenced at comptime, compares by address, and is unequal to every pointer into
+    /// comptime memory.
+    ptr_int: struct { ty: Index, addr: u64 },
     /// A non-null value of optional type `ty` whose payload is itself represented as `null_value`
     /// (or as another `opt_payload`), such as a `??u8` holding a null `?u8`. Every other non-null
     /// optional is represented by its payload value, and `null_value` is the null of every
@@ -1357,6 +1362,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("&");
             try ip.print(v.pointee, w, container_name);
         },
+        .ptr_int => |v| try w.print("@ptrFromInt(0x{x})", .{v.addr}),
         // Matches the compiler, which prints a non-null optional as its payload
         .opt_payload => |v| try ip.print(v.payload, w, container_name),
         .instance, .context => try w.writeAll("instance"),

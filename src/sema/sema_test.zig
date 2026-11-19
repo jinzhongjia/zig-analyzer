@@ -12879,3 +12879,79 @@ test "operands of comparisons and arithmetic have no result type" {
         .{ ".safe", "Optimize = .safe" },
     });
 }
+
+test "comptime pointers made by @ptrFromInt compare by address" {
+    try expectTypes(
+        \\var g: u8 = 0;
+        \\const a: *u8 = @ptrFromInt(0x1000);
+        \\const b: *u8 = @ptrFromInt(0x1000);
+        \\const c: *u8 = @ptrFromInt(0x2000);
+        \\const k: *const u8 = @ptrFromInt(0x1000);
+        \\const eq = a == b;
+        \\const ne = a == c;
+        \\const neq = a != c;
+        \\const ck = a == k;
+        \\const glob = a == &g;
+        \\const addr = @intFromPtr(c);
+        \\const o: ?*u8 = @ptrFromInt(0x10);
+        \\const z: ?*u8 = @ptrFromInt(0);
+        \\const onull = o == null;
+        \\const znull = z == null;
+        \\const oaddr = @intFromPtr(o);
+        \\const az: *allowzero u8 = @ptrFromInt(0);
+        \\const azaddr = @intFromPtr(az);
+        \\const m: [*]u8 = @ptrFromInt(0x1000);
+        \\const m2: [*]u8 = @ptrFromInt(0x1000);
+        \\const meq = m == m2;
+        \\const maddr = @intFromPtr(m);
+        \\const deref = a.*;
+        \\const bad_zero: *u8 = @ptrFromInt(0);
+        \\const bad_align: *u32 = @ptrFromInt(0x1001);
+        \\const bad_zero_eq = bad_zero == a;
+        \\const bad_align_eq = bad_align == bad_align;
+    , &.{
+        .{ "eq", "bool = true" },
+        .{ "ne", "bool = false" },
+        .{ "neq", "bool = true" },
+        .{ "ck", "bool = true" },
+        .{ "glob", "bool = false" },
+        .{ "addr", "usize = 8192" },
+        .{ "onull", "bool = false" },
+        .{ "znull", "bool = true" },
+        .{ "oaddr", "usize = 16" },
+        .{ "azaddr", "usize = 0" },
+        .{ "meq", "bool = true" },
+        .{ "maddr", "usize = 4096" },
+        .{ "deref", "u8" },
+        .{ "bad_zero_eq", "bool" },
+        .{ "bad_align_eq", "bool" },
+    });
+}
+
+test "comptime calls compare @ptrFromInt pointers by address" {
+    // Operations on such pointers that are not modeled (casts, arithmetic) stay unknown
+    try expectTypes(
+        \\const s = "abc";
+        \\fn check() [5]bool {
+        \\    const a: *u8 = @ptrFromInt(0x1000);
+        \\    const b: *const u8 = @ptrFromInt(0x1000);
+        \\    const m: [*]const u8 = @ptrFromInt(0x3000);
+        \\    var x: u8 = 1;
+        \\    _ = &x;
+        \\    const o: ?*u8 = a;
+        \\    return .{ a == b, a == &x, m == s.ptr, o == null, @intFromPtr(a) == 0x1000 };
+        \\}
+        \\const r = check();
+        \\const pc: *align(1) u16 = @ptrCast(@as(*u8, @ptrFromInt(0x1000)));
+        \\const pc_addr = @intFromPtr(pc);
+        \\const m2: [*]u8 = @ptrFromInt(0x1000);
+        \\const step = m2 + 1;
+        \\const step_addr = @intFromPtr(step);
+        \\const shown: *u8 = @ptrFromInt(0x1000);
+    , &.{
+        .{ "r", "[5]bool = .{ true, false, false, false, true }" },
+        .{ "pc_addr", "usize" },
+        .{ "step_addr", "usize" },
+        .{ "shown", "*u8 = @ptrFromInt(0x1000)" },
+    });
+}

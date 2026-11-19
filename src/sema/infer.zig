@@ -2082,7 +2082,12 @@ const Inferrer = struct {
         // Casts: the result type is determined by the expected type (with error union / optional
         // stripped as in the compiler's `resolveDestType`)
         if (eval.castDestStrip(name)) |strip| {
-            if (inf.destType(expected, strip)) |t| return .{ .ty = t };
+            if (inf.destType(expected, strip)) |t| {
+                if (eq(u8, name, "@ptrFromInt") and args.len == 1 and inf.dead == 0 and !inf.r.ctx.incomplete()) {
+                    if (value.intOf(ip, inf.get(args[0]).val)) |addr| return .{ .ty = t, .val = try eval.ptrFromInt(inf.r, t, addr) };
+                }
+                return .{ .ty = t };
+            }
             // `@alignCast` / `@addrSpaceCast` without a result type (an error in the compiler)
             // take the type of the argument
             if ((eq(u8, name, "@alignCast") or eq(u8, name, "@addrSpaceCast")) and args.len == 1) return .{ .ty = inf.get(args[0]).ty };
@@ -2147,6 +2152,7 @@ const Inferrer = struct {
             const n = if (eq(u8, name, "@offsetOf")) bits / 8 else bits;
             return .{ .ty = .comptime_int_type, .val = try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = n } }) };
         }
+        if (eq(u8, name, "@intFromPtr")) if (try inf.pureValue(name, args)) |tv| return tv;
         const simple = [_]struct { []const u8, Index }{
             .{ "@intFromPtr", .usize_type },
             .{ "@inComptime", .bool_type },
