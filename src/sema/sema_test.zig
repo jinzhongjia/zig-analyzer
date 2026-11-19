@@ -3103,6 +3103,119 @@ test "containers in a function capture a comptime var where the body reaches the
     });
 }
 
+test "defer and errdefer write comptime vars at the exit of their block" {
+    // Prevents applying a deferred write at the defer statement and applying errdefer writes on
+    // the success path; expected values are the results of `zig run`
+    const text =
+        \\fn blockDefer() void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer x += 1;
+        \\        const y = x;
+        \\        const z = x + y;
+        \\        _ = .{ y, z };
+        \\    }
+        \\    const w = x;
+        \\    _ = w;
+        \\}
+        \\fn successErrdefer() !u32 {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        errdefer x += 10;
+        \\        const a = x;
+        \\        _ = a;
+        \\    }
+        \\    const b = x;
+        \\    return b;
+        \\}
+        \\fn prongDefer() void {
+        \\    comptime var x: u32 = 1;
+        \\    const c = true;
+        \\    if (c) {
+        \\        defer x += 1;
+        \\        const p = x;
+        \\        _ = p;
+        \\    }
+        \\    const q = x;
+        \\    _ = q;
+        \\}
+        \\fn fnScope() u32 {
+        \\    comptime var x: u32 = 1;
+        \\    defer x += 1;
+        \\    const r = x;
+        \\    return r;
+        \\}
+        \\fn bodyAtExit() void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer {
+        \\            x += 1;
+        \\            const in_defer = x;
+        \\            _ = in_defer;
+        \\        }
+        \\        x = 5;
+        \\    }
+        \\}
+        \\fn order() void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer x *= 2;
+        \\        defer x += 1;
+        \\    }
+        \\    const ordered = x;
+        \\    _ = ordered;
+        \\}
+        \\fn labeled() void {
+        \\    comptime var x: u32 = 1;
+        \\    const v = blk: {
+        \\        defer x += 1;
+        \\        break :blk x;
+        \\    };
+        \\    const after_break = x;
+        \\    _ = .{ v, after_break };
+        \\}
+        \\fn loop() void {
+        \\    comptime var x: u32 = 0;
+        \\    inline for (0..3) |i| {
+        \\        defer x += 1;
+        \\        const cur = x;
+        \\        _ = .{ i, cur };
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", text);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "y", "u32 = 1" },
+        .{ "z", "u32 = 2" },
+        .{ "w", "u32 = 2" },
+        .{ "a", "u32 = 1" },
+        .{ "b", "u32 = 1" },
+        .{ "p", "u32 = 1" },
+        .{ "q", "u32 = 2" },
+        .{ "r", "u32 = 1" },
+        .{ "in_defer", "u32 = 6" },
+        .{ "ordered", "u32 = 4" },
+        .{ "v", "u32 = 1" },
+        .{ "after_break", "u32 = 2" },
+    };
+    for (cases) |c| {
+        testing.expectEqualStrings(c[1], try typeAt(&w, f.file, text, c[0], 0)) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+    for ([_][]const u8{ "u32 = 0", "u32 = 1", "u32 = 2" }, 0..) |want, n| {
+        testing.expectEqualStrings(want, try iterationTypeAt(&w, f.file, text, "cur", "i", @intCast(n))) catch |err| {
+            std.debug.print("type of `cur` in iteration {d}\n", .{n});
+            return err;
+        };
+    }
+}
+
 test "containers in a loop of a type function capture the values of each iteration" {
     // Prevents the containers of all iterations from sharing one type, which left the locals they
     // capture without a value and made the types of different iterations compare equal

@@ -374,6 +374,10 @@ const Inferrer = struct {
     var_levels: []u32 = &.{},
     /// See `Result.iteration_vars`
     iteration_vars: std.ArrayList(Result.IterationVar) = .empty,
+    /// `defer` / `errdefer` statements reached in the blocks being inferred, innermost last: the
+    /// compiler runs their bodies when leaving the block, so `block` infers them there (see
+    /// `runDefers`)
+    pending_defers: std.ArrayList(PendingDefer) = .empty,
     /// Inference mode (used to get the previous iteration's result in per-iteration inference)
     mode: Mode = .full,
     /// The owner is the root expression of a `.zon` file: values are converted to the result type
@@ -2399,6 +2403,7 @@ const Inferrer = struct {
 
     fn block(inf: *Inferrer, blk: Body.Block, expected: ?Index) Error!TypedValue {
         try inf.labels.append(inf.scratch, .{ .name = blk.label, .is_loop = false, .expected = expected });
+        const defers_start = inf.pending_defers.items.len;
         var last: Index = .void_type;
         var dead_rest = false;
         for (blk.stmts, 0..) |s, si| {
@@ -2410,6 +2415,7 @@ const Inferrer = struct {
             }
         }
         if (dead_rest) inf.dead -= 1;
+        try inf.runDefers(defers_start);
         var frame = inf.labels.pop().?;
         if (blk.label != null) {
             // Reaching the end of the block yields void
@@ -2447,7 +2453,10 @@ const Inferrer = struct {
                 return .void_type;
             },
             .@"defer", .@"errdefer" => |e| {
-                _ = try inf.infer(e, null);
+                // A statement that does not execute registers nothing (see `runDefers`)
+                if (inf.dead > 0) {
+                    _ = try inf.infer(e, null);
+                } else try inf.pending_defers.append(inf.scratch, .{ .body = e, .on_error = s.kind == .@"errdefer" });
                 return .void_type;
             },
             .destructure => |d| {
@@ -2466,6 +2475,36 @@ const Inferrer = struct {
                 return .void_type;
             },
         }
+    }
+
+    /// A `defer` or `errdefer` statement whose block has been reached
+    const PendingDefer = struct { body: ExprId, on_error: bool };
+
+    /// Leaving a block: infers the bodies of its `defer` / `errdefer` statements registered from
+    /// `start` on, in reverse order, as the compiler runs them at every exit of the block. A
+    /// `return`, `break` or `continue` that leaves the block has already been inferred, so the
+    /// bodies see the `comptime var` values at the end of the block; each body has one result,
+    /// that of the exit reached by falling through. An `errdefer` runs only when the function
+    /// returns an error, after which the function's `comptime var`s are not read: its body is
+    /// inferred as at an error return here, and the `comptime var`s it assigns keep the values
+    /// they had before it.
+    fn runDefers(inf: *Inferrer, start: usize) Error!void {
+        var i = inf.pending_defers.items.len;
+        while (i > start) {
+            i -= 1;
+            const d = inf.pending_defers.items[i];
+            if (!d.on_error) {
+                _ = try inf.infer(d.body, null);
+                continue;
+            }
+            var vars: std.ArrayList(Body.BindingId) = .empty;
+            _ = try inf.outerComptimeVars(d.body, &vars);
+            const saved = try inf.scratch.alloc(?Index, vars.items.len);
+            for (vars.items, saved) |v, *old| old.* = inf.bindings[@backingInt(v)].val;
+            _ = try inf.infer(d.body, null);
+            for (vars.items, saved) |v, old| inf.bindings[@backingInt(v)].val = old;
+        }
+        inf.pending_defers.shrinkRetainingCapacity(start);
     }
 
     /// The `i`-th element of the destructuring `const a, const b = x;`: a field of a tuple, or an
