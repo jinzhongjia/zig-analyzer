@@ -5309,6 +5309,77 @@ test "peer types of different integer and float types" {
     });
 }
 
+test "an integer and a float peer at the float when the integer is comptime-known or fits" {
+    // Expected values are the results of zig 0.17.1: a comptime-known integer peers with any
+    // float; a runtime one only when every value of its type is exact in the widest float
+    // peer, otherwise the types are incompatible
+    try expectTypes(
+        \\fn five() u64 {
+        \\    return 5;
+        \\}
+        \\const S = struct {
+        \\    var gv: u64 = 5;
+        \\};
+        \\fn h(g: bool, x: f32, y: f64, h16: f16, u: u8, i: i24, w: u32, d: i64, v: u53) void {
+        \\    const k: u64 = 5;
+        \\    var kv: u64 = 5;
+        \\    _ = &kv;
+        \\    const kc = five();
+        \\    const z = @as(u64, @intFromBool(g));
+        \\    const n1 = if (g) kv else x;
+        \\    const n2 = if (g) kc else x;
+        \\    const n3 = if (g) S.gv else x;
+        \\    const n4 = if (g) z else x;
+        \\    const c1 = if (g) @as(i64, 1) else @as(f32, 2);
+        \\    const c2 = if (g) x else k;
+        \\    const c3 = if (g) @as(u64, 1) else h16;
+        \\    const r1 = if (g) u else x;
+        \\    const r2 = if (g) i else x;
+        \\    const r3 = if (g) w else x;
+        \\    const r4 = if (g) d else y;
+        \\    const r5 = if (g) v else y;
+        \\    const m1 = @TypeOf(w, x, y);
+        \\    const m2 = @TypeOf(@as(u64, 1), u, x);
+        \\    const m3 = @TypeOf(x, @as(u32, 1), 1.5);
+        \\    const m4 = @TypeOf(w, u, x);
+        \\    const m5 = @TypeOf(null, @as(u64, 1), x);
+        \\    const a1 = @as(u64, 1) + x;
+        \\    const s1 = switch (u) {
+        \\        0 => @as(u64, 1),
+        \\        1 => u,
+        \\        else => x,
+        \\    };
+        \\    const l1 = blk: {
+        \\        if (g) break :blk @as(u64, 1);
+        \\        break :blk x;
+        \\    };
+        \\    _ = .{ c1, c2, c3, r1, r2, r3, r4, r5, m1, m2, m3, m4, m5, a1, s1, l1, n1, n2, n3, n4 };
+        \\}
+    , &.{
+        .{ "c1", "f32" },
+        .{ "c2", "f32" },
+        .{ "c3", "f16" },
+        .{ "r1", "f32" },
+        .{ "r2", "f32" },
+        .{ "r3", "unknown" },
+        .{ "r4", "unknown" },
+        .{ "r5", "f64" },
+        .{ "m1", "type = f64" },
+        .{ "m2", "type = f32" },
+        .{ "m3", "type = f32" },
+        .{ "m4", "type" },
+        .{ "m5", "type = ?f32" },
+        .{ "a1", "f32" },
+        .{ "s1", "f32" },
+        .{ "l1", "f32" },
+        // Runtime integers, whose values the compiler does not know
+        .{ "n1", "unknown" },
+        .{ "n2", "unknown" },
+        .{ "n3", "unknown" },
+        .{ "n4", "unknown" },
+    });
+}
+
 test "vector layouts follow the backend and CPU features" {
     // Expected values are the results of zig 0.17.0: Debug on x86_64-linux uses the self-hosted
     // backend by default, and `-fllvm` uses LLVM

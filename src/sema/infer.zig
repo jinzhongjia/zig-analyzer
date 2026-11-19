@@ -1129,7 +1129,7 @@ const Inferrer = struct {
                     }
                     return if (t) then else other;
                 }
-                const ty = try inf.peer(&.{ then.ty, other.ty });
+                const ty = try inf.peerValues(&.{ then, other });
                 try inf.peerLiteral(x.then, ty);
                 if (x.@"else") |el| try inf.peerLiteral(el, ty);
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(x.cond, ty)) try sameLiveValue(ip, &.{ then, other }, ty) else null };
@@ -1156,7 +1156,6 @@ const Inferrer = struct {
                 // jumps to other prongs, so no prong is chosen when it is present.
                 const chosen = if (label != null and inf.continuesTo(label.?)) null else try inf.chooseProng(s.prongs, operand);
                 if (label) |name| try inf.labels.append(inf.scratch, .{ .name = name, .is_loop = false, .expected = expected });
-                var types: std.ArrayList(Index) = .empty;
                 var values: std.ArrayList(TypedValue) = .empty;
                 var chosen_tv: TypedValue = .unknown;
                 if (chosen == null) inf.uncertain += 1;
@@ -1168,7 +1167,6 @@ const Inferrer = struct {
                     inf.captureBound(prong.capture);
                     const tv = try inf.inferArm(prong.body, expected, chosen != null and chosen.? != i);
                     if (chosen != null and chosen.? == i) chosen_tv = tv;
-                    try types.append(inf.scratch, tv.ty);
                     try values.append(inf.scratch, tv);
                 }
                 var break_exprs: []const ExprId = &.{};
@@ -1179,24 +1177,18 @@ const Inferrer = struct {
                     // inferred as not executing)
                     if (chosen != null) {
                         if (frame.types.items.len == 0) return chosen_tv;
-                        var live_types: std.ArrayList(Index) = .empty;
                         var live_values: std.ArrayList(TypedValue) = .empty;
-                        if (chosen_tv.ty != .noreturn_type) {
-                            try live_types.append(inf.scratch, chosen_tv.ty);
-                            try live_values.append(inf.scratch, chosen_tv);
-                        }
-                        try live_types.appendSlice(inf.scratch, frame.types.items);
+                        if (chosen_tv.ty != .noreturn_type) try live_values.append(inf.scratch, chosen_tv);
                         try live_values.appendSlice(inf.scratch, frame.values.items);
-                        const t = try inf.peer(live_types.items);
+                        const t = try inf.peerValues(live_values.items);
                         try inf.peerLiteral(s.prongs[chosen.?].body, t);
                         for (frame.exprs.items) |x| try inf.peerLiteral(x, t);
                         return .{ .ty = t, .val = sameValue(live_values.items, t) };
                     }
-                    try types.appendSlice(inf.scratch, frame.types.items);
                     try values.appendSlice(inf.scratch, frame.values.items);
                 }
                 if (chosen != null) return chosen_tv;
-                const ty = try inf.peer(types.items);
+                const ty = try inf.peerValues(values.items);
                 for (s.prongs) |prong| try inf.peerLiteral(prong.body, ty);
                 for (break_exprs) |x| try inf.peerLiteral(x, ty);
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) try sameLiveValue(ip, values.items, ty) else null };
@@ -1974,9 +1966,9 @@ const Inferrer = struct {
             const in_typeof = inf.in_typeof;
             inf.in_typeof = true;
             defer inf.in_typeof = in_typeof;
-            var types: std.ArrayList(Index) = .empty;
-            for (args) |a| try types.append(inf.scratch, (try inf.infer(a, null)).ty);
-            const t = try inf.peer(types.items);
+            var values: std.ArrayList(TypedValue) = .empty;
+            for (args) |a| try values.append(inf.scratch, try inf.infer(a, null));
+            const t = try inf.peerValues(values.items);
             return if (t == .unknown) typeUnknown() else TypedValue.ofType(t);
         }
         if (eq(u8, name, "@Int")) {
@@ -2429,7 +2421,7 @@ const Inferrer = struct {
                 try frame.types.append(inf.scratch, .void_type);
                 try frame.values.append(inf.scratch, .{ .ty = .void_type, .val = .void_value });
             }
-            const t = try inf.peer(frame.types.items);
+            const t = try inf.peerValues(frame.values.items);
             for (frame.exprs.items) |x| try inf.peerLiteral(x, t);
             return .{ .ty = t, .val = sameValue(frame.values.items, t) };
         }
@@ -3287,7 +3279,7 @@ const Inferrer = struct {
     /// comptime_int, giving 255, and only then converted to u8; `b + @intCast(y)` has no type).
     fn arith(inf: *Inferrer, op: SyntaxKind, lhs: TypedValue, rhs_e: ExprId) Error!TypedValue {
         const rhs = try inf.infer(rhs_e, null);
-        return inf.foldInt(op, try inf.peer(&.{ lhs.ty, rhs.ty }), lhs, rhs);
+        return inf.foldInt(op, try inf.peerValues(&.{ lhs, rhs }), lhs, rhs);
     }
 
     /// `++` (matches the compiler's `zirArrayCat`): concatenating tuples gives a tuple;
@@ -4020,7 +4012,28 @@ const Inferrer = struct {
     /// pointers, numbers, enum literals, optionals, pointers, arrays, vectors and tuples); unknown
     /// when the types cannot be unified
     pub fn peer(inf: *Inferrer, types: []const Index) Error!Index {
+        return inf.peerKnown(types, null);
+    }
+
+    /// Peer type resolution of values: like `peer`, and an integer whose value is known peers
+    /// with any float
+    fn peerValues(inf: *Inferrer, values: []const TypedValue) Error!Index {
+        const types = try inf.scratch.alloc(Index, values.len);
+        const known = try inf.scratch.alloc(bool, values.len);
+        for (values, types, known) |v, *t, *k| {
+            t.* = v.ty;
+            k.* = v.val != null;
+        }
+        return inf.peerKnown(types, known);
+    }
+
+    /// `peer`, where `known[i]` tells whether the value of peer `i` is comptime-known
+    fn peerKnown(inf: *Inferrer, types: []const Index, known: ?[]const bool) Error!Index {
         const ip = inf.ip;
+        if (floatPeer(ip, types, known)) |fp| {
+            const t, const has_null = fp;
+            return if (has_null and t != .unknown) ip.optionalOf(t) else t;
+        }
         var result: ?Index = null;
         var has_null = false;
         for (types) |t| {
@@ -4080,9 +4093,9 @@ const Inferrer = struct {
                 if (y > x) result = t;
                 continue;
             }
-            // A fixed-width float with an integer: the float, when every value of the integer
-            // type is exact in it (a comptime-known integer value always is, but values are not
-            // part of peer resolution here)
+            // A fixed-width float with an integer among other kinds of peers (`floatPeer`
+            // resolves the peers that are all numbers): the float, when every value of the
+            // integer type is exact in it
             if (ip.isInt(cur) and t != .comptime_float_type and ip.isFloat(t)) {
                 if (!intFitsFloat(ip, cur, t)) return .unknown;
                 result = t;
@@ -4648,6 +4661,40 @@ fn runtimePtr(ip: *InternPool, t: Index) ?@FieldType(InternPool.Key, "ptr_type")
         .ptr_type => |p| p,
         else => null,
     };
+}
+
+/// Peer of numbers among which are fixed-width integers and floats (and possibly comptime
+/// numbers, null, noreturn and undefined): the widest float, and whether null is a peer. Matches
+/// the compiler: a comptime-known integer (`known`) peers with any float; a runtime one only when
+/// every value of its type is exact in that float, otherwise the types are incompatible and the
+/// result is unknown. Null when the peers are not such numbers.
+fn floatPeer(ip: *InternPool, types: []const Index, known: ?[]const bool) ?struct { Index, bool } {
+    var float: ?Index = null;
+    var has_int = false;
+    var has_null = false;
+    for (types) |t| switch (t) {
+        .noreturn_type, .undefined_type, .comptime_int_type, .comptime_float_type => {},
+        .null_type => has_null = true,
+        else => if (ip.isInt(t)) {
+            has_int = true;
+        } else if (ip.isFloat(t)) {
+            const cur = float orelse {
+                float = t;
+                continue;
+            };
+            const x = value.floatBits(ip, cur) orelse return .{ .unknown, has_null };
+            const y = value.floatBits(ip, t) orelse return .{ .unknown, has_null };
+            if (y > x) float = t;
+        } else return null,
+    };
+    const f = float orelse return null;
+    if (!has_int) return null;
+    for (types, 0..) |t, i| {
+        if (t == .comptime_int_type or !ip.isInt(t)) continue;
+        if (known) |k| if (k[i]) continue;
+        if (!intFitsFloat(ip, t, f)) return .{ .unknown, has_null };
+    }
+    return .{ f, has_null };
 }
 
 /// Whether every value of the integer type `int` is exact in the float type `float` (the
