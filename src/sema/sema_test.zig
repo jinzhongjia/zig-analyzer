@@ -1216,8 +1216,8 @@ test "the sentinel element of an array" {
     , &.{
         .{ "read", "u8 = 0" },
         .{ "same", "[2:0]u8 = \"ab\"" },
-        // Storing a value other than the sentinel is a compile error
-        .{ "other", "[2:0]u8" },
+        // The compiler accepts storing another value; the sentinel stays part of the type
+        .{ "other", "[2:0]u8 = \"ab\"" },
     });
 }
 
@@ -1305,6 +1305,92 @@ test "the sentinel element read through pointers, slices and many-item pointers"
         .{ "range_past", "u8" },
         .{ "range_no_sentinel", "u8" },
         .{ "scanned", "usize = 4" },
+    });
+}
+
+test "stores into the sentinel position and explicit-sentinel slicing" {
+    try expectTypes(
+        \\const array_slot = blk: {
+        \\    var buf: [5:0]u8 = .{ 1, 2, 3, 4, 5 };
+        \\    buf[5] = 1;
+        \\    break :blk [2]u8{ buf[5], buf[0] };
+        \\};
+        \\const through_array_ptr = blk: {
+        \\    var b: [8]u8 = .{ 9, 9, 9, 9, 0, 9, 9, 9 };
+        \\    const t = b[0..4 :0];
+        \\    t[4] = 1;
+        \\    break :blk [2]u8{ b[4], t[4] };
+        \\};
+        \\const through_slice = blk: {
+        \\    var b: [8]u8 = .{ 9, 9, 9, 9, 0, 9, 9, 9 };
+        \\    const s: [:0]u8 = b[0..4 :0];
+        \\    s[4] = 1;
+        \\    break :blk [2]u8{ b[4], s[4] };
+        \\};
+        \\const same_through_slice = blk: {
+        \\    var b: [8]u8 = .{ 9, 9, 9, 9, 0, 9, 9, 9 };
+        \\    const s: [:0]u8 = b[0..4 :0];
+        \\    s[4] = 0;
+        \\    break :blk b[4];
+        \\};
+        \\const address_of_slot = blk: {
+        \\    var b: [8]u8 = .{ 9, 9, 9, 9, 0, 9, 9, 9 };
+        \\    const t = b[0..4 :0];
+        \\    const p = &t[4];
+        \\    p.* = 3;
+        \\    break :blk b[4];
+        \\};
+        \\const array_slot_through_slice = blk: {
+        \\    var buf: [5:0]u8 = .{ 1, 2, 3, 4, 5 };
+        \\    const s: [:0]u8 = buf[0..];
+        \\    s[5] = 1;
+        \\    break :blk [2]u8{ s[5], buf[5] };
+        \\};
+        \\const no_sentinel_slot = blk: {
+        \\    var b: [8]u8 = .{ 9, 9, 9, 9, 0, 9, 9, 9 };
+        \\    const t = b[0..4];
+        \\    t[4] = 1;
+        \\    break :blk b[4];
+        \\};
+        \\const mismatch = blk: {
+        \\    var b: [8]u8 = .{ 9, 9, 9, 9, 1, 9, 9, 9 };
+        \\    const t = b[0..4 :0];
+        \\    break :blk t[4];
+        \\};
+        \\const undefined_slot = blk: {
+        \\    var b: [8]u8 = undefined;
+        \\    const t = b[0..4 :0];
+        \\    t[0] = 1;
+        \\    break :blk t[0];
+        \\};
+        \\const constant_mismatch = blk: {
+        \\    const b = [_]u8{ 9, 9, 9, 9, 1 };
+        \\    const t = b[0..4 :0];
+        \\    break :blk t[0];
+        \\};
+        \\const constant_match = blk: {
+        \\    const b = [_]u8{ 9, 9, 9, 9, 0 };
+        \\    const t = b[0..4 :0];
+        \\    break :blk t[0];
+        \\};
+        \\fn g() void { _ = .{ array_slot, through_array_ptr, through_slice, same_through_slice, address_of_slot, array_slot_through_slice, no_sentinel_slot, mismatch, undefined_slot, constant_mismatch, constant_match }; }
+    , &.{
+        // The compiler accepts the store and reads the type's sentinel afterwards
+        .{ "array_slot", "[2]u8 = \"\\x00\\x01\"" },
+        // The store writes the memory; `*[4:0]u8` reads its type's sentinel there
+        .{ "through_array_ptr", "[2]u8 = \"\\x01\\x00\"" },
+        // A slice reads the memory there
+        .{ "through_slice", "[2]u8 = \"\\x01\\x01\"" },
+        .{ "same_through_slice", "u8 = 0" },
+        .{ "address_of_slot", "u8 = 3" },
+        .{ "array_slot_through_slice", "[2]u8 = \"\\x00\\x00\"" },
+        // Index `len` of `*[4]u8` is out of bounds
+        .{ "no_sentinel_slot", "u8" },
+        // "value in memory does not match slice sentinel"
+        .{ "mismatch", "u8" },
+        .{ "undefined_slot", "u8" },
+        .{ "constant_mismatch", "u8" },
+        .{ "constant_match", "u8 = 9" },
     });
 }
 

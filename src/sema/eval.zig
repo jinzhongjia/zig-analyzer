@@ -1687,10 +1687,10 @@ const Evaluator = struct {
         var cell = ref.cell;
         for (ref.path, 0..) |i, depth| {
             // The sentinel of an array (`buf[buf.len] = 0` in std.fmt.comptimePrint) is part of
-            // the type: storing the same value changes nothing, storing another is an error
+            // the type: the compiler accepts a store of any value there, and reads still yield
+            // the type's sentinel
             if (depth == ref.path.len - 1) if (ev.sentinelElem(cell.ty, i)) |s| {
-                const x = try ev.freeze(try ev.coerce(v, s.ty)) orelse return error.Abort;
-                if (try eqlValues(ev.r, x, s.v.ip) != true) return error.Abort;
+                _ = try ev.coerce(v, s.ty);
                 return;
             };
             const agg = try ev.mutableAgg(cell);
@@ -3879,11 +3879,11 @@ const Evaluator = struct {
             },
             .field_access => |fa| {
                 const name = fa.field orelse return error.Abort;
-                const base = ev.placeOrPointee(f, fa.lhs, use) catch |err| switch (err) {
+                const base = (ev.placeOrPointee(f, fa.lhs, use) catch |err| switch (err) {
                     // `@This().x`, `@import("m.zig").x`: evaluating the type has no effects
                     error.Abort => if (use == .address and isTypeBuiltin(f.body, fa.lhs)) return ev.memberPlace(try ev.eval(f, fa.lhs, null), name) else return err,
                     else => return err,
-                };
+                }).ref;
                 const target = try ev.load(base);
                 if (use == .address and target.ty == .type_type) return ev.memberPlace(target, name);
                 const i = try ev.fieldIndex(target.ty, name) orelse return error.Abort;
@@ -3891,8 +3891,17 @@ const Evaluator = struct {
             },
             .index => |x| {
                 const base = try ev.placeOrPointee(f, x.lhs, use);
-                const i = try ev.evalInt(f, x.index, .usize_type);
-                return ev.extend(base, std.math.cast(u32, i) orelse return error.Abort);
+                const i = std.math.cast(u32, try ev.evalInt(f, x.index, .usize_type)) orelse return error.Abort;
+                // Index `len` of a range reached through a pointer with a sentinel is the
+                // element of the storage right after the range (`t[4] = 1` for
+                // `t = b[0..4 :0]` writes `b[4]`)
+                if (base.ref.window) |w| if (i == w.len and base.ptr_ty != null and ev.seqSentinel(base.ptr_ty.?) != null) {
+                    if (base.ref.as_array) return error.Abort;
+                    var past = base.ref;
+                    past.window = null;
+                    return ev.extend(past, std.math.cast(u32, @as(u64, w.start) + w.len) orelse return error.Abort);
+                };
+                return ev.extend(base.ref, i);
             },
             .deref => |x| {
                 const p = try ev.eval(f, x, null);
@@ -3914,10 +3923,13 @@ const Evaluator = struct {
         };
     }
 
+    /// A place, and the type of the pointer it was reached through (null for the place itself)
+    const PlaceThrough = struct { ref: Ref, ptr_ty: ?Index = null };
+
     /// Place; when its value is a pointer to storage of this evaluation, or for `&` to a place an
     /// interned pointer records (`basePlace`), the place it points to instead (automatic
     /// dereferencing)
-    fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId, use: PlaceUse) EvalError!Ref {
+    fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId, use: PlaceUse) EvalError!PlaceThrough {
         // A pointer computed by pointer arithmetic (`(p + 1)[0] = x`), returned by a call
         // (`std.mem.asBytes(&x)[i] = b`) or, for `&`, made by slicing (`&a[1..][0]`) is not a
         // place: the compiler takes the element pointer of the value, so the place is the one it
@@ -3930,28 +3942,28 @@ const Evaluator = struct {
                 if (use == .write and f.body.expr(e) == .slice) return error.Abort;
                 const p = try ev.eval(f, e, null);
                 return switch (p.v) {
-                    .ref => |r| ev.through(r, p.ty),
-                    else => if (use == .address and ev.ip.key(p.ty) == .ptr_type) try ev.basePlace(p) orelse error.Abort else error.Abort,
+                    .ref => |r| .{ .ref = ev.through(r, p.ty), .ptr_ty = p.ty },
+                    else => if (use == .address and ev.ip.key(p.ty) == .ptr_type) .{ .ref = try ev.basePlace(p) orelse return error.Abort } else error.Abort,
                 };
             },
             else => {},
         }
         const ref = try ev.placeFor(f, e, use);
         // The value of a range, or of a `*T` → `*[1]T` view, is an array, not a pointer
-        if (ref.window != null or ref.as_array) return ref;
+        if (ref.window != null or ref.as_array) return .{ .ref = ref };
         const v = try ev.load(ref);
         switch (v.v) {
-            .ref => |r| return ev.through(r, v.ty),
+            .ref => |r| return .{ .ref = ev.through(r, v.ty), .ptr_ty = v.ty },
             else => {},
         }
-        if (use == .address) if (try ev.basePlace(v)) |r| return r;
+        if (use == .address) if (try ev.basePlace(v)) |r| return .{ .ref = r };
         // A pointer that records no place, held by a declaration, a temporary or a copy, points to
         // storage outside it, whose identity is not known here. A local holding an interned
         // pointer is the base itself (element paths are taken through the pointer, see `elemAt`).
         return if (use == .address and ev.ip.key(v.ty) == .ptr_type and switch (ev.cellOrigin(ref.cell)) {
             .decl, .extern_decl, .thread_local, .temporary, .copy => true,
             .storage, .variable, .constant, .aligned_constant => false,
-        }) error.Abort else ref;
+        }) error.Abort else .{ .ref = ref };
     }
 
     /// The storage of local `b`: a variable is storage of this evaluation, and pointers to a
@@ -4274,6 +4286,16 @@ const Evaluator = struct {
             const v = try ev.eval(f, se, child);
             break :blk try ev.freeze(v) orelse return error.Abort;
         } else null;
+        // The memory right after the range must hold an explicit sentinel ("value in memory does
+        // not match slice sentinel", also for undefined memory); memory known only at runtime is
+        // checked at runtime
+        if (explicit) |x| {
+            const at = try ev.elemAt(base, end);
+            if (at.v != .unknown) {
+                const m = try ev.freeze(at) orelse return error.Abort;
+                if (try eqlValues(ev.r, m, x) != true) return error.Abort;
+            }
+        }
         const sentinel: ?Index = if (explicit) |x| x else if (end == count) src_sentinel else null;
         // Range known at comptime: a pointer to an array
         const array = try ip.get(.{ .array_type = .{ .len = end - start, .child = child, .sentinel = sentinel } });
