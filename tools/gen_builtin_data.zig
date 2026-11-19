@@ -450,8 +450,68 @@ fn parseDocuments(a: Allocator, input: []const u8, metadata: Metadata) !std.Stri
     return result;
 }
 
+const Override = struct {
+    /// Builtin whose rendered documentation needs a compiler-verified correction.
+    name: []const u8,
+    /// Rendered Language Reference text that the compiler contradicts; must occur exactly once.
+    find: []const u8,
+    /// Replacement text.
+    corrected: []const u8,
+};
+
+/// Entries where the pinned Language Reference disagrees with the compiler. A `find` that no longer
+/// occurs exactly once fails generation, so a source update cannot silently disable a correction.
+const overrides = [_]Override{
+    .{
+        .name = "@bitSizeOf",
+        // The 0.17.1 compiler rejects @bitSizeOf(comptime_int) with
+        // "error: no bit size available for type 'comptime_int'" and @bitSizeOf(type) with
+        // "error: no bit size available for type 'type'".
+        .find = "For types that are disallowed at runtime, such as `comptime_int` and `type`, the result is `0`.",
+        .corrected = "`comptime_int` and `type` have no bit size; the compiler rejects them with " ++
+            "`error: no bit size available for type 'comptime_int'` and `error: no bit size available for type 'type'`.",
+    },
+    .{
+        .name = "@sizeOf",
+        // The 0.17.1 compiler rejects @sizeOf(comptime_int) with
+        // "error: no size available for comptime-only type 'comptime_int'" and @sizeOf(type) with
+        // "error: no size available for comptime-only type 'type'".
+        .find = "For types that are disallowed at runtime, such as `comptime_int` and `type`, the result is `0`.",
+        .corrected = "`comptime_int` and `type` have no size; the compiler rejects them with " ++
+            "`error: no size available for comptime-only type 'comptime_int'` and `error: no size available for comptime-only type 'type'`.",
+    },
+    .{
+        .name = "@errorName",
+        // The 0.17.1 compiler gives @errorName(error.Foo) the type *const [3:0]u8 and a runtime
+        // anyerror operand the type [:0]const u8, which is the signature's return type.
+        .find = "The string representation of `error.OutOfMem` is `\"OutOfMem\"`.",
+        .corrected = "The string representation of `error.OutOfMem` is `\"OutOfMem\"`. When `err` is comptime-known, " ++
+            "the result is `*const [N:0]u8` with a comptime-known length `N`; the `[:0]const u8` return type describes a runtime value.",
+    },
+    .{
+        .name = "@tagName",
+        // The 0.17.1 compiler gives @tagName(E.a) the type *const [1:0]u8 and a runtime enum
+        // operand the type [:0]const u8, which is the signature's return type.
+        .find = "Converts an enum value or union value to a string literal representing the name.",
+        .corrected = "Converts an enum value or union value to a string literal representing the name. When `value` is " ++
+            "comptime-known, the result is `*const [N:0]u8` with a comptime-known length `N`; the `[:0]const u8` return type describes a runtime value.",
+    },
+};
+
+fn applyOverrides(a: Allocator, docs: *std.StringHashMapUnmanaged(Document)) !void {
+    for (overrides) |override| {
+        const doc = docs.getPtr(override.name) orelse
+            return invalid("override targets a builtin without official documentation: {s}", .{override.name});
+        const matches = std.mem.count(u8, doc.documentation, override.find);
+        if (matches != 1)
+            return invalid("override for {s} matches the official documentation {d} times, expected exactly once", .{ override.name, matches });
+        doc.documentation = try std.mem.replaceOwned(u8, a, doc.documentation, override.find, override.corrected);
+    }
+}
+
 fn generate(a: Allocator, input: []const u8, metadata: Metadata) ![:0]const u8 {
-    const docs = try parseDocuments(a, input, metadata);
+    var docs = try parseDocuments(a, input, metadata);
+    try applyOverrides(a, &docs);
     const registry = std.zig.BuiltinFn.list;
     if (registry.keys().len != documented_count + compiler_only.len)
         return invalid("compiler builtin coverage mismatch: expected {d}, got {d}", .{ documented_count + compiler_only.len, registry.keys().len });
@@ -620,4 +680,49 @@ test "official reference keeps generic signature arity and renders concrete sour
     try std.testing.expect(std.mem.indexOf(u8, docs.get("@cmpxchgWeak").?.documentation, "```zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, docs.get("@call").?.documentation, "[lang.CallModifier struct.zig](https://ziglang.org/documentation/0.17.1/#call)") != null);
     try std.testing.expect(docs.get("@Frame") == null);
+}
+
+test "builtin overrides match the pinned reference exactly once and correct the text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const metadata = try std.json.parseFromSliceLeaky(Metadata, a, @embedFile("zig/metadata.json"), .{});
+    var docs = try parseDocuments(a, @embedFile("zig/langref.html.in"), metadata);
+    for (overrides) |override| {
+        const documentation = docs.get(override.name).?.documentation;
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, documentation, override.find));
+        try std.testing.expect(std.mem.indexOf(u8, documentation, override.corrected) == null);
+    }
+    try applyOverrides(a, &docs);
+    for (overrides) |override| {
+        try std.testing.expect(std.mem.indexOf(u8, docs.get(override.name).?.documentation, override.corrected) != null);
+    }
+}
+
+test "builtin overrides reject reference text that changed or disappeared" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const metadata = try std.json.parseFromSliceLeaky(Metadata, a, @embedFile("zig/metadata.json"), .{});
+    var changed = try parseDocuments(a, @embedFile("zig/langref.html.in"), metadata);
+    changed.getPtr("@bitSizeOf").?.documentation = "edited";
+    try std.testing.expectError(error.InvalidOfficialSource, applyOverrides(a, &changed));
+    var missing = try parseDocuments(a, @embedFile("zig/langref.html.in"), metadata);
+    _ = missing.remove("@tagName");
+    try std.testing.expectError(error.InvalidOfficialSource, applyOverrides(a, &missing));
+}
+
+test "generated metadata carries compiler-verified builtin corrections" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const metadata = try std.json.parseFromSliceLeaky(Metadata, a, @embedFile("zig/metadata.json"), .{});
+    const generated = try generate(a, @embedFile("zig/langref.html.in"), metadata);
+    for (overrides) |override| {
+        const escaped = try std.fmt.allocPrint(a, "{f}", .{std.zig.fmtString(override.corrected)});
+        try std.testing.expect(std.mem.indexOf(u8, generated, escaped) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, generated, "such as `comptime_int` and `type`, the result is `0`") == null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, ".name = \"@errorName\", .signature = \"@errorName(err: anyerror) [:0]const u8\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, ".name = \"@tagName\", .signature = \"@tagName(value: anytype) [:0]const u8\"") != null);
 }
