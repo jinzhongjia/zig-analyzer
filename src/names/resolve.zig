@@ -136,7 +136,17 @@ pub const Resolver = struct {
     /// Resolves a name at `scope` of BodyOwner `item`
     pub fn resolveName(r: *Resolver, file: FileId, item: u32, b: *const Body, scope: Body.ScopeId, name: []const u8) Error!?Def {
         if (b.lookup(scope, name)) |binding| return .{ .local = .{ .file = file, .item = item, .binding = binding } };
-        return r.resolveContainerName(file, item, name);
+        const def = try r.resolveContainerName(file, item, name);
+        // A container-level variable does not see the declaration it initializes: `const x = x;`
+        // is an error. A function body may refer to the function itself (`fn f() { _ = f; }`).
+        if (def) |d| switch (d) {
+            .item => |it| if (it.file == file and it.item == item) switch ((try r.itemTree(file)).items[item].kind) {
+                .@"const", .@"var" => return null,
+                else => {},
+            },
+            .local, .file => {},
+        };
+        return def;
     }
 
     /// Container-level names: member declarations and, when the container is defined in a member's
