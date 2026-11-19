@@ -6614,7 +6614,7 @@ const Evaluator = struct {
         const ip = ev.ip;
         if (depth > max_layout_depth) return null;
         switch (ip.key(t)) {
-            .optional_type => |c| return value.optionalLayout(ip, c, try ev.typeLayout(c, depth + 1) orelse return null),
+            .optional_type => |c| return if (c == .noreturn_type) value.optional_noreturn_layout else value.optionalLayout(ip, c, try ev.typeLayout(c, depth + 1) orelse return null),
             .array_type => |a| return value.arrayLayout(try ev.typeLayout(a.child, depth + 1) orelse return null, a, try ev.hasBitRepr(a.child)),
             .error_union_type => |eu| return value.errorUnionLayout(ip, try ev.typeLayout(eu.payload, depth + 1) orelse return null),
             .container_type, .reified_type, .union_tag_type, .tuple_type, .anon_struct_type => {},
