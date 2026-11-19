@@ -4241,8 +4241,10 @@ const Evaluator = struct {
             .ref => |r| r,
             else => return false,
         };
-        // A `*T` → `*[1]T` view without a range covers its only element
-        const w: Ref.Window = r.window orelse if (r.as_array) .{ .start = 0, .len = 1 } else return false;
+        const n = if (r.as_array) 1 else try ev.elemCount(try ev.load(.{ .cell = r.cell, .path = r.path })) orelse return error.Abort;
+        // A slice without a range (a `*T` → `*[1]T` view, or a slice coerced from an array
+        // pointer) covers the whole array
+        const w: Ref.Window = r.window orelse .{ .start = 0, .len = std.math.cast(u32, n) orelse return error.Abort };
         const rhs = try ev.evalInt(f, rhs_e, .usize_type);
         const len: i128 = switch (op) {
             .equal => rhs,
@@ -4250,7 +4252,6 @@ const Evaluator = struct {
             .minus_equal => @as(i128, w.len) - rhs,
             else => return error.Abort,
         };
-        const n = if (r.as_array) 1 else try ev.elemCount(try ev.load(.{ .cell = r.cell, .path = r.path })) orelse return error.Abort;
         if (len < 0 or w.start + len > n) return error.Abort;
         try ev.store(ref, .{ .ty = s.ty, .v = .{ .ref = .{ .cell = r.cell, .path = r.path, .window = .{ .start = w.start, .len = @intCast(len) }, .as_array = r.as_array, .immutable = r.immutable } } });
         return true;

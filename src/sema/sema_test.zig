@@ -11229,6 +11229,22 @@ test "comptime evaluation: a *T coerced to *[1]T views the same place" {
         .{ "r_payload", "u8 = 8" },
     });
 }
+test "comptime evaluation: assigning len re-windows a slice coerced from an array pointer" {
+    // `s.len = n` on a slice without a range gave up instead of shortening it.
+    try expectTypes(
+        \\fn f() usize {
+        \\    var a = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+        \\    var s: []u8 = &a;
+        \\    s.len = 4;
+        \\    s[3] += 10;
+        \\    s.len += 2;
+        \\    return s.len * 1000 + @as(usize, s[3]) * 10 + a[3] / 14;
+        \\}
+        \\const r_len = f();
+    , &.{
+        .{ "r_len", "usize = 6141" },
+    });
+}
 test "comptime evaluation: @fieldParentPtr goes back from a field pointer to its parent" {
     try expectTypes(
         \\const S = struct { a: u8, b: u8 };
