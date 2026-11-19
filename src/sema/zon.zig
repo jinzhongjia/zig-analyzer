@@ -138,7 +138,7 @@ const Lowering = struct {
         const ty = if (names) |ns| blk: {
             const strs = try l.arena.alloc([]const u8, ns.len);
             for (ns, strs) |name, *s| s.* = name.get(l.zoir);
-            break :blk try ip.get(.{ .anon_struct_type = .{ .names = strs, .types = types, .values = values, .origin = .{ .file = l.file, .path = l.path.items } } });
+            break :blk try ip.get(.{ .anon_struct_type = .{ .names = strs, .types = types, .values = values, .origin = .{ .zon = .{ .file = l.file, .path = l.path.items } } } });
         } else try ip.get(.{ .tuple_type = .{ .types = types, .values = values } });
         return .{ .ty = ty, .val = if (known) try value.aggregate(ip, l.arena, ty, values) else null };
     }
