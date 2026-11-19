@@ -320,11 +320,12 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     var out: Collector = .{ .arena = r.arena };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset > text.len) return .{ .context = .ignored };
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
 
     const literal = try commentOrString(r, file, offset);
     if (literal == .comment) return .{ .context = .ignored };
     if (literal == .quoted) return quotedName(r, file, offset, cursor_owner);
-    if (literal == .none and !paths_only) if (try project_config.valueCompletions(r, file, text, offset, (try r.ctx.get(database.syntax.ParseFile, file)).rootNode())) |values| {
+    if (literal == .none and !paths_only) if (try project_config.valueCompletions(r, file, text, offset, root)) |values| {
         out.member_mode = true;
         for (values.values) |v| try out.add(.{ .label = v.name, .kind = if (values.tags) .enum_member else .constant, .doc = v.doc });
         return .{ .items = out.items.items, .context = if (values.tags) .enum_literal else .ignored };
@@ -342,7 +343,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         for (builtins.entries) |*entry| try out.add(.{ .label = entry.name, .kind = .builtin, .replace = range, .detail = entry.signature, .doc = try builtins.documentation(r.arena, entry, dialect) });
         return .{ .items = out.items.items, .context = .builtin };
     };
-    if (importString(text, offset)) |start| {
+    if (try importString(r.arena, root, offset)) |start| {
         try importPaths(r, &out, file, text[start..offset], .{ .start = start, .end = stringContentEnd(text, offset) });
         return .{ .items = out.items.items, .context = .path };
     }
@@ -1919,25 +1920,27 @@ fn afterDot(text: []const u8, offset: u32) bool {
     return i > 0 and text[i - 1] == '.' and (i == 1 or text[i - 2] != '.');
 }
 
-/// Start of the string content when the cursor is in the string of `@import("` (the string may
-/// be unterminated; escaped quotes do not end it)
-fn importString(text: []const u8, offset: u32) ?u32 {
-    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
-    var open: ?usize = null;
-    var i = line_start;
-    while (i < offset) : (i += 1) switch (text[i]) {
-        '"' => open = if (open == null) i + 1 else null,
-        '\\' => if (open != null) {
-            i += 1;
-        },
-        else => {},
-    };
-    const start: u32 = @intCast(open orelse return null);
-    var head = std.mem.trimEnd(u8, text[line_start .. start - 1], " \t");
-    if (!std.mem.endsWith(u8, head, "(")) return null;
-    head = std.mem.trimEnd(u8, head[0 .. head.len - 1], " \t");
-    if (!std.mem.endsWith(u8, head, "@import")) return null;
-    return start;
+/// Start of the string content when the cursor is in the string argument of an `@import` call
+/// (the string may be unterminated; escaped quotes do not end it). The call is found through the
+/// syntax tree, so it and the string may span lines.
+fn importString(arena: Allocator, root: SyntaxNode, offset: u32) Allocator.Error!?u32 {
+    if (offset == 0) return null;
+    const tok = root.tokenAtOffset(offset - 1) orelse return null;
+    switch (tok.kind) {
+        // A cursor after the closing quote is outside the string
+        .string_literal => if (offset >= tok.offset + tok.text.len) return null,
+        .invalid => if (tok.text.len == 0 or tok.text[0] != '"') return null,
+        else => return null,
+    }
+    const path = try root.coveringPath(arena, @intCast(tok.offset));
+    // The string is a direct argument: `builtin_call` > `arg_list` > `literal` (or `error_node`
+    // when the string is unterminated)
+    if (path.len < 3) return null;
+    const call = ast.cast(ast.BuiltinCall, path[path.len - 3]) orelse return null;
+    const name = call.name() orelse return null;
+    if (!std.mem.eql(u8, name.text, "@import")) return null;
+    if (path[path.len - 2].kind() != .arg_list) return null;
+    return @intCast(tok.offset + 1);
 }
 
 /// End of the content of the string literal holding `offset`: its closing quote, or `offset` when

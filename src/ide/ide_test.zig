@@ -3203,6 +3203,37 @@ test "build.zig.zon paths are completed relative to the build root" {
     }
 }
 
+test "completion: @import paths when the string is on another line" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "lib.zig", .data = "" });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "const m = @import(\n    \"li<|>\"\n);\n", "std builtin root lib.zig" },
+        .{ "const m = @import(\n    \"li<|>\");\n", "std builtin root lib.zig" },
+        .{ "const m = @import(\"li<|>\");\n", "std builtin root lib.zig" },
+        // A string that is not the argument of `@import` gets no paths
+        .{ "const m = other(\n    \"li<|>\"\n);\n", "" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const at = try w.addNative(try std.fs.path.join(w.arena.allocator(), &.{ dir, "main.zig" }), c[0]);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const items = (try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items;
+        var labels: std.ArrayList([]const u8) = .empty;
+        for (items) |it| try labels.append(w.arena.allocator(), it.label);
+        testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+}
+
 test "path completion escapes entry names and decodes the typed directory" {
     // `"` and `\` cannot be part of file names on Windows
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
