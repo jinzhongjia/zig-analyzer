@@ -1419,12 +1419,7 @@ pub fn eqlTypes(ip: *InternPool, a: Index, b: Index) ?bool {
         .vector_type => |v| if (v.len != kb.vector_type.len) false else eqlTypes(ip, v.child, kb.vector_type.child),
         .anon_struct_type => |x| blk: {
             const y = kb.anon_struct_type;
-            if (!eqlNames(x.names, y.names)) break :blk false;
-            if (x.origin != null or y.origin != null) {
-                const from = x.origin orelse break :blk false;
-                const to = y.origin orelse break :blk false;
-                if (from.file != to.file or !std.mem.eql(u32, from.path, to.path)) break :blk false;
-            }
+            if (!eqlNames(x.names, y.names) or !eqlOrigins(x.origin, y.origin)) break :blk false;
             break :blk all(&.{ eqlTypeLists(ip, x.types, y.types), eqlFieldValues(ip, x.values, y.values, x.types.len) });
         },
         // Types constructed at the same location with the same contents are the same (the instance
@@ -1496,10 +1491,17 @@ fn eqlNames(a: []const []const u8, b: []const []const u8) bool {
     return true;
 }
 
-fn eqlOrigins(a: ?InternPool.ZonLiteral, b: ?InternPool.ZonLiteral) bool {
-    const x = a orelse return b == null;
-    const y = b orelse return false;
-    return x.file == y.file and std.mem.eql(u32, x.path, y.path);
+fn eqlOrigins(a: InternPool.LiteralOrigin, b: InternPool.LiteralOrigin) bool {
+    return switch (a) {
+        .zon => |x| switch (b) {
+            .zon => |y| x.file == y.file and std.mem.eql(u32, x.path, y.path),
+            .zig => false,
+        },
+        .zig => |x| switch (b) {
+            .zig => |y| x.file == y.file and x.owner == y.owner and x.expr == y.expr,
+            .zon => false,
+        },
+    };
 }
 
 fn eqlSentinel(ip: *InternPool, a: ?Index, b: ?Index) ?bool {

@@ -1274,7 +1274,7 @@ const Inferrer = struct {
                 const saved = inf.current_init;
                 inf.current_init = e;
                 defer inf.current_init = saved;
-                return inf.initExpr(x.ty, x.fields, expected);
+                return inf.initExpr(e, x.ty, x.fields, expected);
             },
             .container => |c| {
                 if (c.arg) |arg| _ = try inf.infer(arg, null);
@@ -3412,12 +3412,12 @@ const Inferrer = struct {
         }
     }
 
-    fn initExpr(inf: *Inferrer, ty_e: ?ExprId, fields: []const Body.FieldInit, expected: ?Index) Error!TypedValue {
+    fn initExpr(inf: *Inferrer, e: ExprId, ty_e: ?ExprId, fields: []const Body.FieldInit, expected: ?Index) Error!TypedValue {
         const ip = inf.ip;
         // The type of `.{ ... }` is the result type with error union and optional stripped
         // (matches the compiler)
         const want = inf.destType(expected, .eu_opt);
-        if (ty_e == null and want == null) return inf.anonInit(fields);
+        if (ty_e == null and want == null) return inf.anonInit(e, fields);
         const t: Index = if (ty_e) |te|
             try inf.inferredLenArray(te, fields.len) orelse (try inf.infer(te, null)).asType() orelse .unknown
         else
@@ -3434,7 +3434,7 @@ const Inferrer = struct {
 
     /// `.{ ... }` without a result type: a tuple (`struct { A, B }`) or an anonymous struct;
     /// it carries a value when all elements are known
-    fn anonInit(inf: *Inferrer, fields: []const Body.FieldInit) Error!TypedValue {
+    fn anonInit(inf: *Inferrer, e: ExprId, fields: []const Body.FieldInit) Error!TypedValue {
         const ip = inf.ip;
         const types = try inf.scratch.alloc(Index, fields.len);
         const vals = try inf.scratch.alloc(Index, fields.len);
@@ -3462,7 +3462,7 @@ const Inferrer = struct {
         const ty = if (named) blk: {
             const names = try inf.scratch.alloc([]const u8, fields.len);
             for (fields, names) |f, *n| n.* = f.name orelse return .unknown;
-            break :blk try ip.get(.{ .anon_struct_type = .{ .names = names, .types = types, .values = field_values } });
+            break :blk try ip.get(.{ .anon_struct_type = .{ .names = names, .types = types, .values = field_values, .origin = .{ .zig = .{ .file = inf.file, .owner = try inf.body_owner(), .expr = @backingInt(e) } } } });
         } else try ip.get(.{ .tuple_type = .{ .types = types, .values = field_values } });
         return .{ .ty = ty, .val = if (known) try value.aggregate(ip, inf.scratch, ty, vals) else null };
     }

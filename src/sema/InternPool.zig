@@ -288,6 +288,16 @@ pub const CallConv = union(enum) {
 /// root value of the file
 pub const ZonLiteral = struct { file: FileId, path: []const u32 };
 
+/// The struct literal an anonymous struct type is the type of. As in the compiler, each literal
+/// has a type of its own: literals at different locations never have the same type, whatever their
+/// contents, and one literal evaluated again with the same field types and values has the same type
+pub const LiteralOrigin = union(enum) {
+    /// A struct literal of a `.zon` file
+    zon: ZonLiteral,
+    /// A struct literal of a `.zig` file: the expression `expr` in the body of the item `owner`
+    zig: struct { file: FileId, owner: AstId, expr: u32 },
+};
+
 /// See `Key.ptr_base`. `root` is the storage the place is in; `path` is the field or element
 /// index taken at each level of its value, and `window` the elements of the aggregate at `path`
 /// that a pointer to several elements starts from (a slice or a sliced array), as in the
@@ -338,9 +348,8 @@ pub const Key = union(enum) {
     /// `@Vector(len, T)`
     vector_type: struct { len: u32, child: Index },
     /// Type of an anonymous struct literal `.{ .a = x }` without a result type; `values` as in
-    /// `Tuple`. `origin`: the struct literal of a `.zon` file this is the type of; as in the compiler,
-    /// each such literal has a type of its own, whatever its contents
-    anon_struct_type: struct { names: []const []const u8, types: []const Index, values: []const Index = &.{}, origin: ?ZonLiteral = null },
+    /// `Tuple`. `origin`: the literal this is the type of
+    anon_struct_type: struct { names: []const []const u8, types: []const Index, values: []const Index = &.{}, origin: LiteralOrigin },
     /// Types constructed by `@Enum` / `@Struct` / `@Union`
     reified_type: Reified,
     /// The tag enum generated automatically for a `union(enum)` (the value is the union type)
@@ -999,7 +1008,10 @@ fn own(ip: *InternPool, k: Key) Allocator.Error!Key {
         .error_value => |n| .{ .error_value = try a.dupe(u8, n) },
         .instance => |i| .{ .instance = .{ .file = i.file, .decl = i.decl, .args = try a.dupe(Index, i.args), .arg_types = try a.dupe(Index, i.arg_types), .parent = i.parent, .captured = try a.dupe(CapturedLocal, i.captured), .iteration = i.iteration } },
         .tuple_type => |t| .{ .tuple_type = .{ .types = try a.dupe(Index, t.types), .values = try a.dupe(Index, t.values) } },
-        .anon_struct_type => |t| .{ .anon_struct_type = .{ .names = try dupeNames(a, t.names), .types = try a.dupe(Index, t.types), .values = try a.dupe(Index, t.values), .origin = if (t.origin) |o| .{ .file = o.file, .path = try a.dupe(u32, o.path) } else null } },
+        .anon_struct_type => |t| .{ .anon_struct_type = .{ .names = try dupeNames(a, t.names), .types = try a.dupe(Index, t.types), .values = try a.dupe(Index, t.values), .origin = switch (t.origin) {
+            .zon => |o| .{ .zon = .{ .file = o.file, .path = try a.dupe(u32, o.path) } },
+            .zig => |o| .{ .zig = o },
+        } } },
         .reified_type => |t| blk: {
             var out = t;
             out.names = try dupeNames(a, t.names);

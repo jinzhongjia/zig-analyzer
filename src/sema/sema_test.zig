@@ -12613,6 +12613,49 @@ test "types of zon values are the same only for the same literal of the same fil
     }
 }
 
+test "each anonymous struct literal has a type of its own, and tuple literals are pooled by contents" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const src =
+        \\const x = .{ .a = 1, .b = 2 };
+        \\const y = .{ .a = 1, .b = 2 };
+        \\const t = .{ 1, 2 };
+        \\const u = .{ 1, 2 };
+        \\fn local() bool {
+        \\    const p = .{ .a = 1 };
+        \\    const q = .{ .a = 1 };
+        \\    return @TypeOf(p) == @TypeOf(q);
+        \\}
+        \\fn site() type {
+        \\    return @TypeOf(.{ .a = 1 });
+        \\}
+        \\fn Wrap(comptime T: type) type {
+        \\    return struct { pub const inner = T; };
+        \\}
+        \\const container = @TypeOf(x) == @TypeOf(y);
+        \\const self = @TypeOf(x) == @TypeOf(x);
+        \\const in_fn = local();
+        \\const same_site = site() == site();
+        \\const instances = Wrap(@TypeOf(x)) == Wrap(@TypeOf(y));
+        \\const tuple = @TypeOf(t) == @TypeOf(u);
+    ;
+    const file = (try w.add("/p/main.zig", src)).file;
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "container", "bool = false" },
+        .{ "self", "bool = true" },
+        .{ "in_fn", "bool = false" },
+        .{ "same_site", "bool = true" },
+        .{ "instances", "bool = false" },
+        .{ "tuple", "bool = true" },
+    }) |c| {
+        testing.expectEqualStrings(c[1], try typeAt(&w, file, src, c[0], 0)) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "the root expression of a zon file is inferred and inf and nan are floats" {
     var w: World = undefined;
     try w.init();

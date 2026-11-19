@@ -283,7 +283,10 @@ pub fn zonLiteralOfType(ip: *InternPool, ty: InternPool.Index) ?InternPool.ZonLi
         else => ty,
     };
     return switch (ip.key(t)) {
-        .anon_struct_type => |s| s.origin,
+        .anon_struct_type => |s| switch (s.origin) {
+            .zon => |o| o,
+            .zig => null,
+        },
         else => null,
     };
 }

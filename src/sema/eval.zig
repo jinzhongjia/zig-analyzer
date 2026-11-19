@@ -1885,7 +1885,7 @@ const Evaluator = struct {
                 };
                 return try ev.unwrapOptional(v, child) orelse error.Abort;
             },
-            .init => |x| return ev.initExpr(f, x.ty, x.fields, want),
+            .init => |x| return ev.initExpr(f, e, x.ty, x.fields, want),
             .container => |c| {
                 const ns = try ev.containerAt(f, e) orelse return error.Abort;
                 if (ev.stop) |s| if (s.frame == f and s.container == ns.container) try ev.take(f, s);
@@ -4309,7 +4309,7 @@ const Evaluator = struct {
 
     // ── Initialization ───────────────────────────────────────────────
 
-    fn initExpr(ev: *Evaluator, f: *Frame, ty_e: ?ExprId, fields: []const Body.FieldInit, want: ?Index) EvalError!Val {
+    fn initExpr(ev: *Evaluator, f: *Frame, e: ExprId, ty_e: ?ExprId, fields: []const Body.FieldInit, want: ?Index) EvalError!Val {
         const ip = ev.ip;
         var t: ?Index = want;
         if (ty_e) |te| t = switch (f.body.expr(te)) {
@@ -4321,14 +4321,14 @@ const Evaluator = struct {
             } else try ev.evalType(f, te),
             else => try ev.evalType(f, te),
         };
-        const target = t orelse return ev.anonInit(f, fields);
+        const target = t orelse return ev.anonInit(f, e, fields);
         switch (ip.key(target)) {
             .optional_type => |child| {
-                const inner = try ev.initExpr(f, null, fields, child);
+                const inner = try ev.initExpr(f, e, null, fields, child);
                 return ev.wrapOptional(target, inner);
             },
             .error_union_type => |eu| {
-                const inner = try ev.initExpr(f, null, fields, eu.payload);
+                const inner = try ev.initExpr(f, e, null, fields, eu.payload);
                 return .{ .ty = target, .v = inner.v };
             },
             .array_type, .vector_type, .tuple_type => {
@@ -4360,7 +4360,7 @@ const Evaluator = struct {
     }
 
     /// `.{ ... }` without a result type: a tuple or an anonymous struct
-    fn anonInit(ev: *Evaluator, f: *Frame, fields: []const Body.FieldInit) EvalError!Val {
+    fn anonInit(ev: *Evaluator, f: *Frame, e: ExprId, fields: []const Body.FieldInit) EvalError!Val {
         const ip = ev.ip;
         const elems = try ev.a.alloc(Val, fields.len);
         const types = try ev.a.alloc(Index, fields.len);
@@ -4373,7 +4373,7 @@ const Evaluator = struct {
         const ty = if (named) blk: {
             const names = try ev.a.alloc([]const u8, fields.len);
             for (fields, names) |fl, *n| n.* = fl.name orelse return error.Abort;
-            break :blk try ip.get(.{ .anon_struct_type = .{ .names = names, .types = types, .values = values } });
+            break :blk try ip.get(.{ .anon_struct_type = .{ .names = names, .types = types, .values = values, .origin = .{ .zig = .{ .file = f.file, .owner = (try ev.r.itemTree(f.file)).items[f.item].ast_id, .expr = @backingInt(e) } } } });
         } else try ip.get(.{ .tuple_type = .{ .types = types, .values = values } });
         return ev.makeAgg(ty, elems);
     }
