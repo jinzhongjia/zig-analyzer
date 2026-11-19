@@ -1,5 +1,6 @@
 //! Completion: after `a.`, lists the members of the namespace; after `.`, lists members by the
-//! expected type, and in initializers the fields not yet assigned; after `.@`, the same names
+//! expected type, and in initializers the fields not yet assigned (for a union, only while no
+//! field is assigned, since a union initializer takes exactly one); after `.@`, the same names
 //! quoted (`.@"name"`); after `error.`, lists error names; after `@`, lists builtins (not in `.zon`
 //! files); inside `@import("`, lists modules and files; after `break :` /
 //! `continue :`, lists labels; otherwise lists the names visible at the cursor (local names and
@@ -410,7 +411,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
                 return .{ .items = out.items.items, .context = .init_field };
             } else a.exprType(init).ty;
             if (fieldsType(r.ctx.db.env.ip, ty)) |t| {
-                try initFields(r, &out, t, x.fields);
+                try initFields(r, &out, t, x.fields, hasFieldName(x.fields));
                 return .{ .items = out.items.items, .context = .init_field };
             }
         }
@@ -431,7 +432,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
             const a = try context.atSeeded(r, file, offset, true) orelse return .{ .context = .init_field };
             const ty = if (x.ty == null) a.literalExpected(e) orelse return .{ .context = .init_field } else a.exprType(e).ty;
             const t = fieldsType(r.ctx.db.env.ip, ty) orelse return .{ .context = .init_field };
-            try initFields(r, &out, t, try std.mem.concat(r.arena, Body.FieldInit, &.{ x.fields[0..i], x.fields[i + 1 ..] }));
+            try initFields(r, &out, t, try std.mem.concat(r.arena, Body.FieldInit, &.{ x.fields[0..i], x.fields[i + 1 ..] }), hasFieldName(x.fields));
             return .{ .items = out.items.items, .context = .init_field };
         }
     };
@@ -2015,9 +2016,27 @@ fn fieldsType(ip: *InternPool, ty: Index) ?Index {
     };
 }
 
-/// Fields of the struct or union `t` (see `fieldsType`) that have not been assigned yet
-fn initFields(r: *Resolver, out: *Collector, t: Index, given: []const Body.FieldInit) resolve.Error!void {
+/// Whether the struct or union `t` (see `fieldsType`) is a union
+fn isUnion(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .container_type => |c| c.kind == .@"union",
+        .reified_type => |rt| rt.kind == .@"union",
+        else => false,
+    };
+}
+
+/// Whether `fields` assigns at least one field name (the element at the cursor may be unnamed)
+fn hasFieldName(fields: []const Body.FieldInit) bool {
+    for (fields) |f| if (f.name != null) return true;
+    return false;
+}
+
+/// Fields of the struct or union `t` (see `fieldsType`) that `given` does not assign. A union
+/// initializer takes exactly one field, so a union offers none once the initializer names one
+/// (`named`)
+fn initFields(r: *Resolver, out: *Collector, t: Index, given: []const Body.FieldInit, named: bool) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
+    if (named and isUnion(ip, t)) return;
     if (ip.key(t) == .reified_type) {
         outer: for (try eval.fieldNames(r, t)) |f| {
             for (given) |g| if (g.name) |n| if (std.mem.eql(u8, n, f.name)) continue :outer;
