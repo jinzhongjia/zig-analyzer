@@ -307,7 +307,13 @@ pub const Resolver = struct {
             if (try r.ctx.get(ModuleGraph.Input, {})) |graph| if (graph.entry(file)) |e| {
                 var allowed = false;
                 for ([_][]const u32{ &.{e.module}, e.others }) |modules| for (modules) |m| {
-                    const root: ?FileId = if (m == ModuleGraph.std_module) graph.std_root else graph.modules[m].root;
+                    const root: ?FileId = if (m == ModuleGraph.std_module) blk: {
+                        // The standard library can have its own root in the compilation that
+                        // reached the file (its `zig_lib_dir`)
+                        const c = e.compile orelse break :blk graph.std_root;
+                        if (c >= graph.compiles.len) break :blk graph.std_root;
+                        break :blk graph.compiles[c].std_root orelse graph.std_root;
+                    } else graph.modules[m].root;
                     const module_dir = std.fs.path.dirname(r.vfs().path(root orelse continue)) orelse continue;
                     if (r.vfs().isUnder(target, module_dir)) {
                         allowed = true;
