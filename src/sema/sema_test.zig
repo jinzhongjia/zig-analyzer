@@ -8579,7 +8579,8 @@ test "anonymous enums display their tag type, the values written for members and
 }
 
 test "anonymous containers display their tag type, layout and backing integer" {
-    // Prevents displaying `union(E)` as the untagged `union`
+    // Prevents displaying `union(E)` as the untagged `union`, and `@Struct` / `@Union` containers
+    // without their layout and argument
     try expectStdTypes(
         \\const std = @import("std");
         \\const Status = enum { ok, err };
@@ -8590,6 +8591,10 @@ test "anonymous containers display their tag type, layout and backing integer" {
         \\const backed: packed struct(u8) { a: u4, b: u4 } = .{ .a = 1, .b = 2 };
         \\const packed_union: packed union(u8) { a: u8, b: i8 } = .{ .a = 1 };
         \\const ext: extern struct { a: u8 } = .{ .a = 1 };
+        \\const r_packed: @Struct(.@"packed", u8, &.{ "a", "b" }, &.{ u4, u4 }, &@splat(.{})) = .{ .a = 1, .b = 2 };
+        \\const r_inferred: @Struct(.@"packed", null, &.{"a"}, &.{u8}, &@splat(.{})) = .{ .a = 1 };
+        \\const r_extern: @Struct(.@"extern", null, &.{"a"}, &.{u8}, &@splat(.{})) = .{ .a = 1 };
+        \\const r_tagged: @Union(.auto, Status, &.{ "ok", "err" }, &.{ u8, void }, &@splat(.{})) = .{ .ok = 1 };
     , &.{
         .{ "tagged", "union(Status) { ok: u8, err: void } = .{ .ok = 1 }" },
         .{ "auto", "union(enum) { a: u8, b: void } = .{ .a = 1 }" },
@@ -8598,6 +8603,10 @@ test "anonymous containers display their tag type, layout and backing integer" {
         .{ "backed", "packed struct(u8) { a: u4, b: u4 } = .{ .a = 1, .b = 2 }" },
         .{ "packed_union", "packed union(u8) { a: u8, b: i8 } = .{ .a = 1 }" },
         .{ "ext", "extern struct { a: u8 } = .{ .a = 1 }" },
+        .{ "r_packed", "packed struct(u8) { a: u4, b: u4 } = .{ .a = 1, .b = 2 }" },
+        .{ "r_inferred", "packed struct { a: u8 } = .{ .a = 1 }" },
+        .{ "r_extern", "extern struct { a: u8 } = .{ .a = 1 }" },
+        .{ "r_tagged", "union(Status) { ok: u8, err: void } = .{ .ok = 1 }" },
     });
 }
 
