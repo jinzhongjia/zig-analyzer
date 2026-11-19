@@ -12879,3 +12879,52 @@ test "operands of comparisons and arithmetic have no result type" {
         .{ ".safe", "Optimize = .safe" },
     });
 }
+
+test "comptime writes to the active field of a union update its payload" {
+    // Prevents giving up on a store through the active field of a union held in a variable.
+    // Expected values: zig 0.17.1.
+    try expectTypes(
+        \\const U = union(enum) { a: u8, b: u16 };
+        \\const B = union { a: u8, b: S };
+        \\const S = struct { x: u32, y: u32 };
+        \\fn m1() u8 {
+        \\    var u = U{ .a = 1 };
+        \\    u.a = 5;
+        \\    return u.a;
+        \\}
+        \\fn m3() u8 {
+        \\    var u = U{ .a = 1 };
+        \\    const p = &u.a;
+        \\    p.* = 7;
+        \\    return u.a;
+        \\}
+        \\fn m5() u16 {
+        \\    var u = U{ .a = 1 };
+        \\    u = .{ .b = 300 };
+        \\    (&u.b).* += 5;
+        \\    return u.b;
+        \\}
+        \\fn nested() u32 {
+        \\    var u = B{ .b = .{ .x = 1, .y = 2 } };
+        \\    u.b.y += 40;
+        \\    return u.b.x + u.b.y;
+        \\}
+        \\fn inactive() u16 {
+        \\    var u = U{ .a = 1 };
+        \\    u.b = 5;
+        \\    return u.b;
+        \\}
+        \\pub const v1 = m1();
+        \\pub const v3 = m3();
+        \\pub const v5 = m5();
+        \\pub const v_nested = nested();
+        \\pub const v_inactive = inactive();
+    , &.{
+        .{ "v1", "u8 = 5" },
+        .{ "v3", "u8 = 7" },
+        .{ "v5", "u16 = 305" },
+        .{ "v_nested", "u32 = 43" },
+        // Writing an inactive field is a compile error
+        .{ "v_inactive", "u16" },
+    });
+}

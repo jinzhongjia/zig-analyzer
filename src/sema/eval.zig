@@ -1693,11 +1693,23 @@ const Evaluator = struct {
                 if (try eqlValues(ev.r, x, s.v.ip) != true) return error.Abort;
                 return;
             };
+            if (cell.v == .ip) if (ev.ip.key(cell.v.ip) == .union_value) return ev.storeUnionField(cell, i, ref.path[depth + 1 ..], v);
             const agg = try ev.mutableAgg(cell);
             if (i >= agg.elems.len) return error.Abort;
             cell = &agg.elems[i];
         }
         cell.* = try ev.copy(try ev.coerce(v, if (cell.ty != .unknown) cell.ty else null));
+    }
+
+    /// Stores `v` at `rest` inside field `i` of the union in `cell`. Only the active field can be
+    /// written (writing another one is a compile error); the tag stays and the payload is
+    /// replaced. A union value is interned, so the new payload must be comptime-known.
+    fn storeUnionField(ev: *Evaluator, cell: *Val, i: u32, rest: []const u32, v: Val) EvalError!void {
+        const u = ev.ip.key(cell.v.ip).union_value;
+        var payload = try ev.elemAt(cell.*, i);
+        try ev.store(.{ .cell = &payload, .path = rest }, v);
+        const frozen = try ev.freeze(payload) orelse return error.Abort;
+        cell.* = Val.of(cell.ty, try ev.ip.get(.{ .union_value = .{ .ty = u.ty, .tag = u.tag, .payload = frozen } }));
     }
 
     /// Expands the value in a storage cell into a mutable aggregate
