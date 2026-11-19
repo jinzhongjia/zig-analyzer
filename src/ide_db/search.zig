@@ -852,7 +852,7 @@ const Finder = struct {
                     // tagged unions, declarations in other targets' branches) come from inference.
                     // Either way, a namespace chosen per build configuration has the member of
                     // each choice
-                    const ns_def = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns| try r.memberDef(ns, f.name) else null;
+                    const ns_def = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns| try r.memberDef(ns, file, f.name) else null;
                     var current: Target = if (ns_def) |d| try f.matches(file, d, try r.pathAlternatives(file, item_index, body, id), at) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
                     if (current == .unknown) current = try f.importedMember(file, item_index, body, fa.lhs, at);
                     if (current != .hit and f.is_field and try f.zonFieldIsDef(file, item_index, body, try f.inferred(&res, file, item_index), fa.lhs, range.start, at)) current = .hit;
@@ -1035,7 +1035,7 @@ const Finder = struct {
         var miss = !here;
         for (try f.alternatives(file, item_index, body, lhs)) |t| {
             const ns = try sema.namespaceOfType(f.r, t) orelse continue;
-            const d = try f.r.memberDef(ns, f.name) orelse continue;
+            const d = try f.r.memberDef(ns, file, f.name) orelse continue;
             if (deepEql(d, f.def)) hit = true else miss = true;
         }
         if (hit and miss) if (f.ambiguous) |a| if (a.* == null) {
@@ -1052,7 +1052,7 @@ const Finder = struct {
             .name_ref => |n| try r.resolveName(file, item_index, body, body.expr_scopes[@backingInt(lhs)], n) orelse return &.{},
             .field_access => |fa| blk: {
                 const ns = try r.evalNamespace(file, item_index, body, fa.lhs) orelse return &.{};
-                break :blk try r.memberDef(ns, fa.field orelse return &.{}) orelse return &.{};
+                break :blk try r.memberDef(ns, file, fa.field orelse return &.{}) orelse return &.{};
             },
             else => return &.{},
         };

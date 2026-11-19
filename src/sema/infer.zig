@@ -1430,7 +1430,7 @@ const Inferrer = struct {
             switch (ip.key(t)) {
                 .container_type => {
                     const ns = try queries.namespaceOfType(inf.r, t) orelse return .unknown;
-                    const def = try inf.r.memberDef(ns, name) orelse {
+                    const def = try inf.r.memberDef(ns, inf.file, name) orelse {
                         if (try inf.unionTagMember(e, t, ns, name)) |tv| return tv;
                         return try inf.otherBranchMember(e, lhs_e, t, name) orelse .unknown;
                     };
@@ -1439,7 +1439,7 @@ const Inferrer = struct {
                 },
                 .error_set_type => return .{ .ty = t, .val = try ip.get(.{ .error_value = name }) },
                 // Members of constructed enums (`@Enum`, the tag enum of a union(enum))
-                .reified_type, .union_tag_type => return try eval.typeMember(inf.r, t, name) orelse .unknown,
+                .reified_type, .union_tag_type => return try eval.typeMember(inf.r, inf.file, t, name) orelse .unknown,
                 // The value under the current configuration is not a container (`std.c.EVFILT`
                 // is void on linux)
                 else => return try inf.otherBranchMember(e, lhs_e, t, name) orelse .unknown,
@@ -1450,7 +1450,7 @@ const Inferrer = struct {
             if (try inf.otherBranchField(e, lhs_e, lhs.ty, name)) |x| tv = x;
         }
         // comptime-known values (structs, unions, tuples, `len`): extract the field value
-        if (tv.val == null and lhs.val != null) if (try eval.fieldValue(inf.r, lhs, name)) |fv| {
+        if (tv.val == null and lhs.val != null) if (try eval.fieldValue(inf.r, inf.file, lhs, name)) |fv| {
             return .{ .ty = if (tv.ty != .unknown) tv.ty else fv.ty, .val = fv.val };
         };
         if (tv.val == null and lhs.val == null) if (try inf.declInitFieldValue(lhs_e, name)) |fv| {
@@ -1515,7 +1515,7 @@ const Inferrer = struct {
         for (cands.items) |t| {
             if (t == current) continue;
             const ns = try queries.namespaceOfType(inf.r, t) orelse continue;
-            const def = try inf.r.memberDef(ns, name) orelse continue;
+            const def = try inf.r.memberDef(ns, inf.file, name) orelse continue;
             inf.members[@backingInt(e)] = try defKey(inf.r, def);
             return try queries.defType(inf.r, def, null, queries.instOfType(ip, t));
         }
@@ -1543,7 +1543,7 @@ const Inferrer = struct {
             const def: resolve.Def = if (fieldItem(tree, ns.container, name)) |fi|
                 .{ .item = .{ .file = ns.file, .item = fi } }
             else
-                try inf.r.memberDef(ns, name) orelse continue;
+                try inf.r.memberDef(ns, inf.file, name) orelse continue;
             inf.members[@backingInt(e)] = try defKey(inf.r, def);
             return try queries.defType(inf.r, def, null, queries.instOfType(ip, t));
         }
@@ -1580,7 +1580,7 @@ const Inferrer = struct {
                     return .{ .ty = (try queries.defType(inf.r, .{ .item = .{ .file = ns.file, .item = f } }, null, queries.instOfType(ip, t))).ty };
                 }
                 // Methods
-                const def = try inf.r.memberDef(ns, name) orelse return .unknown;
+                const def = try inf.r.memberDef(ns, inf.file, name) orelse return .unknown;
                 inf.members[@backingInt(e)] = try defKey(inf.r, def);
                 const tv = try queries.defType(inf.r, def, null, queries.instOfType(ip, t));
                 if (ip.key(tv.ty) == .fn_type) try inf.bound.put(inf.scratch, e, {});
@@ -1708,7 +1708,8 @@ const Inferrer = struct {
         var ns: Namespace = .{ .file = try inf.r.ctx.get(database.ModuleGraph.StdRoot, inf.r.context) orelse return null, .container = 0 };
         var t: Index = .unknown;
         for (path, 0..) |name, i| {
-            const def = try inf.r.memberDef(ns, name) orelse return null;
+            // A structural traversal of compiler-known standard library types: no use site
+            const def = try inf.r.memberDef(ns, ns.file, name) orelse return null;
             t = (try queries.defType(inf.r, def, null, null)).asType() orelse return null;
             if (i + 1 < path.len) ns = try queries.namespaceOfType(inf.r, t) orelse return null;
         }
@@ -3939,7 +3940,7 @@ const Inferrer = struct {
                 // A member of a namespace is a declaration
                 if (inf.get(fa.lhs).asType()) |t| {
                     const ns = try queries.namespaceOfType(inf.r, t) orelse return .{};
-                    return inf.defAttrs(try inf.r.memberDef(ns, field) orelse return .{});
+                    return inf.defAttrs(try inf.r.memberDef(ns, inf.file, field) orelse return .{});
                 }
                 return inf.fieldPlaceAttrs(fa.lhs, field, inf.get(e).ty);
             },
@@ -4355,7 +4356,7 @@ fn leafAlternatives(r: *Resolver, a: Allocator, file: FileId, item: u32, body: *
             try leafAlternatives(r, a, file, item, body, exprs, fa.lhs, &bases, depth + 1);
             for (bases.items) |base| {
                 const ns = try queries.namespaceOfType(r, base) orelse continue;
-                const def = try r.memberDef(ns, name) orelse continue;
+                const def = try r.memberDef(ns, file, name) orelse continue;
                 const tv = try queries.defType(r, def, null, queries.instOfType(ip, base));
                 if (tv.asType()) |t| if (ip.key(t) == .container_type) try appendUnique(a, out, t);
                 const key = try defKey(r, def) orelse continue;
@@ -4388,7 +4389,7 @@ pub fn placeIsConst(r: *Resolver, file: FileId, item: u32, b: *const Body, types
             // `var` / `const` decides
             if (types.exprType(fa.lhs).asType()) |t| {
                 const ns = try queries.namespaceOfType(r, t) orelse return true;
-                const def = try r.memberDef(ns, fa.field orelse return true) orelse return true;
+                const def = try r.memberDef(ns, file, fa.field orelse return true) orelse return true;
                 return switch (def) {
                     .item => |it| (try r.itemTree(it.file)).items[it.item].kind != .@"var",
                     else => true,

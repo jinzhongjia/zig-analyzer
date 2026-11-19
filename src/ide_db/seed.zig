@@ -1410,11 +1410,13 @@ fn dispatched(r: *Resolver, file: FileId, item: u32, root: u32) resolve.Error!?F
         var t = try queries.containerType(r, .{ .file = std_root, .container = 0 }, null);
         for (d.path) |part| {
             const ns = try queries.namespaceOfType(r, t) orelse return null;
-            const def = try r.memberDef(ns, part) orelse return null;
+            // The dispatcher path is not written at a use site: each namespace's declarations
+            // are visible as its own
+            const def = try r.memberDef(ns, ns.file, part) orelse return null;
             t = (try queries.defType(r, def, null, null)).asType() orelse return null;
         }
         const ns = try queries.namespaceOfType(r, t) orelse continue;
-        const it = switch (try r.memberDef(ns, d.func) orelse continue) {
+        const it = switch (try r.memberDef(ns, ns.file, d.func) orelse continue) {
             .item => |x| x,
             else => continue,
         };
@@ -1735,10 +1737,10 @@ fn staticRef(r: *Resolver, in: FileId, i: u32, body: *const Body, e: Body.ExprId
         .name_ref => |n| return r.resolveName(in, i, body, body.expr_scopes[@backingInt(e)], n),
         .field_access => |fa| {
             const field = fa.field orelse return null;
-            if (try r.evalNamespace(in, i, body, fa.lhs)) |ns| return r.memberDef(ns, field);
+            if (try r.evalNamespace(in, i, body, fa.lhs)) |ns| return r.memberDef(ns, in, field);
             const ty = try staticValueType(r, in, i, body, fa.lhs) orelse return null;
             const ns = try queries.namespaceOfType(r, ty) orelse return null;
-            return r.memberDef(ns, field);
+            return r.memberDef(ns, in, field);
         },
         else => return null,
     }

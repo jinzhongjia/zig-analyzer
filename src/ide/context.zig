@@ -499,7 +499,7 @@ fn typeProto(r: *Resolver, a: At, e: Body.ExprId, hops: u32) resolve.Error!?Foun
             } else blk: {
                 const fa = b.expr(e).field_access;
                 const ns = try r.evalNamespace(a.file, a.item, b, fa.lhs) orelse return null;
-                break :blk try r.memberDef(ns, fa.field orelse return null);
+                break :blk try r.memberDef(ns, a.file, fa.field orelse return null);
             }) orelse return null;
             // An alias of a type: the type expression it is initialized with
             switch (def) {
