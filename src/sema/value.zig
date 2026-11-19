@@ -1926,7 +1926,19 @@ pub fn optionalCoercion(ip: *InternPool, from: Index, to: Index) ?OptionalCoerci
             else => .wrap,
         },
         .unknown => null,
-        else => if (a == .unknown) null else .keep,
+        // Only payloads of the same optional representation coerce in memory: `?*T` stores null
+        // as address 0, while `?[*c]T` and `?*allowzero T` need a separate flag, so `?*T` to
+        // `?[*c]T` wraps (a non-null optional holding a null C pointer)
+        else => if (a == .unknown) null else if (isPtrLikePayload(ip, a) != isPtrLikePayload(ip, b)) .wrap else .keep,
+    };
+}
+
+/// Whether an optional of payload type `t` stores null as address 0 (the compiler's pointer-like
+/// optional): a pointer that is neither a C pointer nor `allowzero`
+fn isPtrLikePayload(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .ptr_type => |p| p.size != .c and !p.attrs.is_allowzero,
+        else => false,
     };
 }
 
