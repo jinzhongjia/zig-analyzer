@@ -361,6 +361,7 @@ pub fn typeOfValue(ip: *InternPool, v: Index) Index {
         .bytes => |b| b.ty,
         .union_value => |u| u.ty,
         .ptr_value => |p| p.ty,
+        .ptr_int => |p| p.ty,
         .opt_payload => |o| o.ty,
         else => |k| if (isTypeKey(k)) .type_type else .unknown,
     };
@@ -580,18 +581,15 @@ pub fn floatOf(ip: *InternPool, v: ?Index) ?f128 {
     };
 }
 
-/// Rounds to the precision of the float type; null when it is not a float type
+/// Rounds to the precision of the float type; null when it is not a float type or is
+/// c_longdouble on an unknown target
 fn roundTo(ip: *InternPool, ty: Index, x: f128) ?f128 {
-    return switch (ip.key(ty)) {
-        .simple_type => |s| switch (s) {
-            .f16 => @as(f16, @floatCast(x)),
-            .f32 => @as(f32, @floatCast(x)),
-            .f64 => @as(f64, @floatCast(x)),
-            .f80 => @as(f80, @floatCast(x)),
-            .f128, .comptime_float => x,
-            else => null,
-        },
-        else => null,
+    return switch (floatKind(ip, ty) orelse return null) {
+        .f16 => @as(f16, @floatCast(x)),
+        .f32 => @as(f32, @floatCast(x)),
+        .f64 => @as(f64, @floatCast(x)),
+        .f80 => @as(f80, @floatCast(x)),
+        else => x,
     };
 }
 
@@ -683,10 +681,41 @@ pub fn floatBits(ip: *InternPool, t: Index) ?u16 {
     };
 }
 
+/// The float type whose arithmetic values of `ty` use: c_longdouble computes as the IEEE type of
+/// its target bit width (as the compiler's `Value` does via `Type.floatBits`); null when `ty` is
+/// not a float type or is c_longdouble on an unknown target
+fn isSimple(ip: *InternPool, t: Index, s: InternPool.Simple) bool {
+    return switch (ip.key(t)) {
+        .simple_type => |x| x == s,
+        else => false,
+    };
+}
+
+/// The fixed-width float type of `bits` bits (f16, f32, f64, f80 or f128)
+pub fn fixedFloatType(ip: *InternPool, bits: u16) Allocator.Error!?Index {
+    const s: InternPool.Simple = switch (bits) {
+        16 => .f16,
+        32 => .f32,
+        64 => .f64,
+        80 => .f80,
+        128 => .f128,
+        else => return null,
+    };
+    return try ip.get(.{ .simple_type = s });
+}
+
 fn floatKind(ip: *InternPool, ty: Index) ?InternPool.Simple {
     return switch (ip.key(ty)) {
         .simple_type => |s| switch (s) {
             .f16, .f32, .f64, .f80, .f128, .comptime_float => s,
+            .c_longdouble => switch (floatBits(ip, ty) orelse return null) {
+                16 => .f16,
+                32 => .f32,
+                64 => .f64,
+                80 => .f80,
+                128 => .f128,
+                else => null,
+            },
             else => null,
         },
         else => null,
@@ -1156,6 +1185,7 @@ pub fn isPrecise(ip: *InternPool, v: Index) bool {
         .aggregate => |agg| allPrecise(ip, agg.elems),
         .union_value => |u| isPrecise(ip, u.payload),
         .ptr_value => |p| isPrecise(ip, p.pointee),
+        .ptr_int => |p| isPrecise(ip, p.ty),
         .opt_payload => |o| isPrecise(ip, o.payload),
         .fn_value => |f| f.inst == null or isPrecise(ip, f.inst.?),
         .enum_tag => |t| isPrecise(ip, t.ty),
@@ -1617,7 +1647,7 @@ fn eqlUnsigned128(ip: *InternPool, x: @FieldType(InternPool.Key, "int_value"), y
 /// pointer to several elements, represented by the elements it points to
 fn isPointerValue(ip: *InternPool, k: InternPool.Key) bool {
     return switch (k) {
-        .ptr_value => true,
+        .ptr_value, .ptr_int => true,
         .aggregate => |x| ip.key(x.ty) == .ptr_type,
         .bytes => |x| ip.key(x.ty) == .ptr_type,
         else => false,
@@ -1630,9 +1660,17 @@ fn isPointerValue(ip: *InternPool, k: InternPool.Key) bool {
 /// location when it records one (`base`, or the function a function pointer points to); without
 /// it, it may stand for pointers to two declarations with equal values. Pointers through which
 /// different data is visible point to different locations. Otherwise the result is unknown.
+/// A pointer to an integer address (`InternPool.Key.ptr_int`) equals another one to the same
+/// address, and no pointer into comptime memory.
 fn eqlPointers(ip: *InternPool, a: Index, b: Index) ?bool {
-    if (a == b) return if (recordsPlace(ip, ip.key(a))) true else null;
-    return if (pointeesDiffer(ip, ip.key(a), ip.key(b))) false else null;
+    const ka = ip.key(a);
+    const kb = ip.key(b);
+    if (ka == .ptr_int or kb == .ptr_int) {
+        if (ka == .ptr_int and kb == .ptr_int) return ka.ptr_int.addr == kb.ptr_int.addr;
+        return if (isPointerValue(ip, if (ka == .ptr_int) kb else ka)) false else null;
+    }
+    if (a == b) return if (recordsPlace(ip, ka)) true else null;
+    return if (pointeesDiffer(ip, ka, kb)) false else null;
 }
 
 /// Whether pointer value `k` records the location it points to. A function is the identity of
@@ -1764,6 +1802,12 @@ pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index 
         },
     }
     if (ip.isFloat(to)) {
+        // Where long double is 64 bits, zig 0.17 folds the coercion of a c_longdouble value to
+        // f64 to 0, so the result is left unknown rather than disagree with the compiler
+        if (isSimple(ip, to, .f64)) switch (ip.key(v)) {
+            .float_value => |f| if (isSimple(ip, f.ty, .c_longdouble) and floatBits(ip, f.ty) == 64) return null,
+            else => {},
+        };
         const x = floatOf(ip, v) orelse return null;
         return floatValue(ip, to, x);
     }
@@ -1926,7 +1970,19 @@ pub fn optionalCoercion(ip: *InternPool, from: Index, to: Index) ?OptionalCoerci
             else => .wrap,
         },
         .unknown => null,
-        else => if (a == .unknown) null else .keep,
+        // Only payloads of the same optional representation coerce in memory: `?*T` stores null
+        // as address 0, while `?[*c]T` and `?*allowzero T` need a separate flag, so `?*T` to
+        // `?[*c]T` wraps (a non-null optional holding a null C pointer)
+        else => if (a == .unknown) null else if (isPtrLikePayload(ip, a) != isPtrLikePayload(ip, b)) .wrap else .keep,
+    };
+}
+
+/// Whether an optional of payload type `t` stores null as address 0 (the compiler's pointer-like
+/// optional): a pointer that is neither a C pointer nor `allowzero`
+fn isPtrLikePayload(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .ptr_type => |p| p.size != .c and !p.attrs.is_allowzero,
+        else => false,
     };
 }
 
