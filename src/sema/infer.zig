@@ -2458,6 +2458,17 @@ const Inferrer = struct {
                 return .void_type;
             },
             .destructure => |d| {
+                // An anonymous list `.{ a, b }` takes the targets as its result location: each
+                // element is stored before the next one is evaluated, so `x, y = .{ y, x }`
+                // assigns the old value of `y` to both
+                const elems: ?[]const Body.FieldInit = switch (inf.body.expr(d.value)) {
+                    .init => |in| if (in.ty == null and in.fields.len == d.targets.len) in.fields else null,
+                    else => null,
+                };
+                if (elems) |fields| for (d.targets, fields) |t, fi| switch (t) {
+                    .expr => |x| try inf.destructureStore(x, try inf.infer(fi.value, null)),
+                    .binding => _ = try inf.infer(fi.value, null),
+                };
                 const v = try inf.infer(d.value, null);
                 for (d.targets, 0..) |t, i| switch (t) {
                     .binding => |b| {
@@ -2468,7 +2479,7 @@ const Inferrer = struct {
                             break :blk .{ .ty = annotation, .val = if (binding.kind == .local_const and elem.ty == annotation) elem.val else null };
                         } else if (binding.kind == .local_const) elem else .{ .ty = elem.ty };
                     },
-                    .expr => |x| _ = try inf.infer(x, null),
+                    .expr => |x| if (elems == null) try inf.destructureStore(x, try inf.destructureElem(v, i)),
                 };
                 return .void_type;
             },
@@ -2503,6 +2514,17 @@ const Inferrer = struct {
             for (vars.items, saved) |v, old| inf.bindings[@backingInt(v)].val = old;
         }
         inf.pending_defers.shrinkRetainingCapacity(start);
+    }
+
+    /// Stores `elem` into the destructure target `x`, which is written like the left-hand side of
+    /// `=`: a `comptime var` takes the value (see `assignComptimeVar`); a field or element of one
+    /// (`v.f, _ = ...`) is an indirect modification (see `indirectlyModifiedVar`)
+    fn destructureStore(inf: *Inferrer, x: ExprId, elem: TypedValue) Error!void {
+        _ = try inf.infer(x, null);
+        if (inf.var_levels.len == 0) return;
+        if (try inf.comptimeVarOf(x)) |cv| {
+            try inf.assignComptimeVar(cv, .equal, elem);
+        } else if (try inf.comptimeVarPlace(x)) |cv| inf.untrackComptimeVar(cv);
     }
 
     /// The `i`-th element of the destructuring `const a, const b = x;`: a field of a tuple, or an
@@ -2856,7 +2878,8 @@ const Inferrer = struct {
         slot.val = (try inf.foldInt(bin, ty, slot.*, rhs)).val;
     }
 
-    /// Assignments within `e` to `comptime var`s declared outside it
+    /// Assignments within `e` to `comptime var`s declared outside it, including the targets of
+    /// destructures (`v, _ = .{ a, b }`)
     fn outerComptimeVars(inf: *Inferrer, e: ExprId, out: ?*std.ArrayList(Body.BindingId)) Error!bool {
         const b = inf.body;
         // When the member has no `comptime var`, the left-hand sides of assignments need not be
@@ -2870,14 +2893,32 @@ const Inferrer = struct {
         var any = false;
         for (b.exprs, b.expr_ranges) |x, rg| {
             if (rg.start < range.start or rg.end > range.end) continue;
+            // A destructure is a statement, not an expression: its targets are found through the
+            // block holding it
+            if (x == .block) for (x.block.stmts) |s| switch (s.kind) {
+                .destructure => |d| for (d.targets) |t| switch (t) {
+                    .expr => |te| if (try inf.comptimeVarPlace(te)) |v| {
+                        if (try inf.outerVar(range, v, out) orelse return true) any = true;
+                    },
+                    .binding => {},
+                },
+                else => {},
+            };
             const v = (if (x == .assign) try inf.comptimeVarOf(x.assign.lhs) else null) orelse
                 try inf.indirectlyModifiedVar(x) orelse continue;
-            if (range.contains(b.binding(v).range.start)) continue;
-            any = true;
-            const list = out orelse return true;
-            try list.append(inf.scratch, v);
+            if (try inf.outerVar(range, v, out) orelse return true) any = true;
         }
         return any;
+    }
+
+    /// A `comptime var` modified within `range`: whether it is declared outside it, after
+    /// appending it to `out`; null when it is outside and there is no `out` to append to (the
+    /// answer is known)
+    fn outerVar(inf: *Inferrer, range: Body.Range, v: Body.BindingId, out: ?*std.ArrayList(Body.BindingId)) Error!?bool {
+        if (range.contains(inf.body.binding(v).range.start)) return false;
+        const list = out orelse return null;
+        try list.append(inf.scratch, v);
+        return true;
     }
 
     fn assignsOuterComptimeVar(inf: *Inferrer, e: ExprId) Error!bool {

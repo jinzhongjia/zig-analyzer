@@ -6184,6 +6184,84 @@ test "comptime vars modified through pointers, methods, fields and elements are 
     });
 }
 
+test "comptime vars written by a destructure are not stale" {
+    // Prevents a destructure target that names a `comptime var` from being inferred as a read
+    // only, which kept the value from before the write. Expected values: zig 0.17.1
+    try expectTypes(
+        \\const S = struct { n: u32 = 0 };
+        \\const c_s: S = .{};
+        \\export fn entry() u32 {
+        \\    comptime var x: u32 = 1;
+        \\    x, _ = .{ 2, 9 };
+        \\    const plain_v = x;
+        \\    comptime var a: u32 = 1;
+        \\    comptime var b: u32 = 2;
+        \\    a, b = .{ b, a };
+        \\    const swap_a = a;
+        \\    const swap_b = b;
+        \\    comptime var c: u32 = 1;
+        \\    comptime var e: u32 = 2;
+        \\    const pair = .{ e, c };
+        \\    c, e = pair;
+        \\    const whole_c = c;
+        \\    const whole_e = e;
+        \\    comptime var k: u32 = 1;
+        \\    comptime var m: u32 = 2;
+        \\    k, m = .{ m, k + 10 };
+        \\    const chain_m = m;
+        \\    comptime var p: u32 = 5;
+        \\    p, const q = .{ 1, p };
+        \\    const mixed_q = q;
+        \\    comptime var s = c_s;
+        \\    s.n, _ = .{ 5, 0 };
+        \\    const field_v = s.n;
+        \\    comptime var i: u32 = 0;
+        \\    inline while (i < 3) {
+        \\        i, _ = .{ i + 1, 0 };
+        \\    }
+        \\    const loop_v = i;
+        \\    _ = .{ plain_v, swap_a, swap_b, whole_c, whole_e, chain_m, mixed_q, field_v, loop_v };
+        \\    return 0;
+        \\}
+    , &.{
+        .{ "plain_v", "u32 = 2" },
+        // An anonymous list stores each element before evaluating the next one
+        .{ "swap_a", "u32 = 2" },
+        .{ "swap_b", "u32 = 2" },
+        .{ "chain_m", "u32 = 12" },
+        .{ "mixed_q", "u32 = 1" },
+        // Any other value is computed whole before any target is stored
+        .{ "whole_c", "u32 = 2" },
+        .{ "whole_e", "u32 = 1" },
+        .{ "field_v", "u32" },
+        // The loop ends once the destructure has made the condition false
+        .{ "loop_v", "u32" },
+    });
+}
+
+test "loop iterations start from the value a destructure leaves in a comptime var" {
+    // Prevents the next iteration of an inline loop from missing a write to an outer
+    // `comptime var` made by a destructure. Expected type: zig 0.17.1
+    const text =
+        \\pub fn main() void {
+        \\    comptime var acc: u32 = 1;
+        \\    inline for (.{ u8, u16 }) |T| {
+        \\        if (T == u16) {
+        \\            const y: [acc]T = undefined;
+        \\            _ = y;
+        \\        }
+        \\        acc, _ = .{ acc * 2, 0 };
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", text);
+    try testing.expectEqualStrings("[2]u16 = undefined", try iterationTypeAt(&w, f.file, text, "y", "T", 1));
+}
+
 /// Type of the binding `needle` when the loop variable `seed` takes the value of iteration `index`
 fn iterationTypeAt(w: *World, file: FileId, text: []const u8, needle: []const u8, seed: []const u8, index: u32) ![]const u8 {
     const offset = try wordAt(text, needle, 0);
@@ -11298,7 +11376,7 @@ test "comptime evaluation: @fieldParentPtr goes back from a field pointer to its
         \\    const parent: *const T = @alignCast(@fieldParentPtr("1", &t_val[1]));
         \\    break :blk parent[0];
         \\};
-        \\const array_elem = blk: {
+        \\const whole_elem = blk: {
         \\    const parent: *const S = @fieldParentPtr("b", &arr[1].b);
         \\    break :blk parent.a;
         \\};
@@ -11350,7 +11428,7 @@ test "comptime evaluation: @fieldParentPtr goes back from a field pointer to its
         .{ "optional", "u8 = 1" },
         .{ "error_union", "u8 = 1" },
         .{ "tuple", "u8 = 1" },
-        .{ "array_elem", "u8 = 3" },
+        .{ "whole_elem", "u8 = 3" },
         .{ "whole", "S = .{ .a = 1, .b = 2 }" },
         .{ "in_fn", "u8 = 3" },
         // The parent pointer is the address of the declaration
