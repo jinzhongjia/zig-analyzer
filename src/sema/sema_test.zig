@@ -8291,7 +8291,7 @@ test "std.meta type functions" {
         \\    const slice = std.meta.Slice(*[10]i32);
         \\    const tags = std.meta.tags(E);
         \\    const field_ty = std.meta.fieldInfo(S, .x).type;
-        \\    const sliced = std.mem.SliceTo([:0]const u8, 0);
+        \\    const sliced = @TypeOf(std.mem.sliceTo("abc", 0));
         \\    _ = .{ child, elem, sent, tag_e, tag_u, active, FE, fe, DE, args, backing, slice, tags, field_ty, sliced };
         \\}
     , &.{
