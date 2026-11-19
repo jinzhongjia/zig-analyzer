@@ -22,6 +22,12 @@ fn editContaining(result: imports.Result, needle: []const u8) ?imports.Candidate
     };
     return null;
 }
+fn displayPath(w: *World, from: FileId, target: FileId) ![]const u8 {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    return imports.displayPath(&r, from, target);
+}
 
 test "auto imports cover modules file names top declarations and nested types" {
     var w: World = undefined;
@@ -239,7 +245,7 @@ test "auto import graph changes update named module availability" {
     try testing.expectEqual(@as(usize, 0), (try run(&w, main.file, main.cursor, "Avail", 128)).items.len);
 }
 
-test "auto imports use safe parent relative paths and the primary module only" {
+test "auto imports use safe parent relative paths inside a shared module root" {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
@@ -263,6 +269,33 @@ test "auto imports use safe parent relative paths and the primary module only" {
     const server = find(try run(&w, current.file, current.cursor, "Server", 128), "Server").?;
     try testing.expectEqualStrings("const Server = @import(\"../Server.zig\");\n", server.import_edit.?.text);
     try testing.expectEqual(@as(usize, 0), (try run(&w, current.file, current.cursor, "Shared", 128)).items.len);
+}
+
+test "auto imports allow a target whose priority module differs from the importing file's" {
+    // A target is importable when the files share a module, even when the target was reached by
+    // another compile step first and its priority module differs.
+    const cases = [_][]const u8{ "in:test in:exe", "in:exe in:test" };
+    for (cases) |helper_attrs| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.fmt.allocPrint(w.arena.allocator(),
+            \\//- /p/main.zig module:exe module:test
+            \\const value = <|>missing;
+            \\//- /p/helper.zig {s}
+            \\pub const HelperValue = struct {{}};
+            \\//- /other/root.zig module:other
+            \\//- /other/foreign.zig in:other
+            \\pub const ForeignValue = struct {{}};
+        , .{helper_attrs});
+        const f = try w.fixture(text);
+        const at = f.cursor.?;
+        const result = try run(&w, at.file, at.offset, "HelperV", 128);
+        const candidate = find(result, "HelperValue") orelse return error.MissingSharedModuleCandidate;
+        try testing.expectEqualStrings("const HelperValue = @import(\"helper.zig\").HelperValue;\n", candidate.import_edit.?.text);
+        try testing.expectEqual(@as(usize, 0), (try run(&w, at.file, at.offset, "ForeignV", 128)).items.len);
+        try testing.expectEqualStrings("helper.zig", try displayPath(&w, at.file, f.file("/p/helper.zig")));
+    }
 }
 
 test "auto imports preserve mutable globals through their namespace" {
