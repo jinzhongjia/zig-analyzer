@@ -824,3 +824,76 @@ test "alias targets distinguish bare primitives from escaped declarations" {
         (try r.namespaceOf(.{ .item = .{ .file = added.file, .item = quoted } })).?,
     );
 }
+
+test "members of another file resolve only when pub" {
+    // `other.hidden` is a compile error, not a reference to the declaration
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/other.zig
+        \\const hidden: u32 = 1;
+        \\pub const shown: u32 = 2;
+        \\pub const E = enum { a, b };
+        \\//- /p/main.zig
+        \\const other = @import("other.zig");
+        \\const alias = other;
+        \\test {
+        \\    _ = other.hidden;
+        \\    _ = other.shown;
+        \\    _ = other.E.a;
+        \\    _ = alias.hidden;
+        \\    _ = alias.shown;
+        \\    other.<|>
+        \\}
+    );
+    const main = f.file("/p/main.zig");
+    const text = blk: {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        break :blk try w.arena.allocator().dupe(u8, (try ctx.get(database.syntax.SourceText, main)).text);
+    };
+    const at = struct {
+        fn of(t: []const u8, needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, t, needle).?);
+        }
+    }.of;
+    try testing.expectEqualStrings("null", try w.goto(main, at(text, "hidden;")));
+    try testing.expectEqualStrings("other.zig:shown", try w.goto(main, at(text, "shown;")));
+    // Enum fields are not gated by `pub`
+    try testing.expectEqualStrings("other.zig:a", try w.goto(main, at(text, "a;")));
+    // The same through an alias
+    try testing.expectEqualStrings("null", try w.goto(main, at(text, "alias.hidden") + 6));
+    try testing.expectEqualStrings("other.zig:shown", try w.goto(main, at(text, "alias.shown") + 6));
+    // Completion offers only pub declarations of another file
+    try testing.expectEqualStrings("E shown", try w.complete(main, f.cursor.?.offset));
+}
+
+test "members of the same file resolve through a self-import" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/self.zig
+        \\const self = @import("self.zig");
+        \\const hidden: u32 = 1;
+        \\pub const shown: u32 = 2;
+        \\test {
+        \\    _ = self.hidden;
+        \\    _ = self.shown;
+        \\}
+    );
+    const self_file = f.file("/p/self.zig");
+    const text = blk: {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        break :blk try w.arena.allocator().dupe(u8, (try ctx.get(database.syntax.SourceText, self_file)).text);
+    };
+    const at = struct {
+        fn of(t: []const u8, needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, t, needle).?);
+        }
+    }.of;
+    try testing.expectEqualStrings("self.zig:hidden", try w.goto(self_file, at(text, "hidden;")));
+    try testing.expectEqualStrings("self.zig:shown", try w.goto(self_file, at(text, "shown;")));
+}

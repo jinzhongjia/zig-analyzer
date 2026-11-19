@@ -2592,7 +2592,7 @@ fn receivesFn(r: *Resolver, file: FileId, item: u32, fb: *const Body, param: Bod
         if (local != .local or local.local.binding != param) continue;
         const callee: resolve.Def = switch (fb.expr(call.callee)) {
             .name_ref => |n| try r.resolveName(file, item, fb, fb.expr_scopes[@backingInt(call.callee)], n),
-            .field_access => |fa| if (try r.evalNamespace(file, item, fb, fa.lhs)) |ns| try r.memberDef(ns, fa.field orelse continue) else null,
+            .field_access => |fa| if (try r.evalNamespace(file, item, fb, fa.lhs)) |ns| try r.memberDef(ns, file, fa.field orelse continue) else null,
             else => null,
         } orelse continue;
         const args_tuple = try stdDecl(r, file, &.{ "meta", "ArgsTuple" }) orelse break;
@@ -2885,7 +2885,7 @@ fn stdHas(r: *Resolver, file: FileId, path: []const []const u8) resolve.Error!bo
 fn stdDecl(r: *Resolver, file: FileId, path: []const []const u8) resolve.Error!?resolve.Def {
     var ns: Namespace = .{ .file = try r.resolveImport(file, "std") orelse return null, .container = 0 };
     for (path, 0..) |name, i| {
-        const def = try r.memberDef(ns, name) orelse return null;
+        const def = try r.memberDef(ns, file, name) orelse return null;
         if (i + 1 == path.len) return def;
         ns = try r.namespaceOf(def) orelse return null;
     }

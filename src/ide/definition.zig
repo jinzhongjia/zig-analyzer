@@ -246,7 +246,7 @@ pub fn instanceDefsAt(r: *Resolver, file: FileId, offset: u32) resolve.Error![]c
         .field_access => |fa| blk: {
             if (a.rel < b.range(fa.lhs).end) return &.{};
             if (try r.evalNamespace(file, a.item, b, fa.lhs)) |ns| {
-                if (try r.memberDef(ns, fa.field orelse return &.{}) != null) return &.{};
+                if (try r.memberDef(ns, file, fa.field orelse return &.{}) != null) return &.{};
             }
             break :blk null;
         },
@@ -693,7 +693,7 @@ fn declOf(r: *Resolver, file: FileId, item: u32, body: *const Body, e: Body.Expr
         .name_ref => |n| try r.resolveName(file, item, body, body.expr_scopes[@backingInt(e)], n),
         .field_access => |fa| blk: {
             const ns = try r.evalNamespace(file, item, body, fa.lhs) orelse return null;
-            break :blk try r.memberDef(ns, fa.field orelse return null);
+            break :blk try r.memberDef(ns, file, fa.field orelse return null);
         },
         else => null,
     };
@@ -1318,7 +1318,7 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
             // The cursor is on the field name (not inside the left-hand expression)
             if (rel < b.range(fa.lhs).end) return null;
             if (try r.evalNamespace(file, item, b, fa.lhs)) |ns| {
-                if (try r.memberDef(ns, fa.field orelse return null)) |def| return def;
+                if (try r.memberDef(ns, file, fa.field orelse return null)) |def| return def;
             }
             // Via the type: fields, methods
             if (try memberViaTypes(r, file, tok.offset, e)) |def| return def;

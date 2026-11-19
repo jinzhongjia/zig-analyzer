@@ -174,11 +174,15 @@ pub const Resolver = struct {
         return tree.lookupDecl(container, name);
     }
 
-    /// `ns.name`: declarations, and for enums also their fields (`E.a`)
-    pub fn memberDef(r: *Resolver, ns: Namespace, name: []const u8) Error!?Def {
+    /// `ns.name`: declarations, and for enums also their fields (`E.a`). `from` is the file of
+    /// the member access: a declaration that is not `pub` is visible only from its own file.
+    pub fn memberDef(r: *Resolver, ns: Namespace, from: FileId, name: []const u8) Error!?Def {
         const tree = try r.itemTree(ns.file);
         if (ns.container >= tree.containers.len) return null;
-        if (lookupDecl(tree, ns.container, name)) |m| return .{ .item = .{ .file = ns.file, .item = m } };
+        if (lookupDecl(tree, ns.container, name)) |m| {
+            if (ns.file != from and !tree.items[m].flags.is_pub) return null;
+            return .{ .item = .{ .file = ns.file, .item = m } };
+        }
         if (tree.containers[ns.container].kind == .@"enum") {
             for (tree.containerMembers(ns.container)) |m| {
                 const it = tree.items[m];
@@ -202,7 +206,7 @@ pub const Resolver = struct {
             const value = b.value orelse return cur;
             cur = switch (b.expr(value)) {
                 .name_ref => |n| if (b.nameRefIsBuiltin(value)) null else try r.resolveName(it.file, it.item, b, b.expr_scopes[@backingInt(value)], n),
-                .field_access => |fa| if (try r.evalNamespace(it.file, it.item, b, fa.lhs)) |ns| try r.memberDef(ns, fa.field orelse return cur) else null,
+                .field_access => |fa| if (try r.evalNamespace(it.file, it.item, b, fa.lhs)) |ns| try r.memberDef(ns, it.file, fa.field orelse return cur) else null,
                 else => null,
             } orelse return cur;
         }
@@ -254,7 +258,7 @@ pub const Resolver = struct {
             },
             .field_access => |fa| {
                 const ns = try r.evalDepth(file, item, b, fa.lhs, depth + 1) orelse return null;
-                const def = try r.memberDef(ns, fa.field orelse return null) orelse return null;
+                const def = try r.memberDef(ns, file, fa.field orelse return null) orelse return null;
                 return r.namespaceOfDepth(def, depth + 1);
             },
             .builtin_call => |call| {
@@ -397,7 +401,7 @@ pub const Resolver = struct {
                 if (!std.mem.eql(u8, call.name, "@import") or try r.importTarget(cur_file, cur_body, call.args) != null) return &.{};
                 var out: std.ArrayList(Def) = .empty;
                 for (try r.importTargets(cur_file, cur_body, call.args)) |t| {
-                    try out.append(r.arena, try r.memberDef(.{ .file = t, .container = 0 }, name) orelse continue);
+                    try out.append(r.arena, try r.memberDef(.{ .file = t, .container = 0 }, file, name) orelse continue);
                 }
                 return out.items;
             },
@@ -545,7 +549,9 @@ pub const Resolver = struct {
         if (path.len == 0) return null;
         var ns: Namespace = .{ .file = file, .container = 0 };
         for (path[0 .. path.len - 1]) |name| {
-            ns = try r.namespaceOf(try r.memberDef(ns, name) orelse return null) orelse return null;
+            // A structural traversal of the same path in another module: the names are not
+            // written at a use site, so visibility is that of each namespace itself
+            ns = try r.namespaceOf(try r.memberDef(ns, ns.file, name) orelse return null) orelse return null;
         }
         const last = path[path.len - 1];
         const tree = try r.itemTree(ns.file);
