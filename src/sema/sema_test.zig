@@ -1308,6 +1308,38 @@ test "the sentinel element read through pointers, slices and many-item pointers"
     });
 }
 
+test "a many-item pointer into a declaration's sentinel array reads its sentinel" {
+    // The pointer value is interned with the pointer type, which has no sentinel: index `len`
+    // gave up instead of reading the sentinel of the declaration's array.
+    try expectTypes(
+        \\const buf: [5:0]u8 = .{ 1, 2, 3, 4, 5 };
+        \\const words: [3:7]u32 = .{ 1, 2, 3 };
+        \\const plain_buf: [5]u8 = .{ 1, 2, 3, 4, 5 };
+        \\const fp: [*]const u8 = &buf;
+        \\const cp: [*c]const u8 = &buf;
+        \\const wp: [*]const u32 = &words;
+        \\const pp: [*]const u8 = &plain_buf;
+        \\fn retPtr() [*]const u8 {
+        \\    return &buf;
+        \\}
+        \\const fs = fp[5];
+        \\const cy = cp[5];
+        \\const rz = retPtr()[5];
+        \\const off = (fp + 2)[3];
+        \\const wz = wp[3];
+        \\const past = fp[6];
+        \\const unterminated = pp[5];
+    , &.{
+        .{ "fs", "u8 = 0" },
+        .{ "cy", "u8 = 0" },
+        .{ "rz", "u8 = 0" },
+        .{ "off", "u8 = 0" },
+        .{ "wz", "u32 = 7" },
+        .{ "past", "u8" },
+        .{ "unterminated", "u8" },
+    });
+}
+
 test "inline calls with comptime-known arguments have comptime-known results" {
     try expectTypes(
         \\inline fn twice(x: u32) u32 { return x * 2; }

@@ -1535,11 +1535,17 @@ const Evaluator = struct {
     /// right after them is known, as a sentinel: for a slice its own, which the language
     /// guarantees the storage holds there; for a many-item pointer that of the storage, since the
     /// pointer type does not bound the read (`[*]const u8` pointing to `"ab"` reads its `0`).
-    fn elemPastEnd(ev: *Evaluator, t: Index, storage: Index, i: usize, len: usize) EvalError!Val {
+    /// When the storage type is the pointer type, the elements were interned from the place the
+    /// pointer records (`basePlace`), whose storage is read instead: `[*]const u8` pointing to a
+    /// `[5:0]u8` declaration reads its `0`. `v` is the pointer.
+    fn elemPastEnd(ev: *Evaluator, v: Val, storage: Index, i: usize, len: usize) EvalError!Val {
+        const t = v.ty;
         if (i != len or !ev.readsPastEnd(t)) return error.Abort;
         const p = ev.ip.key(t).ptr_type;
-        const s = (if (p.size == .slice) p.sentinel else ev.seqSentinel(storage)) orelse return error.Abort;
-        return Val.of(p.child, s);
+        if (p.size == .slice) return Val.of(p.child, p.sentinel orelse return error.Abort);
+        if (ev.seqSentinel(storage)) |s| return Val.of(p.child, s);
+        const ref = try ev.basePlace(v) orelse return error.Abort;
+        return ev.elemAt(.{ .ty = t, .v = .{ .ref = ref } }, i);
     }
 
     /// Element `i`; unknown when the value is unknown
@@ -1580,10 +1586,10 @@ const Evaluator = struct {
                 return elem;
             },
             .ip => |x| switch (ev.ip.key(x)) {
-                .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else ev.elemPastEnd(v.ty, agg.ty, i, agg.elems.len),
+                .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else ev.elemPastEnd(v, agg.ty, i, agg.elems.len),
                 // Aggregates whose elements are all u8 are also represented as bytes (e.g. a
                 // value of `struct { short: ?u8 }`): use the declared type of the element
-                .bytes => |b| return if (i < b.bytes.len) Val.of(if (ty != .unknown) ty else .u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else ev.elemPastEnd(v.ty, b.ty, i, b.bytes.len),
+                .bytes => |b| return if (i < b.bytes.len) Val.of(if (ty != .unknown) ty else .u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else ev.elemPastEnd(v, b.ty, i, b.bytes.len),
                 .ptr_value => |p| return ev.elemAt(ev.ptrValueTarget(v.ty, p.pointee), i),
                 // Field `i` of a union (the place of `&u.y`): only the active field has a value
                 .union_value => |u| {
