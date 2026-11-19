@@ -1250,8 +1250,8 @@ const Inferrer = struct {
                 // (`[len:sentinel]T`); a runtime-known one cannot be dereferenced
                 const child = if (pt.size == .slice) child: {
                     if (p.val == null) {
-                        // Inference does not compute every comptime-known slice (`&.{ 1, 2 }`
-                        // coerced to a slice): the interpreter evaluates the dereference
+                        // Inference does not compute every comptime-known slice: the interpreter
+                        // evaluates the dereference
                         if (inf.dead != 0 or inf.r.ctx.incomplete()) return .unknown;
                         const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
                         return if (tv.val != null and ip.key(tv.ty) == .array_type) tv else .unknown;
@@ -3361,20 +3361,9 @@ const Inferrer = struct {
                     },
                     else => null,
                 } else null;
-                var v = try inf.infer(operand_e, child_expected);
+                const v = try inf.infer(operand_e, child_expected);
                 const is_const = try inf.isConstPlace(operand_e);
                 const ty: Index = if (v.ty == .unknown) .unknown else try ip.get(.{ .ptr_type = .{ .child = v.ty, .size = .one, .is_const = is_const, .attrs = try inf.placeAttrs(operand_e) } });
-                // Typed aggregate literals get no value from inference: a pointer to an array
-                // literal whose elements are all comptime-known (`&.{ 1, 2 }` coerced to a slice)
-                // gets the array from the interpreter
-                if (is_const and v.val == null and ip.key(v.ty) == .array_type and inf.dead == 0 and !inf.r.ctx.incomplete()) switch (inf.body.expr(operand_e)) {
-                    .init => |init| known: {
-                        for (init.fields) |f| if (inf.get(f.value).val == null) break :known;
-                        const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, operand_e, inf.inst, inf.bindings, v.ty, inf.branchQuota());
-                        if (tv.ty == v.ty) v = tv;
-                    },
-                    else => {},
-                };
                 // A pointer to a comptime-known constant (`parseEx(Id, &params, ...)`,
                 // `@field(x, &name)`) is comptime-known: its value points to the constant's value,
                 // and to its place when that is inside a container-level declaration or an
@@ -3428,6 +3417,13 @@ const Inferrer = struct {
             if (field.member) |m| if (inf.current_init) |init_e| try inf.field_refs.append(inf.scratch, .{ .init = init_e, .index = @intCast(fi_index), .member = m });
             if (t == .unknown or field.ty == .unknown) try inf.noteUnknownResult(f.value);
             _ = try inf.infer(f.value, if (field.ty) |x| (if (x != .unknown) x else null) else null);
+        }
+        // An array literal whose elements are all comptime-known is comptime-known (`[3]u8{ 7,
+        // 8, 9 }`): the interpreter computes the value, coercing the elements to the element type
+        if (t != .unknown and ip.key(t) == .array_type and inf.dead == 0 and !inf.r.ctx.incomplete()) known: {
+            for (fields) |f| if (inf.get(f.value).val == null) break :known;
+            const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, t, inf.branchQuota());
+            if (tv.val != null and tv.ty == t) return tv;
         }
         return .{ .ty = t };
     }
