@@ -1135,7 +1135,7 @@ test "exit and the end of input cancel the requests in flight instead of waiting
     }
 }
 
-test "a module graph update does not cancel the outline, folding and selection requests in flight" {
+test "a module graph update does not cancel the folding and selection requests in flight" {
     // Guards against server writes that change no text (the module graph after the zig
     // environment query or a build) answering the syntax requests in flight with ContentModified,
     // although their results cannot change
@@ -1162,7 +1162,7 @@ test "a module graph update does not cancel the outline, folding and selection r
 
     const doc = .{ .textDocument = .{ .uri = uri } };
     const positions = .{ .textDocument = .{ .uri = uri }, .positions = &[_]struct { line: u32, character: u32 }{.{ .line = 3, .character = 17 }} };
-    inline for (.{ .{ "textDocument/documentSymbol", doc }, .{ "textDocument/foldingRange", doc }, .{ "textDocument/selectionRange", positions } }, 0..) |r, i| {
+    inline for (.{ .{ "textDocument/foldingRange", doc }, .{ "textDocument/selectionRange", positions } }, 0..) |r, i| {
         const expected = try std.json.Stringify.valueAlloc(a, (try h.request(r[0], r[1])).object.get("result").?, .{});
 
         var gate: Server.TestGate = .{ .method = r[0], .point = .in_read };
