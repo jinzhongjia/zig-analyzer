@@ -2654,9 +2654,16 @@ const Evaluator = struct {
             .@"defer" => |x| try defers.append(ev.a, .{ .body = x, .on_error = false }),
             .@"errdefer" => |x| try defers.append(ev.a, .{ .body = x, .on_error = true }),
             .destructure => |d| {
-                const v = try ev.eval(f, d.value, null);
+                // An anonymous list `.{ a, b }` takes the targets as its result location: each
+                // element is stored before the next one is evaluated, so `x, y = .{ y, x }`
+                // assigns the old value of `y` to both
+                const fields: ?[]const Body.FieldInit = switch (f.body.expr(d.value)) {
+                    .init => |in| if (in.ty == null and in.fields.len == d.targets.len) in.fields else null,
+                    else => null,
+                };
+                const v: Val = if (fields == null) try ev.eval(f, d.value, null) else .unknown;
                 for (d.targets, 0..) |t, i| {
-                    const elem = try ev.elemAt(v, i);
+                    const elem = if (fields) |fs| try ev.copy(try ev.eval(f, fs[i].value, null)) else try ev.elemAt(v, i);
                     switch (t) {
                         .binding => |bid| {
                             const ty: ?Index = if (f.body.binding(bid).ty) |te| try ev.evalType(f, te) else null;

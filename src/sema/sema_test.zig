@@ -6239,6 +6239,38 @@ test "comptime vars written by a destructure are not stale" {
     });
 }
 
+test "type functions store each element of a destructured anonymous list before the next" {
+    // Prevents the interpreter from evaluating the whole list before storing any target, which
+    // swapped `a, b = .{ b, a }`. Expected values: zig 0.17.1
+    try expectTypes(
+        \\fn Swap() type {
+        \\    comptime var a: u32 = 1;
+        \\    comptime var b: u32 = 2;
+        \\    a, b = .{ b, a };
+        \\    return struct { pub const va = a; pub const vb = b; };
+        \\}
+        \\fn Whole() type {
+        \\    comptime var a: u32 = 1;
+        \\    comptime var b: u32 = 2;
+        \\    const pair = .{ b, a };
+        \\    a, b = pair;
+        \\    return struct { pub const va = a; pub const vb = b; };
+        \\}
+        \\fn g() void {
+        \\    const swap_a = Swap().va;
+        \\    const swap_b = Swap().vb;
+        \\    const whole_a = Whole().va;
+        \\    const whole_b = Whole().vb;
+        \\    _ = .{ swap_a, swap_b, whole_a, whole_b };
+        \\}
+    , &.{
+        .{ "swap_a", "u32 = 2" },
+        .{ "swap_b", "u32 = 2" },
+        .{ "whole_a", "u32 = 2" },
+        .{ "whole_b", "u32 = 1" },
+    });
+}
+
 test "loop iterations start from the value a destructure leaves in a comptime var" {
     // Prevents the next iteration of an inline loop from missing a write to an outer
     // `comptime var` made by a destructure. Expected type: zig 0.17.1
