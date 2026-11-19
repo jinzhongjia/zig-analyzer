@@ -445,6 +445,22 @@ pub fn typeLayout(r: *Resolver, t: Index) Error!?value.Layout {
     };
 }
 
+/// `@ptrFromInt(addr)` with destination type `dest` (the result type without its error union):
+/// a pointer to the integer address (`InternPool.Key.ptr_int`), or null for address zero of an
+/// optional pointer. Null when the compiler reports an error (a destination that is not a
+/// pointer or optional pointer, an address outside usize, address zero of a pointer that does
+/// not allow it, an address not aligned for the pointer) and when the alignment is unknown.
+/// Address zero of a C pointer is not modeled.
+pub fn ptrFromInt(r: *Resolver, dest: Index, addr: i128) Error!?Index {
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    defer ev.deinit();
+    return ev.ptrFromInt(dest, addr) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => null,
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
 /// Result type of `@backingInt` (matches the compiler): the tag integer for enums, the integer
 /// of the tag enum for tagged unions, the explicitly given backing integer for packed
 /// containers; null for other types or when it cannot be evaluated
@@ -3239,7 +3255,19 @@ const Evaluator = struct {
     /// interpreter (string literals) record no place.
     /// Pointer arithmetic on interned data that records no place points into a cell holding
     /// that data (see `internedCell`).
+    /// A pointer to an integer address is compared by address (`value.eqlValues`), and is unequal
+    /// to every reference, which points into comptime memory.
     fn pointerEql(ev: *Evaluator, a_in: Val, b_in: Val) EvalError!?bool {
+        const ia = a_in.v == .ip and ev.ip.key(a_in.v.ip) == .ptr_int;
+        const ib = b_in.v == .ip and ev.ip.key(b_in.v.ip) == .ptr_int;
+        if (ia or ib) {
+            const other = if (ia) b_in else a_in;
+            return switch (other.v) {
+                .ref => false,
+                .ip => |x| value.eqlValues(ev.ip, if (ia) a_in.v.ip else b_in.v.ip, x),
+                else => null,
+            };
+        }
         if (a_in.v == .ip and b_in.v == .ip) {
             const x = a_in.v.ip;
             const y = b_in.v.ip;
@@ -4689,6 +4717,12 @@ const Evaluator = struct {
             o.* = if (operand == .round_op) try ev.roundOperand(f, a, t) else try ev.eval(f, a, t);
         }
         if (try ev.pureBuiltin(name, vals)) |v| return v;
+        if (eq(u8, name, "@ptrFromInt")) {
+            if (vals.len != 1) return error.Abort;
+            const t = destType(ip, want, .eu) orelse return error.Abort;
+            const addr = ev.intOf(vals[0]) orelse return error.Abort;
+            return Val.of(t, try ev.ptrFromInt(t, addr));
+        }
         if (eq(u8, name, "@TypeOf")) {
             if (vals.len == 0) return error.Abort;
             var t = vals[0].ty;
@@ -4947,6 +4981,19 @@ const Evaluator = struct {
             const l = try ev.typeLayout(try asType(vals[0]), 0) orelse return error.Abort;
             const n = if (eq(u8, name, "@sizeOf")) l.size else if (eq(u8, name, "@alignOf")) l.alignment else l.bits orelse return error.Abort;
             return try ev.int(.comptime_int_type, n);
+        }
+        // Only a pointer to an integer address is modeled; pointers into comptime memory have no
+        // address
+        if (eq(u8, name, "@intFromPtr")) {
+            if (vals.len != 1) return error.Abort;
+            const x = switch (vals[0].v) {
+                .ip => |x| x,
+                else => return null,
+            };
+            return switch (ip.key(x)) {
+                .ptr_int => |p| try ev.int(.usize_type, p.addr),
+                else => null,
+            };
         }
         if (eq(u8, name, "@intFromEnum") or eq(u8, name, "@backingInt")) {
             if (vals.len != 1) return error.Abort;
@@ -5335,6 +5382,34 @@ const Evaluator = struct {
         const eq = std.mem.eql;
         if (i == 0 and (eq(u8, name, "@as") or eq(u8, name, "@typeInfo") or eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf") or eq(u8, name, "@offsetOf") or eq(u8, name, "@bitOffsetOf"))) return .type_type;
         return null;
+    }
+
+    /// See the public `ptrFromInt`
+    fn ptrFromInt(ev: *Evaluator, dest: Index, addr: i128) EvalError!Index {
+        const ip = ev.ip;
+        const optional = ip.key(dest) == .optional_type;
+        const ptr_ty = if (optional) ip.key(dest).optional_type else dest;
+        const p = switch (ip.key(ptr_ty)) {
+            .ptr_type => |p| p,
+            else => return error.Abort,
+        };
+        if (p.size == .slice) return error.Abort;
+        const bits = ip.pointerBits() orelse return error.Abort;
+        if (addr < 0 or (bits < 128 and addr >> @intCast(bits) != 0)) return error.Abort;
+        const a: u64 = std.math.cast(u64, addr) orelse return error.Abort;
+        if (a == 0) {
+            if (p.size == .c) return error.Abort;
+            if (optional) return .null_value;
+            if (!p.attrs.is_allowzero) return error.Abort;
+        }
+        const alignment: u64 = if (p.attrs.alignment != .natural)
+            p.attrs.alignment.bytes() orelse return error.Abort
+        else if (p.child == .anyopaque_type)
+            1
+        else
+            (try ev.typeLayout(p.child, 0) orelse return error.Abort).alignment;
+        if (alignment == 0 or a % alignment != 0) return error.Abort;
+        return ip.get(.{ .ptr_int = .{ .ty = ptr_ty, .addr = a } });
     }
 
     /// Whether pointer `v` cast to type `to` points to the same elements: values are not
