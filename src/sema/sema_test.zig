@@ -1308,6 +1308,38 @@ test "the sentinel element read through pointers, slices and many-item pointers"
     });
 }
 
+test "a many-item pointer into a declaration's sentinel array reads its sentinel" {
+    // The pointer value is interned with the pointer type, which has no sentinel: index `len`
+    // gave up instead of reading the sentinel of the declaration's array.
+    try expectTypes(
+        \\const buf: [5:0]u8 = .{ 1, 2, 3, 4, 5 };
+        \\const words: [3:7]u32 = .{ 1, 2, 3 };
+        \\const plain_buf: [5]u8 = .{ 1, 2, 3, 4, 5 };
+        \\const fp: [*]const u8 = &buf;
+        \\const cp: [*c]const u8 = &buf;
+        \\const wp: [*]const u32 = &words;
+        \\const pp: [*]const u8 = &plain_buf;
+        \\fn retPtr() [*]const u8 {
+        \\    return &buf;
+        \\}
+        \\const fs = fp[5];
+        \\const cy = cp[5];
+        \\const rz = retPtr()[5];
+        \\const off = (fp + 2)[3];
+        \\const wz = wp[3];
+        \\const past = fp[6];
+        \\const unterminated = pp[5];
+    , &.{
+        .{ "fs", "u8 = 0" },
+        .{ "cy", "u8 = 0" },
+        .{ "rz", "u8 = 0" },
+        .{ "off", "u8 = 0" },
+        .{ "wz", "u32 = 7" },
+        .{ "past", "u8" },
+        .{ "unterminated", "u8" },
+    });
+}
+
 test "inline calls with comptime-known arguments have comptime-known results" {
     try expectTypes(
         \\inline fn twice(x: u32) u32 { return x * 2; }
@@ -1844,6 +1876,31 @@ test "a non-null optional holding a null optional is not null" {
         \\    const b: ?*const u8 = a;
         \\    break :blk b == null;
         \\};
+        \\const one_to_c = blk: {
+        \\    const a: ?*const u8 = null;
+        \\    const b: ?[*c]const u8 = a;
+        \\    break :blk b == null;
+        \\};
+        \\const many_to_c = blk: {
+        \\    const a: ?[*]const u8 = null;
+        \\    const b: ?[*c]const u8 = a;
+        \\    break :blk b == null;
+        \\};
+        \\const to_allowzero = blk: {
+        \\    const a: ?*const u8 = null;
+        \\    const b: ?*allowzero const u8 = a;
+        \\    break :blk b == null;
+        \\};
+        \\const allowzero_to_c = blk: {
+        \\    const a: ?*allowzero const u8 = null;
+        \\    const b: ?[*c]const u8 = a;
+        \\    break :blk b == null;
+        \\};
+        \\const c_to_const_c = blk: {
+        \\    const a: ?[*c]u8 = null;
+        \\    const b: ?[*c]const u8 = a;
+        \\    break :blk b == null;
+        \\};
     , &.{
         .{ "ret_eq", "bool = false" },
         .{ "ret_local_eq", "bool = false" },
@@ -1894,6 +1951,13 @@ test "a non-null optional holding a null optional is not null" {
         .{ "opt_eu_payload", "bool = true" },
         // An optional that coerces in memory keeps its null
         .{ "ptr_keep", "bool = true" },
+        // A pointer-like optional (`?*T`, `?[*]T`) to one with a null flag (`?[*c]T`,
+        // `?*allowzero T`) wraps: the null becomes a non-null optional holding a null pointer
+        .{ "one_to_c", "bool = false" },
+        .{ "many_to_c", "bool = false" },
+        .{ "to_allowzero", "bool = false" },
+        .{ "allowzero_to_c", "bool = true" },
+        .{ "c_to_const_c", "bool = true" },
     });
 }
 
@@ -3101,6 +3165,119 @@ test "containers in a function capture a comptime var where the body reaches the
         .{ "other_capture", "bool = false" },
         .{ "in_loop", "comptime_int = 3" },
     });
+}
+
+test "defer and errdefer write comptime vars at the exit of their block" {
+    // Prevents applying a deferred write at the defer statement and applying errdefer writes on
+    // the success path; expected values are the results of `zig run`
+    const text =
+        \\fn blockDefer() void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer x += 1;
+        \\        const y = x;
+        \\        const z = x + y;
+        \\        _ = .{ y, z };
+        \\    }
+        \\    const w = x;
+        \\    _ = w;
+        \\}
+        \\fn successErrdefer() !u32 {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        errdefer x += 10;
+        \\        const a = x;
+        \\        _ = a;
+        \\    }
+        \\    const b = x;
+        \\    return b;
+        \\}
+        \\fn prongDefer() void {
+        \\    comptime var x: u32 = 1;
+        \\    const c = true;
+        \\    if (c) {
+        \\        defer x += 1;
+        \\        const p = x;
+        \\        _ = p;
+        \\    }
+        \\    const q = x;
+        \\    _ = q;
+        \\}
+        \\fn fnScope() u32 {
+        \\    comptime var x: u32 = 1;
+        \\    defer x += 1;
+        \\    const r = x;
+        \\    return r;
+        \\}
+        \\fn bodyAtExit() void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer {
+        \\            x += 1;
+        \\            const in_defer = x;
+        \\            _ = in_defer;
+        \\        }
+        \\        x = 5;
+        \\    }
+        \\}
+        \\fn order() void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer x *= 2;
+        \\        defer x += 1;
+        \\    }
+        \\    const ordered = x;
+        \\    _ = ordered;
+        \\}
+        \\fn labeled() void {
+        \\    comptime var x: u32 = 1;
+        \\    const v = blk: {
+        \\        defer x += 1;
+        \\        break :blk x;
+        \\    };
+        \\    const after_break = x;
+        \\    _ = .{ v, after_break };
+        \\}
+        \\fn loop() void {
+        \\    comptime var x: u32 = 0;
+        \\    inline for (0..3) |i| {
+        \\        defer x += 1;
+        \\        const cur = x;
+        \\        _ = .{ i, cur };
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", text);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "y", "u32 = 1" },
+        .{ "z", "u32 = 2" },
+        .{ "w", "u32 = 2" },
+        .{ "a", "u32 = 1" },
+        .{ "b", "u32 = 1" },
+        .{ "p", "u32 = 1" },
+        .{ "q", "u32 = 2" },
+        .{ "r", "u32 = 1" },
+        .{ "in_defer", "u32 = 6" },
+        .{ "ordered", "u32 = 4" },
+        .{ "v", "u32 = 1" },
+        .{ "after_break", "u32 = 2" },
+    };
+    for (cases) |c| {
+        testing.expectEqualStrings(c[1], try typeAt(&w, f.file, text, c[0], 0)) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+    for ([_][]const u8{ "u32 = 0", "u32 = 1", "u32 = 2" }, 0..) |want, n| {
+        testing.expectEqualStrings(want, try iterationTypeAt(&w, f.file, text, "cur", "i", @intCast(n))) catch |err| {
+            std.debug.print("type of `cur` in iteration {d}\n", .{n});
+            return err;
+        };
+    }
 }
 
 test "containers in a loop of a type function capture the values of each iteration" {
@@ -12926,5 +13103,81 @@ test "comptime calls through function pointers" {
         .{ "r_optional", "u8 = 4" },
         .{ "r_args", "u8 = 5" },
         .{ "r_field", "u8 = 4" },
+    });
+}
+
+test "comptime pointers made by @ptrFromInt compare by address" {
+    try expectTypes(
+        \\var g: u8 = 0;
+        \\const a: *u8 = @ptrFromInt(0x1000);
+        \\const b: *u8 = @ptrFromInt(0x1000);
+        \\const c: *u8 = @ptrFromInt(0x2000);
+        \\const k: *const u8 = @ptrFromInt(0x1000);
+        \\const eq = a == b;
+        \\const ne = a == c;
+        \\const neq = a != c;
+        \\const ck = a == k;
+        \\const glob = a == &g;
+        \\const addr = @intFromPtr(c);
+        \\const o: ?*u8 = @ptrFromInt(0x10);
+        \\const z: ?*u8 = @ptrFromInt(0);
+        \\const onull = o == null;
+        \\const znull = z == null;
+        \\const oaddr = @intFromPtr(o);
+        \\const az: *allowzero u8 = @ptrFromInt(0);
+        \\const azaddr = @intFromPtr(az);
+        \\const m: [*]u8 = @ptrFromInt(0x1000);
+        \\const m2: [*]u8 = @ptrFromInt(0x1000);
+        \\const meq = m == m2;
+        \\const maddr = @intFromPtr(m);
+        \\const deref = a.*;
+        \\const bad_zero: *u8 = @ptrFromInt(0);
+        \\const bad_align: *u32 = @ptrFromInt(0x1001);
+        \\const bad_zero_eq = bad_zero == a;
+        \\const bad_align_eq = bad_align == bad_align;
+    , &.{
+        .{ "eq", "bool = true" },
+        .{ "ne", "bool = false" },
+        .{ "neq", "bool = true" },
+        .{ "ck", "bool = true" },
+        .{ "glob", "bool = false" },
+        .{ "addr", "usize = 8192" },
+        .{ "onull", "bool = false" },
+        .{ "znull", "bool = true" },
+        .{ "oaddr", "usize = 16" },
+        .{ "azaddr", "usize = 0" },
+        .{ "meq", "bool = true" },
+        .{ "maddr", "usize = 4096" },
+        .{ "deref", "u8" },
+        .{ "bad_zero_eq", "bool" },
+        .{ "bad_align_eq", "bool" },
+    });
+}
+
+test "comptime calls compare @ptrFromInt pointers by address" {
+    // Operations on such pointers that are not modeled (casts, arithmetic) stay unknown
+    try expectTypes(
+        \\const s = "abc";
+        \\fn check() [5]bool {
+        \\    const a: *u8 = @ptrFromInt(0x1000);
+        \\    const b: *const u8 = @ptrFromInt(0x1000);
+        \\    const m: [*]const u8 = @ptrFromInt(0x3000);
+        \\    var x: u8 = 1;
+        \\    _ = &x;
+        \\    const o: ?*u8 = a;
+        \\    return .{ a == b, a == &x, m == s.ptr, o == null, @intFromPtr(a) == 0x1000 };
+        \\}
+        \\const r = check();
+        \\const pc: *align(1) u16 = @ptrCast(@as(*u8, @ptrFromInt(0x1000)));
+        \\const pc_addr = @intFromPtr(pc);
+        \\const m2: [*]u8 = @ptrFromInt(0x1000);
+        \\const step = m2 + 1;
+        \\const step_addr = @intFromPtr(step);
+        \\const shown: *u8 = @ptrFromInt(0x1000);
+    , &.{
+        .{ "r", "[5]bool = .{ true, false, false, false, true }" },
+        .{ "pc_addr", "usize" },
+        .{ "step_addr", "usize" },
+        .{ "shown", "*u8 = @ptrFromInt(0x1000)" },
     });
 }

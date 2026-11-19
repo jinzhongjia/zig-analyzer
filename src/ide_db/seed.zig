@@ -989,6 +989,7 @@ const Closure = struct {
             // The `base` of a pointer is only where it points: the pointer's type and the value
             // it points to are what lead to types
             .ptr_value => |p| (try c.reaches(p.ty)) or try c.reaches(p.pointee),
+            .ptr_int => |p| c.reaches(p.ty),
             .opt_payload => |o| (try c.reaches(o.ty)) or try c.reaches(o.payload),
             .ptr_base => |b| switch (b.root) {
                 .decl => |d| c.importers.contains(d.file) or (if (d.inst) |i| try c.reaches(i) else false),
