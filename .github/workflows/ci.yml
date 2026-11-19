@@ -94,9 +94,10 @@ jobs:
           fi
 
           # A pull request runs the fast matrix. It runs the whole suite (including the tests that
-          # start a real zig) on Linux in Debug, and only the tests that need no external tools
-          # on macOS and Windows, where a project load and a zig start are the slowest and most
-          # of the suite's duration is in end-to-end tests. The build job checks every system,
+          # start a real zig) in Debug on Linux and on Windows, whose paths, URIs, and process
+          # starts the end-to-end tests cover, and only the tests that need no external tools on
+          # macOS, where a project load and a zig start are the slowest and most of the suite's
+          # duration is in end-to-end tests. The build job checks every system,
           # but compiles the tools only on Linux. A push to main, a release, and a change to CI
           # itself run every combination. Shards of the test suite run in parallel in one job
           # (see `-Dtest-shards`), so a job is as long as its longest shard, not as long as the
@@ -128,7 +129,7 @@ jobs:
               {"os":"ubuntu-latest","zig":"0.17.0","optimize":"Debug","suite":"test-all","shards":'"$shards"'},
               {"os":"ubuntu-latest","zig":"0.17.1","optimize":"Debug","suite":"test-all","shards":'"$shards"'},
               {"os":"macos-latest","zig":"0.17.1","optimize":"Debug","suite":"test","shards":'"$shards"'},
-              {"os":"windows-latest","zig":"0.17.1","optimize":"Debug","suite":"test","shards":'"$shards"'}
+              {"os":"windows-latest","zig":"0.17.1","optimize":"Debug","suite":"test-all","shards":'"$shards"'}
             ]}'
             build_matrix='{"include":[
               {"os":"ubuntu-latest","zig":"0.17.1","check":true},
