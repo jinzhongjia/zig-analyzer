@@ -8578,6 +8578,29 @@ test "anonymous enums display their tag type, the values written for members and
     });
 }
 
+test "anonymous containers display their tag type, layout and backing integer" {
+    // Prevents displaying `union(E)` as the untagged `union`
+    try expectStdTypes(
+        \\const std = @import("std");
+        \\const Status = enum { ok, err };
+        \\const tagged: union(Status) { ok: u8, err: void } = .{ .ok = 1 };
+        \\const auto: union(enum) { a: u8, b: void } = .{ .a = 1 };
+        \\const auto_int: union(enum(u8)) { a: u8, b: void } = .{ .a = 1 };
+        \\const bare: union { a: u8, b: u16 } = .{ .a = 1 };
+        \\const backed: packed struct(u8) { a: u4, b: u4 } = .{ .a = 1, .b = 2 };
+        \\const packed_union: packed union(u8) { a: u8, b: i8 } = .{ .a = 1 };
+        \\const ext: extern struct { a: u8 } = .{ .a = 1 };
+    , &.{
+        .{ "tagged", "union(Status) { ok: u8, err: void } = .{ .ok = 1 }" },
+        .{ "auto", "union(enum) { a: u8, b: void } = .{ .a = 1 }" },
+        .{ "auto_int", "union(enum(u8)) { a: u8, b: void } = .{ .a = 1 }" },
+        .{ "bare", "union { a: u8, b: u16 } = .{ .a = 1 }" },
+        .{ "backed", "packed struct(u8) { a: u4, b: u4 } = .{ .a = 1, .b = 2 }" },
+        .{ "packed_union", "packed union(u8) { a: u8, b: i8 } = .{ .a = 1 }" },
+        .{ "ext", "extern struct { a: u8 } = .{ .a = 1 }" },
+    });
+}
+
 test "@typeInfo lists error names in declaration order" {
     // Prevents listing `error_names` sorted by their bytes; expected values are the results of
     // zig 0.17.0, which sorts only the names in `@typeName`

@@ -472,9 +472,10 @@ pub fn explicitTagType(r: *Resolver, t: Index) Error!?Index {
     return decl.arg;
 }
 
-/// The `T` of the source enum `ns` declared `enum(T)`, in instance `inst`, for display: null when
-/// the declaration gives no tag type, `.unknown` when it cannot be evaluated
-pub fn writtenTagType(r: *Resolver, ns: Namespace, inst: ?Index) Error!?Index {
+/// The type argument written in the declaration of source container `ns`, in instance `inst`, for
+/// display: the `T` of `enum(T)`, `union(T)`, `union(enum(T))`, `packed struct(T)` and
+/// `packed union(T)`; null when the declaration gives none, `.unknown` when it cannot be evaluated
+pub fn writtenContainerArg(r: *Resolver, ns: Namespace, inst: ?Index) Error!?Index {
     const arg = try containerArgValue(r, ns, inst) orelse return null;
     return arg.asType() orelse .unknown;
 }

@@ -2316,6 +2316,26 @@ test "hover names a reified type after the constant it initializes" {
     try testing.expect(std.mem.indexOf(u8, member.text, "enum {") == null);
 }
 
+test "hover on a parameter of an anonymous union shows its tag type" {
+    // Prevents showing `union(Status)` as the untagged `union`
+    const text =
+        \\const Status = enum { ok, err };
+        \\fn f(u: union(Status) { ok: u8, err: void }) void {
+        \\    _ = u;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const u = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "u;").?), &.{}, .count)).?;
+    try testing.expectEqualStrings("```zig\nu: union(Status) { ok: u8, err: void }\n```", u.text);
+}
+
 test "member completion of reified, tuple and anonymous struct types" {
     const text =
         \\fn Fields() type { return @Enum(u8, .exhaustive, &.{ "alpha", "beta" }, &.{ 0, 1 }); }
