@@ -2782,6 +2782,66 @@ test "references find the fields of a zon file whose import sites give several r
     }
 }
 
+test "zon field references report an incomplete generic function closure" {
+    // Prevents a use that is a hit under the explored instances from being accepted when the
+    // instances of the generic function grow without bound: the field may differ under the
+    // instances that are not explored
+    const main_text =
+        \\const raw = @import("cfg.zon");
+        \\fn read(v: anytype) comptime_int {
+        \\    return v.x;
+        \\}
+        \\fn grow(comptime T: type) void {
+        \\    _ = read(?T);
+        \\    other(?T);
+        \\}
+        \\fn other(comptime T: type) void {
+        \\    grow(T);
+        \\}
+        \\pub fn main() void {
+        \\    grow(u8);
+        \\    _ = read(raw);
+        \\}
+        \\
+    ;
+    const complete_text =
+        \\const raw = @import("cfg.zon");
+        \\fn read(v: anytype) comptime_int {
+        \\    return v.x;
+        \\}
+        \\pub fn main() void {
+        \\    _ = read(raw);
+        \\}
+        \\
+    ;
+    const zon_text = ".{ .x = 1 }\n";
+    const cases = [_]struct { text: []const u8, incomplete: bool }{
+        .{ .text = main_text, .incomplete = true },
+        .{ .text = complete_text, .incomplete = false },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const main = (try w.fixture(try std.mem.concat(w.arena.allocator(), u8, &.{ "//- /p/main.zig module:app\n", c.text }))).file("/p/main.zig");
+        const zon_file = (try w.add("/p/cfg.zon", zon_text)).file;
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const symbols = try definition.symbolsAt(&r, zon_file, @intCast(std.mem.indexOf(u8, zon_text, "x").?));
+        var incomplete: ?search.Reference = null;
+        const refs = try search.symbolsReferences(&r, symbols, .{ .scope = &.{ main, zon_file }, .incomplete = &incomplete });
+        try testing.expectEqual(c.incomplete, incomplete != null);
+        // The use in `read` is found under the explored instances
+        const use = std.mem.indexOf(u8, c.text, "v.x").? + 2;
+        var found = false;
+        for (refs) |ref| if (ref.file == main and ref.start == use) {
+            found = true;
+        };
+        try testing.expect(found);
+    }
+}
+
 test "zon files have no result type unless their typed imports agree" {
     const cases = [_]struct { []const u8, []const u8 }{
         // No import site; only an import without a result type

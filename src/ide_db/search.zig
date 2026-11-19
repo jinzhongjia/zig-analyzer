@@ -290,8 +290,10 @@ pub fn zonLiteralOfType(ip: *InternPool, ty: InternPool.Index) ?InternPool.ZonLi
 
 /// The `.zon` file literals that the value of `e` (at `rel` in the member) has the type of: from the
 /// abstract inference `res`, or under each call-site instance and iteration when that does not
-/// determine the type, each literal once. A written or expected type counts for an initializer
-pub fn zonLiteralsOf(r: *Resolver, file: FileId, item: u32, body: *const Body, res: *const infer.Result, e: Body.ExprId, rel: u32) resolve.Error![]const InternPool.ZonLiteral {
+/// determine the type, each literal once. A written or expected type counts for an initializer.
+/// `complete` is false when the call-site instances were truncated because instantiation grows
+/// without bound, so there may be literals under other instances.
+pub fn zonLiteralsOf(r: *Resolver, file: FileId, item: u32, body: *const Body, res: *const infer.Result, e: Body.ExprId, rel: u32) resolve.Error!struct { literals: []const InternPool.ZonLiteral, complete: bool } {
     const ip = r.ctx.db.env.ip;
     var out: std.ArrayList(InternPool.ZonLiteral) = .empty;
     const add = struct {
@@ -313,11 +315,14 @@ pub fn zonLiteralsOf(r: *Resolver, file: FileId, item: u32, body: *const Body, r
         }
     }.add;
     try add(r, &out, ip, body, res, e);
+    var complete = true;
     const i = @backingInt(e);
     if (out.items.len == 0 and (i >= res.exprs.len or seed.wanted(ip, res.exprs[i]))) {
-        for (try seed.allSeeds(r, file, item, body, res, rel)) |s| try add(r, &out, ip, body, s.res, e);
+        const all = try seed.allSeeds(r, file, item, body, res, rel);
+        complete = all.complete;
+        for (all.seeds) |s| try add(r, &out, ip, body, s.res, e);
     }
-    return out.items;
+    return .{ .literals = out.items, .complete = complete };
 }
 
 /// All references to the field: the name in the `.zon` file, field accesses on values of the type
@@ -844,7 +849,7 @@ const Finder = struct {
                     const ns_def = if (try r.evalNamespace(file, item_index, body, fa.lhs)) |ns| try r.memberDef(ns, f.name) else null;
                     var current: Target = if (ns_def) |d| try f.matches(file, d, try r.pathAlternatives(file, item_index, body, id), at) else try f.refersTo(&res, file, item_index, .{ .e = id }, at);
                     if (current == .unknown) current = try f.importedMember(file, item_index, body, fa.lhs, at);
-                    if (current != .hit and f.is_field and try f.zonFieldIsDef(file, item_index, body, try f.inferred(&res, file, item_index), fa.lhs, range.start)) current = .hit;
+                    if (current != .hit and f.is_field and try f.zonFieldIsDef(file, item_index, body, try f.inferred(&res, file, item_index), fa.lhs, range.start, at)) current = .hit;
                     const target = if (current == .unknown) current else try f.configurations(file, item_index, body, fa.lhs, current == .hit, at);
                     switch (target) {
                         .hit => try f.addLastToken(file, base + range.end, try isWritten(r, &written, body, id)),
@@ -865,7 +870,7 @@ const Finder = struct {
                     if (!std.mem.eql(u8, n, f.name)) continue;
                     const at: Reference = .{ .file = file, .start = base + fi.name_range.start, .end = base + fi.name_range.end };
                     var current = try f.refersTo(&res, file, item_index, .{ .e = id, .field = k }, at);
-                    if (current != .hit and try f.zonFieldIsDef(file, item_index, body, try f.inferred(&res, file, item_index), id, range.start)) current = .hit;
+                    if (current != .hit and try f.zonFieldIsDef(file, item_index, body, try f.inferred(&res, file, item_index), id, range.start, at)) current = .hit;
                     switch (current) {
                         .hit => try f.add(file, at.start, at.end),
                         .miss => {},
@@ -893,7 +898,7 @@ const Finder = struct {
                 .field_access => |fa| if (fa.field != null and std.mem.eql(u8, fa.field.?, f.name)) {
                     const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
                     const literals = try zonLiteralsOf(r, file, item_index, body, try f.inferred(&res, file, item_index), fa.lhs, range.start);
-                    switch (f.literalMatch(literals, literal, at)) {
+                    switch (f.literalMatch(literals.literals, literals.complete, literal, at)) {
                         .hit => try f.addLastToken(file, base + range.end, try isWritten(r, &written, body, id)),
                         .miss => {},
                         .unknown => try f.noteUncertain(&res, file, item_index, fa.lhs, at),
@@ -904,7 +909,7 @@ const Finder = struct {
                     if (!std.mem.eql(u8, n, f.name)) continue;
                     const at: Reference = .{ .file = file, .start = base + fi.name_range.start, .end = base + fi.name_range.end };
                     const literals = try zonLiteralsOf(r, file, item_index, body, try f.inferred(&res, file, item_index), id, range.start);
-                    switch (f.literalMatch(literals, literal, at)) {
+                    switch (f.literalMatch(literals.literals, literals.complete, literal, at)) {
                         .hit => try f.add(file, at.start, at.end),
                         .miss => {},
                         .unknown => try f.noteUncertainLiteral(&res, file, item_index, id, at),
@@ -916,8 +921,12 @@ const Finder = struct {
     }
 
     /// Whether `literals`, the literals a use may refer to, include `literal`; when they also include
-    /// others, the use is recorded as ambiguous (`at`)
-    fn literalMatch(f: *Finder, literals: []const InternPool.ZonLiteral, literal: InternPool.ZonLiteral, at: Reference) Target {
+    /// others, the use is recorded as ambiguous (`at`). When `complete` is false, the use is recorded
+    /// in `Options.incomplete`: the literals under the truncated instances are unknown.
+    fn literalMatch(f: *Finder, literals: []const InternPool.ZonLiteral, complete: bool, literal: InternPool.ZonLiteral, at: Reference) Target {
+        if (!complete) if (f.incomplete) |slot| if (slot.* == null) {
+            slot.* = at;
+        };
         if (literals.len == 0) return .unknown;
         var hit = false;
         var miss = false;
@@ -932,9 +941,15 @@ const Finder = struct {
 
     /// Whether the field named like `def` of the `.zon` file literal that `e` has the type of is
     /// `def`, which it is when the file has a result type: the value is used through its own
-    /// anonymous type at import sites without a result type, and renaming must follow
-    fn zonFieldIsDef(f: *Finder, file: FileId, item_index: u32, body: *const Body, res: *const infer.Result, e: Body.ExprId, rel: u32) resolve.Error!bool {
-        for (try zonLiteralsOf(f.r, file, item_index, body, res, e, rel)) |literal| {
+    /// anonymous type at import sites without a result type, and renaming must follow. When the
+    /// literals are only known under truncated instances, the use is recorded in
+    /// `Options.incomplete` (`at`).
+    fn zonFieldIsDef(f: *Finder, file: FileId, item_index: u32, body: *const Body, res: *const infer.Result, e: Body.ExprId, rel: u32, at: Reference) resolve.Error!bool {
+        const all = try zonLiteralsOf(f.r, file, item_index, body, res, e, rel);
+        if (!all.complete) if (f.incomplete) |slot| if (slot.* == null) {
+            slot.* = at;
+        };
+        for (all.literals) |literal| {
             const site = try zonFieldSite(f.r, .{ .literal = literal, .name = f.name }) orelse continue;
             if (try typedZonField(f.r, site)) |d| if (deepEql(d, f.def)) return true;
             if ((try f.r.ctx.get(database.sema.ZonImports, site.file)).unresolved) {
