@@ -4713,6 +4713,52 @@ test "float math builtins use the precision of the operand type" {
     });
 }
 
+/// c_longdouble arithmetic for `expectLongDouble`
+const long_double_src =
+    \\fn g() void {
+    \\    const lit = @as(c_longdouble, 1.5);
+    \\    const sq = @sqrt(@as(c_longdouble, 4));
+    \\    const div = @as(c_longdouble, 1) / 3;
+    \\    const ma = @mulAdd(c_longdouble, 2, 3, 4);
+    \\    const mx = @max(@as(c_longdouble, -2), 1);
+    \\    const ab = @abs(@as(c_longdouble, -2.5));
+    \\    _ = .{ lit, sq, div, ma, mx, ab };
+    \\}
+;
+
+/// `long_double_src` on `target`; `div` is `1 / 3` rounded to c_longdouble's width there
+fn expectLongDouble(target: InternPool.Target, div: []const u8) !void {
+    try expectTypesTargeted(target, long_double_src, &.{
+        .{ "lit", "c_longdouble = 1.5" },
+        .{ "sq", "c_longdouble = 2" },
+        .{ "div", div },
+        .{ "ma", "c_longdouble = 10" },
+        .{ "mx", "c_longdouble = 1" },
+        .{ "ab", "c_longdouble = 2.5" },
+    });
+}
+
+test "c_longdouble values are computed at the target's long double width" {
+    // Expected values are the results of zig 0.17.1 (long double is f80, f128 and f64 there)
+    try expectLongDouble(try targetOf("x86_64-linux-gnu", null), "c_longdouble = 0.33333333333333333334");
+    try expectLongDouble(try targetOf("aarch64-linux-musl", null), "c_longdouble = 0.3333333333333333333333333333333333");
+    try expectLongDouble(try targetOf("arm-linux-musleabihf", null), "c_longdouble = 0.3333333333333333");
+    // c_longdouble with another float type gives the fixed-width float of the wider width
+    const peer_src =
+        \\fn g() void {
+        \\    const peer = @as(c_longdouble, 1) + @as(f32, 0.5);
+        \\    _ = peer;
+        \\}
+    ;
+    try expectTypesTargeted(try targetOf("x86_64-linux-gnu", null), peer_src, &.{.{ "peer", "f80 = 1.5" }});
+    try expectTypesTargeted(try targetOf("aarch64-linux-musl", null), peer_src, &.{.{ "peer", "f128 = 1.5" }});
+    // Where long double is 64 bits, zig 0.17.1 folds a c_longdouble value coerced to f64 to 0
+    // (this gives `f64 = 0.5`), so no value is given
+    try expectTypesTargeted(try targetOf("arm-linux-musleabihf", null), peer_src, &.{.{ "peer", "f64" }});
+    // No value when the target's long double width is unknown
+    try expectTypesTargeted(.{ .scalar_abi = .unknown }, long_double_src, &.{ .{ "lit", "c_longdouble" }, .{ "div", "c_longdouble" } });
+}
+
 test "rounding builtins have their result type" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (`Sema.zirRoundCast`): with a
     // result type, the call has that type without error unions and optionals. An integer result
