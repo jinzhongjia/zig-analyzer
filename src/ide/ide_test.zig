@@ -4006,6 +4006,29 @@ test "completion on the name of an existing initializer field lists the fields" 
     });
 }
 
+test "completion of union initializer fields stops once a field is assigned" {
+    try expectCompletions(
+        \\const U = union(enum) { ua: u32, ub: void };
+        \\const UU = union { ua: u32, ub: void };
+        \\const S = struct { ua: u32, ub: void };
+        \\
+    , &.{
+        // The empty initializer lists every field
+        .{ "const u: U = .{ .<|> };", "ua ub" },
+        .{ "const u: UU = .{ .<|> };", "ua ub" },
+        // A union initializer takes exactly one field, so after one is assigned there is
+        // nothing left to offer
+        .{ "const u: U = .{ .ua = 1, .<|> };", "" },
+        .{ "const u: U = .{ .ub = {}, .<|> };", "" },
+        .{ "const u: UU = .{ .ua = 1, .<|> };", "" },
+        .{ "const u: ?U = .{ .ua = 1, .<|> };", "" },
+        // A struct initializer takes any number of fields
+        .{ "const s: S = .{ .ua = 1, .<|> };", "ub" },
+        // The field of a nested initializer has its own type
+        .{ "const n: struct { u: U } = .{ .u = .{ .ua = 1, .<|> } };", "" },
+    });
+}
+
 test "decl literal completion keeps the declarations that coerce to the result type" {
     try expectCompletions(
         \\const S = struct {
