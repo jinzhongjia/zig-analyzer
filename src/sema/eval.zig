@@ -2325,7 +2325,7 @@ const Evaluator = struct {
     fn callExpr(ev: *Evaluator, f: *Frame, callee_e: ExprId, args: []const ExprId, want: ?Index) EvalError!Val {
         const ip = ev.ip;
         var self: ?Val = null;
-        const callee: Val = switch (f.body.expr(callee_e)) {
+        const callee_v: Val = switch (f.body.expr(callee_e)) {
             .field_access => |fa| blk: {
                 const name = fa.field orelse return error.Abort;
                 const lhs = try ev.eval(f, fa.lhs, null);
@@ -2350,10 +2350,8 @@ const Evaluator = struct {
             },
             else => try ev.eval(f, callee_e, null),
         };
-        const fty = switch (ip.key(callee.ty)) {
-            .fn_type => |ft| ft,
-            else => return error.Abort,
-        };
+        const callee = try ev.fnCallee(callee_v);
+        const fty = ip.key(callee.ty).fn_type;
         const skip: usize = if (self != null) 1 else 0;
         const vals = try ev.a.alloc(Val, args.len + skip);
         if (self) |s| vals[0] = s;
@@ -2362,6 +2360,21 @@ const Evaluator = struct {
             out.* = try ev.eval(f, a, pt);
         }
         return ev.callFn(callee, fty, vals);
+    }
+
+    /// The function a call calls when its callee is `v`: a function body, or a single-item
+    /// pointer to one, which the compiler calls through (`analyzeCall`)
+    fn fnCallee(ev: *Evaluator, v: Val) EvalError!Val {
+        const ip = ev.ip;
+        switch (ip.key(v.ty)) {
+            .fn_type => return v,
+            .ptr_type => |p| if (p.size == .one and ip.key(p.child) == .fn_type) {
+                const target = try ev.deref(v);
+                if (ip.key(target.ty) == .fn_type) return target;
+            },
+            else => {},
+        }
+        return error.Abort;
     }
 
     /// Calls a function value: through `CallEval` (results are cached) when all arguments can be
@@ -4905,14 +4918,12 @@ const Evaluator = struct {
         }
         if (eq(u8, name, "@call")) {
             if (vals.len != 3) return error.Abort;
-            const fty = switch (ip.key(vals[1].ty)) {
-                .fn_type => |ft| ft,
-                else => return error.Abort,
-            };
+            const callee = try ev.fnCallee(vals[1]);
+            const fty = ip.key(callee.ty).fn_type;
             const n = try ev.elemCount(vals[2]) orelse return error.Abort;
             const call_args = try ev.a.alloc(Val, n);
             for (call_args, 0..) |*x, i| x.* = try ev.elemAt(vals[2], i);
-            return ev.callFn(vals[1], fty, call_args);
+            return ev.callFn(callee, fty, call_args);
         }
         return error.Abort;
     }
