@@ -15,8 +15,9 @@ env:
   ZIG_VERSION: 0.17.1
 
 jobs:
-  # A pull request runs the jobs of the paths it changes; a push to main and a release run every
-  # job, so that changes that pass one at a time still meet each other in CI
+  # A pull request runs the jobs of the paths it changes, and the fast subset of the Zig matrix; a
+  # push to main and a release run every job and every matrix entry, so that changes that pass one
+  # at a time still meet each other in CI
   changes:
     name: Changed paths
     runs-on: ubuntu-latest
@@ -29,6 +30,10 @@ jobs:
       vim: ${{ steps.detect.outputs.vim }}
       updates: ${{ steps.detect.outputs.updates }}
       emacs: ${{ steps.detect.outputs.emacs }}
+      test-matrix: ${{ steps.detect.outputs.test-matrix }}
+      build-matrix: ${{ steps.detect.outputs.build-matrix }}
+      corpus-matrix: ${{ steps.detect.outputs.corpus-matrix }}
+      fuzz-runs: ${{ steps.detect.outputs.fuzz-runs }}
     steps:
       # The three-dot diff of a pull request needs the base commit and the merge base
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,10 +48,11 @@ jobs:
           HEAD: ${{ github.sha }}
         run: |
           set -euo pipefail
-          zig=false vscode=false zed=false nvim=false vim=false updates=false emacs=false
+          zig=false vscode=false zed=false nvim=false vim=false updates=false emacs=false full=false
           all() { zig=true vscode=true zed=true nvim=true vim=true updates=true emacs=true; }
 
           if [ "$EVENT" != pull_request ]; then
+            full=true
             all
           else
             if [ -z "$BASE" ]; then
@@ -59,7 +65,7 @@ jobs:
             while IFS= read -r -d '' path; do
               case "$path" in
                 # A change to CI itself is tested by running all of it
-                .github/workflows/ci.yml) all ;;
+                .github/workflows/ci.yml) all; full=true ;;
                 # The VS Code extension checks its settings against the server's settings table
                 src/server/Config.zig) zig=true; vscode=true ;;
                 src/*|tools/*|build.zig|build.zig.zon|zig-analyzer.default.zon) zig=true ;;
@@ -81,12 +87,67 @@ jobs:
                 *)
                   echo "::warning file=.github/workflows/ci.yml,title=No CI path rule::$path matches no rule in the Changed paths job, so every job runs; add a rule for it"
                   all
+                  full=true
                   ;;
               esac
             done < "$changed"
           fi
 
-          printf 'Jobs: zig=%s vscode=%s zed=%s nvim=%s vim=%s updates=%s emacs=%s\n' "$zig" "$vscode" "$zed" "$nvim" "$vim" "$updates" "$emacs"
+          # A pull request runs the fast matrix. It runs the whole suite (including the tests that
+          # start a real zig) on Linux in Debug, and only the tests that need no external tools
+          # on macOS and Windows, where a project load and a zig start are the slowest and most
+          # of the suite's duration is in end-to-end tests. The build job checks every system,
+          # but compiles the tools only on Linux. A push to main, a release, and a change to CI
+          # itself run every combination. Shards of the test suite run in parallel in one job
+          # (see `-Dtest-shards`), so a job is as long as its longest shard, not as long as the
+          # whole suite.
+          shards=4
+          if [ "$full" = true ]; then
+            test_matrix='{"include":[
+              {"os":"ubuntu-latest","zig":"0.17.0","optimize":"Debug","suite":"test-all","shards":'"$shards"'},
+              {"os":"ubuntu-latest","zig":"0.17.0","optimize":"ReleaseSafe","suite":"test-all","shards":'"$shards"'},
+              {"os":"ubuntu-latest","zig":"0.17.1","optimize":"Debug","suite":"test-all","shards":'"$shards"'},
+              {"os":"ubuntu-latest","zig":"0.17.1","optimize":"ReleaseSafe","suite":"test-all","shards":'"$shards"'},
+              {"os":"macos-latest","zig":"0.17.0","optimize":"ReleaseSafe","suite":"test-all","shards":'"$shards"'},
+              {"os":"macos-latest","zig":"0.17.1","optimize":"Debug","suite":"test-all","shards":'"$shards"'},
+              {"os":"macos-latest","zig":"0.17.1","optimize":"ReleaseSafe","suite":"test-all","shards":'"$shards"'},
+              {"os":"windows-latest","zig":"0.17.0","optimize":"ReleaseSafe","suite":"test-all","shards":'"$shards"'},
+              {"os":"windows-latest","zig":"0.17.1","optimize":"Debug","suite":"test-all","shards":'"$shards"'},
+              {"os":"windows-latest","zig":"0.17.1","optimize":"ReleaseSafe","suite":"test-all","shards":'"$shards"'}
+            ]}'
+            build_matrix='{"include":[
+              {"os":"ubuntu-latest","zig":"0.17.0","check":true},
+              {"os":"ubuntu-latest","zig":"0.17.1","check":true},
+              {"os":"macos-latest","zig":"0.17.1","check":true},
+              {"os":"windows-latest","zig":"0.17.1","check":true}
+            ]}'
+            corpus_matrix='{"include":[{"os":"ubuntu-latest","zig":"0.17.0"},{"os":"ubuntu-latest","zig":"0.17.1"}]}'
+            fuzz_runs=50K
+          else
+            test_matrix='{"include":[
+              {"os":"ubuntu-latest","zig":"0.17.0","optimize":"Debug","suite":"test-all","shards":'"$shards"'},
+              {"os":"ubuntu-latest","zig":"0.17.1","optimize":"Debug","suite":"test-all","shards":'"$shards"'},
+              {"os":"macos-latest","zig":"0.17.1","optimize":"Debug","suite":"test","shards":'"$shards"'},
+              {"os":"windows-latest","zig":"0.17.1","optimize":"Debug","suite":"test","shards":'"$shards"'}
+            ]}'
+            build_matrix='{"include":[
+              {"os":"ubuntu-latest","zig":"0.17.1","check":true},
+              {"os":"macos-latest","zig":"0.17.1","check":false},
+              {"os":"windows-latest","zig":"0.17.1","check":false}
+            ]}'
+            corpus_matrix='{"include":[{"os":"ubuntu-latest","zig":"0.17.1"}]}'
+            fuzz_runs=10K
+          fi
+          # The matrices are single lines for GITHUB_OUTPUT
+          test_matrix=$(printf '%s' "$test_matrix" | tr -d '\n')
+          build_matrix=$(printf '%s' "$build_matrix" | tr -d '\n')
+          corpus_matrix=$(printf '%s' "$corpus_matrix" | tr -d '\n')
+
+          printf 'Jobs: full=%s zig=%s vscode=%s zed=%s nvim=%s vim=%s updates=%s emacs=%s\n' "$full" "$zig" "$vscode" "$zed" "$nvim" "$vim" "$updates" "$emacs"
+          printf 'Test matrix: %s\n' "$test_matrix"
+          printf 'Build matrix: %s\n' "$build_matrix"
+          printf 'Corpus matrix: %s\n' "$corpus_matrix"
+          printf 'Fuzz runs: %s\n' "$fuzz_runs"
           {
             printf 'zig=%s\n' "$zig"
             printf 'vscode=%s\n' "$vscode"
@@ -95,6 +156,10 @@ jobs:
             printf 'vim=%s\n' "$vim"
             printf 'updates=%s\n' "$updates"
             printf 'emacs=%s\n' "$emacs"
+            printf 'test-matrix=%s\n' "$test_matrix"
+            printf 'build-matrix=%s\n' "$build_matrix"
+            printf 'corpus-matrix=%s\n' "$corpus_matrix"
+            printf 'fuzz-runs=%s\n' "$fuzz_runs"
           } >> "$GITHUB_OUTPUT"
 
   updates:
@@ -118,20 +183,17 @@ jobs:
     if: needs.changes.outputs.zig == 'true'
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        zig: [0.17.0, 0.17.1]
-        optimize: [Debug, ReleaseSafe]
+      matrix: ${{ fromJSON(needs.changes.outputs.test-matrix) }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ matrix.zig }}
           cache-key: test-${{ matrix.optimize }}
-      - name: All tests
-        run: zig build test-all -Doptimize=${{ matrix.optimize }} --summary all
+      - name: zig build ${{ matrix.suite }} (in ${{ matrix.shards }} shards)
+        run: zig build ${{ matrix.suite }} -Doptimize=${{ matrix.optimize }} -Dtest-shards=${{ matrix.shards }} --summary all
 
   build:
     name: Build (${{ matrix.os }}, Zig ${{ matrix.zig }})
@@ -139,11 +201,9 @@ jobs:
     if: needs.changes.outputs.zig == 'true'
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        zig: [0.17.0, 0.17.1]
+      matrix: ${{ fromJSON(needs.changes.outputs.build-matrix) }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -153,6 +213,7 @@ jobs:
       - name: Build the executable
         run: zig build -Doptimize=ReleaseSafe
       - name: Compile check (including the tools)
+        if: matrix.check
         run: zig build check -Doptimize=ReleaseSafe
 
   corpus:
@@ -161,11 +222,9 @@ jobs:
     if: needs.changes.outputs.zig == 'true'
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        zig: [0.17.0, 0.17.1]
+      matrix: ${{ fromJSON(needs.changes.outputs.corpus-matrix) }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -208,9 +267,10 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       # Use ReleaseSafe: Debug builds on Linux x86_64 use the self-hosted backend by default, which
       # does not support coverage instrumentation (pcs_len in the coverage file is 0); ReleaseSafe
-      # uses LLVM and also has higher throughput. 50K runs per fuzz target.
+      # uses LLVM and also has higher throughput. A pull request runs 10K runs per fuzz target;
+      # main and releases run 50K.
       - name: zig build test --fuzz
-        run: zig build test -Doptimize=ReleaseSafe --fuzz=50K
+        run: zig build test -Doptimize=ReleaseSafe --fuzz=${{ needs.changes.outputs.fuzz-runs }}
 
   vscode:
     name: VS Code extension
