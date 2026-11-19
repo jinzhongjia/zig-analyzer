@@ -125,8 +125,8 @@ pub fn atSeeded(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) re
 /// result, with `seeded` set to it
 pub fn allSeeded(r: *Resolver, a: At) resolve.Error![]const At {
     const seeds = try seed.allSeeds(r, a.file, a.item, a.body, a.res, a.rel);
-    const out = try r.arena.alloc(At, seeds.len);
-    for (seeds, out) |s, *x| {
+    const out = try r.arena.alloc(At, seeds.seeds.len);
+    for (seeds.seeds, out) |s, *x| {
         x.* = a;
         x.seeded = s;
     }

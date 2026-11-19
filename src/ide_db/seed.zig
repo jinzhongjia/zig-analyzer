@@ -98,7 +98,7 @@ pub const Refiner = struct {
                     1 => for (try f.r.ctx.get(Instances, .{ .owner = f.owner, .depth = max_depth })) |found| try f.add(found),
                     // All instances: branches that run only in some instances (the prongs of
                     // `switch (@typeInfo(T))`) are refined by them
-                    2 => for (try allFound(f.r, f.owner)) |found| try f.add(found),
+                    2 => for ((try allFound(f.r, f.owner)).found) |found| try f.add(found),
                     else => unreachable,
                 }
                 f.stage_ends[stage] = f.candidates.items.len;
@@ -347,16 +347,18 @@ const Combinations = struct {
 /// call site) whose code at `rel` executes, in discovery order. In a region inferred per iteration
 /// (see `iterationResults`), the results of each combination of iterations of the abstract
 /// inference `res` and of every instance. Used where an answer must cover all instances, such as
-/// goto, which lists the target under each of them.
-pub fn allSeeds(r: *Resolver, file: FileId, item: u32, body: *const Body, res: *const infer.Result, rel: u32) resolve.Error![]const Seed {
-    if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return &.{};
+/// goto, which lists the target under each of them. `complete` is false when the instances were
+/// truncated because instantiation grows without bound.
+pub fn allSeeds(r: *Resolver, file: FileId, item: u32, body: *const Body, res: *const infer.Result, rel: u32) resolve.Error!struct { seeds: []const Seed, complete: bool } {
+    if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return .{ .seeds = &.{}, .complete = true };
     const owner = try r.ownerKey(file, item);
-    const node_offset = try r.itemOffset(file, item) orelse return &.{};
+    const node_offset = try r.itemOffset(file, item) orelse return .{ .seeds = &.{}, .complete = true };
     var out: std.ArrayList(Seed) = .empty;
     var instances: std.ArrayList(?Seed) = .empty;
     try instances.append(r.arena, null);
     var seen: std.AutoHashMapUnmanaged(Index, void) = .empty;
-    for (try allFound(r, owner)) |found| {
+    const all = try allFound(r, owner);
+    for (all.found) |found| {
         const inst = found.inst orelse continue;
         if (seen.contains(inst)) continue;
         try instances.append(r.arena, try present(r, owner, found) orelse continue);
@@ -373,7 +375,7 @@ pub fn allSeeds(r: *Resolver, file: FileId, item: u32, body: *const Body, res: *
             try out.append(r.arena, try per.combos.seed(it, node_offset));
         }
     }
-    return out.items;
+    return .{ .seeds = out.items, .complete = all.complete };
 }
 
 /// The regions inferred per iteration of a member body, in expression order
@@ -839,18 +841,19 @@ pub const CallsIn = struct {
 };
 
 /// Call sites of all instances of member `owner` (see `AllInstances`), with the instances
-/// normalized for the member
-pub fn allFound(r: *Resolver, owner: hir.OwnerKey) resolve.Error![]const Found {
+/// normalized for the member. `complete` is false when the closure was truncated because
+/// instantiation grows without bound.
+pub fn allFound(r: *Resolver, owner: hir.OwnerKey) resolve.Error!struct { found: []const Found, complete: bool } {
     const tree = try r.itemTree(owner.file);
-    const item: u32 = tree.itemOf(owner.item) orelse return &.{};
-    const root = try genericRoot(r, owner.file, item) orelse return &.{};
+    const item: u32 = tree.itemOf(owner.item) orelse return .{ .found = &.{}, .complete = true };
+    const root = try genericRoot(r, owner.file, item) orelse return .{ .found = &.{}, .complete = true };
     const all = try r.ctx.get(AllInstances, try r.ownerKey(owner.file, root));
     const out = try r.arena.alloc(Found, all.found.len);
     for (all.found, out) |f, *o| {
         o.* = f;
         o.inst = try queries.normalizeInst(r, owner.file, item, f.inst.?);
     }
-    return out;
+    return .{ .found = out, .complete = all.complete };
 }
 
 /// Limit on the argument nesting depth of instances in the closure: code that compiles instantiates
