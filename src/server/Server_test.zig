@@ -2062,6 +2062,81 @@ fn symbolNames(h: anytype, document_uri: []const u8) ![]const []const u8 {
     return names.items;
 }
 
+/// Position of the start of `needle` in `text`
+fn positionOf(text: []const u8, needle: []const u8) struct { line: u32, character: u32 } {
+    const offset = std.mem.indexOf(u8, text, needle).?;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
+    return .{ .line = @intCast(std.mem.count(u8, text[0..offset], "\n")), .character = @intCast(offset - line_start) };
+}
+
+test "rename checks strings in files that reach the definition without importing it" {
+    // Rename edits `v.x` in helper.zig, which does not import lib.zig, so it has to check for
+    // strings there too: `@field(v, "x")` would be left behind and break the instantiation.
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const lib_text = "pub const S = struct { x: u32 };\n";
+    const helper_text =
+        \\pub fn probe(v: anytype) u32 {
+        \\    return v.x + @field(v, "x");
+        \\}
+        \\
+    ;
+    const main_text =
+        \\const lib = @import("lib.zig");
+        \\const helper = @import("helper.zig");
+        \\pub fn main() void {
+        \\    const s: lib.S = .{ .x = 1 };
+        \\    _ = helper.probe(s);
+        \\}
+        \\
+    ;
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "lib.zig", .data = lib_text });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "helper.zig", .data = helper_text });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "main.zig", .data = main_text });
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(a, root),
+        .capabilities = Empty{},
+        .initializationOptions = .{ .zig = .{ .path = "/nonexistent/zig" } },
+    });
+    try h.notify("initialized", Empty{});
+    const lib_uri = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "lib.zig" }));
+    const helper_uri = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "helper.zig" }));
+    const main_uri = try za.base.uri.fromPath(a, try std.fs.path.join(a, &.{ root, "main.zig" }));
+    for ([_]struct { []const u8, []const u8 }{
+        .{ lib_uri, lib_text },
+        .{ helper_uri, helper_text },
+        .{ main_uri, main_text },
+    }) |doc| try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = doc[0], .languageId = "zig", .version = 1, .text = doc[1] } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    const at = positionOf(lib_text, "x: u32");
+    const refs = try h.request("textDocument/references", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .context = .{ .includeDeclaration = true } });
+    var reaches_helper = false;
+    for (refs.object.get("result").?.array.items) |l| {
+        if (std.mem.eql(u8, l.object.get("uri").?.string, helper_uri)) reaches_helper = true;
+    }
+    try testing.expect(reaches_helper);
+
+    const renamed = try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = at, .newName = "y" });
+    try testing.expect(renamed.object.get("error") != null);
+    const message = renamed.object.get("error").?.object.get("message").?.string;
+    try testing.expect(std.mem.indexOf(u8, message, "appears in a string literal") != null);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "didChange for a document that is not open changes nothing" {
     const Harness = @import("test_harness.zig").Harness;
     const prev_level = testing.log_level;

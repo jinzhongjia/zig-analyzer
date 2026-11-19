@@ -333,11 +333,7 @@ fn zonFieldReferences(r: *Resolver, field: ZonField, opts: Options) resolve.Erro
         slot.* = decl;
     };
     try noteSyntaxError(r, opts.syntax_error, site.file);
-    const reach = if (opts.only_file) |f|
-        (if (f == site.file or try reaches(r, f, site.file)) try r.arena.dupe(FileId, &.{f}) else &.{})
-    else
-        try importers(r, site.file, opts.scope);
-    const files = if (opts.only_file) |f| try r.arena.dupe(FileId, &.{f}) else try candidateFiles(r, reach, opts.scope);
+    const files = if (opts.only_file) |f| try r.arena.dupe(FileId, &.{f}) else try candidateFilesFor(r, site.file, opts.scope);
     // The name of `Finder.def` is what this looks for; its other uses are not reached from here
     var finder: Finder = .{ .r = r, .def = .{ .file = site.file }, .is_field = true, .name = field.name, .out = &out, .ambiguous = opts.ambiguous, .uncertain = opts.uncertain, .incomplete = opts.incomplete, .zon_import = opts.zon_import };
     for (files) |f| {
@@ -428,7 +424,7 @@ pub fn labelReferences(r: *Resolver, label: Label) resolve.Error![]Reference {
 /// left-hand side is an error set in some call-site instances only as ambiguous (`opts`)
 pub fn findErrorReferences(r: *Resolver, name: []const u8, file: FileId, opts: Options) resolve.Error![]Reference {
     var out: std.ArrayList(Reference) = .empty;
-    const files = if (opts.only_file) |f| try r.arena.dupe(FileId, &.{f}) else try candidateFiles(r, try importers(r, file, opts.scope), opts.scope);
+    const files = if (opts.only_file) |f| try r.arena.dupe(FileId, &.{f}) else try candidateFilesFor(r, file, opts.scope);
     for (files) |f| {
         if (!(try r.ctx.get(FileIndex.Query, f)).contains(name)) continue;
         try noteSyntaxError(r, opts.syntax_error, f);
@@ -591,6 +587,13 @@ pub fn candidateFiles(r: *Resolver, reach: []const FileId, scope: []const FileId
     var out: std.ArrayList(FileId) = .empty;
     for (try reachable(r, reach)) |f| if (keep.contains(f)) try out.append(r.arena, f);
     return out.items;
+}
+
+/// Candidate files that may reference a declaration in `file`: the files in `scope` that import
+/// `file`, directly or through files outside the scope, and the files those reach (see
+/// `candidateFiles`), `file` itself included
+pub fn candidateFilesFor(r: *Resolver, file: FileId, scope: []const FileId) resolve.Error![]const FileId {
+    return candidateFiles(r, try importers(r, file, scope), scope);
 }
 
 /// Files reachable from `from` through `@import` chains (through any files, including the
