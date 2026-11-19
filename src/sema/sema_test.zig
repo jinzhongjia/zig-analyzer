@@ -4458,6 +4458,27 @@ test "oversized layouts degrade to unknown instead of overflowing" {
     });
 }
 
+test "?noreturn has size 0 and alignment 1" {
+    // Prevents `?noreturn` layouts from being unknown because `noreturn` itself has no layout
+    try expectTypes(
+        \\const sz = @sizeOf(?noreturn);
+        \\const al = @alignOf(?noreturn);
+        \\const sz_nested = @sizeOf(??noreturn);
+        \\const al_nested = @alignOf(??noreturn);
+        \\const sz_array = @sizeOf([2]?noreturn);
+        \\const bits = @bitSizeOf(?noreturn);
+        \\const sz_bare = @sizeOf(noreturn);
+    , &.{
+        .{ "sz", "comptime_int = 0" },
+        .{ "al", "comptime_int = 1" },
+        .{ "sz_nested", "comptime_int = 1" },
+        .{ "al_nested", "comptime_int = 1" },
+        .{ "sz_array", "comptime_int = 0" },
+        .{ "bits", "comptime_int" },
+        .{ "sz_bare", "comptime_int" },
+    });
+}
+
 test "error code layouts follow the error limit" {
     // Prevents assuming 16-bit error codes when the compilation sets an error limit; expected
     // values are the results of zig 0.17.0 with `--error-limit 255`

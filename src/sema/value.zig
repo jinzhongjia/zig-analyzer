@@ -897,7 +897,7 @@ pub fn typeLayout(ip: *InternPool, t: Index) ?Layout {
             else
                 .{ .size = ptr_bytes, .alignment = alignment, .bits = pointer_bits };
         },
-        .optional_type => |c| optionalLayout(ip, c, typeLayout(ip, c) orelse return null),
+        .optional_type => |c| if (c == .noreturn_type) optional_noreturn_layout else optionalLayout(ip, c, typeLayout(ip, c) orelse return null),
         .array_type => |a| arrayLayout(typeLayout(ip, a.child) orelse return null, a, hasBitRepr(ip, a.child)),
         .error_union_type => |eu| errorUnionLayout(ip, typeLayout(ip, eu.payload) orelse return null),
         .vector_type => |v| vectorLayout(ip, v.len, v.child),
@@ -999,6 +999,10 @@ pub fn intLayout(ip: *InternPool, bits: u16) ?Layout {
     if (@min(natural, max_align.max) != alignment) return null;
     return .{ .size = std.mem.alignForward(u64, bytes, alignment), .alignment = alignment, .bits = bits };
 }
+
+/// `?noreturn`: it can only hold `null`, so it stores nothing, although `noreturn` itself has no
+/// layout; like other optionals of non-pointers it has no bit representation
+pub const optional_noreturn_layout: Layout = .{ .size = 0, .alignment = 1, .bits = null };
 
 /// `?T`: non-C pointers (including slices) and error sets represent null as zero and have the
 /// size of the payload; the rest add a flag after the payload, padded to the payload's alignment.
