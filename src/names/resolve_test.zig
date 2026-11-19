@@ -416,6 +416,73 @@ test "imports: relative files, modules, std and root" {
     try testing.expectEqualStrings("Allocator eql", try w.complete(main.file, main.cursor));
 }
 
+test "relative imports may not leave the module root" {
+    // The compiler reports `import of file outside module path`: `/p/other.zig` is not part of
+    // the module rooted at `/p/src/main.zig`, so the import stays unknown.
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/src/main.zig module:app
+        \\const util = @import("util.zig");
+        \\pub fn main() void {
+        \\    util.run();
+        \\}
+        \\//- /p/src/util.zig in:app
+        \\const other = @import("../other.zig");
+        \\pub fn run() void {
+        \\    other.thing<|>;
+        \\}
+        \\//- /p/other.zig
+        \\pub const thing = 1;
+    );
+    const util = f.file("/p/src/util.zig");
+    try testing.expectEqualStrings("null", try w.goto(util, f.cursor.?.offset));
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    try testing.expectEqual(@as(?FileId, null), try r.resolveImport(util, "../other.zig"));
+}
+
+test "relative imports inside the module root resolve" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/src/main.zig module:app
+        \\pub const value = 1;
+        \\//- /p/src/a/util.zig in:app
+        \\const main = @import("../main.zig");
+        \\pub const value = main.value<|>;
+    );
+    const util = f.file("/p/src/a/util.zig");
+    try testing.expectEqualStrings("main.zig:value", try w.goto(util, f.cursor.?.offset));
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    try testing.expectEqual(@as(?FileId, f.file("/p/src/main.zig")), try r.resolveImport(util, "../main.zig"));
+}
+
+test "relative imports of a file outside the module graph resolve" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/src/main.zig module:app
+        \\//- /p/loose.zig
+        \\const sibling = @import("sibling.zig");
+        \\pub const value = sibling.value<|>;
+        \\//- /p/sibling.zig
+        \\pub const value = 1;
+    );
+    const loose = f.file("/p/loose.zig");
+    try testing.expectEqualStrings("sibling.zig:value", try w.goto(loose, f.cursor.?.offset));
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    try testing.expectEqual(@as(?FileId, f.file("/p/sibling.zig")), try r.resolveImport(loose, "sibling.zig"));
+}
+
 test "imports of a file in several modules" {
     var w: World = undefined;
     try w.init();

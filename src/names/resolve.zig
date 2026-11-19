@@ -298,7 +298,25 @@ pub const Resolver = struct {
     pub fn resolveImport(r: *Resolver, file: FileId, name: []const u8) Error!?FileId {
         if (std.mem.endsWith(u8, name, ".zig") or std.mem.endsWith(u8, name, ".zon")) {
             const dir = std.fs.path.dirname(r.vfs().path(file)) orelse return null;
-            return try r.vfs().intern(try std.fs.path.join(r.arena, &.{ dir, name }));
+            const target = try Vfs.resolve(.native, r.arena, dir, name) orelse return null;
+            // A relative import may not leave the directory of the module root: the compiler
+            // reports `import of file outside module path` and compiles nothing from it. A file
+            // outside the module graph has no single module root here (build scripts are rooted
+            // at the build root, single-file roots are computed from imports), so its imports are
+            // not limited.
+            if (try r.ctx.get(ModuleGraph.Input, {})) |graph| if (graph.entry(file)) |e| {
+                var allowed = false;
+                for ([_][]const u32{ &.{e.module}, e.others }) |modules| for (modules) |m| {
+                    const root: ?FileId = if (m == ModuleGraph.std_module) graph.std_root else graph.modules[m].root;
+                    const module_dir = std.fs.path.dirname(r.vfs().path(root orelse continue)) orelse continue;
+                    if (r.vfs().isUnder(target, module_dir)) {
+                        allowed = true;
+                        break;
+                    }
+                };
+                if (!allowed) return null;
+            };
+            return try r.vfs().intern(target);
         }
         if (r.context) |c| if (ModuleGraph.isContextName(name)) {
             const targets = try r.ctx.get(ModuleGraph.ContextImports, .{ .file = file, .context = c });
