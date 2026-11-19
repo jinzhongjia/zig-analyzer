@@ -7162,7 +7162,7 @@ fn checkedRename(server: *Server, r: *Resolver, arena: Allocator, def: za.names.
     // Strings (`@field`, `@hasDecl`, `@fieldParentPtr`, serialization keys) can name only
     // container members, and one without `pub` only in its own file
     if (def == .item) {
-        const files = if (try za.ide_db.search.visibleOutsideFile(r, def)) try za.ide_db.search.importers(r, def_file, try server.searchScope(r)) else try arena.dupe(Vfs.FileId, &.{def_file});
+        const files = if (try za.ide_db.search.visibleOutsideFile(r, def)) try za.ide_db.search.candidateFilesFor(r, def_file, try server.searchScope(r)) else try arena.dupe(Vfs.FileId, &.{def_file});
         if (try ide.rename.stringReference(r, files, old)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
     }
     return .{ .ok = .{ .refs = refs, .text = text } };
@@ -7205,7 +7205,7 @@ fn checkedZonFieldRename(server: *Server, r: *Resolver, arena: Allocator, field:
     var edits: std.ArrayList(ide.rename.Edit) = .empty;
     for (refs) |ref| if (ref.file == file) try edits.append(arena, .{ .start = ref.start, .end = ref.end, .text = text });
     if (try ide.rename.verifyAstGen(r, file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    const files = try za.ide_db.search.importers(r, file, try server.searchScope(r));
+    const files = try za.ide_db.search.candidateFilesFor(r, file, try server.searchScope(r));
     if (try ide.rename.stringReference(r, files, old)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
     return .{ .ok = .{ .refs = refs, .text = text } };
 }
@@ -7223,7 +7223,7 @@ fn checkedErrorRename(server: *Server, r: *Resolver, arena: Allocator, file: Vfs
     };
     const scope = try server.searchScope(r);
     if (try ide.rename.errorNameConflict(r, file, scope, old, try decodedName(arena, new))) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    const files = try za.ide_db.search.candidateFiles(r, try za.ide_db.search.importers(r, file, scope), scope);
+    const files = try za.ide_db.search.candidateFilesFor(r, file, scope);
     if (try ide.rename.stringReference(r, files, old)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
     // Error names may be names of primitive types (`error.u8`)
     const text = try identifierText(arena, new, true);
