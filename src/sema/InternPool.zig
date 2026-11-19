@@ -415,8 +415,12 @@ pub const Key = union(enum) {
 /// Members of an error set, without duplicates. Two sets with the same members are the same
 /// type whatever the order of their names: identity (hashing, equality) follows `sorted`, and
 /// `names` keeps the order of the first set interned with these members. The compiler lists
-/// `@typeInfo(E).error_set.error_names` in the order in which it first saw each name (in
-/// practice, the declaration order), but `@typeName` sorted by bytes.
+/// `@typeInfo(E).error_set.error_names` in the order in which each name string first entered its
+/// string table anywhere in the compilation (any identifier counts, including declarations in the
+/// standard library), and `@typeName` sorted by bytes. That order depends on what the whole
+/// compilation analyzed before, which is not available here; `names` gives the same result when
+/// the names of a set first appear in it, which for a declared set is its declaration order and
+/// for an inferred set the order of the returned errors.
 pub const ErrorSet = struct {
     names: []const []const u8,
     /// Indexes into `names`, ordering the names by their bytes
