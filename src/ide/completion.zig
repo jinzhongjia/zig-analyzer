@@ -222,9 +222,10 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
 /// auto-import candidates take their own scores (see `localMembers` and `imports.Candidate.score`);
 /// candidates whose type fits the expected type at the cursor are further multiplied by
 /// `expected_boost` (see `Expected`). From high to low, keeping the collection order among equal
-/// scores. Names in scope that do not match the input score 0, sort last, and are filtered by the
-/// client. The expected type only changes the order of the returned candidates, not which ones are
-/// kept (the limit applies to the unboosted scores)
+/// scores; among names in scope whose scores are equal, those whose spelling starts with the input
+/// in the same case come first. Names in scope that do not match the input score 0, sort last, and
+/// are filtered by the client. The expected type only changes the order of the returned
+/// candidates, not which ones are kept (the limit applies to the unboosted scores)
 fn rank(arena: Allocator, items: []Item, prefix: []const u8, expected: ?Expected) resolve.Error!void {
     var matcher: fuzzy.Matcher = try .init(arena, prefix);
     for (items) |*it| {
@@ -233,8 +234,21 @@ fn rank(arena: Allocator, items: []Item, prefix: []const u8, expected: ?Expected
             it.score *= expected_boost;
         };
     }
-    std.mem.sort(Item, items, {}, higherScore);
+    std.mem.sort(Item, items, Rank{ .prefix = prefix }, higherRank);
     for (items, 0..) |*it, i| it.sort = try std.fmt.allocPrint(arena, "{d:0>5}", .{i});
+}
+
+const Rank = struct {
+    /// The input; a name that starts with it in the same case is preferred among equal scores
+    prefix: []const u8,
+};
+
+fn higherRank(ctx: Rank, a: Item, b: Item) bool {
+    if (a.score != b.score) return a.score > b.score;
+    // Only names in scope take the case tie-break: member paths and auto-import candidates keep
+    // their own order among equal scores
+    if (a.weight == 0 or b.weight == 0) return false;
+    return std.mem.startsWith(u8, a.label, ctx.prefix) and !std.mem.startsWith(u8, b.label, ctx.prefix);
 }
 
 fn higherScore(_: void, a: Item, b: Item) bool {

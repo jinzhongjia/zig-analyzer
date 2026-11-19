@@ -964,6 +964,21 @@ test "local member paths filter by the member name when it starts with the input
     } else return error.MissingCompletion;
 }
 
+test "name completion ranks names whose case agrees before other ties" {
+    // With an all-lowercase input, `Mem` and `mem` score the same; the one whose case agrees with
+    // the input comes first.
+    const labels = try completionLabels(
+        \\const Mem = 1;
+        \\const mem = 2;
+        \\fn f() u32 {
+        \\    return mem<|>;
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("mem Mem f", labels);
+}
+
 test "local member paths rank below scope names and above namespace members, deeper paths lower" {
     var w: World = undefined;
     try w.init();
