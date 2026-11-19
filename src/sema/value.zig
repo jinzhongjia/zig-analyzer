@@ -197,9 +197,10 @@ pub fn binaryInt(ip: *InternPool, op: SyntaxKind, ty: Index, a: i128, b: i128) ?
         .asterisk => mul(ip, ty, x, y, .check),
         .asterisk_percent => mul(ip, ty, x, y, .wrap),
         .asterisk_pipe => mul(ip, ty, x, y, .saturate),
-        // Signed `/` and `%` require @divTrunc etc., so only nonnegative operands are folded
-        .slash => if (y <= 0 or x < 0) null else fit(ip, ty, @divTrunc(x, y), .check),
-        .percent => if (y <= 0 or x < 0) null else fit(ip, ty, @rem(x, y), .check),
+        // `/` truncates toward zero for every sign. `%` with a negative operand is rejected by
+        // the compiler unless the remainder is zero.
+        .slash => if (y == 0) null else fit(ip, ty, @divTrunc(x, y), .check),
+        .percent => if (y == 0) null else if (@rem(x, y) == 0) 0 else if (y < 0 or x < 0) null else fit(ip, ty, @rem(x, y), .check),
         .ampersand => fit(ip, ty, x & y, .check),
         .pipe => fit(ip, ty, x | y, .check),
         .caret => fit(ip, ty, x ^ y, .check),
@@ -2036,7 +2037,10 @@ test "integer folding follows the type's width" {
     // the u8 shift of the machine integer)
     const u1000_t = try ip.intType(.unsigned, 1000);
     try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .angle_bracket_angle_bracket_right, u1000_t, 5, 300));
-    try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .slash, i8_t, -4, 2));
+    try testing.expectEqual(@as(?i128, -2), binaryInt(&ip, .slash, i8_t, -4, 2));
+    try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .slash, i8_t, -128, -1));
+    try testing.expectEqual(@as(?i128, 0), binaryInt(&ip, .percent, i8_t, -4, 2));
+    try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .percent, i8_t, -5, 2));
     try testing.expectEqual(@as(?i128, null), negate(&ip, i8_t, -128, false));
     try testing.expectEqual(@as(?i128, -128), negate(&ip, i8_t, -128, true));
     try testing.expectEqual(@as(?i128, 0xfe), bitNot(&ip, u8_t, 1));

@@ -8305,6 +8305,54 @@ test "integer types wider than 128 bits are computed at arbitrary precision" {
     });
 }
 
+test "signed division truncates toward zero and a zero remainder folds" {
+    // Signed `/` and a `%` with a zero remainder gave no value.
+    // Expected values are the results of zig 0.17.1.
+    try expectTypes(
+        \\const ct_div = -7 / 2;
+        \\const ct_div_neg_rhs = 7 / -2;
+        \\const ct_rem_zero = -4 % 2;
+        \\const i64_div = @as(i64, -7) / 2;
+        \\const i64_div_neg_rhs = @as(i64, 7) / -2;
+        \\const i64_div_both_neg = @as(i64, -7) / -2;
+        \\const i64_rem_zero = @as(i64, -4) % 2;
+        \\const i64_rem_zero_neg_rhs = @as(i64, 4) % -2;
+        \\const i64_rem_neg = @as(i64, -7) % 2;
+        \\const i8_div_overflow = @as(i8, -128) / -1;
+        \\const i256_div = @as(i256, -7) / 2;
+        \\const i256_div_big = @as(i256, -(1 << 200)) / -3;
+        \\const i256_rem_zero = @as(i256, -4) % 2;
+        \\const i256_rem_neg = @as(i256, -7) % 2;
+        \\const i256_div_overflow = @as(i256, -(1 << 255)) / -1;
+        \\const in_block = comptime blk: {
+        \\    var x: i64 = -7;
+        \\    x /= 2;
+        \\    break :blk x;
+        \\};
+        \\fn g() void {
+        \\    _ = .{ ct_div, ct_div_neg_rhs, ct_rem_zero, i64_div, i64_div_neg_rhs, i64_div_both_neg, i64_rem_zero, i64_rem_zero_neg_rhs, i64_rem_neg, i8_div_overflow, i256_div, i256_div_big, i256_rem_zero, i256_rem_neg, i256_div_overflow, in_block };
+        \\}
+    , &.{
+        .{ "ct_div", "comptime_int = -3" },
+        .{ "ct_div_neg_rhs", "comptime_int = -3" },
+        .{ "ct_rem_zero", "comptime_int = 0" },
+        .{ "i64_div", "i64 = -3" },
+        .{ "i64_div_neg_rhs", "i64 = -3" },
+        .{ "i64_div_both_neg", "i64 = 3" },
+        .{ "i64_rem_zero", "i64 = 0" },
+        .{ "i64_rem_zero_neg_rhs", "i64 = 0" },
+        // The compiler rejects `%` with a negative operand and a nonzero remainder
+        .{ "i64_rem_neg", "i64" },
+        .{ "i8_div_overflow", "i8" },
+        .{ "i256_div", "i256 = -3" },
+        .{ "i256_div_big", "i256 = 535646014752996758513987364113720867507400997927597611767125" },
+        .{ "i256_rem_zero", "i256 = 0" },
+        .{ "i256_rem_neg", "i256" },
+        .{ "i256_div_overflow", "i256" },
+        .{ "in_block", "i64 = -3" },
+    });
+}
+
 test "builtins on integer types wider than 128 bits" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both)
     try expectTypes(
