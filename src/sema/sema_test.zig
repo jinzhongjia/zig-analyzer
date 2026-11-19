@@ -11834,6 +11834,31 @@ test "comptime evaluation: vector operators, @reduce, @select and @shuffle" {
     });
 }
 
+test "comptime evaluation: unary vector operators" {
+    // Expected values are the results of zig 0.17.1: `-`, `-%`, `~` and `!` apply the scalar
+    // operator to each element
+    try expectTypes(
+        \\const neg = -@Vector(2, i8){ 1, -2 };
+        \\const neg_wrap = -%@Vector(2, i8){ -128, 3 };
+        \\const not_signed = ~@Vector(2, i4){ 0, -1 };
+        \\const not_unsigned = ~@Vector(3, u8){ 0, 1, 255 };
+        \\const not_bool = !@Vector(2, bool){ true, false };
+        \\const neg_float = -@Vector(2, f32){ 1.5, -2 };
+        \\const neg_wide = -@Vector(2, i200){ 1 << 150, -3 };
+        \\const e_overflow = -@Vector(2, i8){ -128, 3 };
+    , &.{
+        .{ "neg", "@Vector(2, i8) = .{ -1, 2 }" },
+        .{ "neg_wrap", "@Vector(2, i8) = .{ -128, -3 }" },
+        .{ "not_signed", "@Vector(2, i4) = .{ -1, 0 }" },
+        .{ "not_unsigned", "@Vector(3, u8) = .{ 255, 254, 0 }" },
+        .{ "not_bool", "@Vector(2, bool) = .{ false, true }" },
+        .{ "neg_float", "@Vector(2, f32) = .{ -1.5, 2 }" },
+        .{ "neg_wide", "@Vector(2, i200) = .{ -1427247692705959881058285969449495136382746624, 3 }" },
+        // Compile error: overflow of an element
+        .{ "e_overflow", "@Vector(2, i8)" },
+    });
+}
+
 test "comptime evaluation: vector operators on integers wider than 128 bits" {
     // Expected values are the results of zig 0.17.0 and 0.17.1: element-wise comparison and
     // arithmetic take the arbitrary-precision path of the scalar operators

@@ -3715,29 +3715,57 @@ const Evaluator = struct {
         };
     }
 
+    /// `-v`, `-%v` or `~v` on a scalar number
+    fn unary(ev: *Evaluator, op: SyntaxKind, v: Val) EvalError!Val {
+        const ip = ev.ip;
+        if (op == .minus and ip.isFloat(v.ty)) {
+            const x = ev.floatOf(v) orelse return error.Abort;
+            return Val.of(v.ty, try value.floatValue(ip, v.ty, -x) orelse return error.Abort);
+        }
+        if (ev.intOf(v)) |a| {
+            if (switch (op) {
+                .tilde => value.bitNot(ip, v.ty, a),
+                else => value.negate(ip, v.ty, a, op == .minus_percent),
+            }) |r| return Val.ofInt(v.ty, r);
+        }
+        if (value.isBigIntType(ip, v.ty)) {
+            const a = try ev.bigOf(v) orelse return error.Abort;
+            const r = try value.unaryBig(ip, ev.a, op, v.ty, a) orelse return error.Abort;
+            return Val.ofBig(v.ty, r);
+        }
+        return error.Abort;
+    }
+
+    /// Element-wise prefix operator on a vector (`Sema.zirNegate`, `Sema.zirBitNot`,
+    /// `Sema.zirBoolNot`): the scalar operator applied to each element, with the type of the
+    /// operand
+    fn vectorUnary(ev: *Evaluator, op: SyntaxKind, v: Val) EvalError!Val {
+        const vec = ev.ip.key(v.ty).vector_type;
+        if (v.v == .unknown or v.v == .undef) return error.Abort;
+        if ((op == .bang) != (vec.child == .bool_type)) return error.Abort;
+        const elems = try ev.allocElems(vec.len);
+        for (elems, 0..) |*o, i| {
+            const x = try ev.elemAt(v, i);
+            o.* = if (op == .bang) boolVal(!(try ev.condition(x)).yes) else try ev.unary(op, x);
+        }
+        return ev.makeAgg(v.ty, elems);
+    }
+
     fn prefix(ev: *Evaluator, f: *Frame, op: SyntaxKind, operand_e: ExprId, want: ?Index) EvalError!Val {
         const ip = ev.ip;
         switch (op) {
-            .bang => return boolVal(!(try ev.condition(try ev.eval(f, operand_e, .bool_type))).yes),
+            .bang => {
+                // A vector of bools is not coerced to `bool`
+                try ev.tick();
+                const v = try ev.evalInner(f, operand_e, .bool_type);
+                if (ip.key(v.ty) == .vector_type) return ev.vectorUnary(op, v);
+                return boolVal(!(try ev.condition(try ev.coerce(v, .bool_type))).yes);
+            },
             .minus, .minus_percent, .tilde => {
                 // Matches the compiler: the operand has no result type
                 const v = try ev.eval(f, operand_e, null);
-                if (op == .minus and ip.isFloat(v.ty)) {
-                    const x = ev.floatOf(v) orelse return error.Abort;
-                    return Val.of(v.ty, try value.floatValue(ip, v.ty, -x) orelse return error.Abort);
-                }
-                if (ev.intOf(v)) |a| {
-                    if (switch (op) {
-                        .tilde => value.bitNot(ip, v.ty, a),
-                        else => value.negate(ip, v.ty, a, op == .minus_percent),
-                    }) |r| return Val.ofInt(v.ty, r);
-                }
-                if (value.isBigIntType(ip, v.ty)) {
-                    const a = try ev.bigOf(v) orelse return error.Abort;
-                    const r = try value.unaryBig(ip, ev.a, op, v.ty, a) orelse return error.Abort;
-                    return Val.ofBig(v.ty, r);
-                }
-                return error.Abort;
+                if (ip.key(v.ty) == .vector_type) return ev.vectorUnary(op, v);
+                return ev.unary(op, v);
             },
             .ampersand => {
                 // `&s.*` for a slice `s`: a single-item pointer to its array, with the constness
