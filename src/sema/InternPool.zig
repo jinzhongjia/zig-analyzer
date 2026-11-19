@@ -1299,6 +1299,13 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             const x: f128 = @bitCast(v.bits);
             switch (ip.key(v.ty)) {
                 .simple_type => |t| switch (t) {
+                    .c_longdouble => switch (if (ip.scalarAbi().types.get(.c_longdouble)) |a| a.bits else 128) {
+                        16 => try w.print("{d}", .{@as(f16, @floatCast(x))}),
+                        32 => try w.print("{d}", .{@as(f32, @floatCast(x))}),
+                        64 => try w.print("{d}", .{@as(f64, @floatCast(x))}),
+                        80 => try w.print("{d}", .{@as(f80, @floatCast(x))}),
+                        else => try w.print("{d}", .{x}),
+                    },
                     .f16 => try w.print("{d}", .{@as(f16, @floatCast(x))}),
                     .f32 => try w.print("{d}", .{@as(f32, @floatCast(x))}),
                     .f64 => try w.print("{d}", .{@as(f64, @floatCast(x))}),

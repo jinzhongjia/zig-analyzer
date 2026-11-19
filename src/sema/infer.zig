@@ -4086,11 +4086,13 @@ const Inferrer = struct {
                 result = p;
                 continue;
             }
-            // Between floats, take the wider one (c_longdouble's bit width depends on the target)
+            // Between floats, take the wider one (c_longdouble's bit width depends on the target);
+            // two distinct types give the fixed-width float of that width, so c_longdouble with
+            // another float type is never the result (the compiler's `resolvePeerTypesInner`)
             if (ip.isFloat(cur) and ip.isFloat(t)) {
                 const x = value.floatBits(ip, cur) orelse return .unknown;
                 const y = value.floatBits(ip, t) orelse return .unknown;
-                if (y > x) result = t;
+                result = try value.fixedFloatType(ip, @max(x, y)) orelse return .unknown;
                 continue;
             }
             // A fixed-width float with an integer among other kinds of peers (`floatPeer`
