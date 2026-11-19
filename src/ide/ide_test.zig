@@ -3927,6 +3927,27 @@ test "completion inside a quoted identifier offers the candidates of a plain pre
     }
 }
 
+test "completion: quoted error names after `error.@` and inside `error.@\"...\"`" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "const E = error{ Worse, Bad };\nfn f() E!void {\n    return error.@<|>;\n}\n", "@\"Bad\"@-1-0 @\"Worse\"@-1-0" },
+        // The prefix inside the quotes is decoded; candidates keep the spelling typed so far, so
+        // the client filters them by that spelling.
+        .{ "const E = error{ Worse, @\"some name\" };\nfn f() E!void {\n    return error.@\"so<|>me name\";\n}\n", "Worse@-4-8:@\"Worse\" @\"some name\"@-4-8:@\"some name\"" },
+        .{ "const E = error{ @\"some name\" };\nfn f() E!void {\n    return error.@\"\\x73ome na<|>me\";\n}\n", "@\"some name\"@-12-3:@\"\\x73ome name\"" },
+    };
+    for (cases, 0..) |c, i| {
+        const got = try completionEdits(c[0]);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+    const labels = try completionLabels("const E = error{ Worse, Bad };\nfn f() E!void {\n    return error.<|>;\n}\n");
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("Bad Worse", labels);
+}
+
 test "completion on the name of an existing initializer field lists the fields" {
     try expectCompletions(
         \\const S = struct { alpha: u32 = 0, beta: u32 = 0 };

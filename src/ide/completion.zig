@@ -160,7 +160,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
             for (found.items) |candidate| {
                 // The core (`imports.complete`) has already rendered the path segment by segment;
                 // the whole qualified expression must not be escaped as an identifier again.
-                const filter = try completionFilter(r.arena, n, candidate.filter);
+                const filter = try completionFilter(r.arena, n.escaped_prefix, n.prefix, n.closed, candidate.filter);
                 if (visible_labels.get(candidate.label)) |i| {
                     // Only visible bindings are merged; auto-import items with the same name from
                     // different sources must remain separate choices.
@@ -477,13 +477,13 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
 }
 
 /// Completion at `.@` (the `@` at `at`): the names that complete right after the `.` (members,
-/// enum and decl literals, initializer fields), written as quoted identifiers that replace from
-/// the `@`. Nothing when name characters precede the cursor (`.@na` is no name)
+/// enum and decl literals, initializer fields, error names), written as quoted identifiers that
+/// replace from the `@`. Nothing when name characters precede the cursor (`.@na` is no name)
 fn quotedAfterDot(r: *Resolver, file: FileId, at: u32, offset: u32, cursor_owner: *imports.Owner) resolve.Error!Visible {
     if (offset != at + 1) return .{ .context = .ignored };
     var visible = try completeVisible(r, file, at, cursor_owner, false);
     switch (visible.context) {
-        .member, .enum_literal, .init_field => {},
+        .member, .enum_literal, .init_field, .error_name => {},
         else => return .{ .context = .ignored },
     }
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
@@ -573,6 +573,42 @@ const ImportPrefix = struct {
     closed: bool = false,
 };
 
+/// The text typed so far in an escaped identifier (`@"..."`, also unterminated): its raw
+/// spelling, the decoded prefix, and whether the cursor is at the end of the token (after the
+/// closing quote)
+const EscapedPrefix = struct {
+    raw: []const u8,
+    prefix: []const u8,
+    closed: bool,
+};
+
+/// Decodes the text typed so far in an escaped identifier; null when an escape sequence is cut
+/// off, since the name would be a guess
+fn escapedPrefix(arena: Allocator, text: []const u8, token: SyntaxToken, offset: u32) Allocator.Error!?EscapedPrefix {
+    const spelling = if (token.kind == .invalid) std.mem.trimEnd(u8, token.text, "\r\n") else token.text;
+    const token_end = token.offset + @as(u32, @intCast(spelling.len));
+    if (offset <= token.offset or offset > token_end) return null;
+    const raw = text[token.offset..offset];
+    const closed = token.kind == .identifier and offset == token_end;
+    if (raw.len <= 2) return .{ .raw = raw, .prefix = "", .closed = closed };
+    const literal: []const u8 = if (closed) raw[1..] else blk: {
+        const quoted = try arena.allocSentinel(u8, raw.len, 0);
+        @memcpy(quoted[0 .. raw.len - 1], raw[1..]);
+        quoted[raw.len - 1] = '"';
+        // The added closing quote must not be swallowed by an unfinished escape; only pass a
+        // single, lexically closed literal to the string decoder.
+        var tokenizer = std.zig.Tokenizer.init(quoted);
+        const checked = tokenizer.next();
+        if (checked.tag != .string_literal or checked.loc.end != quoted.len) return null;
+        break :blk quoted;
+    };
+    const prefix = std.zig.string_literal.parseAlloc(arena, literal) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidLiteral => return null,
+    };
+    return .{ .raw = raw, .prefix = prefix, .closed = closed };
+}
+
 /// Accepts only names in expressions; declaration names, member names, labels, and capture names
 /// are not direct tokens of a name_ref.
 fn importPrefix(arena: Allocator, root: SyntaxNode, text: []const u8, offset: u32) Allocator.Error!?ImportPrefix {
@@ -592,28 +628,14 @@ fn importPrefix(arena: Allocator, root: SyntaxNode, text: []const u8, offset: u3
     // An invalid token has no closing quote to delimit its end; keep the source after the cursor
     // instead of mistaking the following statements for part of the name and replacing them too.
     const end = if (token.kind == .invalid) offset else token_end;
-    const raw = text[token.offset..offset];
-    const closed = token.kind == .identifier and offset == end;
-    var prefix = raw;
+    var prefix = text[token.offset..offset];
+    var escaped_prefix: ?[]const u8 = null;
+    var closed = false;
     if (escaped) {
-        // Also match by the text typed so far when the cursor is inside the quotes; do not guess
-        // the name when an escape sequence is cut off.
-        if (raw.len <= 2) return null;
-        const literal: []const u8 = if (closed) raw[1..] else blk: {
-            const quoted = try arena.allocSentinel(u8, raw.len, 0);
-            @memcpy(quoted[0 .. raw.len - 1], raw[1..]);
-            quoted[raw.len - 1] = '"';
-            // The added closing quote must not be swallowed by an unfinished escape; only pass a
-            // single, lexically closed literal to the string decoder.
-            var tokenizer = std.zig.Tokenizer.init(quoted);
-            const checked = tokenizer.next();
-            if (checked.tag != .string_literal or checked.loc.end != quoted.len) return null;
-            break :blk quoted;
-        };
-        prefix = std.zig.string_literal.parseAlloc(arena, literal) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.InvalidLiteral => return null,
-        };
+        const typed = (try escapedPrefix(arena, text, token, offset)) orelse return null;
+        prefix = typed.prefix;
+        escaped_prefix = typed.raw;
+        closed = typed.closed;
     } else {
         if (std.zig.primitives.isPrimitive(token.text) or std.mem.eql(u8, token.text, "_")) return null;
     }
@@ -621,8 +643,8 @@ fn importPrefix(arena: Allocator, root: SyntaxNode, text: []const u8, offset: u3
     return .{
         .prefix = prefix,
         .range = .{ .start = token.offset, .end = end },
-        .escaped_prefix = if (escaped) raw else null,
-        .closed = escaped and closed,
+        .escaped_prefix = escaped_prefix,
+        .closed = closed,
     };
 }
 
@@ -644,14 +666,14 @@ fn isBareEnumOrUnionMember(arena: Allocator, root: SyntaxNode, offset: u32) Allo
 }
 
 /// The client filters from the start of the replace range; keep the quotes and escape spelling
-/// that the user typed instead of returning only the decoded name.
-fn completionFilter(arena: Allocator, name: ImportPrefix, target: []const u8) Allocator.Error![]const u8 {
-    const raw = name.escaped_prefix orelse return target;
+/// that the user typed instead of returning only the decoded name. `raw` is null for a name typed
+/// without quotes.
+fn completionFilter(arena: Allocator, raw: ?[]const u8, prefix: []const u8, closed: bool, target: []const u8) Allocator.Error![]const u8 {
+    const typed = raw orelse return target;
     // A candidate matched by path is filtered by its path (see `imports.Builder.filterOf`)
-    if (!std.ascii.startsWithIgnoreCase(target, name.prefix)) return target;
-    const closed = name.closed;
+    if (!std.ascii.startsWithIgnoreCase(target, prefix)) return target;
     return std.fmt.allocPrint(arena, "{s}{f}{s}", .{
-        raw, std.zig.fmtString(target[name.prefix.len..]), if (closed) "" else "\"",
+        typed, std.zig.fmtString(target[prefix.len..]), if (closed) "" else "\"",
     });
 }
 
@@ -1376,7 +1398,7 @@ const MemberSearch = struct {
         item.label = label.written();
         // The same as for auto-import candidates (see `imports.Builder.filterOf`)
         const filter = if (std.ascii.startsWithIgnoreCase(p.leaf.name, name.prefix)) p.leaf.name else item.label;
-        item.filter = try completionFilter(r.arena, name, filter);
+        item.filter = try completionFilter(r.arena, name.escaped_prefix, name.prefix, name.closed, filter);
         return item;
     }
 };
@@ -1801,28 +1823,56 @@ fn commentOrString(r: *Resolver, file: FileId, offset: u32) resolve.Error!enum {
 }
 
 /// Inside a quoted identifier (`@"my v|"`, also unterminated) at a reference (a name, the member
-/// name of a field access, an enum literal): the candidates at the same position with no name
-/// typed yet (the client filters them), replacing the quoted text (up to the closing quote when
-/// there is one) and filtered by their quoted spellings. No candidates at other names
-/// (declarations, labels, and so on), and no builtins: `@"@sizeOf"` is a name
+/// name of a field access, an enum literal, an error name): the candidates at the same position
+/// with no name typed yet (the client filters them), replacing the quoted text (up to the closing
+/// quote when there is one) and filtered by their quoted spellings. Error names are filtered by
+/// the decoded text inside the quotes, keeping the spelling typed so far. No candidates at other
+/// names (declarations, labels, and so on), and no builtins: `@"@sizeOf"` is a name
 fn quotedName(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner) resolve.Error!Visible {
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const tok = root.tokenAtOffset(offset - 1) orelse return .{ .context = .ignored };
     switch (tokenParent(root, tok.offset)) {
-        .name_ref, .field_access, .enum_literal => {},
+        .name_ref, .field_access, .enum_literal, .error_value => {},
         else => return .{ .context = .ignored },
     }
     var visible = try completeVisible(r, file, tok.offset, cursor_owner, false);
     const end: u32 = if (tok.kind == .identifier) @intCast(tok.offset + tok.text.len) else offset;
+    const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
+    const typed = if (visible.context == .error_name) (try escapedPrefix(r.arena, text, tok, offset)) else null;
     const items = try r.arena.dupe(Item, visible.items);
     for (items) |*it| {
         it.replace = .{ .start = tok.offset, .end = end };
-        it.filter = if (std.mem.startsWith(u8, it.label, "@\"")) it.label else try std.fmt.allocPrint(r.arena, "@\"{s}\"", .{it.label});
+        it.filter = if (typed) |t|
+            try quotedErrorFilter(r.arena, it.label, t)
+        else if (std.mem.startsWith(u8, it.label, "@\""))
+            it.label
+        else
+            try std.fmt.allocPrint(r.arena, "@\"{s}\"", .{it.label});
     }
     visible.items = items;
     // The expression at the cursor is the quoted name itself
     if (visible.at) |*a| a.rel = offset - a.node.offset;
     return visible;
+}
+
+/// The name of a completion label formatted by `std.zig.fmtId`: escaped names are `@"..."`
+fn decodedLabel(arena: Allocator, label: []const u8) Allocator.Error![]const u8 {
+    if (!std.mem.startsWith(u8, label, "@\"")) return label;
+    return std.zig.string_literal.parseAlloc(arena, label[1..]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidLiteral => return label,
+    };
+}
+
+/// The filter text of an error name inside `error.@"..."`: the spelling typed so far and the rest
+/// of the candidate's decoded name, so the client filters by the decoded prefix while keeping the
+/// quotes and escapes as typed. Names that do not match keep their quoted spelling.
+fn quotedErrorFilter(arena: Allocator, label: []const u8, typed: EscapedPrefix) Allocator.Error![]const u8 {
+    const name = try decodedLabel(arena, label);
+    if (std.ascii.startsWithIgnoreCase(name, typed.prefix)) {
+        return completionFilter(arena, typed.raw, typed.prefix, typed.closed, name);
+    }
+    return if (std.mem.startsWith(u8, label, "@\"")) label else std.fmt.allocPrint(arena, "@\"{s}\"", .{label});
 }
 
 /// Error names after `error.`: when the expected type is an error set (or error union), lists its
