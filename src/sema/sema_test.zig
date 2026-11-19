@@ -1844,6 +1844,31 @@ test "a non-null optional holding a null optional is not null" {
         \\    const b: ?*const u8 = a;
         \\    break :blk b == null;
         \\};
+        \\const one_to_c = blk: {
+        \\    const a: ?*const u8 = null;
+        \\    const b: ?[*c]const u8 = a;
+        \\    break :blk b == null;
+        \\};
+        \\const many_to_c = blk: {
+        \\    const a: ?[*]const u8 = null;
+        \\    const b: ?[*c]const u8 = a;
+        \\    break :blk b == null;
+        \\};
+        \\const to_allowzero = blk: {
+        \\    const a: ?*const u8 = null;
+        \\    const b: ?*allowzero const u8 = a;
+        \\    break :blk b == null;
+        \\};
+        \\const allowzero_to_c = blk: {
+        \\    const a: ?*allowzero const u8 = null;
+        \\    const b: ?[*c]const u8 = a;
+        \\    break :blk b == null;
+        \\};
+        \\const c_to_const_c = blk: {
+        \\    const a: ?[*c]u8 = null;
+        \\    const b: ?[*c]const u8 = a;
+        \\    break :blk b == null;
+        \\};
     , &.{
         .{ "ret_eq", "bool = false" },
         .{ "ret_local_eq", "bool = false" },
@@ -1894,6 +1919,13 @@ test "a non-null optional holding a null optional is not null" {
         .{ "opt_eu_payload", "bool = true" },
         // An optional that coerces in memory keeps its null
         .{ "ptr_keep", "bool = true" },
+        // A pointer-like optional (`?*T`, `?[*]T`) to one with a null flag (`?[*c]T`,
+        // `?*allowzero T`) wraps: the null becomes a non-null optional holding a null pointer
+        .{ "one_to_c", "bool = false" },
+        .{ "many_to_c", "bool = false" },
+        .{ "to_allowzero", "bool = false" },
+        .{ "allowzero_to_c", "bool = true" },
+        .{ "c_to_const_c", "bool = true" },
     });
 }
 
