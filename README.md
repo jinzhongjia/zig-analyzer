@@ -23,9 +23,6 @@ A language server (LSP) for Zig, built on an incremental query engine. Website: 
 - **Unused declarations** (opt-in): hints on private declarations that no code in the same file reaches, including helpers used only by other unused declarations.
 - **Hint suppressions**: comments such as `// zig-analyzer-disable-next-line: naming` silence analyzer hints for a line or a range; diagnostics from Zig itself are never affected.
 
-For a detailed comparison with ZLS, including measured performance and semantic case studies, see
-[`docs/improvements-over-zls.md`](docs/improvements-over-zls.md).
-
 ## Editor support
 
 | Editor | Integration |

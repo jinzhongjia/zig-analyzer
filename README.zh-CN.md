@@ -23,9 +23,6 @@
 - **未使用声明**（需手动开启）：提示同一文件里没有任何代码能到达的私有声明，包括只被其他未使用声明引用的辅助函数。
 - **提示抑制**：用 `// zig-analyzer-disable-next-line: naming` 这类注释按行或按范围关闭分析器提示；来自 Zig 本身的诊断不受影响。
 
-与 ZLS 的详细对比（含性能测量和语义案例）见
-[`docs/improvements-over-zls.zh-CN.md`](docs/improvements-over-zls.zh-CN.md)。
-
 ## 编辑器支持
 
 | 编辑器 | 集成方式 |
