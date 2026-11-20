@@ -104,9 +104,11 @@ const ContainerNames = struct {
         try w.writeAll(".");
     }
 
-    /// Contents of an anonymous container: layout, kind and fields. An enum shows what its
-    /// declaration gives it: the tag type of `enum(T)`, the members with the values written for
-    /// them (as evaluated), and `_` when it is non-exhaustive (`enum(u8) { a = 1, b, _ }`).
+    /// Contents of an anonymous container: layout, kind, the type argument of its declaration
+    /// and fields, so that the displayed type is the declared one (`union(E)`, `union(enum(u8))`,
+    /// `packed struct(u32)`). An enum shows what its declaration gives it: the tag type of
+    /// `enum(T)`, the members with the values written for them (as evaluated), and `_` when it is
+    /// non-exhaustive (`enum(u8) { a = 1, b, _ }`).
     fn writeContent(n: ContainerNames, c: InternPool.Container, w: *Io.Writer) Io.Writer.Error!void {
         if (n.anonymous) |seen| seen.* = true;
         const tree = n.r.itemTree(c.file) catch return w.writeAll(@tagName(c.kind));
@@ -115,15 +117,18 @@ const ContainerNames = struct {
         const ip = n.r.ctx.db.env.ip;
         if (x.layout != .auto) try w.print("{t} ", .{x.layout});
         try w.writeAll(@tagName(c.kind));
-        if (x.auto_enum) try w.writeAll("(enum)");
-        if (c.kind == .@"enum") {
-            const tag = eval.writtenTagType(n.r, .{ .file = c.file, .container = @intCast(ci) }, c.inst) catch .unknown;
-            if (tag) |t| {
-                try w.writeAll("(");
-                try ip.print(t, w, n);
-                try w.writeAll(")");
-            }
+        // The argument of `union(enum(u8))` is the integer type of the generated tag enum
+        if (x.auto_enum) try w.writeAll("(enum");
+        const arg = switch (c.kind) {
+            .@"enum", .@"union", .@"struct" => eval.writtenContainerArg(n.r, .{ .file = c.file, .container = @intCast(ci) }, c.inst) catch .unknown,
+            .file, .@"opaque" => null,
+        };
+        if (arg) |t| {
+            try w.writeAll("(");
+            try ip.print(t, w, n);
+            try w.writeAll(")");
         }
+        if (x.auto_enum) try w.writeAll(")");
         if (n.full) {
             var o = n.outer;
             while (o) |up| : (o = up.parent) if (up.c.file == c.file and up.c.ast_id == c.ast_id) return w.writeAll(" {...}");

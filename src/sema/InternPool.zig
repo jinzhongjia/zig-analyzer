@@ -1471,16 +1471,19 @@ fn printField(ip: *InternPool, name: ?[]const u8, ty: Index, v: Index, w: *Io.Wr
 }
 
 /// Displays a constructed type by its contents when there is no name for its construction
-/// location. An enum shows what `@Enum` gives it: the tag type, the value of each member, and `_`
-/// when it is non-exhaustive (`enum(u8) { a = 0, b = 1, _ }`).
+/// location: the layout and the type argument (the tag type of an enum or union, the backing
+/// integer of a packed container) as a declaration would write them (`packed struct(u8)`,
+/// `union(E)`). An enum shows what `@Enum` gives it: the tag type, the value of each member, and
+/// `_` when it is non-exhaustive (`enum(u8) { a = 0, b = 1, _ }`).
 pub fn printReified(ip: *InternPool, t: Reified, w: *Io.Writer, container_name: anytype) Io.Writer.Error!void {
     const is_enum = t.kind == .@"enum";
+    if (t.layout != .auto) try w.print("{t} ", .{t.layout});
     try w.print("{t}", .{t.kind});
-    if (is_enum) if (t.tag) |tag| {
+    if (t.tag) |tag| {
         try w.writeAll("(");
         try ip.print(tag, w, container_name);
         try w.writeAll(")");
-    };
+    }
     try w.writeAll(" {");
     const cut = for (t.names, 0..) |n, i| {
         try w.writeAll(if (i == 0) " " else ", ");
