@@ -1534,8 +1534,11 @@ fn importSpec(r: *Resolver, graph: *const database.ModuleGraph, from: FileId, ta
     // is the root of its own module
     const root = if (graph.entry(from)) |src| blk: {
         const dst = graph.entry(target) orelse return null;
-        if (src.module != dst.module or src.module == database.ModuleGraph.std_module) return null;
-        break :blk graph.modules[src.module].root orelse return null;
+        // A relative import is legal when both files are under the root directory of a module
+        // they both belong to; their priority modules can differ when one file was reached by
+        // another compile step first
+        const module = sharedModule(src, dst) orelse return null;
+        break :blk graph.modules[module].root orelse return null;
     } else from;
     const root_dir = std.fs.path.dirname(vfs.path(root)) orelse return null;
     const target_path = vfs.path(target);
@@ -1546,6 +1549,17 @@ fn importSpec(r: *Resolver, graph: *const database.ModuleGraph, from: FileId, ta
         c.* = '/';
     };
     return relative;
+}
+
+/// The highest-priority module both files belong to, other than the standard library; null when
+/// they share none
+fn sharedModule(src: database.ModuleGraph.FileEntry, dst: database.ModuleGraph.FileEntry) ?u32 {
+    const first = [_]u32{src.module};
+    for ([_][]const u32{ &first, src.others }) |modules| for (modules) |m| {
+        if (m == database.ModuleGraph.std_module) continue;
+        if (dst.module == m or std.mem.indexOfScalar(u32, dst.others, m) != null) return m;
+    };
+    return null;
 }
 
 /// The path or module name the current file uses to import `target`; null when it cannot be
