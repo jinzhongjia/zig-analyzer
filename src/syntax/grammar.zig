@@ -165,7 +165,7 @@ fn varDeclProto(p: *Parser) Error!void {
     if (try p.eat(.colon)) {
         if (try typeExpr(p) == null) try p.err("expected type");
     }
-    _ = try byteAlign(p);
+    _ = try byteAlign(p, .byte);
     _ = try clause(p, .keyword_addrspace, .addrspace_clause);
     _ = try clause(p, .keyword_linksection, .linksection_clause);
 }
@@ -185,7 +185,7 @@ fn containerField(p: *Parser, m: Marker) Error!void {
         try p.bump();
     }
     if (try typeExpr(p) == null) try p.err("expected field type");
-    _ = try byteAlign(p);
+    _ = try byteAlign(p, .byte);
     if (try p.eat(.equal)) {
         if (try expr(p) == null) try p.err("expected expression");
     }
@@ -197,7 +197,7 @@ fn fnProto(p: *Parser) Error!CompletedMarker {
     try p.bump(); // fn
     _ = try p.eat(.identifier);
     try paramList(p);
-    _ = try byteAlign(p);
+    _ = try byteAlign(p, .byte);
     _ = try clause(p, .keyword_addrspace, .addrspace_clause);
     _ = try clause(p, .keyword_linksection, .linksection_clause);
     _ = try clause(p, .keyword_callconv, .callconv_clause);
@@ -294,17 +294,41 @@ fn param(p: *Parser) Error!void {
     _ = try m.complete(p, .param);
 }
 
-/// `align(expr)` or the bit-field form `align(expr:expr:expr)`
-fn byteAlign(p: *Parser) Error!CM {
+/// Where an align clause is, which decides whether the bit-range form `align(a:b:c)` is allowed
+const AlignSite = enum {
+    /// Declarations, fields and functions: only `align(a)`
+    byte,
+    /// Single-item pointer types
+    single_ptr,
+    /// Many-item pointer and slice types: the bit range is parsed but rejected
+    multi_ptr,
+};
+
+/// `align(expr)`, or `align(expr:expr:expr)` on a single-item pointer; a rejected bit range is
+/// wrapped in an `error_node`
+fn byteAlign(p: *Parser, site: AlignSite) Error!CM {
     if (!p.at(.keyword_align)) return null;
     const m = try p.start();
     try p.bump();
     _ = try p.expect(.l_paren);
     if (try expr(p) == null) try p.err("expected expression");
-    if (try p.eat(.colon)) {
+    if (p.at(.colon)) {
+        const e: ?Marker = switch (site) {
+            .single_ptr => null,
+            .byte => blk: {
+                try p.err("expected ')'");
+                break :blk try p.start();
+            },
+            .multi_ptr => blk: {
+                try p.err("bit range only allowed on single item pointers");
+                break :blk try p.start();
+            },
+        };
+        try p.bump();
         if (try expr(p) == null) try p.err("expected expression");
         _ = try p.expect(.colon);
         if (try expr(p) == null) try p.err("expected expression");
+        if (e) |em| _ = try em.complete(p, .error_node);
     }
     _ = try p.expect(.r_paren);
     return try m.complete(p, .align_clause);
@@ -1033,7 +1057,7 @@ fn typeExpr(p: *Parser) Error!CM {
         .asterisk => {
             const m = try p.start();
             try p.bump();
-            try ptrModifiers(p);
+            try ptrModifiers(p, .single_ptr);
             if (try typeExpr(p) == null) try p.err("expected type expression");
             return try m.complete(p, .ptr_type);
         },
@@ -1048,14 +1072,14 @@ fn typeExpr(p: *Parser) Error!CM {
                     try sentinel(p);
                 }
                 _ = try p.expect(.r_bracket);
-                try ptrModifiers(p);
+                try ptrModifiers(p, .multi_ptr);
                 if (try typeExpr(p) == null) try p.err("expected type expression");
                 return try m.complete(p, .ptr_type);
             }
             const has_len = try expr(p) != null;
             if (p.at(.colon)) try sentinel(p);
             _ = try p.expect(.r_bracket);
-            if (!has_len) try ptrModifiers(p);
+            if (!has_len) try ptrModifiers(p, .multi_ptr);
             if (try typeExpr(p) == null) try p.err("expected type expression");
             return try m.complete(p, if (has_len) .array_type else .slice_type);
         },
@@ -1078,9 +1102,9 @@ fn sentinel(p: *Parser) Error!void {
     _ = try m.complete(p, .sentinel);
 }
 
-fn ptrModifiers(p: *Parser) Error!void {
+fn ptrModifiers(p: *Parser, align_site: AlignSite) Error!void {
     while (true) switch (p.peek()) {
-        .keyword_align => _ = try byteAlign(p),
+        .keyword_align => _ = try byteAlign(p, align_site),
         .keyword_addrspace => _ = try clause(p, .keyword_addrspace, .addrspace_clause),
         .keyword_allowzero, .keyword_const, .keyword_volatile => try p.bump(),
         else => return,

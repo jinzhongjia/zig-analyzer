@@ -471,6 +471,47 @@ test "recovery: comparison operators cannot be chained" {
     try expectNoErrors("const x = a == b and c != d;\nconst y = (a == b) == c;\nconst z = a + b == c * d;\n");
 }
 
+test "recovery: the bit-range align form is only allowed on single-item pointers" {
+    // `zig ast-check`: `expected ')', found ':'` outside pointer types, `bit range only allowed on
+    // single item pointers` on many-item pointers and slices
+    try expectErrors("const S = struct { x: u3 align(1:0:3) };", "error@32: expected ')'\n");
+    try expectErrors("const g: u32 align(1:0:3) = 1;", "error@20: expected ')'\n");
+    try expectErrors("fn f() align(1:0:3) void {}", "error@14: expected ')'\n");
+    try expectErrors("const p: []align(1:0:3) u8 = undefined;", "error@18: bit range only allowed on single item pointers\n");
+    try expectErrors("const p: [*]align(1:0:3) u8 = undefined;", "error@19: bit range only allowed on single item pointers\n");
+    try expectErrors("const p: [*c]align(1:0:3) u8 = undefined;", "error@20: bit range only allowed on single item pointers\n");
+    try expectNoErrors("const q: *align(1:0:3) u8 = undefined;\nconst r: *const align(1:0:3) u8 = undefined;\n");
+    // The rejected bit range is not part of the align clause
+    try expectTree("const g: u32 align(1:0:3) = 1;",
+        \\source_file@0..30
+        \\  var_decl@0..30
+        \\    keyword_const "const"
+        \\    identifier "g"
+        \\    colon ":"
+        \\    name_ref@9..12
+        \\      identifier "u32"
+        \\    align_clause@13..25
+        \\      keyword_align "align"
+        \\      l_paren "("
+        \\      literal@19..20
+        \\        number_literal "1"
+        \\      error_node@20..24
+        \\        colon ":"
+        \\        literal@21..22
+        \\          number_literal "0"
+        \\        colon ":"
+        \\        literal@23..24
+        \\          number_literal "3"
+        \\      r_paren ")"
+        \\    equal "="
+        \\    literal@28..29
+        \\      number_literal "1"
+        \\    semicolon ";"
+        \\error@20: expected ')'
+        \\
+    );
+}
+
 /// Depth of the syntax tree (computed iteratively)
 fn treeDepth(n: @import("tree.zig").SyntaxNode) !usize {
     const Entry = struct { node: @import("tree.zig").SyntaxNode, depth: usize };
