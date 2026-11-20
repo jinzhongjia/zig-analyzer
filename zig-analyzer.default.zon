@@ -85,6 +85,8 @@
     //   .inlay_hints = .{
     //       // Inferred types of local variables without a type annotation.
     //       .types = true,
+    //       // Types of captures (`|x|`, `|*p|`, `|v, i|`, `|err|`). Needs `.types`.
+    //       .capture_types = true,
     //       // Field types after the field names in initializers that have a result type
     //       // (`.{ .x: i32 = 1 }`).
     //       .field_types = true,
