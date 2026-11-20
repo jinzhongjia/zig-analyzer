@@ -9196,26 +9196,35 @@ test "anonymous containers display their tag type, layout and backing integer" {
 
 test "@typeInfo lists error names in declaration order" {
     // Prevents listing `error_names` sorted by their bytes; expected values are the results of
-    // zig 0.17.0, which sorts only the names in `@typeName`
+    // zig 0.17.1, which lists the names in the order they first entered its string table and sorts
+    // only the names in `@typeName`. The names appear nowhere else in the compilation (`Alpha` is
+    // a declaration in the standard library), so that order is the declaration order.
     try expectStdTypes(
         \\const std = @import("std");
-        \\const Err = error{ Zeta, Alpha, Mid };
+        \\const Err = error{ Zqzeta, Zqalpha, Zqmid };
         \\const v0 = @typeInfo(Err).error_set.error_names.?[0];
-        \\const v1 = @backingInt(std.meta.FieldEnum(Err).Zeta);
-        \\const v2 = @typeInfo(error{ Kilo, Bravo } || error{Echo}).error_set.error_names.?[1];
-        \\const same = Err == error{ Mid, Zeta, Alpha };
+        \\const v1 = @backingInt(std.meta.FieldEnum(Err).Zqzeta);
+        \\const v2 = @typeInfo(error{ Zqkilo, Zqbravo } || error{Zqecho}).error_set.error_names.?[1];
+        \\const same = Err == error{ Zqmid, Zqzeta, Zqalpha };
         \\const name = @typeName(Err);
         \\fn f() Err!void {
-        \\    return error.Zeta;
+        \\    return error.Zqzeta;
         \\}
         \\const v3 = @typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?).error_union.error_set;
+        \\fn g(x: u8) !void {
+        \\    if (x == 0) return error.Zqyy;
+        \\    return error.Zqxx;
+        \\}
+        \\const v4 = @typeInfo(@typeInfo(@TypeOf(g)).@"fn".return_type.?).error_union.error_set;
+        \\const v5 = @typeInfo(v4).error_set.error_names.?[0];
     , &.{
-        .{ "v0", "[:0]const u8 = \"Zeta\"" },
+        .{ "v0", "[:0]const u8 = \"Zqzeta\"" },
         .{ "v1", "u2 = 0" },
-        .{ "v2", "[:0]const u8 = \"Bravo\"" },
+        .{ "v2", "[:0]const u8 = \"Zqbravo\"" },
         .{ "same", "bool = true" },
-        .{ "name", "*const [21:0]u8 = \"error{Alpha,Mid,Zeta}\"" },
-        .{ "v3", "type = error{Alpha,Mid,Zeta}" },
+        .{ "name", "*const [27:0]u8 = \"error{Zqalpha,Zqmid,Zqzeta}\"" },
+        .{ "v3", "type = error{Zqalpha,Zqmid,Zqzeta}" },
+        .{ "v5", "[:0]const u8 = \"Zqyy\"" },
     });
 }
 
