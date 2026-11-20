@@ -29,6 +29,16 @@ fn expectZonTree(source: []const u8, expected: []const u8) !void {
     try testing.expectEqualStrings(expected, actual);
 }
 
+/// Only the parse errors, one `error@offset: message` line each
+fn expectErrors(source: []const u8, expected: []const u8) !void {
+    const parse = try Parse.create(testing.allocator, source, .zig);
+    defer parse.destroy();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    for (parse.errors) |e| try out.writer.print("error@{d}: {s}\n", .{ e.offset, e.message });
+    try testing.expectEqualStrings(expected, out.written());
+}
+
 /// Lossless: the root node's text equals the source
 fn expectLossless(source: []const u8) !void {
     return expectLosslessIn(.zig, source);
@@ -380,6 +390,78 @@ test "recovery: errdefer takes no capture, like defer" {
         defer testing.allocator.free(expected);
         try testing.expectEqualStrings(expected, actual);
     }
+}
+
+test "recovery: each construct takes only its own capture forms" {
+    // `zig ast-check`: `catch` and `else` take `|x|`, `if` and `while` also `|*x|`, a switch prong
+    // also `|*x, i|`
+    try expectErrors("test { _ = e catch |*err| {}; }", "error@20: expected identifier\n");
+    try expectErrors("test { if (x) {} else |*e| {} }", "error@23: expected identifier\n");
+    try expectErrors("test { while (x) {} else |*e| {} }", "error@26: expected identifier\n");
+    try expectErrors("test { if (x) |*a, b| {} }", "error@17: expected '|'\n");
+    try expectErrors("test { while (x) |a, i| {} }", "error@19: expected '|'\n");
+    try expectErrors("test { switch (x) { else => |*a, *b| {} } }", "error@33: expected identifier\n");
+    try expectErrors("test { switch (x) { else => |a, b, c| {} } }", "error@33: expected '|'\n");
+    try expectErrors("test { switch (x) { else => |a,| {} } }", "error@31: expected identifier\n");
+    try expectNoErrors("test { if (x) |*a| {} else |e| {} while (x) |*a| {} else |e| {} }");
+    try expectNoErrors("test { switch (x) { else => |*a, i| {} } for (a, b, c) |*x, y, z,| {} }");
+    // The rejected `*` and extra captures bind nothing
+    try expectTree("test { if (x) |*a, b| {} }",
+        \\source_file@0..26
+        \\  test_decl@0..26
+        \\    keyword_test "test"
+        \\    block@5..26
+        \\      l_brace "{"
+        \\      if_expr@7..24
+        \\        keyword_if "if"
+        \\        l_paren "("
+        \\        name_ref@11..12
+        \\          identifier "x"
+        \\        r_paren ")"
+        \\        payload@14..21
+        \\          pipe "|"
+        \\          asterisk "*"
+        \\          identifier "a"
+        \\          error_node@17..20
+        \\            comma ","
+        \\            identifier "b"
+        \\          pipe "|"
+        \\        block@22..24
+        \\          l_brace "{"
+        \\          r_brace "}"
+        \\      r_brace "}"
+        \\error@17: expected '|'
+        \\
+    );
+    try expectTree("test { _ = e catch |*err| {}; }",
+        \\source_file@0..31
+        \\  test_decl@0..31
+        \\    keyword_test "test"
+        \\    block@5..31
+        \\      l_brace "{"
+        \\      expr_stmt@7..29
+        \\        assign_expr@7..28
+        \\          name_ref@7..8
+        \\            identifier "_"
+        \\          equal "="
+        \\          binary_expr@11..28
+        \\            name_ref@11..12
+        \\              identifier "e"
+        \\            keyword_catch "catch"
+        \\            payload@19..25
+        \\              pipe "|"
+        \\              error_node@20..21
+        \\                asterisk "*"
+        \\              identifier "err"
+        \\              pipe "|"
+        \\            block@26..28
+        \\              l_brace "{"
+        \\              r_brace "}"
+        \\        semicolon ";"
+        \\      r_brace "}"
+        \\error@20: expected identifier
+        \\
+    );
 }
 
 /// Depth of the syntax tree (computed iteratively)

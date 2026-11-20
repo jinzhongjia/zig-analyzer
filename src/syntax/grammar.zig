@@ -574,7 +574,7 @@ fn ifExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
     _ = try p.expect(.l_paren);
     if (try expr(p) == null) try p.err("expected condition expression");
     _ = try p.expect(.r_paren);
-    try optPayload(p);
+    try optPayload(p, .ptr);
     try bodyAndElse(p, form, true);
     return m.complete(p, .if_expr);
 }
@@ -584,7 +584,7 @@ fn whileExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
     _ = try p.expect(.l_paren);
     if (try expr(p) == null) try p.err("expected condition expression");
     _ = try p.expect(.r_paren);
-    try optPayload(p);
+    try optPayload(p, .ptr);
     if (p.at(.colon)) {
         const cm = try p.start();
         try p.bump();
@@ -600,7 +600,7 @@ fn whileExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
 fn forExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
     try p.bump(); // for
     try forInputs(p);
-    if (p.at(.pipe)) try optPayload(p) else try p.err("expected loop capture");
+    if (p.at(.pipe)) try optPayload(p, .list) else try p.err("expected loop capture");
     try bodyAndElse(p, form, false);
     return m.complete(p, .for_expr);
 }
@@ -697,7 +697,7 @@ fn elseClause(p: *Parser, form: Form, allow_payload: bool, required: bool) Error
     }
     const m = try p.start();
     try p.bump();
-    if (allow_payload) try optPayload(p);
+    if (allow_payload) try optPayload(p, .plain);
     switch (form) {
         .statement => try statement(p, false),
         .expr => if (try expr(p) == null) try p.err("expected expression"),
@@ -706,16 +706,50 @@ fn elseClause(p: *Parser, form: Form, allow_payload: bool, required: bool) Error
     _ = try m.complete(p, .else_clause);
 }
 
-/// `|x|`, `|*x|`, `|x, i|`, `|*a, b, c|`: all forms are accepted uniformly.
-fn optPayload(p: *Parser) Error!void {
+/// The capture forms of each construct, as in `std.zig.Parse`
+const PayloadForm = enum {
+    /// `catch` and `else`: `|x|`
+    plain,
+    /// `if` and `while`: `|x|` or `|*x|`
+    ptr,
+    /// Switch prong: `|x|`, `|*x|` or `|*x, i|`
+    ptr_index,
+    /// `for`: `|*a, b, c|`, a trailing comma allowed
+    list,
+};
+
+/// A capture of `form`; a `*` or extra captures the form does not allow are reported and
+/// wrapped in an `error_node`, so they bind nothing.
+fn optPayload(p: *Parser, form: PayloadForm) Error!void {
     if (!p.at(.pipe)) return;
     const m = try p.start();
     try p.bump();
-    while (true) {
-        _ = try p.eat(.asterisk);
+    const max_captures: usize = switch (form) {
+        .plain, .ptr => 1,
+        .ptr_index => 2,
+        .list => std.math.maxInt(usize),
+    };
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        if (p.at(.asterisk)) {
+            const ptr_allowed = switch (form) {
+                .plain => false,
+                .ptr, .list => true,
+                .ptr_index => index == 0,
+            };
+            if (ptr_allowed) try p.bump() else try p.errBump("expected identifier");
+        }
         _ = try p.expect(.identifier);
-        if (!try p.eat(.comma)) break;
-        if (p.at(.pipe)) break;
+        if (!p.at(.comma)) break;
+        if (index + 1 == max_captures) {
+            try p.err("expected '|'");
+            const e = try p.start();
+            while (p.at(.comma) or p.at(.asterisk) or p.at(.identifier)) try p.bump();
+            _ = try e.complete(p, .error_node);
+            break;
+        }
+        try p.bump();
+        if (form == .list and p.at(.pipe)) break;
     }
     _ = try p.expect(.pipe);
     _ = try m.complete(p, .payload);
@@ -783,7 +817,7 @@ fn switchProng(p: *Parser) Error!void {
         _ = try m.complete(p, .switch_prong);
         return;
     }
-    try optPayload(p);
+    try optPayload(p, .ptr_index);
     if (try singleAssignExpr(p) == null) try p.err("expected expression");
     _ = try m.complete(p, .switch_prong);
 }
@@ -862,7 +896,7 @@ fn exprPrec(p: *Parser, min_prec: u8) Error!CM {
         if (prec < min_prec) break;
         const m = try lhs.precede(p);
         try p.bump();
-        if (op == .keyword_catch) try optPayload(p);
+        if (op == .keyword_catch) try optPayload(p, .plain);
         if (try exprPrec(p, prec + 1) == null) try p.err("expected expression");
         lhs = try m.complete(p, .binary_expr);
     }
