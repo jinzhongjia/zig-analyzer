@@ -124,6 +124,9 @@
 
     // Hover (editor only):
     //   .hover = .{
+    //       // Show the size and alignment of a type (`size: 8 · align: 4`), and the byte offset
+    //       // of a struct field (`offset: 8`), when the layout is fully known.
+    //       .layout = true,
     //       // In a generic function body, a member name can refer to a different declaration
     //       // under each instance (each set of comptime arguments at the call sites). Hover shows
     //       // the declaration under one instance; the others follow it:

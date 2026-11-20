@@ -15,6 +15,7 @@ const inlay_hints = @import("inlay_hints.zig");
 const inactive = @import("inactive.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const Vfs = @import("../base/Vfs.zig");
+const InternPool = @import("../sema/InternPool.zig");
 const test_path = @import("../util/test_path.zig");
 const seed = database.ide_db.seed;
 const search = @import("../ide_db/search.zig");
@@ -55,6 +56,19 @@ fn resolver(w: *World, ctx: *database.Db.Ctx) resolve.Resolver {
     return .{ .ctx = ctx, .arena = w.arena.allocator() };
 }
 
+/// Target parameters for `arch_os_abi` (as with the compiler's `-target`)
+fn targetOf(arch_os_abi: []const u8) !InternPool.Target {
+    const t = try std.zig.system.resolveTargetQuery(testing.io, try .parse(.{ .arch_os_abi = arch_os_abi }));
+    return .{ .pointer_bits = t.ptrBitWidth(), .scalar_abi = .of(&t), .endian = t.cpu.arch.endian() };
+}
+
+/// The `size: ...` or `offset: ...` line of a hover, if any
+fn layoutLine(text: []const u8, comptime prefix: []const u8) ?[]const u8 {
+    const start = std.mem.indexOf(u8, text, "\n\n" ++ prefix) orelse return null;
+    const rest = text[start + 2 ..];
+    return rest[0 .. std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len];
+}
+
 test "hover shows signature, type and doc" {
     var w: World = undefined;
     const file = try setup(&w);
@@ -65,8 +79,8 @@ test "hover shows signature, type and doc" {
     const cases = [_]struct { []const u8, usize, []const u8 }{
         .{ "d = p", 0, "```zig\nconst d: u32\n```" },
         .{ "dist(3)", 0, "```zig\npub fn dist(self: Point, scale: u32) u32\n```\n\nDistance to the origin" },
-        .{ "Point", 0, "```zig\nconst Point = struct\n```\n\nA point in the plane" },
-        .{ "x, buf", 0, "```zig\nx: i32\n```" },
+        .{ "Point", 0, "```zig\nconst Point = struct\n```\n\nsize: 8 · align: 4\n\nA point in the plane" },
+        .{ "x, buf", 0, "```zig\nx: i32\n```\n\noffset: 0" },
         .{ "ptr: *Point", 0, "```zig\nptr: *Point\n```" },
         .{ "init(1", 0, "```zig\npub fn init(x: i32, y: i32) Point\n```" },
     };
@@ -367,7 +381,7 @@ test "hover on field names in initializers shows the field" {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(&w, &ctx);
-    const name = "```zig\nname: []const u8\n```\n\nName of the thing.";
+    const name = "```zig\nname: []const u8\n```\n\noffset: 0\n\nName of the thing.";
     const control = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "name, generic").?), &.{}, .count)).?;
     try testing.expectEqualStrings(name, control.text);
     const cases = [_]struct { []const u8, []const u8 }{
@@ -375,12 +389,12 @@ test "hover on field names in initializers shows the field" {
         .{ "name = \"b\"", name },
         .{ "name = \"c\"", name },
         .{ "name = \"d\"", name },
-        .{ "inner = .{ .depth", "```zig\ninner: Inner\n```" },
-        .{ "depth = 2", "```zig\ndepth: u8\n```" },
+        .{ "inner = .{ .depth", "```zig\ninner: Inner\n```\n\noffset: 16" },
+        .{ "depth = 2", "```zig\ndepth: u8\n```\n\noffset: 0" },
         .{ "a = 3", "```zig\na: u32\n```" },
         // The field type in the instance
-        .{ "first = 1", "```zig\nfirst: u32\n```" },
-        .{ "second = 2", "```zig\nsecond: u32\n```" },
+        .{ "first = 1", "```zig\nfirst: u32\n```\n\noffset: 0" },
+        .{ "second = 2", "```zig\nsecond: u32\n```\n\noffset: 4" },
         // Inside a generic function, the field type in terms of its parameters
         .{ "first = undefined", "```zig\nfirst: T\n```" },
     };
@@ -418,9 +432,9 @@ test "hover on field names in initializers of reified structs shows the name and
     defer ctx.end();
     var r = resolver(&w, &ctx);
     for ([_]struct { []const u8, []const u8 }{
-        .{ "alpha = 1", "```zig\nalpha: u32\n```" },
-        .{ "beta = true", "```zig\nbeta: bool\n```" },
-        .{ "red = \"r\"", "```zig\nred: []const u8\n```" },
+        .{ "alpha = 1", "```zig\nalpha: u32\n```\n\noffset: 0" },
+        .{ "beta = true", "```zig\nbeta: bool\n```\n\noffset: 4" },
+        .{ "red = \"r\"", "```zig\nred: []const u8\n```\n\noffset: 0" },
     }) |c| {
         const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .count)) orelse {
             std.debug.print("no hover at `{s}`\n", .{c[0]});
@@ -5353,6 +5367,8 @@ test "hover in generic bodies follows the declarations under the other instances
             \\len: u32
             \\```
             \\
+            \\offset: 0
+            \\
             \\inferred from the call at main.zig:29
             \\
             \\---
@@ -5360,6 +5376,8 @@ test "hover in generic bodies follows the declarations under the other instances
             \\```zig
             \\len: u16
             \\```
+            \\
+            \\offset: 0
             \\
             \\at main.zig:11, inferred from the call at main.zig:30
         },
@@ -5449,7 +5467,7 @@ test "hover in generic bodies on names whose result type is a parameter" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     for ([_]struct { []const u8, []const u8 }{
-        .{ "len = 3", "```zig\nlen: u32\n```\n\ninferred from the call at main.zig:17" },
+        .{ "len = 3", "```zig\nlen: u32\n```\n\noffset: 0\n\ninferred from the call at main.zig:17" },
         .{ "empty;", "```zig\nconst empty: A = .{ .len = 1 }\n```\n\ninferred from the call at main.zig:18\n\nThe empty A" },
         .{ "alpha;", "```zig\nalpha: E = .alpha\n```\n\ninferred from the call at main.zig:19" },
     }) |c| {
@@ -5544,7 +5562,7 @@ test "goto, hover and symbols on the types of unnamed extern parameters" {
     try testing.expectEqual(null, try definition.definition(&r, file, at("c_int) void")));
     try testing.expectEqual(null, try definition.symbolAt(&r, file, at("c_int) void")));
     const info = (try hover.hover(&r, file, at("Foo, *const"), &.{}, .count)) orelse return error.NoHover;
-    try testing.expectEqualStrings("```zig\nconst Foo = struct\n```", info.text);
+    try testing.expectEqualStrings("```zig\nconst Foo = struct\n```\n\nsize: 4 · align: 4", info.text);
 }
 
 test "goto declaration of labels and field names in initializers" {
@@ -6255,13 +6273,13 @@ test "hover on a constant aliasing a container shows the aliased type" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, []const u8 }{
-        .{ "Point = struct", "const Point = struct\n```\n\nA point" },
-        .{ "P2 =", "const P2: type = Point" },
-        .{ "L =", "const L: type = List(u8)" },
-        .{ "Foo =", "const Foo: type = Foo" },
-        .{ "Choice =", "const Choice = struct" },
-        .{ "Self =", "const Self: type = Holder" },
-        .{ "Self) u8", "const Self: type = Holder" },
+        .{ "Point = struct", "const Point = struct\n```\n\nsize: 4 · align: 4\n\nA point" },
+        .{ "P2 =", "const P2: type = Point\n```\n\nsize: 4 · align: 4" },
+        .{ "L =", "const L: type = List(u8)\n```\n\nsize: 16 · align: 8" },
+        .{ "Foo =", "const Foo: type = Foo\n```\n\nsize: 1 · align: 1" },
+        .{ "Choice =", "const Choice = struct\n```\n\nsize: 1 · align: 1" },
+        .{ "Self =", "const Self: type = Holder\n```\n\nsize: 1 · align: 1" },
+        .{ "Self) u8", "const Self: type = Holder\n```\n\nsize: 1 · align: 1" },
     };
     for (cases) |c| {
         const info = (try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .count)).?;
@@ -9406,7 +9424,7 @@ test "an iteration that leaves the loop before a declaration is not used for it"
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const info = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, text, "F =").?), &.{}, .count)) orelse return error.NoHover;
-    try testing.expectEqualStrings("```zig\nconst F: type = u8\n```\n\ninferred from iteration 2 of the loop at main.zig:4", info.text);
+    try testing.expectEqualStrings("```zig\nconst F: type = u8\n```\n\nsize: 1 · align: 1\n\ninferred from iteration 2 of the loop at main.zig:4", info.text);
 }
 
 test "hover in a defer body shows the value at one exit and counts or lists the others" {
@@ -9538,8 +9556,8 @@ test "a type read in a defer body resolves members at each exit that runs it" {
     var r = resolver(&w, &ctx);
     const info = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, text, "U =").?), &.{}, .full)) orelse return error.NoHover;
     try testing.expectEqualStrings(
-        "```zig\nconst U: type = A\n```\n\ninferred from the exit at main.zig:18" ++
-            "\n\n---\n\n```zig\nconst U: type = B\n```\n\ninferred from the end of the block at main.zig:20",
+        "```zig\nconst U: type = A\n```\n\nsize: 0 · align: 1\n\ninferred from the exit at main.zig:18" ++
+            "\n\n---\n\n```zig\nconst U: type = B\n```\n\nsize: 0 · align: 1\n\ninferred from the end of the block at main.zig:20",
         info.text,
     );
     const targets = try definition.definitionTargets(&r, added.file, @intCast(std.mem.indexOf(u8, text, "U.name").? + 2));
@@ -9669,9 +9687,9 @@ test "hover on a capture read through a container in the body shows the value of
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, []const u8 }{
-        .{ "p_via =", "```zig\nconst p_via: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:2" },
-        .{ "p_opt =", "```zig\nconst p_opt: type = ?u8\n```\n\ninferred from iteration 1 of the loop at main.zig:2" },
-        .{ "p_payload =", "```zig\nconst p_payload: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:14" },
+        .{ "p_via =", "```zig\nconst p_via: type = u8\n```\n\nsize: 1 · align: 1\n\ninferred from iteration 1 of the loop at main.zig:2" },
+        .{ "p_opt =", "```zig\nconst p_opt: type = ?u8\n```\n\nsize: 2 · align: 1\n\ninferred from iteration 1 of the loop at main.zig:2" },
+        .{ "p_payload =", "```zig\nconst p_payload: type = u8\n```\n\nsize: 1 · align: 1\n\ninferred from iteration 1 of the loop at main.zig:14" },
     };
     for (cases) |c| {
         const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .count) orelse return error.NoHover;
@@ -9752,14 +9770,14 @@ test "hover in nested inline loops takes an iteration of each enclosing loop" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, []const u8 }{
-        .{ "direct =", "```zig\nconst direct: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:2 and iteration 1 of the loop at main.zig:3" },
-        .{ "via =", "```zig\nconst via: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:2 and iteration 1 of the loop at main.zig:3" },
-        .{ "arr =", "```zig\nconst arr: type = [1]u8\n```\n\ninferred from iteration 1 of the loop at main.zig:2 and iteration 1 of the loop at main.zig:3" },
-        .{ "outer =", "```zig\nconst outer: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:2" },
-        .{ "P =", "```zig\nconst P: type = struct { u8, i32, [1]u8 }\n```\n\ninferred from iteration 1 of the loop at main.zig:17, iteration 1 of the loop at main.zig:18 and iteration 1 of the loop at main.zig:19" },
-        .{ "W =", "```zig\nconst W: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:27" },
-        .{ "B =", "```zig\nconst B: type = [1]u8\n```\n\ninferred from iteration 1 of the loop at main.zig:38 and iteration 1 of the loop at main.zig:39" },
-        .{ "L =", "```zig\nconst L: type = [1]u8\n```\n\ninferred from iteration 1 of the loop at main.zig:47 and iteration 1 of the loop at main.zig:48" },
+        .{ "direct =", "```zig\nconst direct: type = u8\n```\n\nsize: 1 · align: 1\n\ninferred from iteration 1 of the loop at main.zig:2 and iteration 1 of the loop at main.zig:3" },
+        .{ "via =", "```zig\nconst via: type = u8\n```\n\nsize: 1 · align: 1\n\ninferred from iteration 1 of the loop at main.zig:2 and iteration 1 of the loop at main.zig:3" },
+        .{ "arr =", "```zig\nconst arr: type = [1]u8\n```\n\nsize: 1 · align: 1\n\ninferred from iteration 1 of the loop at main.zig:2 and iteration 1 of the loop at main.zig:3" },
+        .{ "outer =", "```zig\nconst outer: type = u8\n```\n\nsize: 1 · align: 1\n\ninferred from iteration 1 of the loop at main.zig:2" },
+        .{ "P =", "```zig\nconst P: type = struct { u8, i32, [1]u8 }\n```\n\nsize: 12 · align: 4\n\ninferred from iteration 1 of the loop at main.zig:17, iteration 1 of the loop at main.zig:18 and iteration 1 of the loop at main.zig:19" },
+        .{ "W =", "```zig\nconst W: type = u8\n```\n\nsize: 1 · align: 1\n\ninferred from iteration 1 of the loop at main.zig:27" },
+        .{ "B =", "```zig\nconst B: type = [1]u8\n```\n\nsize: 1 · align: 1\n\ninferred from iteration 1 of the loop at main.zig:38 and iteration 1 of the loop at main.zig:39" },
+        .{ "L =", "```zig\nconst L: type = [1]u8\n```\n\nsize: 1 · align: 1\n\ninferred from iteration 1 of the loop at main.zig:47 and iteration 1 of the loop at main.zig:48" },
     };
     for (cases) |c| {
         const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .count) orelse return error.NoHover;
@@ -9795,7 +9813,7 @@ test "hover in an inline loop over the fields of an enclosing loop variable" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "F =").?), &.{}, .count) orelse return error.NoHover;
-    try testing.expectEqualStrings("```zig\nconst F: type = u8\n```\n\ninferred from iteration 1 of the loop at main.zig:4 and iteration 1 of the loop at main.zig:5", info.text);
+    try testing.expectEqualStrings("```zig\nconst F: type = u8\n```\n\nsize: 1 · align: 1\n\ninferred from iteration 1 of the loop at main.zig:4 and iteration 1 of the loop at main.zig:5", info.text);
 }
 test "references through the loop variable of an enclosing inline loop" {
     // `T.tag` in the inner loop body is `A.tag` in the first iteration of the outer loop: the
@@ -10022,8 +10040,8 @@ test "hover never treats the initializer as the missing type of a declaration" {
     // `const T2: = u32;` lacks its type: it must not be shown as a value of type `u32`
     const text = "const T2: = u32;\nconst z = T2;\nconst w: T2 = 1;\ntest { _ = .{ T2, z, w }; }\n";
     const cases = [_]struct { []const u8, []const u8 }{
-        .{ "T2, z", "```zig\nconst T2: type = u32\n```" },
-        .{ "z, w", "```zig\nconst z: type = u32\n```" },
+        .{ "T2, z", "```zig\nconst T2: type = u32\n```\n\nsize: 4 · align: 4" },
+        .{ "z, w", "```zig\nconst z: type = u32\n```\n\nsize: 4 · align: 4" },
         .{ "w }", "```zig\nconst w: u32 = 1\n```" },
     };
     for (cases) |c| {
@@ -10228,7 +10246,7 @@ test "hover on a reference in a coercing context shows its own type" {
         .{ "a);", "```zig\nconst a: u8 = 5\n```" },
         .{ "a;\n", "```zig\nconst a: u8 = 5\n```" },
         .{ "p;", "```zig\np: u8\n```" },
-        .{ "x;", "```zig\nx: u32\n```" },
+        .{ "x;", "```zig\nx: u32\n```\n\noffset: 0" },
         .{ "red;\n    const d", "```zig\nred: Color = .red\n```" },
         .{ "default;\n    const e", "```zig\nconst default: Color = .red\n```" },
         .{ "G2;\n    const n", "```zig\nconst G2: u8 = 2\n```" },
@@ -10576,4 +10594,218 @@ test "inlay hints: capture types in a generic body" {
         }
     }
     try testing.expect(saw_hx and saw_ko);
+}
+
+test "hover shows the size and alignment of a type" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 build-obj -target
+    // x86_64-linux-musl @compileLog(@sizeOf(T), @alignOf(T)).
+    const text =
+        \\pub const Wide = u64;
+        \\const A = struct { a: u8, b: u32, c: u16 };
+        \\const B = extern struct { a: u8, b: u32, c: u16 };
+        \\const C = packed struct { a: u3, b: u5, c: u16 };
+        \\const U = union(enum) { a: u64, b: u8 };
+        \\const Z = struct { a: void, b: [0]u32 };
+        \\const P = struct { p: *u8, s: []const u8 };
+        \\const Inner = struct { pub const Deep = struct { x: u8 }; };
+        \\fn Gen(comptime T: type) type { return struct { v: T }; }
+        \\const G = Gen(u16);
+        \\const CT = struct { t: type, n: u8 };
+        \\const O = opaque {};
+        \\const F = fn () void;
+        \\const N = noreturn;
+        \\const Ty = type;
+        \\const Ci = comptime_int;
+        \\fn generic(comptime T: type) void {
+        \\    _ = T;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    try w.setTarget(try targetOf("x86_64-linux-musl"));
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "Wide =", "size: 8 · align: 8" },
+        .{ "A =", "size: 8 · align: 4" },
+        .{ "B =", "size: 12 · align: 4" },
+        .{ "C =", "size: 4 · align: 4" },
+        .{ "U =", "size: 16 · align: 8" },
+        .{ "Z =", "size: 0 · align: 4" },
+        .{ "P =", "size: 24 · align: 8" },
+        .{ "Deep", "size: 1 · align: 1" },
+        .{ "G =", "size: 2 · align: 2" },
+        // Comptime-only and uninstantiable types have no size
+        .{ "CT =", null },
+        .{ "O =", null },
+        .{ "F =", null },
+        .{ "N =", null },
+        .{ "Ty =", null },
+        .{ "Ci =", null },
+        // An abstract generic parameter has no concrete layout
+        .{ "T;", null },
+    };
+    for (cases) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .count) orelse {
+            std.debug.print("no hover at `{s}`\n", .{c[0]});
+            return error.NoHover;
+        };
+        if (c[1]) |want| {
+            testing.expectEqualStrings(want, layoutLine(info.text, "size: ") orelse "") catch |err| {
+                std.debug.print("hover at `{s}`: {s}\n", .{ c[0], info.text });
+                return err;
+            };
+        } else testing.expect(layoutLine(info.text, "size: ") == null) catch |err| {
+            std.debug.print("hover at `{s}`: {s}\n", .{ c[0], info.text });
+            return err;
+        };
+    }
+}
+
+test "hover shows the offset of a struct field" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 build-obj -target
+    // x86_64-linux-musl @compileLog(@offsetOf(T, "field")).
+    const text =
+        \\const S = struct { f: u8, g: u64 };
+        \\const K = struct { comptime k: u8 = 1, v: u32 };
+        \\const Pk = packed struct { a: u3, b: u5, c: u16 };
+        \\fn use(s: S, p: *S) void {
+        \\    _ = s.g;
+        \\    _ = p.f;
+        \\    _ = S{ .f = 1, .g = 2 };
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    try w.setTarget(try targetOf("x86_64-linux-musl"));
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, u32, ?[]const u8 }{
+        // Field declarations
+        .{ "f: u8", 0, "offset: 8" },
+        .{ "g: u64", 0, "offset: 0" },
+        // Comptime fields and packed fields have no byte offset
+        .{ "k: u8", 0, null },
+        .{ "a: u3", 0, null },
+        // Field accesses, through a value and through a pointer
+        .{ "s.g", 2, "offset: 0" },
+        .{ "p.f", 2, "offset: 8" },
+        // Fields of an initializer
+        .{ ".f = 1", 1, "offset: 8" },
+        .{ ".g = 2", 1, "offset: 0" },
+    };
+    for (cases) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).? + c[1]), &.{}, .count) orelse {
+            std.debug.print("no hover at `{s}`\n", .{c[0]});
+            return error.NoHover;
+        };
+        if (c[2]) |want| {
+            testing.expectEqualStrings(want, layoutLine(info.text, "offset: ") orelse "") catch |err| {
+                std.debug.print("hover at `{s}`: {s}\n", .{ c[0], info.text });
+                return err;
+            };
+        } else testing.expect(layoutLine(info.text, "offset: ") == null) catch |err| {
+            std.debug.print("hover at `{s}`: {s}\n", .{ c[0], info.text });
+            return err;
+        };
+    }
+}
+
+test "hover layout follows a 32-bit target" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 build-obj -target
+    // x86-linux-musl @compileLog(@sizeOf(T), @alignOf(T)).
+    const text =
+        \\const P = struct { p: *u8, s: []const u8 };
+        \\const Q = struct { p: *u8, n: usize };
+        \\const U = usize;
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    try w.setTarget(try targetOf("x86-linux-musl"));
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "P =", "size: 12 · align: 4" },
+        .{ "Q =", "size: 8 · align: 4" },
+        .{ "U =", "size: 4 · align: 4" },
+    }) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .count) orelse return error.NoHover;
+        try testing.expectEqualStrings(c[1], layoutLine(info.text, "size: ") orelse "");
+    }
+}
+
+test "hover layout without a target shows only target-independent layouts" {
+    // Without a compilation, the targets of the projects disagree: only what they agree on is
+    // known (see Target-dependent layout in docs/design.md)
+    const text =
+        \\const Q = struct { n: usize };
+        \\const A = struct { a: u8 };
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    try w.setTarget(.{ .pointer_bits = null, .scalar_abi = .unknown, .endian = null });
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const q = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "Q =").?), &.{}, .count) orelse return error.NoHover;
+    try testing.expect(layoutLine(q.text, "size: ") == null);
+    const a = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "A =").?), &.{}, .count) orelse return error.NoHover;
+    try testing.expectEqualStrings("size: 1 · align: 1", layoutLine(a.text, "size: ") orelse "");
+}
+
+test "hover.layout turns the layout off" {
+    const text = "const Wide = u64;\n";
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const off = try hover.hoverWith(&r, file, 6, .{ .layout = false }) orelse return error.NoHover;
+    try testing.expect(layoutLine(off.text, "size: ") == null);
+    const on = try hover.hoverWith(&r, file, 6, .{}) orelse return error.NoHover;
+    try testing.expectEqualStrings("size: 8 · align: 8", layoutLine(on.text, "size: ") orelse "");
+}
+
+test "hover shows the hidden tag of an untagged union by optimize mode" {
+    // Expected values are the results of zig 0.17.0 and 0.17.1 build-obj -target
+    // x86_64-linux-musl with -O Debug (16/8) and -O ReleaseFast (8/8).
+    const text = "const U = union { a: u64, b: u8 };\n";
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "debug", "size: 16 · align: 8" },
+        .{ "fast", "size: 8 · align: 8" },
+    }) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const builtin_text = try std.fmt.allocPrint(w.arena.allocator(), "pub const optimize: enum {{ debug, safe, fast, small }} = .{s};\n", .{c[0]});
+        w.default_builtin = (try w.add("/b/builtin.zig", builtin_text)).file;
+        try w.setGraph(null, &.{}, &.{});
+        try w.setTarget(try targetOf("x86_64-linux-musl"));
+        const file = (try w.add("/p/main.zig", text)).file;
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, "U =").?), &.{}, .count) orelse return error.NoHover;
+        testing.expectEqualStrings(c[1], layoutLine(info.text, "size: ") orelse "") catch |err| {
+            std.debug.print("optimize mode `{s}`: {s}\n", .{ c[0], info.text });
+            return err;
+        };
+    }
 }

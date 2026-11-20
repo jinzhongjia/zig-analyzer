@@ -377,6 +377,11 @@
           "default": "count",
           "markdownDescription": "In a generic function body, how hover shows the declarations a member name refers to under the other instances."
         },
+        "zig-analyzer.hover.layout": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show the size and alignment of a type (`size: 8 · align: 4`), and the byte offset of a struct field (`offset: 8`), when the layout is fully known."
+        },
         "zig-analyzer.hover.fqn": {
           "type": "boolean",
           "default": false,

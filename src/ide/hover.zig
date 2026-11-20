@@ -10,6 +10,7 @@ const definition = @import("definition.zig");
 const context = @import("context.zig");
 const render = @import("../sema/render.zig");
 const queries = @import("../sema/queries.zig");
+const eval = @import("../sema/eval.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
@@ -51,6 +52,9 @@ pub const Options = struct {
     /// `Vfs.shownPath`)
     roots: []const []const u8 = &.{},
     instances: Instances = .count,
+    /// Show the size and alignment of a type value, and the offset of a struct field, when the
+    /// layout is fully known
+    layout: bool = true,
     /// Show the compiler's fully qualified name of a container-level declaration after its
     /// signature (`fqn: main.Wide`)
     fqn: bool = false,
@@ -257,6 +261,7 @@ fn writeBlock(w: *std.Io.Writer, r: *Resolver, a: context.At, def: ?Def, tv: Typ
     else
         try render.exprAlloc(r, tv);
     w.print("```zig\n{s}\n```", .{code}) catch return error.OutOfMemory;
+    if (opts.layout) try writeLayout(w, r, a, def, tv, e);
     if (opts.fqn) if (def) |d| switch (d) {
         .item => |it| if (try render.declName(r, r.arena, it.file, it.item, defInstance(a, e, seeded))) |name|
             w.print("\n\nfqn: `{s}`", .{name}) catch return error.OutOfMemory,
@@ -300,6 +305,60 @@ fn defInstance(a: context.At, e: ?Body.ExprId, seeded: ?seed.Seed) ?Index {
         else => {},
     };
     return if (seeded) |s| s.inst else null;
+}
+
+/// The size and alignment of the type `tv` when it is the value of a type, and the byte offset of
+/// the struct field that `def` and `e` name, when the layout is fully known
+fn writeLayout(w: *std.Io.Writer, r: *Resolver, a: context.At, def: ?Def, tv: TypedValue, e: ?Body.ExprId) resolve.Error!void {
+    if (tv.asType()) |t| if (!isNamespace(r, t)) if (try eval.typeLayout(r, t)) |l|
+        w.print("\n\nsize: {d} · align: {d}", .{ l.size, l.alignment }) catch return error.OutOfMemory;
+    const d = def orelse return;
+    const it = switch (d) {
+        .item => |x| x,
+        else => return,
+    };
+    const tree = try r.itemTree(it.file);
+    const item = tree.items[it.item];
+    // Only a field has an offset, not a declaration of the container
+    if (item.kind != .field) return;
+    const name = item.name orelse return;
+    // The field's container: the type of the value on the left of the access, or the container
+    // the field is declared in
+    var container: ?Index = null;
+    if (e) |x| switch (a.body.expr(x)) {
+        .field_access => |f| container = a.exprType(f.lhs).asType(),
+        else => {},
+    };
+    if (container == null) container = try queries.containerType(r, .{ .file = it.file, .container = item.container }, if (a.seeded) |s| s.inst else null);
+    if (try fieldOffset(r, container, name)) |offset|
+        w.print("\n\noffset: {d}", .{offset}) catch return error.OutOfMemory;
+}
+
+/// A file is a struct type, but a module is not a value with a size to show
+fn isNamespace(r: *Resolver, t: Index) bool {
+    return switch (r.ctx.db.env.ip.key(t)) {
+        .container_type => |c| c.kind == .file,
+        else => false,
+    };
+}
+
+/// Byte offset of the field `name` of `base` (following a single pointer, which a field access
+/// dereferences), when it is a non-packed struct whose layout is fully known; null for comptime
+/// fields and packed structs, whose offset is a bit offset
+fn fieldOffset(r: *Resolver, base: ?Index, name: []const u8) resolve.Error!?u64 {
+    var t = base orelse return null;
+    const ip = r.ctx.db.env.ip;
+    // A field access follows a single-item or C pointer
+    switch (ip.key(t)) {
+        .ptr_type => |p| {
+            if (p.size == .one or p.size == .c) t = p.child;
+        },
+        else => {},
+    }
+    const layout = (try eval.containerLayout(r, t)) orelse return null;
+    if (layout == .@"packed") return null;
+    const bits = try eval.bitOffsetOf(r, t, name) orelse return null;
+    return bits / 8;
 }
 
 /// Where the instance `s` comes from: `the call at file.zig:12`, or the iteration of each loop
@@ -471,14 +530,18 @@ fn initFieldHover(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.Expr
     };
     var out: std.Io.Writer.Allocating = .init(r.arena);
     const w = &out.writer;
+    // The result type is abstract when the field exists only under an instance
+    const init_ty = if (opts.layout) (if (from != null) instanceOnly(a) else a).initType(e) else null;
     const member = field.member orelse {
         const ty = field.ty orelse return null;
         if (ty == .unknown) return null;
         w.print("```zig\n{f}: {s}\n```", .{ std.zig.fmtId(fields[k].name.?), try render.typeAlloc(r, ty) }) catch return error.OutOfMemory;
+        if (opts.layout) if (try fieldOffset(r, init_ty, fields[k].name.?)) |offset| w.print("\n\noffset: {d}", .{offset}) catch return error.OutOfMemory;
         return .{ .text = out.written(), .start = tok.offset, .end = tok.range().end };
     };
     const def = try context.defOfKey(r, member) orelse return null;
     w.print("```zig\n{s}\n```", .{try context.signature(r, def, .{ .ty = field.ty orelse .unknown }, .multi_line)}) catch return error.OutOfMemory;
+    if (opts.layout) if (try fieldOffset(r, init_ty, fields[k].name.?)) |offset| w.print("\n\noffset: {d}", .{offset}) catch return error.OutOfMemory;
     if (from) |s| {
         w.writeAll("\n\ninferred from ") catch return error.OutOfMemory;
         try writeSource(w, r, s, opts.links);
