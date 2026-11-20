@@ -12,7 +12,7 @@ The lookup searches `error{ ... }` declarations, preferring one whose members eq
 
 ## Generic function bodies
 
-A generic function body is inferred with the instance of a call site, and hover names the call (`inferred from the call at main.zig:4`). This includes an enum literal or an initializer field whose result type is a parameter (`return .empty` and `.{ .len = 3 }` in a function returning `T`), which name a declaration or field only under an instance.
+A generic function body is inferred with the instance of a call site, and hover names the call (`inferred from the call at main.zig:4`). In a client that accepts Markdown, such locations are links that open the file at that line. This includes an enum literal or an initializer field whose result type is a parameter (`return .empty` and `.{ .len = 3 }` in a function returning `T`), which name a declaration or field only under an instance.
 
 A member name can refer to a different declaration under each instance. Goto lists the declaration under the selected instance first, then the one under every other instance; find references and document highlight cover all of them. Hover shows the declaration under the selected instance, followed by the others as set by `hover.instances`:
 
