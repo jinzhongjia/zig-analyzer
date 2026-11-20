@@ -843,8 +843,8 @@ test "auto-import offers declarations of files reached from build.zig" {
 }
 
 test "the first completion after opening includes auto-imports in single-file and build projects" {
-    // The index used to start only at the first completion, so that completion offered no
-    // auto-imports and the client had to request again. It now starts when the document opens.
+    // Prevents the first completion after opening from offering no auto-imports, which leaves
+    // them missing once the user stops typing
     const build_files = [_]fixture.File{
         .{ .path = "build.zig", .text = fixture.basic[0].text },
         .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },

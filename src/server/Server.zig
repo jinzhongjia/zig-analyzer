@@ -1375,9 +1375,10 @@ fn hasOpenZigDocument(server: *Server) bool {
 
 /// Starts building the auto-import index when a Zig document opens: the first completion at a
 /// name then includes auto-imports instead of waiting for the index and marking the result
-/// incomplete. Sessions with auto-import off do not build it before a request needs it. Called
-/// when the first project load ends too: the index waits until then, so that one build of it
-/// covers the final module graph.
+/// incomplete. Sessions with auto-import off do not build it before a request needs it. The index
+/// waits until the first project load ends, so that one build of it covers the final module graph:
+/// every place that ends it (startup, a project's first load, a restart during a first load) calls
+/// this too. Until startup ends, which follows the configuration pull, it does nothing.
 pub fn requestAutoImportIndex(server: *Server) void {
     if (!server.autoImportEnabled()) return;
     if (!server.hasOpenZigDocument()) return;
@@ -2225,9 +2226,8 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
     server.compileSingle(id);
     server.scheduleCompileSetRefresh(&.{id});
     // The auto-import index starts here so that the first completion at a name includes
-    // auto-imports. While the configuration is being pulled, its value is not known yet;
-    // `startProjects` requests the index once it has been applied.
-    if (!server.config_pulling.load(.acquire)) server.requestAutoImportIndex();
+    // auto-imports
+    server.requestAutoImportIndex();
 }
 
 /// Records `item` as the current document of its file `id` (see `OpenDoc`); called in the write
@@ -3430,7 +3430,6 @@ fn startProjects(server: *Server) void {
         server.watcher = null;
         w.destroy();
     };
-    server.requestAutoImportIndex();
 }
 
 // ── Projects and background tasks ────────────────────────────────────
@@ -4418,6 +4417,8 @@ pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) voi
     defer if (first_load) {
         _ = server.first_load_restarts.fetchSub(1, .acq_rel);
         server.wakeProjectWaiters();
+        // The new instance could not start or was discarded: no first load ends after this one
+        server.requestAutoImportIndex();
     };
     ws.stop();
     {
