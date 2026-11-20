@@ -9288,6 +9288,60 @@ test "hover in a defer body shows the value at one exit and counts or lists the 
     );
 }
 
+test "hover in a defer body lists an exit inside an inline loop once per iteration that reaches it" {
+    // Prevents counting the exit once with the loop's comptime vars unknown; `zig run` prints 1
+    // for the `return` in iteration 2 and 3 for the end of the block, for both loops
+    const text =
+        \\fn m(c: bool) void {
+        \\    comptime var x: u32 = 0;
+        \\    {
+        \\        defer {
+        \\            const m_seen = x;
+        \\            _ = m_seen;
+        \\        }
+        \\        inline for (0..3) |i| {
+        \\            if (c and i == 1) return;
+        \\            x += 1;
+        \\        }
+        \\    }
+        \\}
+        \\fn w(c: bool) void {
+        \\    comptime var x: u32 = 0;
+        \\    {
+        \\        defer {
+        \\            const w_seen = x;
+        \\            _ = w_seen;
+        \\        }
+        \\        comptime var i: u32 = 0;
+        \\        inline while (i < 3) : (i += 1) {
+        \\            if (c and i == 1) return;
+        \\            x += 1;
+        \\        }
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const info = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, text, "m_seen =").?), &.{}, .full)) orelse return error.NoHover;
+    try testing.expectEqualStrings(
+        "```zig\nconst m_seen: u32 = 1\n```\n\ninferred from the exit at main.zig:9 in iteration 2 of the loop at main.zig:8" ++
+            "\n\n---\n\n```zig\nconst m_seen: u32 = 3\n```\n\ninferred from the end of the block at main.zig:12",
+        info.text,
+    );
+    const in_while = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, text, "w_seen =").?), &.{}, .full)) orelse return error.NoHover;
+    try testing.expectEqualStrings(
+        "```zig\nconst w_seen: u32 = 1\n```\n\ninferred from the exit at main.zig:23 in iteration 2 of the loop at main.zig:22" ++
+            "\n\n---\n\n```zig\nconst w_seen: u32 = 3\n```\n\ninferred from the end of the block at main.zig:26",
+        in_while.text,
+    );
+}
+
 test "a type read in a defer body resolves members at each exit that runs it" {
     // Prevents resolving the member only at the end of the block: the compiler analyzes the body
     // with T = A at the `return` and T = B at the end of the block

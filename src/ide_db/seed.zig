@@ -43,8 +43,9 @@ pub const Seed = struct {
     /// (`exit`)
     pub const LoopIteration = struct { offset: u32, iteration: u32, exit: ?Exit = null };
     /// An exit that runs a `defer` body: a `return`, `break`, `continue` or `try`, or the end of
-    /// the block (`fall_through`)
-    pub const Exit = struct { fall_through: bool };
+    /// the block (`fall_through`); inside `inline for` loops inferred as a whole, the iteration
+    /// of each that reaches it, outermost first (see `infer.Result.DeferExit.iterations`)
+    pub const Exit = struct { fall_through: bool, iterations: []const LoopIteration = &.{} };
 };
 
 /// Result of inferring member `item` (inside some generic function) under the instance of the first
@@ -181,7 +182,7 @@ pub const Refiner = struct {
                 .inst = candidate.inst,
                 .loop = step.seed,
             });
-            const where = step.at(f.body, f.node_offset);
+            const where = try step.at(f.r, f.body, f.node_offset);
             const s: Seed = .{
                 .res = result.*.?,
                 .inst = candidate.inst,
@@ -248,8 +249,12 @@ const Step = struct {
 
     /// The iteration or exit the step presents (positions relative to the member start
     /// `node_offset`)
-    fn at(s: Step, body: *const Body, node_offset: u32) Seed.LoopIteration {
-        if (s.exit) |x| return .{ .offset = node_offset + x.at, .iteration = s.seed.index, .exit = .{ .fall_through = x.fall_through } };
+    fn at(s: Step, r: *Resolver, body: *const Body, node_offset: u32) resolve.Error!Seed.LoopIteration {
+        if (s.exit) |x| {
+            const its = try r.arena.alloc(Seed.LoopIteration, x.iterations.len);
+            for (x.iterations, its) |it, *o| o.* = .{ .offset = node_offset + it.loop, .iteration = it.index };
+            return .{ .offset = node_offset + x.at, .iteration = s.seed.index, .exit = .{ .fall_through = x.fall_through, .iterations = its } };
+        }
         return .{ .offset = node_offset + body.range(s.expr).start, .iteration = s.seed.index };
     }
 };
@@ -378,9 +383,9 @@ const Combinations = struct {
 
     /// The seed presenting a combination (positions relative to the member start `node_offset`)
     fn seed(c: *const Combinations, found: Combo, node_offset: u32) resolve.Error!Seed {
-        const last = found.steps[found.steps.len - 1].at(c.body, node_offset);
+        const last = try found.steps[found.steps.len - 1].at(c.r, c.body, node_offset);
         const enclosing = try c.r.arena.alloc(Seed.LoopIteration, found.steps.len - 1);
-        for (found.steps[0 .. found.steps.len - 1], enclosing) |s, *e| e.* = s.at(c.body, node_offset);
+        for (found.steps[0 .. found.steps.len - 1], enclosing) |s, *e| e.* = try s.at(c.r, c.body, node_offset);
         return .{
             .res = found.res,
             .inst = c.inst,
