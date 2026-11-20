@@ -4918,7 +4918,9 @@ const Evaluator = struct {
         if (eq(u8, name, "@Vector")) {
             if (vals.len != 2) return error.Abort;
             const len = std.math.cast(u32, try ev.intArg(vals[0])) orelse return error.Abort;
-            return Val.ofType(try ip.get(.{ .vector_type = .{ .len = len, .child = try asType(vals[1]) } }));
+            const child = try asType(vals[1]);
+            if (!value.isVectorElemType(ip, child)) return error.Abort;
+            return Val.ofType(try ip.get(.{ .vector_type = .{ .len = len, .child = child } }));
         }
         if (eq(u8, name, "@Tuple")) {
             if (vals.len != 1) return error.Abort;
@@ -5140,11 +5142,15 @@ const Evaluator = struct {
         }
         if (eq(u8, name, "@select")) {
             if (vals.len != 4) return error.Abort;
-            return try ev.select(try asType(vals[0]), vals[1], vals[2], vals[3]);
+            const elem = try asType(vals[0]);
+            if (!value.isVectorElemType(ip, elem)) return error.Abort;
+            return try ev.select(elem, vals[1], vals[2], vals[3]);
         }
         if (eq(u8, name, "@shuffle")) {
             if (vals.len != 4) return error.Abort;
-            return try ev.shuffle(try asType(vals[0]), vals[1], vals[2], vals[3]);
+            const elem = try asType(vals[0]);
+            if (!value.isVectorElemType(ip, elem)) return error.Abort;
+            return try ev.shuffle(elem, vals[1], vals[2], vals[3]);
         }
         if (eq(u8, name, "@min") or eq(u8, name, "@max")) {
             if (vals.len == 0) return error.Abort;

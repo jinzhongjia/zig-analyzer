@@ -2005,6 +2005,18 @@ pub fn optionalCoercion(ip: *InternPool, from: Index, to: Index) ?OptionalCoerci
     };
 }
 
+/// Whether `t` can be the element type of a vector (`Sema.checkVectorElemType`): a runtime
+/// integer, float or bool, a pointer other than a slice, or a pointer-like optional
+pub fn isVectorElemType(ip: *InternPool, t: Index) bool {
+    if (t == .comptime_int_type or t == .comptime_float_type) return false;
+    if (t == .bool_type or ip.isInt(t) or ip.isFloat(t)) return true;
+    return switch (ip.key(t)) {
+        .ptr_type => |p| p.size != .slice,
+        .optional_type => |child| isPtrLikePayload(ip, child) and ip.key(child).ptr_type.size != .slice,
+        else => false,
+    };
+}
+
 /// Whether an optional of payload type `t` stores null as address 0 (the compiler's pointer-like
 /// optional): a pointer that is neither a C pointer nor `allowzero`
 fn isPtrLikePayload(ip: *InternPool, t: Index) bool {

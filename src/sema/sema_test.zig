@@ -8687,6 +8687,54 @@ test "a store through a const pointer or to an immutable place gives no value" {
     });
 }
 
+test "a vector element type must be an integer, float, bool or pointer" {
+    // `@Vector` built vectors of any element type, and their arithmetic was evaluated.
+    // Expected values are the results of zig 0.17.1, which rejects the `bad` element types
+    // ("expected integer, float, bool, or pointer for the vector element type").
+    try expectTypes(
+        \\const E = enum { a, b };
+        \\const bad_comptime_int = @Vector(3, comptime_int);
+        \\const bad_comptime_float = @Vector(2, comptime_float);
+        \\const bad_optional = @Vector(2, ?u8);
+        \\const bad_enum = @Vector(2, E);
+        \\const bad_slice = @Vector(2, []u8);
+        \\const bad_optional_slice = @Vector(2, ?[]u8);
+        \\const bad_allowzero_optional = @Vector(2, ?*allowzero u8);
+        \\const bad_vector = @Vector(2, @Vector(2, u8));
+        \\const bad_size = @sizeOf(@Vector(2, ?u8));
+        \\const bad_select = @select(comptime_int, @Vector(2, bool){ true, false }, .{ 1, 2 }, .{ 3, 4 });
+        \\const bad_shuffle = @shuffle(comptime_int, .{ 1, 2 }, .{ 3, 4 }, .{ 0, 1 });
+        \\const ok_int = @Vector(2, u0);
+        \\const ok_float = @Vector(2, f80);
+        \\const ok_bool = @Vector(2, bool);
+        \\const ok_ptr = @Vector(2, *u8);
+        \\const ok_many = @Vector(2, [*c]u8);
+        \\const ok_optional_ptr = @Vector(2, ?*u8);
+        \\const ok_fn_ptr = @Vector(2, *const fn () void);
+        \\const ok_select = @select(u8, @Vector(2, bool){ true, false }, [2]u8{ 1, 2 }, [2]u8{ 3, 4 });
+    , &.{
+        .{ "bad_comptime_int", "type" },
+        .{ "bad_comptime_float", "type" },
+        .{ "bad_optional", "type" },
+        .{ "bad_enum", "type" },
+        .{ "bad_slice", "type" },
+        .{ "bad_optional_slice", "type" },
+        .{ "bad_allowzero_optional", "type" },
+        .{ "bad_vector", "type" },
+        .{ "bad_size", "comptime_int" },
+        .{ "bad_select", "unknown" },
+        .{ "bad_shuffle", "unknown" },
+        .{ "ok_int", "type = @Vector(2, u0)" },
+        .{ "ok_float", "type = @Vector(2, f80)" },
+        .{ "ok_bool", "type = @Vector(2, bool)" },
+        .{ "ok_ptr", "type = @Vector(2, *u8)" },
+        .{ "ok_many", "type = @Vector(2, [*c]u8)" },
+        .{ "ok_optional_ptr", "type = @Vector(2, ?*u8)" },
+        .{ "ok_fn_ptr", "type = @Vector(2, *const fn () void)" },
+        .{ "ok_select", "@Vector(2, u8) = .{ 1, 4 }" },
+    });
+}
+
 test "builtins on integer types wider than 128 bits" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both)
     try expectTypes(

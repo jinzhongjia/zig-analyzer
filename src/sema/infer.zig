@@ -2127,6 +2127,7 @@ const Inferrer = struct {
         if (eq(u8, name, "@select") or eq(u8, name, "@shuffle")) {
             if (args.len != 4) return .unknown;
             const t = inf.get(args[0]).asType() orelse return .unknown;
+            if (!value.isVectorElemType(ip, t)) return .unknown;
             const n: ?u64 = switch (ip.key(inf.get(if (eq(u8, name, "@select")) args[1] else args[3]).ty)) {
                 .vector_type => |v| v.len,
                 .array_type => |a| a.len,
