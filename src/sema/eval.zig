@@ -4977,6 +4977,14 @@ const Evaluator = struct {
             if (types.len != names.len) return error.Abort;
             const is_union = eq(u8, name, "@Union");
             const attrs = try ev.reifiedAttrs(vals[4], names.len, is_union);
+            // Specs the compiler rejects when it analyzes the call: a backing integer of a struct
+            // that is not packed, an enum tag of an extern union, aligned fields of a packed
+            // container, comptime fields of an extern struct or without a default value. A packed
+            // backing integer that does not match the fields is reported only when the layout is
+            // resolved, which then gives no layout.
+            if (tag != .null_value and (if (is_union) layout == .@"extern" else layout != .@"packed")) return error.Abort;
+            if (layout == .@"packed" and attrs.aligns.len != 0) return error.Abort;
+            if (attrs.comptimes.len != 0 and (layout == .@"extern" or attrs.comptime_without_default)) return error.Abort;
             return Val.ofType(try ev.reify(f, e, .{
                 .kind = if (is_union) .@"union" else .@"struct",
                 .layout = layout,
@@ -7071,7 +7079,13 @@ const Evaluator = struct {
         return .{ .size = value.alignForward(size, alignment) orelse return null, .alignment = alignment, .bits = null };
     }
 
-    const ReifiedAttrs = struct { aligns: []const u64 = &.{}, comptimes: []const bool = &.{}, unknown: bool = false };
+    const ReifiedAttrs = struct {
+        aligns: []const u64 = &.{},
+        comptimes: []const bool = &.{},
+        /// A comptime field has no default value
+        comptime_without_default: bool = false,
+        unknown: bool = false,
+    };
 
     /// Whether an untagged auto union has a hidden tag for safety checks (matching the compiler's
     /// `wantSafeTypes`): it does when the optimize mode of its module is Debug or ReleaseSafe. When
@@ -7123,15 +7137,25 @@ const Evaluator = struct {
         const comptimes = try ev.a.alloc(bool, n);
         var any_align = false;
         var any_comptime = false;
+        var comptime_without_default = false;
         for (aligns, comptimes, 0..) |*al, *ct, i| {
             const attr = try ev.elemAt(attrs, i);
             const x = try ev.freeze(try ev.fieldAccess(null, attr, "align")) orelse return error.Abort;
             al.* = if (x == .null_value) 0 else try alignValue(ev.ip, x);
             ct.* = !is_union and (try ev.condition(try ev.fieldAccess(null, attr, "comptime"))).yes;
+            if (ct.*) {
+                const default = try ev.fieldAccess(null, attr, "default_value_ptr");
+                if (default.v == .unknown) return error.Abort;
+                if (ev.isNullRepr(default) or default.is(.null_value)) comptime_without_default = true;
+            }
             any_align = any_align or al.* != 0;
             any_comptime = any_comptime or ct.*;
         }
-        return .{ .aligns = if (any_align) aligns else &.{}, .comptimes = if (any_comptime) comptimes else &.{} };
+        return .{
+            .aligns = if (any_align) aligns else &.{},
+            .comptimes = if (any_comptime) comptimes else &.{},
+            .comptime_without_default = comptime_without_default,
+        };
     }
 
     // ── @typeInfo ────────────────────────────────────────────────────

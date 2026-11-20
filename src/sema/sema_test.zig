@@ -8839,6 +8839,48 @@ test "@hasDecl on a type that is not a container gives no value" {
     });
 }
 
+test "@Struct and @Union give no type for specs the compiler rejects" {
+    // `@Struct` and `@Union` built a type from any spec.
+    // Expected values are the results of zig 0.17.1, which rejects the `bad` specs when the call
+    // is analyzed; the packed backing integer is checked only when the layout is resolved.
+    try expectTypes(
+        \\const bad_backing_auto = @Struct(.auto, u32, &.{"a"}, &.{u1}, &.{.{}});
+        \\const bad_backing_extern = @Struct(.@"extern", u32, &.{"a"}, &.{u32}, &.{.{}});
+        \\const bad_extern_union_tag = @Union(.@"extern", enum { a }, &.{"a"}, &.{u8}, &.{.{}});
+        \\const Mismatch = @Struct(.@"packed", u32, &.{ "a", "b" }, &.{ u1, u2 }, &.{ .{}, .{} });
+    , &.{
+        .{ "bad_backing_auto", "type" },
+        .{ "bad_backing_extern", "type" },
+        .{ "bad_extern_union_tag", "type" },
+        .{ "Mismatch", "type = Mismatch" },
+    });
+    // The field attributes are read through `std.builtin.Type`
+    try expectStdTypes(
+        \\const Mismatch = @Struct(.@"packed", u32, &.{ "a", "b" }, &.{ u1, u2 }, &.{ .{}, .{} });
+        \\const bad_mismatch_size = @sizeOf(Mismatch);
+        \\const ok_packed = @sizeOf(@Struct(.@"packed", u3, &.{ "a", "b" }, &.{ u1, u2 }, &.{ .{}, .{} }));
+        \\const ok_union = @sizeOf(@Union(.auto, enum { a }, &.{"a"}, &.{u8}, &.{.{}}));
+        \\const ok_packed_union = @sizeOf(@Union(.@"packed", u8, &.{"a"}, &.{u8}, &.{.{}}));
+        \\const bad_comptime_no_default = @Struct(.auto, null, &.{"a"}, &.{u8}, &.{.{ .@"comptime" = true }});
+        \\const bad_extern_comptime = @Struct(.@"extern", null, &.{"a"}, &.{u8}, &.{.{ .@"comptime" = true, .default_value_ptr = &@as(u8, 3) }});
+        \\const bad_packed_align = @Struct(.@"packed", null, &.{"a"}, &.{u8}, &.{.{ .@"align" = 4 }});
+        \\const bad_packed_union_align = @Union(.@"packed", null, &.{"a"}, &.{u8}, &.{.{ .@"align" = 4 }});
+        \\const ok_comptime = @sizeOf(@Struct(.auto, null, &.{"a"}, &.{u8}, &.{.{ .@"comptime" = true, .default_value_ptr = &@as(u8, 3) }}));
+        \\const ok_aligned = @alignOf(@Struct(.auto, null, &.{"a"}, &.{u8}, &.{.{ .@"align" = 4 }}));
+    , &.{
+        .{ "bad_comptime_no_default", "type" },
+        .{ "bad_extern_comptime", "type" },
+        .{ "bad_packed_align", "type" },
+        .{ "bad_packed_union_align", "type" },
+        .{ "bad_mismatch_size", "comptime_int" },
+        .{ "ok_packed", "comptime_int = 1" },
+        .{ "ok_union", "comptime_int = 1" },
+        .{ "ok_packed_union", "comptime_int = 1" },
+        .{ "ok_comptime", "comptime_int = 0" },
+        .{ "ok_aligned", "comptime_int = 4" },
+    });
+}
+
 test "builtins on integer types wider than 128 bits" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both)
     try expectTypes(
