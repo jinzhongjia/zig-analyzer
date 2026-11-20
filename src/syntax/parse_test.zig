@@ -464,6 +464,13 @@ test "recovery: each construct takes only its own capture forms" {
     );
 }
 
+test "recovery: comparison operators cannot be chained" {
+    // `zig ast-check`: `comparison operators cannot be chained` at the second operator
+    try expectErrors("const x = a == b == c;", "error@17: comparison operators cannot be chained\n");
+    try expectErrors("const x = a < b != c;", "error@16: comparison operators cannot be chained\n");
+    try expectNoErrors("const x = a == b and c != d;\nconst y = (a == b) == c;\nconst z = a + b == c * d;\n");
+}
+
 /// Depth of the syntax tree (computed iteratively)
 fn treeDepth(n: @import("tree.zig").SyntaxNode) !usize {
     const Entry = struct { node: @import("tree.zig").SyntaxNode, depth: usize };

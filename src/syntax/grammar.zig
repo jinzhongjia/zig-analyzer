@@ -879,7 +879,7 @@ fn binaryPrec(kind: SyntaxKind) ?u8 {
     return switch (kind) {
         .keyword_or => 10,
         .keyword_and => 20,
-        .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => 30,
+        .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => comparison_prec,
         .ampersand, .caret, .pipe, .keyword_orelse, .keyword_catch => 40,
         .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_left_pipe, .angle_bracket_angle_bracket_right => 50,
         .plus, .minus, .plus_plus, .plus_percent, .minus_percent, .plus_pipe, .minus_pipe => 60,
@@ -888,12 +888,21 @@ fn binaryPrec(kind: SyntaxKind) ?u8 {
     };
 }
 
+/// Precedence of the comparison operators, which do not associate
+const comparison_prec = 30;
+
 fn exprPrec(p: *Parser, min_prec: u8) Error!CM {
     var lhs = try prefixExpr(p) orelse return null;
+    var compared = false;
     while (true) {
         const op = p.peek();
         const prec = binaryPrec(op) orelse break;
         if (prec < min_prec) break;
+        if (prec == comparison_prec) {
+            // As in `std.zig.Parse`, a second comparison at the same level is an error
+            if (compared) try p.err("comparison operators cannot be chained");
+            compared = true;
+        }
         const m = try lhs.precede(p);
         try p.bump();
         if (op == .keyword_catch) try optPayload(p, .plain);
