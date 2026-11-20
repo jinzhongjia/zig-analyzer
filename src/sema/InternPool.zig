@@ -1374,8 +1374,16 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try ip.print(v.pointee, w, container_name);
         },
         .ptr_int => |v| try w.print("@ptrFromInt(0x{x})", .{v.addr}),
-        // Matches the compiler, which prints a non-null optional as its payload
-        .opt_payload => |v| try ip.print(v.payload, w, container_name),
+        // Matches the compiler, which prints a non-null optional as its payload, and a null
+        // pointer (of a `?[*c]T` or `?*allowzero T`) as its address, so that it does not read as
+        // the optional's own null
+        .opt_payload => |v| {
+            if (v.payload == .null_value) switch (ip.key(v.ty)) {
+                .optional_type => |child| if (ip.key(child) == .ptr_type) return w.writeAll("@ptrFromInt(0x0)"),
+                else => {},
+            };
+            try ip.print(v.payload, w, container_name);
+        },
         .instance, .context => try w.writeAll("instance"),
         // Only referred to by the `base` of pointer values, which are shown by what they point to
         .ptr_base => try w.writeAll("_"),
