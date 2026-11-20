@@ -8800,6 +8800,45 @@ test "vector builtins give no type for operands the compiler rejects" {
     });
 }
 
+test "@hasDecl on a type that is not a container gives no value" {
+    // `@hasDecl(u8, "foo")` was false.
+    // Expected values are the results of zig 0.17.1, which rejects the `bad` operands
+    // ("expected struct, enum, union, or opaque").
+    try expectTypes(
+        \\const Inner = struct {
+        \\    pub const x = 1;
+        \\    const priv_const = 2;
+        \\};
+        \\const bad_int = @hasDecl(u8, "foo");
+        \\const bad_optional = @hasDecl(?u8, "foo");
+        \\const bad_pointer = @hasDecl(*Inner, "x");
+        \\const bad_error_set = @hasDecl(error{A}, "A");
+        \\const bad_array = @hasDecl([2]u8, "len");
+        \\const ok_pub = @hasDecl(Inner, "x");
+        \\const ok_private = @hasDecl(Inner, "priv_const");
+        \\const ok_missing = @hasDecl(Inner, "y");
+        \\const ok_anyopaque = @hasDecl(anyopaque, "foo");
+        \\const ok_tuple = @hasDecl(struct { u8 }, "foo");
+        \\const ok_anon = @hasDecl(@TypeOf(.{ .a = 1 }), "a");
+        \\const ok_reified = @hasDecl(@Struct(.auto, null, &.{}, &.{}, &.{}), "foo");
+        \\const ok_opaque = @hasDecl(opaque {}, "foo");
+    , &.{
+        .{ "bad_int", "bool" },
+        .{ "bad_optional", "bool" },
+        .{ "bad_pointer", "bool" },
+        .{ "bad_error_set", "bool" },
+        .{ "bad_array", "bool" },
+        .{ "ok_pub", "bool = true" },
+        .{ "ok_private", "bool = false" },
+        .{ "ok_missing", "bool = false" },
+        .{ "ok_anyopaque", "bool = false" },
+        .{ "ok_tuple", "bool = false" },
+        .{ "ok_anon", "bool = false" },
+        .{ "ok_reified", "bool = false" },
+        .{ "ok_opaque", "bool = false" },
+    });
+}
+
 test "builtins on integer types wider than 128 bits" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both)
     try expectTypes(

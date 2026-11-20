@@ -4893,7 +4893,14 @@ const Evaluator = struct {
                 if (value.sliceArrayHasField(ip, t, field)) |has| return boolVal(has);
                 return boolVal(try ev.fieldIndex(t, field) != null or (value.isEnumType(ip, t) and try ev.isEnumMember(t, field)));
             }
-            const ns = try queries.namespaceOfType(ev.r, t) orelse return boolVal(false);
+            // Only a struct, enum, union or opaque has declarations ("expected struct, enum,
+            // union, or opaque"); those without source code have none
+            switch (ip.key(t)) {
+                .container_type => {},
+                .tuple_type, .anon_struct_type, .reified_type, .union_tag_type => return boolVal(false),
+                else => return if (t == .anyopaque_type) boolVal(false) else error.Abort,
+            }
+            const ns = try queries.namespaceOfType(ev.r, t) orelse return error.Abort;
             const tree = try ev.r.itemTree(ns.file);
             const m = Resolver.lookupDecl(tree, ns.container, field) orelse return boolVal(false);
             return boolVal(tree.items[m].flags.is_pub);
