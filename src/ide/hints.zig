@@ -13,8 +13,9 @@ pub const inactive_code = "inactive";
 /// Code of the hint on a private declaration that no code in its file uses
 pub const unused_code = "unused.declaration";
 
-/// Families whose hints a suppression comment may name. Naming hints use `naming.<rule>`.
-const families = [_][]const u8{ "naming", "unused", "inactive" };
+/// Families whose hints a suppression comment may name. Naming hints use `naming.<rule>`, lint
+/// hints `lint.<rule>`.
+const families = [_][]const u8{ "naming", "unused", "inactive", "lint" };
 
 /// The code of a diagnostic that a suppression comment may remove: analyzer-owned hints only,
 /// never compiler diagnostics (their source is `zig`)

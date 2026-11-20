@@ -103,15 +103,26 @@ Hints that are not compiler output have `source = "zig-analyzer"` and a code. Th
 |---|---|---|
 | `naming.<rule>` | a name that does not follow the Names section of the style guide | `naming.enable` |
 | `unused.declaration` | a private `fn`, `const` or `var` that no code in its file reaches | `unused.enable` |
+| `lint.redundant_cast` | `@as`, `@intCast`, `@truncate` or `@floatCast` whose operand already has the type | `lint.enable`, `lint.rules` |
+| `lint.constant_comparison` | a comparison that the range of a fixed-width integer type decides | `lint.enable`, `lint.rules` |
+| `lint.dead_errdefer` | an `errdefer` that never runs | `lint.enable`, `lint.rules` |
 | `inactive` | code that is not compiled under the current build configuration | `diagnostics.inactive_code` |
 
-Hints are published for open files of user code (or files outside the workspace), not for dependency libraries, generated files, or the Zig installation; `naming.exclude` applies to the naming check. Hints on unused declarations and inactive code are tagged `Unnecessary`, which editors show faded.
+Hints are published for open files of user code (or files outside the workspace), not for dependency libraries, generated files, or the Zig installation; `naming.exclude` applies to the naming check. Hints on unused declarations, inactive code, redundant casts and dead `errdefer` statements are tagged `Unnecessary`, which editors show faded; a constant comparison is a warning, since it is most likely a bug (such as a loop that never ends).
 
 ### Unused declarations
 
 A declaration without `pub`, `export` or `extern` is visible only in the file that declares it: the compiler rejects `S.x` and `@field(S, "x")` from another file, also when the container is a type returned by a generic function. `@hasDecl` and `std.meta.declarations` see only `pub` declarations, and `@typeInfo` does not list declarations. The check therefore searches references in the file only.
 
 Hints follow reachability, not just direct references: a private helper used only by another unused declaration is reported too. Live declarations are the file-scope declarations that code outside the file or the compiler can reach (`pub`, `export`, `extern`, tests, `comptime` blocks, fields) and, through the declaration that defines a nested container, the members of that container's interface (fields, `pub`/`export`/`extern` declarations, tests, `comptime` blocks). A `@field` with a string literal is treated as a reference to the declaration of that name, since its first operand may be a type; a `@hasDecl` with a string literal is treated the same way, although it only sees `pub` declarations. A `@field` whose name is computed disables the check for the file, since it could name any declaration. Files with syntax errors get no hint, and names starting with `_` or written as `@"..."` are left out.
+
+### Lint
+
+A lint hint must hold under every build configuration and every instance, not only the analyzed one, so a type counts only when the source writes it as a primitive type name: an alias may name another type on another target or with other build options (`std.posix.mode_t`, `if (options.wide) u64 else u32`), while the same primitive name is the same type everywhere. Inference results confirm that the types are known and equal. Generic functions and members of the types they return are not checked (a cast redundant for one instance may be needed for another), and neither are inactive code and files with syntax errors.
+
+- **Redundant cast**: `@as(T, x)` where `x` is a name or a field access whose declaration writes the type `T`: a parameter or variable with that annotation, a field, or `.len` of a slice or an array (`usize`). `@intCast(x)`, `@truncate(x)` and `@floatCast(x)` likewise, when the result type is written as `T`: by `@as`, a variable annotation, the return type (also the payload of `!T`, `E!T` and `?T`), or the annotated variable an `=` assigns to. The fix replaces the cast with its operand. A literal operand is a `comptime_int` and is never reported.
+- **Constant comparison**: `==`, `!=`, `<`, `<=`, `>`, `>=` between an integer literal (or its negation) and a name or field access of a fixed-width integer type (`u8`, `i32`), where the literal decides the result for every value of that type: outside its range, or at an end of it (`x <= 255`, `x >= 0` for a `u8`). `usize`, `isize` and the C integer types have a different range on each target and are not checked.
+- **Dead `errdefer`**: an `errdefer` in a function whose return type is a primitive type name other than `anyerror` (so it cannot return an error), or one followed in its block by no `try` and no `return` whose operand may be an error. A `return` of a literal, an initializer, an enum literal, or a name or field access whose type is not an error union or error set cannot give an error; any other operand may. Code in the rest of the block counts even when it is inactive under the current build configuration. A `break` out of the block, also with an error value, runs only `defer` statements, so it does not keep an `errdefer` alive. `errdefer unreachable` and `errdefer comptime unreachable` assert that no error follows, and are not reported.
 
 ### Suppression comments
 

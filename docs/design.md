@@ -42,7 +42,7 @@ zig-analyzer is a language server (LSP) for Zig 0.17. Current stage: feature-com
 
 ```
 server/       LSP main loop, scheduling, cancellation, workspace and project management, configuration
-ide/          hover · completion · goto · refs · rename · inlay hints · code actions · naming · unused …
+ide/          hover · completion · goto · refs · rename · inlay hints · code actions · naming · unused · lint …
 ide_db/       reference search · call-site seeds
 sema/         InternPool · type inference · comptime interpreter · type rendering
 names/        module graph · import / name resolution

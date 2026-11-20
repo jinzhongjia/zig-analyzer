@@ -54,3 +54,7 @@ These follow the Names section of the Zig 0.17 style guide (the diagnostics link
 - **Hints**: published for open files only, with code `naming.<rule>` and a link to the rule. `naming.ignore` and `naming.rules` set exceptions. Results are cached per member, so an edit recomputes only changed members, reads no other files, and starts no compiler.
 - **Fixes**: refused in the same cases as rename (see `docs/features/references-rename.md`), with a final AstGen check of the renamed file. Only workspace references of public names are updated, so with change annotation support the edit needs confirmation.
 - **Suppression**: a hint can be silenced for a line or a range with a comment (see "Suppression comments" in `docs/diagnostics.md`), without turning the rule off for the file.
+
+## Lint fixes
+
+A `lint.redundant_cast` hint (`ide/lint.zig`, see `docs/diagnostics.md`) has the preferred fix "remove `@as`" (or `@intCast`, `@truncate`, `@floatCast`), which replaces the cast with its operand. The operand is always a name or a field access, so the replacement needs no parentheses. Offered only while `lint.enable` and the rule are on.

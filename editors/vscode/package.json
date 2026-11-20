@@ -562,6 +562,31 @@
           "default": false,
           "markdownDescription": "Hint private declarations that no code in the same file uses. Only open files of your own code are checked."
         },
+        "zig-analyzer.lint.enable": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Hint code that compiles but has no effect or always gives the same result: redundant casts, comparisons the integer type decides, and `errdefer` that never runs. Only open files of your own code are checked."
+        },
+        "zig-analyzer.lint.rules": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "Turn individual lint rules on or off; each matches the diagnostic code `lint.<rule>`.",
+          "properties": {
+            "redundant_cast": {
+              "type": "boolean",
+              "description": "@as, @intCast, @truncate or @floatCast whose operand already has the type."
+            },
+            "constant_comparison": {
+              "type": "boolean",
+              "description": "A comparison of a fixed-width integer with a literal that gives the same result for every value."
+            },
+            "dead_errdefer": {
+              "type": "boolean",
+              "description": "An errdefer that never runs."
+            }
+          },
+          "additionalProperties": false
+        },
         "zig-analyzer.files.watcher": {
           "type": "string",
           "enum": [

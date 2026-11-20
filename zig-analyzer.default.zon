@@ -296,6 +296,45 @@
         .enable = false,
     },
 
+    // Lint hints: code that compiles but has no effect or always gives the same result. A hint is
+    // given only when it holds under every build configuration: the types involved must be
+    // written as primitive type names (`u8`, not an alias that may name another type on another
+    // target), and generic functions are not checked. Only open files of your own code are
+    // checked.
+    // Example:
+    //   .lint = .{
+    //       .enable = true,
+    //       .rules = .{ .constant_comparison = false },
+    //   },
+    .lint = .{
+        // Give lint hints. Off by default.
+        // Example:
+        //   .enable = true,
+        .enable = false,
+        // Turn individual rules on or off; each matches the diagnostic code `lint.<rule>`.
+        // Example:
+        //   .rules = .{
+        //       .dead_errdefer = false,
+        //   },
+        .rules = .{
+            // `@as`, `@intCast`, `@truncate` or `@floatCast` whose operand already has the type,
+            // with a fix that removes the cast.
+            // Example:
+            //   .redundant_cast = false,
+            .redundant_cast = true,
+            // A comparison of a fixed-width integer with a literal that gives the same result for
+            // every value of its type (`x < 256` for a `u8`), reported as a warning.
+            // Example:
+            //   .constant_comparison = false,
+            .constant_comparison = true,
+            // An `errdefer` that never runs: the function cannot return an error, or nothing
+            // after it in its block can.
+            // Example:
+            //   .dead_errdefer = false,
+            .dead_errdefer = true,
+        },
+    },
+
     // Who detects changes on disk (editor only):
     //   .files = .{ .watcher = .auto },
     // .auto: the server watches files when the editor cannot register file watchers;

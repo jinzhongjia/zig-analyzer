@@ -1,5 +1,5 @@
-//! End-to-end: unused-declaration hints (opt-in, updated after edits) and suppression comments,
-//! which remove analyzer-owned hints but never compiler diagnostics.
+//! End-to-end: unused-declaration and lint hints (opt-in, updated after edits) and suppression
+//! comments, which remove analyzer-owned hints but never compiler diagnostics.
 
 const std = @import("std");
 const testing = std.testing;
@@ -154,6 +154,74 @@ test "unused hints are opt-in and suppression comments remove them" {
         \\3:3 unused.declaration declaration `unusedFn` is never used
         \\
     , try hints(&h, "main.zig"));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+const lint_on = "{\"build\": {\"enable\": false}, \"diagnostics\": {\"compiler\": false}, \"lint\": {\"enable\": true}}";
+
+test "lint hints are opt-in, follow the rules setting, and redundant casts have a fix" {
+    const text =
+        \\pub fn f(x: u8) bool {
+        \\    _ = @as(u8, x);
+        \\    return x < 256;
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{.{ .path = "main.zig", .text = text }});
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const a = h.arena.allocator();
+    try initialize(&project, &h, base);
+    const before_open = try publishCount(&h, "main.zig");
+    const uri = try open(&h, &project, "main.zig", text);
+    try waitPublish(&h, "main.zig", before_open);
+    try testing.expectEqualStrings("", try hints(&h, "main.zig"));
+
+    const before_config = try publishCount(&h, "main.zig");
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h, lint_on) });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try waitPublish(&h, "main.zig", before_config);
+    try testing.expectEqualStrings(
+        \\1:8 lint.redundant_cast `@as` has no effect: the operand already has type `u8`
+        \\2:11 lint.constant_comparison comparison is always true: no value of type `u8` gives another result
+        \\
+    , try hints(&h, "main.zig"));
+    // A faded hint for the cast, a warning for the comparison
+    const diags = try lastDiagnostics(&h, "main.zig");
+    try testing.expectEqual(4, diags[0].object.get("severity").?.integer);
+    try testing.expectEqual(1, diags[0].object.get("tags").?.array.items[0].integer);
+    try testing.expectEqual(2, diags[1].object.get("severity").?.integer);
+
+    // The fix replaces the cast with its operand
+    const resp = try h.request("textDocument/codeAction", .{
+        .textDocument = .{ .uri = uri },
+        .range = .{ .start = .{ .line = 1, .character = 10 }, .end = .{ .line = 1, .character = 10 } },
+        .context = .{ .diagnostics = &[_]Empty{} },
+    });
+    const fix = for (resp.object.get("result").?.array.items) |x| {
+        if (std.mem.eql(u8, x.object.get("title").?.string, "remove `@as`")) break x;
+    } else return error.TestNoFix;
+    const edits = fix.object.get("edit").?.object.get("changes").?.object.get(uri).?.array.items;
+    try testing.expectEqual(1, edits.len);
+    try testing.expectEqualStrings("x", edits[0].object.get("newText").?.string);
+
+    // A rule turned off, and a suppression comment naming one rule
+    const before_rules = try publishCount(&h, "main.zig");
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = try jsonValue(&h,
+        \\{"build": {"enable": false}, "diagnostics": {"compiler": false}, "lint": {"enable": true, "rules": {"constant_comparison": false}}}
+    ) });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try waitPublish(&h, "main.zig", before_rules);
+    try testing.expectEqualStrings(
+        \\1:8 lint.redundant_cast `@as` has no effect: the operand already has type `u8`
+        \\
+    , try hints(&h, "main.zig"));
+    const edited = try std.mem.replaceOwned(u8, a, text, "    _ = @as", "    // zig-analyzer-disable-next-line: lint.redundant_cast\n    _ = @as");
+    try change(&h, uri, 2, edited);
+    try testing.expectEqualStrings("", try hints(&h, "main.zig"));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
