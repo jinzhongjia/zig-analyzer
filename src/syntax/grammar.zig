@@ -132,7 +132,11 @@ fn decl(p: *Parser, m: Marker) Error!void {
             try p.bump();
             _ = try p.eat(.string_literal);
         },
-        .keyword_export, .keyword_inline, .keyword_noinline => try p.bump(),
+        .keyword_export => try p.bump(),
+        .keyword_inline, .keyword_noinline => {
+            try p.bump();
+            if (!p.at(.keyword_fn)) return notFnDecl(p, m);
+        },
         else => {},
     }
     if (p.at(.keyword_fn)) {
@@ -154,6 +158,19 @@ fn decl(p: *Parser, m: Marker) Error!void {
         return;
     }
     try p.err("expected function or variable declaration");
+    _ = try m.complete(p, .error_node);
+}
+
+/// After `inline` / `noinline`, which only precede a function: a variable declaration that
+/// follows is parsed into an `error_node`, so it declares nothing
+fn notFnDecl(p: *Parser, m: Marker) Error!void {
+    try p.err("expected function");
+    _ = try p.eat(.keyword_threadlocal);
+    if (p.at(.keyword_const) or p.at(.keyword_var)) {
+        try varDeclProto(p);
+        try varDeclInit(p);
+        _ = try p.expect(.semicolon);
+    }
     _ = try m.complete(p, .error_node);
 }
 

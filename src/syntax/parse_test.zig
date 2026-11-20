@@ -512,6 +512,28 @@ test "recovery: the bit-range align form is only allowed on single-item pointers
     );
 }
 
+test "recovery: inline and noinline only precede a function" {
+    // `zig ast-check`: `expected function, found 'var'`; the declaration is not indexed
+    try expectTree("inline var x: u32 = 1;",
+        \\source_file@0..22
+        \\  error_node@0..22
+        \\    keyword_inline "inline"
+        \\    keyword_var "var"
+        \\    identifier "x"
+        \\    colon ":"
+        \\    name_ref@14..17
+        \\      identifier "u32"
+        \\    equal "="
+        \\    literal@20..21
+        \\      number_literal "1"
+        \\    semicolon ";"
+        \\error@7: expected function
+        \\
+    );
+    try expectErrors("pub noinline const y = 1;", "error@13: expected function\n");
+    try expectNoErrors("export var x: u32 = 1;\npub inline fn f() void {}\nnoinline fn g() void {}\n");
+}
+
 /// Depth of the syntax tree (computed iteratively)
 fn treeDepth(n: @import("tree.zig").SyntaxNode) !usize {
     const Entry = struct { node: @import("tree.zig").SyntaxNode, depth: usize };
