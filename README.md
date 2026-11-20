@@ -21,6 +21,7 @@ A language server (LSP) for Zig, built on an incremental query engine. Website: 
 - **Structure**: folding ranges and selection ranges.
 - **Naming checks** (opt-in): hints based on the [Names](https://ziglang.org/documentation/0.17.1/#Names) section of the Zig style guide, with safe rename fixes.
 - **Unused declarations** (opt-in): hints on private declarations that no code in the same file reaches, including helpers used only by other unused declarations.
+- **Lint hints** (opt-in): redundant `@as` / `@intCast` / `@truncate` / `@floatCast` (with a fix that removes them), comparisons that the range of an integer type decides (`x < 256` for a `u8`), and `errdefer` statements that never run; given only when they hold under every build configuration.
 - **Hint suppressions**: comments such as `// zig-analyzer-disable-next-line: naming` silence analyzer hints for a line or a range; diagnostics from Zig itself are never affected.
 
 ## Editor support

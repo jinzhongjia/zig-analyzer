@@ -82,6 +82,7 @@ pub const ide = struct {
     pub const hints = @import("ide/hints.zig");
     pub const suppression = @import("ide/suppression.zig");
     pub const unused = @import("ide/unused.zig");
+    pub const lint = @import("ide/lint.zig");
     pub const rename = @import("ide/rename.zig");
     pub const remove_param = @import("ide/remove_param.zig");
     pub const unused_capture = @import("ide/unused_capture.zig");

@@ -20,6 +20,7 @@
 //!       "workspace_symbol": { "dependencies": false, "limit": 256 },
 //!       "naming": { "enable": false, "ignore": ["SDL_*"], "exclude": ["src/c/*"], "rules": { "field": false } },
 //!       "unused": { "enable": false },
+//!       "lint": { "enable": false, "rules": { "constant_comparison": false } },
 //!       "files": { "watcher": "auto" },
 //!       "log": { "level": "info", "file": "/tmp/zig-analyzer.log", "slow_request_ms": 100 } }
 //!
@@ -171,6 +172,11 @@ naming_rules: NamingRules = .{},
 /// Unused-declaration check: whether to report private declarations of open files that no code in
 /// the same file uses
 unused_enable: bool = false,
+/// Lint hints (see `ide.lint`): whether to report code in open files that has no effect or always
+/// gives the same result
+lint_enable: bool = false,
+/// Whether each lint rule is enabled
+lint_rules: LintRules = .{},
 /// Who detects external changes on disk (see `Watcher`)
 files_watcher: Watcher = .auto,
 /// Log level (err / warn / info / debug)
@@ -244,6 +250,16 @@ pub const NamingRules = struct {
     field: bool = true,
 };
 
+/// Lint rules, matching the diagnostic codes `lint.<rule>` one to one
+pub const LintRules = struct {
+    /// `@as`, `@intCast`, `@truncate` and `@floatCast` whose operand already has the type
+    redundant_cast: bool = true,
+    /// Comparisons that the range of a fixed-width integer type decides
+    constant_comparison: bool = true,
+    /// `errdefer` statements that never run
+    dead_errdefer: bool = true,
+};
+
 /// File name of the project configuration file (in the project root directory)
 pub const project_file = "zig-analyzer.zon";
 
@@ -293,6 +309,8 @@ const settings = [_]Setting{
     .{ .section = "naming", .key = "exclude", .field = "naming_exclude" },
     .{ .section = "naming", .key = "rules", .field = "naming_rules" },
     .{ .section = "unused", .key = "enable", .field = "unused_enable" },
+    .{ .section = "lint", .key = "enable", .field = "lint_enable" },
+    .{ .section = "lint", .key = "rules", .field = "lint_rules" },
     .{ .section = "files", .key = "watcher", .field = "files_watcher" },
     .{ .section = "log", .key = "level", .field = "log_level" },
     .{ .section = "log", .key = "file", .field = "log_file" },
@@ -303,11 +321,12 @@ const settings = [_]Setting{
 const project_settings = [_][]const u8{
     "build_args",    "diagnostics_steps", "compiler_diagnostics",
     "naming_enable", "naming_ignore",     "naming_exclude",
-    "naming_rules",  "unused_enable",     "imports_derived",
-    "imports_sort",
+    "naming_rules",  "unused_enable",     "lint_enable",
+    "lint_rules",    "imports_derived",   "imports_sort",
 };
 
 fn isProjectSetting(comptime field: []const u8) bool {
+    @setEvalBranchQuota(10_000);
     for (project_settings) |f| if (std.mem.eql(u8, f, field)) return true;
     return false;
 }
@@ -627,6 +646,11 @@ pub fn sameNaming(a: *const Config, b: *const Config) bool {
         eqlList(a.naming_ignore, b.naming_ignore) and eqlList(a.naming_exclude, b.naming_exclude);
 }
 
+/// Whether the lint settings are the same (when they differ, open files are republished)
+pub fn sameLint(a: *const Config, b: *const Config) bool {
+    return a.lint_enable == b.lint_enable and std.meta.eql(a.lint_rules, b.lint_rules);
+}
+
 fn eqlOptional(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?, b.?);
@@ -904,4 +928,28 @@ test "unused settings: client and project file" {
     defer overlaid.deinit(testing.allocator);
     try overlaid.overlayProject(testing.allocator, &project);
     try testing.expect(overlaid.unused_enable);
+}
+
+test "lint settings: client and project file" {
+    var empty = try parseText("{}");
+    defer empty.deinit(testing.allocator);
+    try testing.expect(!empty.lint_enable and empty.lint_rules.redundant_cast and empty.lint_rules.dead_errdefer);
+
+    var client = try parseText(
+        \\{"lint": {"enable": true, "rules": {"constant_comparison": false}}}
+    );
+    defer client.deinit(testing.allocator);
+    try testing.expectEqual(0, client.warnings.len);
+    try testing.expect(client.lint_enable and !client.lint_rules.constant_comparison and client.lint_rules.redundant_cast);
+
+    var project = try parseProject(testing.allocator,
+        \\.{ .lint = .{ .enable = true, .rules = .{ .dead_errdefer = false } } }
+    );
+    defer project.deinit(testing.allocator);
+    try testing.expectEqual(0, project.warnings.len);
+    var overlaid = try parseText("{}");
+    defer overlaid.deinit(testing.allocator);
+    try overlaid.overlayProject(testing.allocator, &project);
+    try testing.expect(overlaid.lint_enable and !overlaid.lint_rules.dead_errdefer);
+    try testing.expect(!overlaid.sameLint(&empty));
 }

@@ -3050,6 +3050,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     const inactive_changed = server.config.inactive_code != new.inactive_code;
     const naming_changed = !server.config.sameNaming(&new);
     const unused_changed = server.config.unused_enable != new.unused_enable;
+    const lint_changed = !server.config.sameLint(&new);
     const build_was_enabled = server.config.build_enable;
     const sub_projects_changed = server.config.build_sub_projects != new.build_sub_projects;
     const watcher_changed = server.config.files_watcher != new.files_watcher;
@@ -3068,7 +3069,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     server.config = new;
     server.config_mutex.unlock(server.io);
     server.wakeProjectWaiters();
-    if (inactive_changed or naming_changed or unused_changed) server.publishOpenFiles();
+    if (inactive_changed or naming_changed or unused_changed or lint_changed) server.publishOpenFiles();
     if (watcher_changed) server.resyncWatcher();
 
     if (zig_changed and server.started) server.showWarning("zig.path takes effect after restarting zig-analyzer");
@@ -5718,6 +5719,9 @@ fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs
     if (text) |t| if (server.unusedFor(file, t)) {
         diags = try appendUnused(server, ctx, arena, file, lines, diags);
     };
+    if (text) |t| if (server.lintFor(file, t)) |rules| {
+        diags = try appendLint(server, ctx, arena, file, lines, rules, diags);
+    };
     if (text != null) diags = try server.appendUnloadedProjectHint(arena, file, lines, diags);
     if (text != null) if (is_zon and std.mem.eql(u8, std.fs.path.basename(server.vfs.path(file)), Config.project_file)) {
         diags = try server.appendProjectConfigProblems(arena, lines, diags);
@@ -6024,6 +6028,41 @@ fn unusedFor(server: *Server, file: Vfs.FileId, text: []const u8) bool {
     return enable;
 }
 
+/// The lint rules the file gets, null when lint hints are off for it: the setting from the client
+/// or the project of the file, for open user code that is not generated
+fn lintFor(server: *Server, file: Vfs.FileId, text: []const u8) ?Config.LintRules {
+    if (!hintsEligible(server, file, text)) return null;
+    const path = server.vfs.path(file);
+    var enable = false;
+    var rules: Config.LintRules = .{};
+    {
+        server.config_mutex.lockUncancelable(server.io);
+        defer server.config_mutex.unlock(server.io);
+        enable = server.config.lint_enable;
+        rules = server.config.lint_rules;
+    }
+    {
+        server.workspaces_mutex.lockUncancelable(server.io);
+        defer server.workspaces_mutex.unlock(server.io);
+        // For nested projects, take the innermost one
+        var best: ?*Workspace = null;
+        for (server.workspaces.items) |ws| {
+            if (server.vfs.isUnder(path, ws.root) and (best == null or ws.root.len > best.?.root.len)) best = ws;
+        }
+        if (best) |ws| if (ws.project) |*p| {
+            if (p.isSet("lint_enable")) enable = p.lint_enable;
+            if (p.isSet("lint_rules")) rules = p.lint_rules;
+        };
+    }
+    return if (enable) rules else null;
+}
+
+fn lintAllows(rules: Config.LintRules, rule: ide.lint.Rule) bool {
+    return switch (rule) {
+        inline else => |r| @field(rules, @tagName(r)),
+    };
+}
+
 fn dupeStrings(arena: Allocator, list: []const []const u8) Allocator.Error![]const []const u8 {
     const out = try arena.alloc([]const u8, list.len);
     for (list, out) |src, *dst| dst.* = try arena.dupe(u8, src);
@@ -6106,6 +6145,29 @@ fn appendUnused(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileI
         .tags = &.{.Unnecessary},
         .message = .{ .string = try std.fmt.allocPrint(arena, "declaration `{s}` is never used", .{f.name}) },
     });
+    return out.items;
+}
+
+/// Lint hints: a comparison with a constant result is a warning, since it is most likely a bug (a
+/// loop that never ends); code without effect is a hint tagged `Unnecessary`
+fn appendLint(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, lines: offsets.LineIndex, rules: Config.LintRules, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+    var r: Resolver = .{ .ctx = ctx, .arena = arena };
+    const found = try ide.lint.findings(&r, file, null);
+    if (found.len == 0) return diags;
+    var out: std.ArrayList(types.Diagnostic) = .empty;
+    try out.appendSlice(arena, diags);
+    for (found) |f| {
+        if (!lintAllows(rules, f.rule)) continue;
+        const warning = f.rule == .constant_comparison;
+        try out.append(arena, .{
+            .range = lines.range(f.start, f.end, server.encoding),
+            .severity = if (warning) .Warning else .Hint,
+            .code = .{ .string = f.rule.code() },
+            .source = ide.hints.source,
+            .tags = if (warning) null else &.{.Unnecessary},
+            .message = .{ .string = f.message },
+        });
+    }
     return out.items;
 }
 
@@ -7515,6 +7577,33 @@ fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.Cod
             if (!settings.allows(f)) continue;
             const range = lines.range(f.start, f.end, server.encoding);
             if (try server.namingAction(r, arena, doc_uri, range, f, params.context.diagnostics)) |action| try out.append(arena, .{ .CodeAction = action });
+        }
+    };
+    if (wantsKind(only, types.CodeActionKind.QuickFix)) if (server.lintFor(file, text)) |rules| {
+        for (try ide.lint.findings(r, file, .{ .start = start, .end = end })) |f| {
+            if (!lintAllows(rules, f.rule)) continue;
+            const fix = f.fix orelse continue;
+            const range = lines.range(f.start, f.end, server.encoding);
+            var action: types.CodeAction = .{
+                .title = try std.fmt.allocPrint(arena, "remove `{s}`", .{text[f.start .. std.mem.indexOfScalarPos(u8, text, f.start, '(') orelse f.start]}),
+                .kind = types.CodeActionKind.QuickFix,
+                .isPreferred = true,
+            };
+            // Link the same hint sent by the client
+            for (params.context.diagnostics) |d| {
+                const c = d.code orelse continue;
+                if (c == .string and std.mem.eql(u8, c.string, f.rule.code()) and std.meta.eql(d.range, range)) {
+                    action.diagnostics = try arena.dupe(types.Diagnostic, &.{d});
+                    break;
+                }
+            }
+            var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
+            try changes.map.put(arena, doc_uri, try arena.dupe(types.TextEdit, &.{.{
+                .range = lines.range(fix.start, fix.end, server.encoding),
+                .newText = fix.text,
+            }}));
+            action.edit = .{ .changes = changes };
+            try out.append(arena, .{ .CodeAction = action });
         }
     };
     if (server.apply_edit and wantsKind(only, types.CodeActionKind.QuickFix)) try server.dependencyHashActions(arena, file, doc_uri, text, start, end, &out);

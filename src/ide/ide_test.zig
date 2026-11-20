@@ -3137,9 +3137,10 @@ test "zon result types follow the importers across files and edits" {
 
 test "zig-analyzer.zon settings are completed from the schema" {
     const cases = [_]struct { []const u8, []const u8 }{
-        .{ ".{ .<|> }", "build diagnostics imports naming unused" },
+        .{ ".{ .<|> }", "build diagnostics imports naming unused lint" },
         // Settings already given are not listed again
-        .{ ".{ .build = .{}, .<|> }", "diagnostics imports naming unused" },
+        .{ ".{ .build = .{}, .<|> }", "diagnostics imports naming unused lint" },
+        .{ ".{ .lint = .{ .rules = .{ .redundant_cast = false, .<|> } } }", "constant_comparison dead_errdefer" },
         .{ ".{ .build = .{ .<|> } }", "args" },
         .{ ".{ .diagnostics = .{ .steps = .{}, .<|> } }", "compiler" },
         .{ ".{ .naming = .{ .rules = .{ .type = false, .<|> } } }", "type_function function namespace value field" },
