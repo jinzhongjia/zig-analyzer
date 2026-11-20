@@ -81,6 +81,9 @@ pub fn binary(allocator: Allocator, op: SyntaxKind, a: Big, b: Big) Allocator.Er
             } else {
                 var q = try int.Managed.initCapacity(allocator, a.limbs.len + 1);
                 try q.divTrunc(&out, &ma, &mb);
+                // The compiler rejects `%` with a negative operand unless the remainder is zero
+                if (out.eqlZero()) return .{ .limbs = out.toConst().limbs, .positive = true };
+                if (!a.positive or !b.positive) return null;
             }
         },
         .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_left_pipe, .angle_bracket_angle_bracket_right => {
@@ -267,12 +270,7 @@ pub fn binaryTyped(allocator: Allocator, op: SyntaxKind, t: IntType, a: Big, b: 
         // `/` truncates toward zero for every sign; the quotient of the minimum by -1 overflows
         .slash => fitTo(allocator, try binary(allocator, .slash, a, b) orelse return null, t, .check),
         // `%` with a negative operand is rejected by the compiler unless the remainder is zero
-        .percent => {
-            const r = try binary(allocator, .percent, a, b) orelse return null;
-            // A zero remainder of a negative dividend carries a negative sign
-            if (r.eqlZero()) return .{ .limbs = r.limbs, .positive = true };
-            return if (a.positive and b.positive) r else null;
-        },
+        .percent => try binary(allocator, .percent, a, b),
         .ampersand, .pipe, .caret => try bitwise(allocator, op, t, a, b),
         .angle_bracket_angle_bracket_left => try shl(allocator, t, a, b, false),
         .angle_bracket_angle_bracket_left_pipe => try shl(allocator, t, a, b, true),

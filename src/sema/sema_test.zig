@@ -8549,6 +8549,35 @@ test "signed division truncates toward zero and a zero remainder folds" {
     });
 }
 
+test "comptime_int remainder with a negative operand and a nonzero remainder gives no value" {
+    // A comptime_int `%` with a negative operand was folded like `@rem`.
+    // Expected values are the results of zig 0.17.1, which rejects the nonzero remainders.
+    try expectTypes(
+        \\const neg_lhs = -7 % 3;
+        \\const neg_rhs = 7 % -3;
+        \\const neg_both = -7 % -3;
+        \\const zero_neg_lhs = -4 % 2;
+        \\const zero_neg_rhs = 4 % -2;
+        \\const big_neg_lhs = -(1 << 100) % 3;
+        \\const big_neg_rhs = (1 << 100) % -3;
+        \\const big_zero = -(1 << 100) % 2;
+        \\const positive = 7 % 3;
+        \\fn g() void {
+        \\    _ = .{ neg_lhs, neg_rhs, neg_both, zero_neg_lhs, zero_neg_rhs, big_neg_lhs, big_neg_rhs, big_zero, positive };
+        \\}
+    , &.{
+        .{ "neg_lhs", "comptime_int" },
+        .{ "neg_rhs", "comptime_int" },
+        .{ "neg_both", "comptime_int" },
+        .{ "zero_neg_lhs", "comptime_int = 0" },
+        .{ "zero_neg_rhs", "comptime_int = 0" },
+        .{ "big_neg_lhs", "comptime_int" },
+        .{ "big_neg_rhs", "comptime_int" },
+        .{ "big_zero", "comptime_int = 0" },
+        .{ "positive", "comptime_int = 1" },
+    });
+}
+
 test "builtins on integer types wider than 128 bits" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both)
     try expectTypes(
