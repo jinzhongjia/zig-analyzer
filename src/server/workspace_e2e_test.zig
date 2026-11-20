@@ -1351,6 +1351,19 @@ fn makerPid(h: *Harness) std.posix.pid_t {
     return ws.client.?.child.id.?;
 }
 
+/// Restarts after consecutive maker crashes (see `Workspace.max_crash_restarts`) of the project's
+/// newest instance (the maker `makerPid` refers to): its count, or 0 when it has completed a build
+/// (the next crash starts the count over, see `Workspace.run`)
+fn crashRestarts(h: *Harness) u8 {
+    h.server.workspaces_mutex.lockUncancelable(testing.io);
+    defer h.server.workspaces_mutex.unlock(testing.io);
+    const visible = h.server.workspaces.items[0];
+    const ws = visible.successor orelse visible;
+    ws.mutex.lockUncancelable(testing.io);
+    defer ws.mutex.unlock(testing.io);
+    return if (ws.built) 0 else ws.crash_restarts;
+}
+
 /// After the `from`-th diagnostics notification, diagnostics were published for `uri` at least
 /// once, and each publish contains `needle`
 fn expectEveryPublishContains(h: *Harness, from: usize, uri: []const u8, needle: []const u8) !void {
@@ -1665,19 +1678,22 @@ test "a maker that keeps exiting before a build completes is restarted three tim
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));
 
-    // Exits before any build completes: the first three are restarted without telling the user
-    // (`waitGate` fails on a warning)
+    // Exits before any build completes: the restarts up to the limit are quiet (`waitGate` fails
+    // on a warning). The 0.17 maker can crash right after a completed build (see
+    // docs/zig-maker-build-request-race.md): the instance that builds now starts with that
+    // restart counted
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "hold", .data = "" });
     try clearGate(&project);
     try h.notify("textDocument/didSave", .{ .textDocument = .{ .uri = main_uri } });
     try waitGate(&h, &project);
-    for (0..3) |_| {
+    var restarts = crashRestarts(&h);
+    while (restarts < Workspace.max_crash_restarts) : (restarts += 1) {
         try std.posix.kill(makerPid(&h), .KILL);
         try waitGate(&h, &project);
     }
 
-    // The fourth is not: the user is warned, and the compiler diagnostics, no longer updated, are
-    // cleared; the build graph is kept
+    // The next exit goes over the limit: the user is warned, and the compiler diagnostics, no
+    // longer updated, are cleared; the build graph is kept
     const ws = visibleInstance(&h);
     try std.posix.kill(makerPid(&h), .KILL);
     _ = try h.request("zig-analyzer/waitIdle", {});
