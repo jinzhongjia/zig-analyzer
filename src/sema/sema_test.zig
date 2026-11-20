@@ -8636,6 +8636,57 @@ test "an integer coerces to a float only when the float represents it exactly" {
     });
 }
 
+test "a store through a const pointer or to an immutable place gives no value" {
+    // Stores through `*const` and `[]const` pointers and to constants changed the stored place.
+    // Expected values are the results of zig 0.17.1, which rejects the `bad` functions.
+    try expectTypes(
+        \\fn badSlice() u8 { var a = [4]u8{ 1, 2, 3, 4 }; const s: []const u8 = a[0..]; s[0] = 9; return a[0]; }
+        \\fn badDeref() u8 { var x: u8 = 1; const p: *const u8 = &x; p.* = 9; return x; }
+        \\fn badCompound() u8 { var x: u8 = 1; const p: *const u8 = &x; p.* += 1; return x; }
+        \\fn badConstant() u8 { const c: u8 = 1; @constCast(&c).* = 9; return c; }
+        \\fn badMemcpy() u8 { var a = [2]u8{ 1, 2 }; const s: []const u8 = &a; @memcpy(s, &[_]u8{ 3, 4 }); return a[0]; }
+        \\fn badMemset() u8 { var a = [2]u8{ 1, 2 }; const s: []const u8 = &a; @memset(s, 7); return a[0]; }
+        \\fn okDeref() u8 { var x: u8 = 1; const p = &x; p.* = 9; return x; }
+        \\fn okConstCast() u8 { var x: u8 = 1; const p: *const u8 = &x; @constCast(p).* = 9; return x; }
+        \\fn okMemcpy() u8 { var a = [2]u8{ 1, 2 }; const s: []u8 = &a; @memcpy(s, &[_]u8{ 3, 4 }); return a[0]; }
+        \\fn okIndex() u8 { var a = [2]u8{ 1, 2 }; const p: *const [2]u8 = &a; const q: *[2]u8 = @constCast(p); q[1] = 5; return a[1]; }
+        \\const bad_slice = comptime badSlice();
+        \\const bad_deref = comptime badDeref();
+        \\const bad_compound = comptime badCompound();
+        \\const bad_constant = comptime badConstant();
+        \\const bad_memcpy = comptime badMemcpy();
+        \\const bad_memset = comptime badMemset();
+        \\const ok_deref = comptime okDeref();
+        \\const ok_const_cast = comptime okConstCast();
+        \\const ok_memcpy = comptime okMemcpy();
+        \\const ok_index = comptime okIndex();
+        \\const var_slice_ty = comptime blk: {
+        \\    var a = [2]u8{ 1, 2 };
+        \\    const s = a[0..];
+        \\    s[0] = 3;
+        \\    break :blk .{ @TypeOf(s), a[0] };
+        \\};
+        \\const const_slice_ty = comptime blk: {
+        \\    const a = [2]u8{ 1, 2 };
+        \\    break :blk @TypeOf(a[0..]);
+        \\};
+    , &.{
+        .{ "bad_slice", "u8" },
+        .{ "bad_deref", "u8" },
+        .{ "bad_compound", "u8" },
+        .{ "bad_constant", "u8" },
+        .{ "bad_memcpy", "u8" },
+        .{ "bad_memset", "u8" },
+        .{ "ok_deref", "u8 = 9" },
+        .{ "ok_const_cast", "u8 = 9" },
+        .{ "ok_memcpy", "u8 = 3" },
+        .{ "ok_index", "u8 = 5" },
+        // Slicing a variable array gives a pointer that can write it
+        .{ "var_slice_ty", "struct { comptime type = *[2]u8, comptime u8 = 3 } = .{ *[2]u8, 3 }" },
+        .{ "const_slice_ty", "type = *const [2]u8" },
+    });
+}
+
 test "builtins on integer types wider than 128 bits" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both)
     try expectTypes(

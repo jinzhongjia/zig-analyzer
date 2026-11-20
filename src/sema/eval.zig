@@ -1702,6 +1702,10 @@ const Evaluator = struct {
     }
 
     fn store(ev: *Evaluator, ref: Ref, v: Val) EvalError!void {
+        // A constant place, or one reached through a `*const` pointer, cannot be written (the
+        // compiler reports "cannot assign to constant"), nor can an immutable cell through a
+        // pointer `@constCast` made writable
+        if (ref.is_const or ref.immutable) return error.Abort;
         // Comptime code cannot write a container-level declaration: a constant, or a variable
         // whose contents are known only at runtime
         if (ev.cell_decls.contains(ref.cell)) return error.Abort;
@@ -4245,7 +4249,7 @@ const Evaluator = struct {
             .deref => |x| {
                 const p = try ev.eval(f, x, null);
                 ref = switch (p.v) {
-                    .ref => |r| r,
+                    .ref => |r| ev.through(r, p.ty),
                     else => return error.Abort,
                 };
                 old = try ev.deref(p);
@@ -4401,10 +4405,6 @@ const Evaluator = struct {
         const end = if (s.end) |e| std.math.cast(usize, try ev.evalInt(f, e, .usize_type)) orelse return error.Abort else count;
         if (start > end or end > count) return error.Abort;
         const child = ev.elemTypeOf(base.ty, 0);
-        const is_const = switch (ip.key(base.ty)) {
-            .ptr_type => |p| p.is_const,
-            else => true,
-        };
         // Consistent with the inference path: an explicit sentinel takes precedence; slicing to
         // the end keeps the sentinel of the source array
         const src_sentinel = ev.seqSentinel(base.ty);
@@ -4423,12 +4423,18 @@ const Evaluator = struct {
             }
         }
         const sentinel: ?Index = if (explicit) |x| x else if (end == count) src_sentinel else null;
+        const slice_target = try ev.sliceTarget(f, s.lhs, base);
+        const is_const = switch (ip.key(base.ty)) {
+            .ptr_type => |p| p.is_const,
+            // Slicing an array takes its address: writable when the array is a variable
+            else => if (slice_target) |t| t.is_const else true,
+        };
         // Range known at comptime: a pointer to an array
         const array = try ip.get(.{ .array_type = .{ .len = end - start, .child = child, .sentinel = sentinel } });
         const ptr_ty = try ip.ptrTo(array, .one, is_const);
         // Slicing storage of a local variable (or reached through a pointer): reference a range of
         // the original storage, so writes are reflected in the original array
-        if (try ev.sliceTarget(f, s.lhs, base)) |target| {
+        if (slice_target) |target| {
             const offset = if (target.window) |tw| tw.start else 0;
             var ref = target;
             ref.window = .{ .start = std.math.cast(u32, offset + start) orelse return error.Abort, .len = std.math.cast(u32, end - start) orelse return error.Abort };
@@ -5016,7 +5022,7 @@ const Evaluator = struct {
         if (eq(u8, name, "@memcpy")) {
             if (vals.len != 2) return error.Abort;
             const dest = switch (vals[0].v) {
-                .ref => |r| r,
+                .ref => |r| ev.through(r, vals[0].ty),
                 else => return error.Abort,
             };
             const n = try ev.elemCount(vals[1]) orelse return error.Abort;
@@ -5030,7 +5036,7 @@ const Evaluator = struct {
         if (eq(u8, name, "@memset")) {
             if (vals.len != 2) return error.Abort;
             const dest = switch (vals[0].v) {
-                .ref => |r| r,
+                .ref => |r| ev.through(r, vals[0].ty),
                 else => return error.Abort,
             };
             const n = try ev.elemCount(vals[0]) orelse return error.Abort;
@@ -5043,7 +5049,7 @@ const Evaluator = struct {
         if (eq(u8, name, "@memmove")) {
             if (vals.len != 2) return error.Abort;
             const dest = switch (vals[0].v) {
-                .ref => |r| r,
+                .ref => |r| ev.through(r, vals[0].ty),
                 else => return error.Abort,
             };
             // Source and destination may overlap: read all elements before writing
