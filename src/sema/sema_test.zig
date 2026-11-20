@@ -6178,7 +6178,7 @@ test "labeled blocks, array literals and type queries" {
     , &.{
         .{ "P", "type = u64" },
         .{ "Q", "type = u32" },
-        .{ "arr", "[3]u16" },
+        .{ "arr", "[3]u16 = .{ 1, 2, 3 }" },
         .{ "sz", "comptime_int = 8" },
         // @hasDecl counts only pub declarations
         .{ "has_hidden", "u16 = 2" },
@@ -7229,12 +7229,12 @@ test "concatenation follows the compiler" {
         // When only one side has a sentinel, it is kept; when the sentinels differ, there is none
         .{ "c2", "*const [4:0]u8" },
         .{ "c3", "*const [4:0]u8" },
-        .{ "c4", "[3]u8" },
+        .{ "c4", "[3]u8 = \"\\x01\\x02\\x03\"" },
         .{ "c5", "struct { comptime comptime_int = 1, comptime bool = true, comptime *const [1:0]u8 = \"x\" }" },
-        .{ "c6", "[2]u8" },
+        .{ "c6", "[2]u8 = \"\\x01\\x02\"" },
         .{ "c7", "*const [3]u8" },
         .{ "c8", "[3]u8" },
-        .{ "c9", "[2]u16" },
+        .{ "c9", "[2]u16 = .{ 1, 2 }" },
     });
 }
 
@@ -7450,7 +7450,7 @@ test "result types reach operands like the compiler" {
         .{ "41", "f32 = 41" },
         .{ "43", "u8 = 43" },
         .{ "45", "u16 = 45" },
-        .{ ".{ 46, 47 }", "[2]u16" },
+        .{ ".{ 46, 47 }", "[2]u16 = .{ 46, 47 }" },
         // The value of `continue` in a labeled switch is inferred from the operand's type
         .{ "49", "u8 = 49" },
         // The break and else of a loop take the loop's result type
@@ -9614,7 +9614,51 @@ test "slicing an outer function's local from a container in the body" {
         \\    _ = .{ a, b, S };
         \\}
     , &.{
-        .{ "part", "*const [3]u8" },
+        .{ "part", "*const [3]u8 = \"\\x01\\x02\\x03\"" },
+    });
+}
+
+test "slicing a comptime-known slice gives a pointer to an array" {
+    // An open end or the full length used to give a runtime slice and drop the sentinel
+    try expectTypes(
+        \\const s: []const u8 = "abcd";
+        \\const tail = s[1..];
+        \\const whole = s[0..];
+        \\const cs: [:0]const u8 = "abcd";
+        \\const wlen = cs[0..cs.len];
+        \\const cw = cs[0..];
+        \\const mid = cs[1..3];
+        \\fn g() void {
+        \\    const arr2 = [3]u8{ 7, 8, 9 };
+        \\    const vs2: []const u8 = &arr2;
+        \\    const t2 = vs2[1..];
+        \\    const l2 = vs2.len;
+        \\    const d2 = vs2.*;
+        \\    var va = [3]u8{ 7, 8, 9 };
+        \\    const ve = va[0];
+        \\    const vt = va[1..];
+        \\    va[0] = 1;
+        \\    _ = .{ t2, l2, d2, ve, vt };
+        \\}
+        \\fn h(rt: []const u8, rz: [:0]const u8) void {
+        \\    const r = rt[1..];
+        \\    const rzt = rz[1..];
+        \\    _ = .{ r, rzt };
+        \\}
+    , &.{
+        .{ "tail", "*const [3]u8 = \"bcd\"" },
+        .{ "whole", "*const [4]u8 = \"abcd\"" },
+        .{ "wlen", "*const [4:0]u8 = \"abcd\"" },
+        .{ "cw", "*const [4:0]u8 = \"abcd\"" },
+        .{ "mid", "*const [2]u8 = \"bc\"" },
+        .{ "t2", "*const [2]u8 = \"\\x08\\t\"" },
+        .{ "l2", "usize = 3" },
+        .{ "d2", "[3]u8 = \"\\x07\\x08\\t\"" },
+        // A variable's elements are runtime-known
+        .{ "ve", "u8" },
+        .{ "vt", "*[2]u8" },
+        .{ "r", "[]const u8" },
+        .{ "rzt", "[:0]const u8" },
     });
 }
 
