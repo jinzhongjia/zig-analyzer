@@ -27,12 +27,10 @@ fn position(text: []const u8, needle: []const u8, delta: u32, encoding: offsets.
     return lines.position(at + delta, encoding);
 }
 
-/// The first completion at a name that can be auto-imported starts building the auto-import index:
-/// there are no auto-imports yet, so the result is marked incomplete. Then waits until the index is
-/// built.
-fn startAutoImport(h: *Harness, uri: []const u8, at: types.Position) !void {
-    const first = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at });
-    try testing.expect(first.object.get("result").?.object.get("isIncomplete").?.bool);
+/// The auto-import index starts when the first Zig document opens. Waiting for idle therefore
+/// leaves the index ready before the first completion; a completion that arrives earlier is marked
+/// incomplete and starts or waits for the index.
+fn waitAutoImport(h: *Harness) !void {
     _ = try h.request("zig-analyzer/waitIdle", {});
 }
 
@@ -42,8 +40,12 @@ fn completionItems(response: std.json.Value) []const std.json.Value {
 }
 
 fn importedWidget(response: std.json.Value) ?std.json.Value {
+    return importedLabel(response, "Widget");
+}
+
+fn importedLabel(response: std.json.Value, label: []const u8) ?std.json.Value {
     for (completionItems(response)) |item| {
-        if (!std.mem.eql(u8, item.object.get("label").?.string, "Widget")) continue;
+        if (!std.mem.eql(u8, item.object.get("label").?.string, label)) continue;
         if (item.object.get("additionalTextEdits") != null) return item;
     }
     return null;
@@ -124,11 +126,9 @@ test "auto-import edits replace the whole identifier and resolve after applicati
         });
         try h.notify("initialized", Empty{});
         try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = source } });
-        _ = try h.request("zig-analyzer/waitIdle", {});
+        try waitAutoImport(&h);
         const params = .{ .textDocument = .{ .uri = uri }, .position = try position(source, "Widgxx", 4, encoding) };
-        // The auto-import index is not built before completion
-        try testing.expect(importedWidget(try h.request("textDocument/completion", params)) == null);
-        _ = try h.request("zig-analyzer/waitIdle", {});
+        // The index starts when the document opens: the first completion already has the import
         const response = try h.request("textDocument/completion", params);
         const item = importedWidget(response) orelse return error.MissingAutoImport;
         const edited = try applyCompletion(a, source, item, encoding);
@@ -189,9 +189,8 @@ test "auto-import indexing restarts when an earlier pass did not finish" {
     });
     try h.notify("initialized", Empty{});
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = source } });
-    _ = try h.request("zig-analyzer/waitIdle", {});
     const params = .{ .textDocument = .{ .uri = uri }, .position = try position(source, "Widgxx", 4, .utf16) };
-    try startAutoImport(&h, uri, params.position);
+    try waitAutoImport(&h);
     try testing.expect(importedWidget(try h.request("textDocument/completion", params)) != null);
     h.server.imports_basis.store(std.math.maxInt(u64), .release);
     const pending = try h.request("textDocument/completion", params);
@@ -226,9 +225,8 @@ test "auto-import works in an unsaved untitled document" {
     const uri = "untitled:Untitled-1";
     const text = "pub fn main() void { _ = ArrayL; }\n";
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
-    _ = try h.request("zig-analyzer/waitIdle", {});
     const at = try position(text, "ArrayL", 6, .utf16);
-    try startAutoImport(&h, uri, at);
+    try waitAutoImport(&h);
     const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at });
     const item = for (completionItems(response)) |candidate| {
         if (!std.mem.eql(u8, candidate.object.get("label").?.string, "ArrayList")) continue;
@@ -323,9 +321,8 @@ test "zig-analyzer.zon import settings override the client's in organize imports
         \\
     ;
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .text = organized }} });
-    _ = try h.request("zig-analyzer/waitIdle", {});
     const at = try position(organized, "Widgxx", 4, .utf16);
-    try startAutoImport(&h, uri, at);
+    try waitAutoImport(&h);
     const item = importedWidget(try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at })) orelse
         return error.MissingAutoImport;
     const edited = try applyCompletion(a, organized, item, .utf16);
@@ -405,9 +402,8 @@ test "auto-import items resolve to the signature, docs and where the target is d
     try testing.expect(provider.object.get("resolveProvider").?.bool);
     try h.notify("initialized", Empty{});
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = source } });
-    _ = try h.request("zig-analyzer/waitIdle", {});
     const at = try position(source, "Widgxx", 4, .utf16);
-    try startAutoImport(&h, uri, at);
+    try waitAutoImport(&h);
     const item = importedWidget(try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at })).?;
     try testing.expect(item.object.get("data") != null);
     const resolved = (try h.request("completionItem/resolve", item)).object.get("result").?;
@@ -436,8 +432,10 @@ test "completion does not run auto-import indexing inside its read transaction" 
     const text = "pub fn main() void {\n    _ = st;\n}\n";
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
     _ = try h.request("zig-analyzer/waitIdle", {});
-    // Changed while the server is idle: neither the completion request nor the task it starts can
-    // be spawned, so both can only run in place
+    // The index was built when the document opened: make it stale, so this completion has to start
+    // indexing again. Changed while the server is idle: neither the completion request nor the
+    // task it starts can be spawned, so both can only run in place
+    h.server.imports_basis.store(std.math.maxInt(u64), .release);
     threaded.concurrent_limit = .nothing;
     errdefer threaded.concurrent_limit = .unlimited;
     const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = try position(text, "st;", 2, .utf16) });
@@ -482,9 +480,8 @@ test "auto-import module and file candidates resolve through completionItem/reso
     try h.notify("initialized", Empty{});
     const text = "fn catalog() void { _ = @import(\"Util.zig\"); }\npub fn main() void { _ = Uti; }\n";
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
-    _ = try h.request("zig-analyzer/waitIdle", {});
     const at = try position(text, "_ = Uti", 7, .utf16);
-    try startAutoImport(&h, uri, at);
+    try waitAutoImport(&h);
     const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at });
     const item = for (completionItems(response)) |candidate| {
         if (!std.mem.eql(u8, candidate.object.get("label").?.string, "Util")) continue;
@@ -533,8 +530,7 @@ test "auto-import completion reports truncation and recomputes for a narrower pr
     try h.notify("initialized", Empty{});
     const broad = "pub fn main() void { _ = Widget; }\n";
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = broad } });
-    _ = try h.request("zig-analyzer/waitIdle", {});
-    try startAutoImport(&h, uri, try position(broad, "Widget", 6, .utf16));
+    try waitAutoImport(&h);
     const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = try position(broad, "Widget", 6, .utf16) });
     try testing.expect(response.object.get("result").?.object.get("isIncomplete").?.bool);
     var truncated: usize = 0;
@@ -598,7 +594,6 @@ test "auto-import storage public paths and direct aliases resolve after applying
     });
     try h.notify("initialized", Empty{});
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = initial } });
-    _ = try h.request("zig-analyzer/waitIdle", {});
     const Case = struct {
         source: []const u8,
         needle: []const u8,
@@ -644,7 +639,7 @@ test "auto-import storage public paths and direct aliases resolve after applying
     var version: i64 = 2;
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .text = cases[0].source }} });
     _ = try h.request("zig-analyzer/waitIdle", {});
-    try startAutoImport(&h, uri, try position(cases[0].source, cases[0].needle, @intCast(cases[0].needle.len), .utf8));
+    try waitAutoImport(&h);
     for (cases) |case| {
         version += 1;
         try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &.{.{ .text = case.source }} });
@@ -717,12 +712,11 @@ test "auto-import is on by default, can be turned off, and its limit is configur
     try h.notify("initialized", Empty{});
     const text = "fn catalog() void { _ = @import(\"lib.zig\"); }\npub fn main() void { _ = Alph; }\n";
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
-    _ = try h.request("zig-analyzer/waitIdle", {});
     const at = try position(text, "_ = Alph", 8, .utf16);
     const params = .{ .textDocument = .{ .uri = uri }, .position = at };
-    // On by default: the index starts building on the first completion at a name that can be
-    // imported, and candidates are offered once it is built
-    try startAutoImport(&h, uri, at);
+    // On by default: the index starts when the document opens, so the first completion already
+    // has the candidates
+    try waitAutoImport(&h);
     const default = try h.request("textDocument/completion", params);
     for ([_][]const u8{ "Alpha1", "Alpha2", "Alpha3" }) |name| {
         for (completionItems(default)) |item| {
@@ -797,9 +791,8 @@ fn completeOpened(h: *Harness, project: *const fixture.Project, path: []const u8
     try h.notify("initialized", Empty{});
     const uri = try za.base.uri.fromPath(a, try project.path(a, path));
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
-    _ = try h.request("zig-analyzer/waitIdle", {});
     const at = try position(text, needle, @intCast(needle.len), .utf16);
-    try startAutoImport(h, uri, at);
+    try waitAutoImport(h);
     // The index covers the files a file in no module reaches: completion only reads its memos
     const before = importSitesExecutions(try h.request("zig-analyzer/status", {}));
     const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = at });
@@ -847,4 +840,47 @@ test "auto-import offers declarations of files reached from build.zig" {
     const response = try completeOpened(&h, &project, "build.zig", build, "tool_na");
     try testing.expectEqualStrings("const tool_name = @import(\"build/tools.zig\").tool_name;\n", importEdit(response, "tool_name") orelse return error.MissingBuildScriptImport);
     _ = try h.request("shutdown", {});
+}
+
+test "the first completion after opening includes auto-imports in single-file and build projects" {
+    // Prevents the first completion after opening from offering no auto-imports, which leaves
+    // them missing once the user stops typing
+    const build_files = [_]fixture.File{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/main.zig", .text = "pub fn main() void {}\n" },
+        .{ .path = "src/lib.zig", .text = "pub const Widget = struct { size: u32 };\n" },
+    };
+    const single_files = [_]fixture.File{
+        .{ .path = "main.zig", .text = "pub fn main() void {}\n" },
+    };
+    const Case = struct { files: []const fixture.File, path: []const u8, text: []const u8, needle: []const u8, label: []const u8 };
+    const cases = [_]Case{
+        .{ .files = &build_files, .path = "src/main.zig", .text = "pub fn main() void { _ = Widg; }\n", .needle = "Widg", .label = "Widget" },
+        .{ .files = &single_files, .path = "main.zig", .text = "pub fn main() void { _ = ArrayL; }\n", .needle = "ArrayL", .label = "ArrayList" },
+    };
+    for (cases) |case| {
+        var project = try fixture.Project.create(case.files);
+        defer project.deinit();
+        var h: Harness = undefined;
+        try h.start();
+        defer h.finish();
+        const a = h.arena.allocator();
+        const uri = try za.base.uri.fromPath(a, try project.path(a, case.path));
+        _ = try h.request("initialize", .{
+            .rootUri = try za.base.uri.fromPath(a, project.root),
+            .capabilities = Empty{},
+            .initializationOptions = .{
+                .completion = .{ .auto_import = true },
+                .diagnostics = .{ .compiler = false, .inactive_code = false },
+                .files = .{ .watcher = "client" },
+            },
+        });
+        try h.notify("initialized", Empty{});
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = case.text } });
+        _ = try h.request("zig-analyzer/waitIdle", {});
+        // No completion before this request: opening the document started the index
+        const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = try position(case.text, case.needle, @intCast(case.needle.len), .utf16) });
+        _ = importedLabel(response, case.label) orelse return error.MissingFirstCompletionAutoImport;
+        _ = try h.request("shutdown", {});
+    }
 }

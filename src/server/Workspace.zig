@@ -492,6 +492,7 @@ fn finishLoading(ws: *Workspace) void {
         ws.load_done = true;
     }
     ws.server.wakeProjectWaiters();
+    ws.server.requestAutoImportIndex();
     ws.server.reconcileSingle();
 }
 

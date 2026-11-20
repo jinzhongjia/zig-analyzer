@@ -1362,6 +1362,33 @@ fn autoImportEnabled(server: *Server) bool {
     return server.config.completion_auto_import;
 }
 
+/// Whether a Zig document is open. Virtual documents opened with languageId `zig` have a `.zig`
+/// path too (see `documentPath`).
+fn hasOpenZigDocument(server: *Server) bool {
+    server.docs_mutex.lockUncancelable(server.io);
+    defer server.docs_mutex.unlock(server.io);
+    for (server.open_docs.keys()) |file| {
+        if (std.mem.endsWith(u8, server.vfs.path(file), ".zig")) return true;
+    }
+    return false;
+}
+
+/// Starts building the auto-import index when a Zig document opens: the first completion at a
+/// name then includes auto-imports instead of waiting for the index and marking the result
+/// incomplete. Sessions with auto-import off do not build it before a request needs it. The index
+/// waits until the first project load ends, so that one build of it covers the final module graph:
+/// every place that ends it (startup, a project's first load, a restart during a first load) calls
+/// this too. Until startup ends, which follows the configuration pull, it does nothing.
+pub fn requestAutoImportIndex(server: *Server) void {
+    if (!server.autoImportEnabled()) return;
+    if (!server.hasOpenZigDocument()) return;
+    // The module graph and the files it covers are final only after the first project load: an
+    // index built earlier would be built again after the graph changes
+    if (server.projectsPending()) return;
+    if (server.imports_wanted.swap(true, .acq_rel)) return;
+    server.scheduleIndexing();
+}
+
 /// Number of files per indexing batch: one read transaction per batch, so an edit (write
 /// transaction) waits for at most one batch
 const index_batch = 8;
@@ -2198,6 +2225,9 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
     if (server.openDocumentCount() > 1) server.requestRefresh();
     server.compileSingle(id);
     server.scheduleCompileSetRefresh(&.{id});
+    // The auto-import index starts here so that the first completion at a name includes
+    // auto-imports
+    server.requestAutoImportIndex();
 }
 
 /// Records `item` as the current document of its file `id` (see `OpenDoc`); called in the write
@@ -3081,7 +3111,10 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     if (compiler_disabled) server.clearSingleFileResults();
     if (inlay_changed) server.requestInlayRefresh();
     if (semantic_changed) server.requestSemanticRefresh();
-    if (imports_enabled and server.imports_wanted.load(.acquire)) server.scheduleIndexing();
+    if (imports_enabled) {
+        if (server.imports_wanted.load(.acquire)) server.scheduleIndexing();
+        server.requestAutoImportIndex();
+    }
     if (build_changed) {
         if (!new.build_enable) {
             // Build system integration turned off: stop the projects; their files are handled
@@ -3783,6 +3816,9 @@ pub fn wakeProjectWaiters(server: *Server) void {
 fn endStartup(server: *Server) void {
     server.startup_ended.store(true, .release);
     server.wakeProjectWaiters();
+    // No project load may follow (single-file mode): start the auto-import index now. With
+    // projects, the end of their first load calls this too.
+    server.requestAutoImportIndex();
 }
 
 fn endConfigPull(server: *Server) void {
@@ -4383,6 +4419,8 @@ pub fn restartWorkspace(server: *Server, ws: *Workspace, crash_restarts: u8) voi
     defer if (first_load) {
         _ = server.first_load_restarts.fetchSub(1, .acq_rel);
         server.wakeProjectWaiters();
+        // The new instance could not start or was discarded: no first load ends after this one
+        server.requestAutoImportIndex();
     };
     ws.stop();
     {
@@ -6625,9 +6663,10 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     const auto_import = server.autoImportEnabled();
     // Auto-imports are not offered until the index has been built for the current module graph, and
     // the result is marked incomplete: the client requests again as the user types, and they are
-    // offered then. Indexing starts the first time completion happens where a name could be
-    // imported; later, if the index is still not built and no indexing is in progress (the previous
-    // round failed, or the task could not start), it starts again.
+    // offered then. Indexing starts when a Zig document opens (with auto-import on; see
+    // `requestAutoImportIndex`) or, for a document opened before that, at the first completion
+    // where a name could be imported. If the index is still not built and no indexing is in
+    // progress (the previous round failed, or the task could not start), it starts again.
     const imports_ready = auto_import and
         server.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
     const max_auto_imports, const snippets, const placeholders = blk: {
