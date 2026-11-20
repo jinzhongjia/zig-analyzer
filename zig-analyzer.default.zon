@@ -125,7 +125,9 @@
     //       // In a generic function body, a member name can refer to a different declaration
     //       // under each instance (each set of comptime arguments at the call sites). Hover shows
     //       // the declaration under one instance; the others follow it:
-    //       // .count: only how many there are; go to definition lists them.
+    //       // The same applies to the values of a binding in a `defer` body at the other exits
+    //       // of its block, when they differ.
+    //       // .count: only how many there are; go to definition lists the declarations.
     //       // .full: the location and complete hover of each (signature, value, documentation).
     //       .instances = .count,
     //   },

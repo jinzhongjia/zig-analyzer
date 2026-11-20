@@ -27,16 +27,24 @@ pub const Seed = struct {
     res: *const infer.Result,
     /// The instance used
     inst: ?Index,
-    /// Position of the call expression; the position of the loop when `iteration` is not null
+    /// Position of the call expression; the position of the loop when `iteration` is not null,
+    /// of the exit when `exit` is not null
     file: FileId,
     offset: u32,
-    /// Inferred for this iteration (0-based) of a loop over a list of types
+    /// Inferred for this iteration (0-based) of a loop over a list of types, or for an exit of a
+    /// `defer` body (`exit`, see `infer.LoopSeed.exit`)
     iteration: ?u32 = null,
     /// With `iteration`: the iterations of the enclosing loops it is inferred in, outermost first
     enclosing: []const LoopIteration = &.{},
+    /// With `iteration`: inferred for the exit at `offset` of the block of a `defer` body
+    exit: ?Exit = null,
 
-    /// The `iteration`-th iteration (0-based) of the loop at `offset`
-    pub const LoopIteration = struct { offset: u32, iteration: u32 };
+    /// The `iteration`-th iteration (0-based) of the loop at `offset`, or the exit at `offset`
+    /// (`exit`)
+    pub const LoopIteration = struct { offset: u32, iteration: u32, exit: ?Exit = null };
+    /// An exit that runs a `defer` body: a `return`, `break`, `continue` or `try`, or the end of
+    /// the block (`fall_through`)
+    pub const Exit = struct { fall_through: bool };
 };
 
 /// Result of inferring member `item` (inside some generic function) under the instance of the first
@@ -73,9 +81,8 @@ pub const Refiner = struct {
         loops: std.ArrayList(LoopResults) = .empty,
     };
     const LoopResults = struct {
-        expr: Body.ExprId,
-        prong: ?u32,
-        binding: u32,
+        region: Region,
+        level: ?Level,
         results: []?*const infer.Result,
     };
 
@@ -152,23 +159,13 @@ pub const Refiner = struct {
         for (try f.regions()) |region| {
             const range = region.range;
             if (rel < range.start or rel > range.end or range.end - range.start >= best_len) continue;
-            const id = region.expr;
             const cached = for (candidate.loops.items) |entry| {
-                if (entry.expr == id and entry.prong == region.prong) break entry;
+                if (entry.region.same(region)) break entry;
             } else blk: {
-                const empty: LoopResults = .{ .expr = id, .prong = region.prong, .binding = 0, .results = &.{} };
-                const entry: LoopResults = if (region.prong) |pi| prong: {
-                    const sw = f.body.expr(id).@"switch";
-                    const n = try prongIterations(f.r, f.body, res, sw, pi) orelse break :prong empty;
-                    const results = try f.r.arena.alloc(?*const infer.Result, n);
-                    @memset(results, null);
-                    break :prong .{ .expr = id, .prong = pi, .binding = @backingInt(sw.prongs[pi].capture[0]), .results = results };
-                } else for (f.body.expr(id).loop.capture, 0..) |capture, k| {
-                    const n = try iterations(f.r, res, f.body.expr(id).loop, k) orelse continue;
-                    const results = try f.r.arena.alloc(?*const infer.Result, n);
-                    @memset(results, null);
-                    break .{ .expr = id, .prong = null, .binding = @backingInt(capture), .results = results };
-                } else empty;
+                const level = try regionIterations(f.r, f.body, res, region);
+                const results = try f.r.arena.alloc(?*const infer.Result, if (level) |l| l.indices.len else 0);
+                @memset(results, null);
+                const entry: LoopResults = .{ .region = region, .level = level, .results = results };
                 try candidate.loops.append(f.r.arena, entry);
                 break :blk entry;
             };
@@ -176,19 +173,22 @@ pub const Refiner = struct {
             best = cached;
             best_len = range.end - range.start;
         }
-        if (best) |loop| for (loop.results, 0..) |*result, idx| {
+        if (best) |loop| for (loop.results, 0..) |*result, k| {
+            const step = loop.level.?.step(loop.region, k);
             if (result.* == null) result.* = try f.r.ctx.get(queries.Infer, .{
                 .owner = f.owner,
                 .mode = .full,
                 .inst = candidate.inst,
-                .loop = .{ .binding = loop.binding, .index = @intCast(idx) },
+                .loop = step.seed,
             });
+            const where = step.at(f.body, f.node_offset);
             const s: Seed = .{
                 .res = result.*.?,
                 .inst = candidate.inst,
                 .file = f.owner.file,
-                .offset = f.node_offset + f.body.range(loop.expr).start,
-                .iteration = @intCast(idx),
+                .offset = where.offset,
+                .iteration = where.iteration,
+                .exit = where.exit,
             };
             if (fits(ip, f.body, f.abstract.res.?, s.res, rel, subject)) return s;
             if (fallback.* == null and !inactiveUnder(f.body, f.abstract.res.?, s.res, rel)) fallback.* = s;
@@ -221,37 +221,87 @@ pub const Refiner = struct {
 };
 
 /// Region inferred per iteration: a `for` loop body, or the body of an `inline` switch prong
-/// (`prong` is the prong index)
+/// (`prong` is the prong index); or inferred per exit: the body of a `defer` / `errdefer`
+/// statement (`exit`, `expr` is the body)
 const Region = struct {
     expr: Body.ExprId,
     prong: ?u32 = null,
+    exit: bool = false,
     range: Body.Range,
 
     /// Enclosing regions first: regions containing the same position are nested
     fn outerFirst(_: void, a: Region, b: Region) bool {
         return a.range.end - a.range.start > b.range.end - b.range.start;
     }
+
+    fn same(a: Region, b: Region) bool {
+        return a.expr == b.expr and a.prong == b.prong and a.exit == b.exit;
+    }
 };
 
-/// One step of a combination: the region at `expr` inferred for one iteration (`seed`)
-const Step = struct { expr: Body.ExprId, seed: infer.LoopSeed };
+/// One step of a combination: the region at `expr` inferred for one iteration or exit (`seed`);
+/// `exit` is the exit of a `defer` body region
+const Step = struct {
+    expr: Body.ExprId,
+    seed: infer.LoopSeed,
+    exit: ?infer.Result.DeferExit = null,
 
-/// The number of iterations of `region` that are inferred separately in the inference `res`, with
-/// the loop variable that takes them; null when its iterations need no separate inference. As in
-/// `Refiner`, for a loop the first loop variable that needs it is chosen, and Infer refines the
-/// other captures of the same loop along with it.
-fn regionIterations(r: *Resolver, body: *const Body, res: *const infer.Result, region: Region) resolve.Error!?struct { binding: u32, n: u32 } {
+    /// The iteration or exit the step presents (positions relative to the member start
+    /// `node_offset`)
+    fn at(s: Step, body: *const Body, node_offset: u32) Seed.LoopIteration {
+        if (s.exit) |x| return .{ .offset = node_offset + x.at, .iteration = s.seed.index, .exit = .{ .fall_through = x.fall_through } };
+        return .{ .offset = node_offset + body.range(s.expr).start, .iteration = s.seed.index };
+    }
+};
+
+/// The iterations or exits of a region that are inferred separately: the loop variable or prong
+/// capture that takes them (an exit seed for a `defer` body region), the seed index of each, and
+/// for a `defer` body the exits (parallel to `indices`)
+const Level = struct {
+    binding: u32,
+    indices: []const u32,
+    exits: []const infer.Result.DeferExit = &.{},
+
+    /// The step for the `k`-th of `indices`
+    fn step(l: Level, region: Region, k: usize) Step {
+        return .{
+            .expr = region.expr,
+            .seed = .{ .binding = l.binding, .index = l.indices[k] },
+            .exit = if (region.exit) l.exits[k] else null,
+        };
+    }
+};
+
+/// The iterations or exits of `region` that are inferred separately in the inference `res`; null
+/// when they need no separate inference. As in `Refiner`, for a loop the first loop variable that
+/// needs it is chosen, and Infer refines the other captures of the same loop along with it.
+fn regionIterations(r: *Resolver, body: *const Body, res: *const infer.Result, region: Region) resolve.Error!?Level {
+    if (region.exit) {
+        var exits: std.ArrayList(infer.Result.DeferExit) = .empty;
+        for (res.defer_exits) |x| if (x.body == region.expr) try exits.append(r.arena, x);
+        if (exits.items.len < 2) return null;
+        const indices = try r.arena.alloc(u32, exits.items.len);
+        for (exits.items, indices) |x, *i| i.* = x.index;
+        return .{ .binding = infer.LoopSeed.exit(region.expr, 0).binding, .indices = indices, .exits = exits.items };
+    }
     if (region.prong) |pi| {
         const sw = body.expr(region.expr).@"switch";
         const n = try prongIterations(r, body, res, sw, pi) orelse return null;
-        return .{ .binding = @backingInt(sw.prongs[pi].capture[0]), .n = n };
+        return .{ .binding = @backingInt(sw.prongs[pi].capture[0]), .indices = try countUp(r, n) };
     }
     const loop = body.expr(region.expr).loop;
     for (loop.capture, 0..) |capture, k| {
         const n = try iterations(r, res, loop, k) orelse continue;
-        return .{ .binding = @backingInt(capture), .n = n };
+        return .{ .binding = @backingInt(capture), .indices = try countUp(r, n) };
     }
     return null;
+}
+
+/// 0, 1, ..., n - 1
+fn countUp(r: *Resolver, n: u32) resolve.Error![]const u32 {
+    const out = try r.arena.alloc(u32, n);
+    for (out, 0..) |*i, k| i.* = @intCast(k);
+    return out;
 }
 
 /// The combinations of iterations of nested regions inferred per iteration (`chain`, outermost
@@ -281,8 +331,8 @@ const Combinations = struct {
     fn findFrom(c: *Combinations, res: *const infer.Result, from: usize, check: anytype) resolve.Error!?Combo {
         for (c.chain[from..], from..) |region, k| {
             const level = try regionIterations(c.r, c.body, res, region) orelse continue;
-            for (0..level.n) |idx| {
-                const node = try c.push(region, level.binding, @intCast(idx));
+            for (0..level.indices.len) |idx| {
+                const node = try c.push(level.step(region, idx));
                 if (try c.findFrom(node, k + 1, check)) |found| return found;
                 if (check.visit(node)) return .{ .res = node, .steps = try c.r.arena.dupe(Step, c.steps.items) };
                 _ = c.steps.pop();
@@ -301,8 +351,8 @@ const Combinations = struct {
     fn allFrom(c: *Combinations, res: *const infer.Result, from: usize, out: *std.ArrayList(Combo)) resolve.Error!void {
         for (c.chain[from..], from..) |region, k| {
             const level = try regionIterations(c.r, c.body, res, region) orelse continue;
-            for (0..level.n) |idx| {
-                const node = try c.push(region, level.binding, @intCast(idx));
+            for (0..level.indices.len) |idx| {
+                const node = try c.push(level.step(region, idx));
                 try c.allFrom(node, k + 1, out);
                 _ = c.steps.pop();
             }
@@ -313,8 +363,8 @@ const Combinations = struct {
 
     /// Adds the step and infers the combination so far: the seeds of the enclosing regions are
     /// carried by the instance (see `infer.LoopSeed`)
-    fn push(c: *Combinations, region: Region, binding: u32, index: u32) resolve.Error!*const infer.Result {
-        try c.steps.append(c.r.arena, .{ .expr = region.expr, .seed = .{ .binding = binding, .index = index } });
+    fn push(c: *Combinations, step: Step) resolve.Error!*const infer.Result {
+        try c.steps.append(c.r.arena, step);
         const steps = c.steps.items;
         var seeds = try c.r.arena.alloc(infer.LoopSeed, steps.len - 1);
         for (steps[0 .. steps.len - 1], 0..) |s, i| seeds[i] = s.seed;
@@ -328,16 +378,17 @@ const Combinations = struct {
 
     /// The seed presenting a combination (positions relative to the member start `node_offset`)
     fn seed(c: *const Combinations, found: Combo, node_offset: u32) resolve.Error!Seed {
-        const last = found.steps[found.steps.len - 1];
+        const last = found.steps[found.steps.len - 1].at(c.body, node_offset);
         const enclosing = try c.r.arena.alloc(Seed.LoopIteration, found.steps.len - 1);
-        for (found.steps[0 .. found.steps.len - 1], 0..) |s, i| enclosing[i] = .{ .offset = node_offset + c.body.range(s.expr).start, .iteration = s.seed.index };
+        for (found.steps[0 .. found.steps.len - 1], enclosing) |s, *e| e.* = s.at(c.body, node_offset);
         return .{
             .res = found.res,
             .inst = c.inst,
             .file = c.owner.file,
-            .offset = node_offset + c.body.range(last.expr).start,
-            .iteration = last.seed.index,
+            .offset = last.offset,
+            .iteration = last.iteration,
             .enclosing = enclosing,
+            .exit = last.exit,
         };
     }
 };
@@ -378,7 +429,29 @@ pub fn allSeeds(r: *Resolver, file: FileId, item: u32, body: *const Body, res: *
     return .{ .seeds = out.items, .complete = all.complete };
 }
 
-/// The regions inferred per iteration of a member body, in expression order
+/// Inference results of member `item` (whose abstract result is `res`) at position `rel`
+/// (relative to the member) for each combination of iterations and exits of the regions containing
+/// it (see `Combinations`) that infers a `defer` body per exit: the compiler analyzes the body once
+/// per exit, each with the `comptime var` values there (see `infer.Result.defer_exits`). Empty
+/// when no such body contains `rel`.
+pub fn exitSeeds(r: *Resolver, file: FileId, item: u32, body: *const Body, res: *const infer.Result, rel: u32) resolve.Error![]const Seed {
+    if (!r.ctx.db.env.callsite_seeding.load(.monotonic)) return &.{};
+    if (res.defer_exits.len == 0 or res.exprs.len != body.exprs.len) return &.{};
+    const owner = try r.ownerKey(file, item);
+    const node_offset = try r.itemOffset(file, item) orelse return &.{};
+    const per = try iterationCombinations(r, owner, body, res, null, rel);
+    var out: std.ArrayList(Seed) = .empty;
+    for (per.found) |it| {
+        for (it.steps) |st| {
+            if (st.exit != null) break;
+        } else continue;
+        if (inactiveUnder(body, res, it.res, rel)) continue;
+        try out.append(r.arena, try per.combos.seed(it, node_offset));
+    }
+    return out.items;
+}
+
+/// The regions inferred per iteration or per exit of a member body, in expression order
 fn allRegions(r: *Resolver, body: *const Body) resolve.Error![]const Region {
     var out: std.ArrayList(Region) = .empty;
     for (body.exprs, 0..) |expr, ei| {
@@ -387,6 +460,10 @@ fn allRegions(r: *Resolver, body: *const Body) resolve.Error![]const Region {
             .loop => |loop| if (loop.kind == .@"for") try out.append(r.arena, .{ .expr = id, .range = body.range(loop.body) }),
             .@"switch" => |sw| for (sw.prongs, 0..) |prong, pi| {
                 if (prong.is_inline and prong.capture.len > 0) try out.append(r.arena, .{ .expr = id, .prong = @intCast(pi), .range = body.range(prong.body) });
+            },
+            .block => |blk| for (blk.stmts) |st| switch (st.kind) {
+                .@"defer", .@"errdefer" => |d| try out.append(r.arena, .{ .expr = d, .exit = true, .range = body.range(d) }),
+                else => {},
             },
             else => {},
         }
@@ -473,9 +550,10 @@ fn iterations(r: *Resolver, res: *const infer.Result, l: Body.Loop, k: usize) re
 }
 
 /// Calls mentioning `names` inside loops of member `i` (in `in`) whose loop variable type differs
-/// per iteration (see `iterations`) and inside `inline` switch prongs (see `prongIterations`): the
-/// arguments do not resolve to a concrete instance, so each iteration is inferred (the result
-/// under instance `inst` is `res`) and searched again. Collects when `all` is not null.
+/// per iteration (see `iterations`), inside `inline` switch prongs (see `prongIterations`), and
+/// inside `defer` bodies whose exits differ (see `infer.Result.defer_exits`): the arguments do
+/// not resolve to a concrete instance, so each iteration or exit is inferred (the result under
+/// instance `inst` is `res`) and searched again. Collects when `all` is not null.
 fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const Body, res: *const infer.Result, inst: ?Index, names: []const []const u8, file: FileId, item: u32, root_key: hir.OwnerKey, all: ?*Collector, strict: bool) resolve.Error!?Found {
     if (res.exprs.len != body.exprs.len) return null;
     for (body.exprs) |e| {
@@ -491,6 +569,22 @@ fn loopCall(r: *Resolver, in: FileId, i: u32, owner: hir.OwnerKey, body: *const 
                         if (all) |c| if (c.full()) return null;
                     }
                 }
+                continue;
+            },
+            .block => |blk| {
+                for (blk.stmts) |st| switch (st.kind) {
+                    .@"defer", .@"errdefer" => |d| {
+                        if (!mentionsWithin(body, d, names)) continue;
+                        const region: Region = .{ .expr = d, .exit = true, .range = body.range(d) };
+                        const level = try regionIterations(r, body, res, region) orelse continue;
+                        for (0..level.indices.len) |k| {
+                            const res_k = try r.ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .inst = inst, .loop = level.step(region, k).seed });
+                            if (try callIn(r, in, i, body, res_k, file, item, root_key, all, strict)) |found| return found;
+                            if (all) |c| if (c.full()) return null;
+                        }
+                    },
+                    else => {},
+                };
                 continue;
             },
             else => continue,

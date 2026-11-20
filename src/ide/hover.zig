@@ -28,17 +28,38 @@ pub const Info = struct {
 
 /// How hover shows the declarations that a member name refers to under the other instances of the
 /// generic function containing it, when they differ from the one shown (see
-/// `definition.instanceDefsAt`)
+/// `definition.instanceDefsAt`), and the other values of a binding or expression in a `defer` body
+/// at the other exits that run it (see `exitValues`)
 pub const Instances = enum {
-    /// Only how many there are; goto lists them
+    /// Only how many there are; goto lists the declarations
     count,
-    /// The location and complete hover of each declaration
+    /// The location and complete hover of each declaration, the complete hover of each value
     full,
+};
+
+/// Turns the source locations hover names (`inferred from the call at main.zig:4`) into links to
+/// the line: `uri` gives the URI of a file as the client knows it
+pub const Links = struct {
+    ctx: *anyopaque,
+    uri: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, file: FileId) std.mem.Allocator.Error![]const u8,
+};
+
+pub const Options = struct {
+    /// The workspace folders: the paths of embedded files are shown relative to them (see
+    /// `Vfs.shownPath`)
+    roots: []const []const u8 = &.{},
+    instances: Instances = .count,
+    /// Null: locations are plain text
+    links: ?Links = null,
 };
 
 /// `roots`: the workspace folders, the paths of embedded files are shown relative to them (see
 /// `Vfs.shownPath`)
 pub fn hover(r: *Resolver, file: FileId, offset: u32, roots: []const []const u8, instances: Instances) resolve.Error!?Info {
+    return hoverWith(r, file, offset, .{ .roots = roots, .instances = instances });
+}
+
+pub fn hoverWith(r: *Resolver, file: FileId, offset: u32, opts: Options) resolve.Error!?Info {
     const tok = try definition.tokenAt(r, file, offset) orelse return null;
     if (tok.kind == .string_literal) return null;
     if (tok.kind == .builtin) {
@@ -48,17 +69,17 @@ pub fn hover(r: *Resolver, file: FileId, offset: u32, roots: []const []const u8,
         if (entry.signature) |signature| w.print("```zig\n{s}\n```\n\n", .{signature}) catch return error.OutOfMemory;
         const doc = try builtins.documentation(r.arena, entry, try r.ctx.get(@import("../database.zig").syntax.SyntaxDialect, {}));
         w.writeAll(doc) catch return error.OutOfMemory;
-        if (try semanticHover(r, file, offset, tok, roots, instances)) |inferred| {
+        if (try semanticHover(r, file, offset, tok, opts)) |inferred| {
             w.print("\n\nInferred result:\n\n{s}", .{inferred.text}) catch return error.OutOfMemory;
         }
         return .{ .text = out.written(), .start = tok.offset, .end = tok.range().end };
     }
     if (try manifest.fieldDoc(r, file, tok)) |doc| return .{ .text = doc, .start = tok.offset, .end = tok.range().end };
     if (try project_config.fieldDoc(r, file, tok)) |doc| return .{ .text = doc, .start = tok.offset, .end = tok.range().end };
-    return semanticHover(r, file, offset, tok, roots, instances);
+    return semanticHover(r, file, offset, tok, opts);
 }
 
-fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, roots: []const []const u8, instances: Instances) resolve.Error!?Info {
+fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, opts: Options) resolve.Error!?Info {
     const a = try context.at(r, file, tok.offset, false) orelse return null;
     const b = a.body;
 
@@ -99,7 +120,7 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, 
                 def = try definition.defAt(r, file, offset);
             },
             .builtin_call => {},
-            .init => return initFieldHover(r, file, tok, e, instances, roots),
+            .init => return initFieldHover(r, file, tok, e, opts),
             .error_value => |name| return errorValue(r, file, tok, e, name),
             else => return null,
         }
@@ -137,19 +158,65 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, 
 
     var out: std.Io.Writer.Allocating = .init(r.arena);
     const w = &out.writer;
-    if (!try writeBlock(w, r, a, def, tv, expr_id, seeded_from, false, roots)) return null;
+    // In a defer body analyzed once per exit, the value at one exit, followed by the others
+    const exits = try exitValues(r, a, binding_id, expr_id, seeded_from);
+    var others: []const ExitValue = &.{};
+    // One value at every exit that the abstract inference already shows needs no exit
+    if (exits.len > 1 or (exits.len == 1 and (exits[0].tv.ty != tv.ty or exits[0].tv.val != tv.val))) {
+        const first = for (exits, 0..) |x, k| {
+            if (seeded_from) |s| if (sameInstance(s, x.seed)) break k;
+        } else 0;
+        tv = exits[first].tv;
+        seeded_from = exits[first].seed;
+        var rest: std.ArrayList(ExitValue) = .empty;
+        for (exits, 0..) |x, k| if (k != first) try rest.append(r.arena, x);
+        others = rest.items;
+    }
+    if (!try writeBlock(w, r, a, def, tv, expr_id, seeded_from, false, opts)) return null;
+    if (others.len > 0) switch (opts.instances) {
+        .count => w.print("\n\nTakes {d} other value{s} at other exits of the block", .{ others.len, if (others.len == 1) "" else "s" }) catch return error.OutOfMemory,
+        .full => for (others) |x| {
+            w.writeAll("\n\n---\n\n") catch return error.OutOfMemory;
+            _ = try writeBlock(w, r, a, def, x.tv, expr_id, x.seed, false, opts);
+        },
+    };
     if (expr_id) |e| switch (b.expr(e)) {
-        .field_access, .enum_literal => try writeOtherInstances(w, r, def, seeded_from, try definition.instanceDefsAt(r, file, offset), .{ .expr = e }, instances, roots),
+        .field_access, .enum_literal => try writeOtherInstances(w, r, def, seeded_from, try definition.instanceDefsAt(r, file, offset), .{ .expr = e }, opts),
         else => {},
     };
     return .{ .text = out.written(), .start = tok.offset, .end = tok.offset + @as(u32, @intCast(tok.text.len)) };
+}
+
+const ExitValue = struct { seed: seed.Seed, tv: TypedValue };
+
+/// In a `defer` body that the compiler analyzes once per exit with different `comptime var`
+/// values (see `seed.exitSeeds`), the value of the binding or expression at each exit, each
+/// distinct value once with its first exit; empty elsewhere, and under a call-site instance
+/// (`shown` is not an exit), whose exits are not inferred separately
+fn exitValues(r: *Resolver, a: context.At, binding_id: ?Body.BindingId, expr_id: ?Body.ExprId, shown: ?seed.Seed) resolve.Error![]const ExitValue {
+    if (binding_id == null and expr_id == null) return &.{};
+    if (shown) |s| if (s.exit == null) return &.{};
+    var out: std.ArrayList(ExitValue) = .empty;
+    for (try seed.exitSeeds(r, a.file, a.item, a.body, a.res, a.rel)) |s| {
+        const res = s.res;
+        const at_exit: TypedValue = if (binding_id) |id|
+            (if (@backingInt(id) < res.bindings.len) res.bindings[@backingInt(id)] else continue)
+        else
+            res.uncoercedValue(expr_id.?);
+        if (at_exit.ty == .unknown) continue;
+        if (for (out.items) |x| {
+            if (x.tv.ty == at_exit.ty and x.tv.val == at_exit.val) break true;
+        } else false) continue;
+        try out.append(r.arena, .{ .seed = s, .tv = at_exit });
+    }
+    return out.items;
 }
 
 /// The hover of `def`, or of the expression `e` when there is no definition, whose value is `tv`
 /// at `a`: the signature or value, the embedded file it comes from, the instance it is inferred
 /// under (`seeded`), preceded by the location of `def` when `located`, and the documentation. False
 /// when there is nothing to show.
-fn writeBlock(w: *std.Io.Writer, r: *Resolver, a: context.At, def: ?Def, tv: TypedValue, e: ?Body.ExprId, seeded: ?seed.Seed, located: bool, roots: []const []const u8) resolve.Error!bool {
+fn writeBlock(w: *std.Io.Writer, r: *Resolver, a: context.At, def: ?Def, tv: TypedValue, e: ?Body.ExprId, seeded: ?seed.Seed, located: bool, opts: Options) resolve.Error!bool {
     if (tv.ty == .unknown and def == null) return false;
     // A value that is directly the result of `@embedFile`: the call instead of the content
     const embed = if (def) |d| try context.embedOf(r, d, tv) else if (tv.val != null) try context.embedCall(r, a, e.?) else null;
@@ -160,37 +227,54 @@ fn writeBlock(w: *std.Io.Writer, r: *Resolver, a: context.At, def: ?Def, tv: Typ
     else
         try render.exprAlloc(r, tv);
     w.print("```zig\n{s}\n```", .{code}) catch return error.OutOfMemory;
-    if (embed) |x| writeEmbedded(w, r.ctx.db.env.vfs.shownPath(roots, r.ctx.db.env.vfs.path(x.file)), x.text) catch return error.OutOfMemory;
+    if (embed) |x| writeEmbedded(w, r.ctx.db.env.vfs.shownPath(opts.roots, r.ctx.db.env.vfs.path(x.file)), x.text) catch return error.OutOfMemory;
     if (seeded) |s| {
         w.writeAll("\n\n") catch return error.OutOfMemory;
         if (located) if (try r.location(def.?)) |loc| {
-            const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, loc.file)).text;
-            const line = std.mem.count(u8, text[0..@min(loc.start, text.len)], "\n") + 1;
-            w.print("at {s}:{d}, ", .{ std.fs.path.basename(r.ctx.db.env.vfs.path(loc.file)), line }) catch return error.OutOfMemory;
+            w.writeAll("at ") catch return error.OutOfMemory;
+            try writeLocation(w, r, loc.file, loc.start, opts.links);
+            w.writeAll(", ") catch return error.OutOfMemory;
         };
         w.writeAll("inferred from ") catch return error.OutOfMemory;
-        try writeSource(w, r, s);
+        try writeSource(w, r, s, opts.links);
     }
     if (def) |d| if (try context.docOf(r, d, tv)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
     return true;
 }
 
 /// Where the instance `s` comes from: `the call at file.zig:12`, or the iteration of each loop
-/// containing the position, outermost first
-fn writeSource(w: *std.Io.Writer, r: *Resolver, s: seed.Seed) resolve.Error!void {
-    const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, s.file)).text;
-    const line = std.mem.count(u8, text[0..@min(s.offset, text.len)], "\n") + 1;
-    const where = std.fs.path.basename(r.ctx.db.env.vfs.path(s.file));
+/// and the exit of each `defer` body containing the position, outermost first
+fn writeSource(w: *std.Io.Writer, r: *Resolver, s: seed.Seed, links: ?Links) resolve.Error!void {
     const n = s.iteration orelse {
-        w.print("the call at {s}:{d}", .{ where, line }) catch return error.OutOfMemory;
-        return;
+        w.writeAll("the call at ") catch return error.OutOfMemory;
+        return writeLocation(w, r, s.file, s.offset, links);
     };
     for (s.enclosing, 0..) |outer, i| {
-        const outer_line = std.mem.count(u8, text[0..@min(outer.offset, text.len)], "\n") + 1;
-        const sep = if (i + 1 < s.enclosing.len) ", " else " and ";
-        w.print("iteration {d} of the loop at {s}:{d}{s}", .{ outer.iteration + 1, where, outer_line, sep }) catch return error.OutOfMemory;
+        try writeStep(w, r, s.file, outer, links);
+        w.writeAll(if (i + 1 < s.enclosing.len) ", " else " and ") catch return error.OutOfMemory;
     }
-    w.print("iteration {d} of the loop at {s}:{d}", .{ n + 1, where, line }) catch return error.OutOfMemory;
+    try writeStep(w, r, s.file, .{ .offset = s.offset, .iteration = n, .exit = s.exit }, links);
+}
+
+/// `iteration 2 of the loop at file.zig:12`, `the exit at file.zig:12` or `the end of the block
+/// at file.zig:12`
+fn writeStep(w: *std.Io.Writer, r: *Resolver, file: FileId, step: seed.Seed.LoopIteration, links: ?Links) resolve.Error!void {
+    if (step.exit) |x| {
+        w.print("{s} at ", .{if (x.fall_through) "the end of the block" else "the exit"}) catch return error.OutOfMemory;
+    } else w.print("iteration {d} of the loop at ", .{step.iteration + 1}) catch return error.OutOfMemory;
+    try writeLocation(w, r, file, step.offset, links);
+}
+
+/// `file.zig:12`, the line of `offset` in `file`; with `links`, a link to that line
+/// (`[file.zig:12](file:///p/file.zig#L12)`)
+fn writeLocation(w: *std.Io.Writer, r: *Resolver, file: FileId, offset: u32, links: ?Links) resolve.Error!void {
+    const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, file)).text;
+    const line = std.mem.count(u8, text[0..@min(offset, text.len)], "\n") + 1;
+    const name = std.fs.path.basename(r.ctx.db.env.vfs.path(file));
+    if (links) |l| {
+        const target = try l.uri(l.ctx, r.arena, file);
+        w.print("[{s}:{d}]({s}#L{d})", .{ name, line, target, line }) catch return error.OutOfMemory;
+    } else w.print("{s}:{d}", .{ name, line }) catch return error.OutOfMemory;
 }
 
 /// A member name in hover: the member of a member access or a decl literal (`expr`), or the
@@ -220,7 +304,7 @@ fn sameInstance(x: seed.Seed, y: seed.Seed) bool {
 /// the hover shows no declaration (a decl literal shows its value), the one under the instance
 /// the hover is inferred under (`shown_seed`). `.count` shows how many there are; `.full` shows
 /// each once, with the first instance that refers to it, in the order goto lists them.
-fn writeOtherInstances(w: *std.Io.Writer, r: *Resolver, shown: ?Def, shown_seed: ?seed.Seed, all: []const definition.InstanceDef, name: Name, instances: Instances, roots: []const []const u8) resolve.Error!void {
+fn writeOtherInstances(w: *std.Io.Writer, r: *Resolver, shown: ?Def, shown_seed: ?seed.Seed, all: []const definition.InstanceDef, name: Name, opts: Options) resolve.Error!void {
     var seen: std.ArrayList(Def) = .empty;
     if (shown) |d| {
         try seen.append(r.arena, d);
@@ -236,15 +320,15 @@ fn writeOtherInstances(w: *std.Io.Writer, r: *Resolver, shown: ?Def, shown_seed:
         } else false) continue;
         try seen.append(r.arena, x.def);
         others += 1;
-        if (instances == .count) continue;
+        if (opts.instances == .count) continue;
         w.writeAll("\n\n---\n\n") catch return error.OutOfMemory;
         const e = switch (name) {
             .expr => |e| e,
             .init_field => null,
         };
-        _ = try writeBlock(w, r, x.at, x.def, try nameType(r, x.at, name), e, s, true, roots);
+        _ = try writeBlock(w, r, x.at, x.def, try nameType(r, x.at, name), e, s, true, opts);
     }
-    if (instances == .count and others > 0) {
+    if (opts.instances == .count and others > 0) {
         w.print("\n\nRefers to {d} other declaration{s} under other instances; go to definition lists them", .{ others, if (others == 1) "" else "s" }) catch return error.OutOfMemory;
     }
 }
@@ -292,7 +376,7 @@ fn isShortText(content: []const u8) bool {
 /// container; inside a generic function body, in a call-site instance) and its documentation. A
 /// field of a constructed type (`@Struct`, such as `std.enums.EnumFieldStruct`) has no
 /// declaration: only its name and type.
-fn initFieldHover(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.ExprId, instances: Instances, roots: []const []const u8) resolve.Error!?Info {
+fn initFieldHover(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.ExprId, opts: Options) resolve.Error!?Info {
     const a = try context.atSeeded(r, file, tok.offset, false) orelse return null;
     const fields = a.body.expr(e).init.fields;
     const rel = tok.offset - a.node.offset;
@@ -323,10 +407,10 @@ fn initFieldHover(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.Expr
     w.print("```zig\n{s}\n```", .{try context.signature(r, def, .{ .ty = field.ty orelse .unknown }, .multi_line)}) catch return error.OutOfMemory;
     if (from) |s| {
         w.writeAll("\n\ninferred from ") catch return error.OutOfMemory;
-        try writeSource(w, r, s);
+        try writeSource(w, r, s, opts.links);
     }
     if (try context.doc(r, def)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
-    try writeOtherInstances(w, r, def, a.seeded, try definition.instanceDefsAt(r, file, tok.offset), .{ .init_field = .{ .e = e, .k = k } }, instances, roots);
+    try writeOtherInstances(w, r, def, a.seeded, try definition.instanceDefsAt(r, file, tok.offset), .{ .init_field = .{ .e = e, .k = k } }, opts);
     return .{ .text = out.written(), .start = tok.offset, .end = tok.range().end };
 }
 

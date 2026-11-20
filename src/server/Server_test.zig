@@ -689,6 +689,43 @@ test "requests at the largest position coordinates are answered" {
     try h.notify("exit", {});
 }
 
+test "hover links the source location an inference comes from to its line" {
+    // The client's URI of the document, so the link opens it in the editor
+    const Harness = @import("test_harness.zig").Harness;
+    const prev_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = prev_level;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const Empty = struct {};
+    const doc_uri = if (@import("builtin").target.os.tag == .windows) "file:///C:/links/main.zig" else "file:///links/main.zig";
+    const text =
+        \\fn f(early: bool) void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer {
+        \\            const seen = x;
+        \\            _ = seen;
+        \\        }
+        \\        if (early) return;
+        \\        x = 5;
+        \\    }
+        \\}
+        \\
+    ;
+    _ = try h.request("initialize", .{ .capabilities = Empty{}, .initializationOptions = .{ .zig = .{ .path = "/nonexistent/zig" } } });
+    try h.notify("initialized", Empty{});
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = doc_uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const Position = struct { line: u32, character: u32 };
+    const hover = try h.request("textDocument/hover", .{ .textDocument = .{ .uri = doc_uri }, .position = Position{ .line = 4, .character = 19 } });
+    const value = hover.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try testing.expect(std.mem.indexOf(u8, value, "inferred from the exit at [main.zig:8](" ++ doc_uri ++ "#L8)") != null);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "read requests run on their own threads: a blocked read does not stall the main loop" {
     const Harness = @import("test_harness.zig").Harness;
     // No free slot in the thread pool: `async` runs synchronously on the caller, so zig env may

@@ -3395,6 +3395,129 @@ test "defer and errdefer write comptime vars at the exit of their block" {
     }
 }
 
+/// Type of the binding `needle` in the inference of each exit of the defer body containing it
+/// that `Result.defer_exits` lists, in order, joined by ", "; empty when it lists none
+fn exitTypesAt(w: *World, file: FileId, text: []const u8, needle: []const u8) ![]const u8 {
+    const offset = try wordAt(text, needle, 0);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const item = try r.ownerAt(file, offset, false) orelse return "no owner";
+    const node = (try r.itemNode(file, item)).?;
+    const owner = try r.ownerKey(file, item);
+    const body = try ctx.get(database.hir.ItemBody, owner);
+    const res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full });
+    const rel = offset - node.offset;
+    const binding = for (body.bindings, 0..) |b, i| {
+        if (b.range.start == rel) break i;
+    } else return "no binding";
+    var out: std.ArrayList(u8) = .empty;
+    for (res.defer_exits) |x| {
+        if (!body.range(x.body).contains(rel)) continue;
+        const exit_res = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .full, .loop = infer.LoopSeed.exit(x.body, x.index) });
+        if (out.items.len > 0) try out.appendSlice(w.arena.allocator(), ", ");
+        try out.appendSlice(w.arena.allocator(), try render.typedValueAlloc(&r, exit_res.bindings[binding]));
+    }
+    return out.items;
+}
+
+test "a defer body reached from exits with different comptime var values is inferred per exit" {
+    // Prevents showing only the value of the end of the block; expected values are the results of
+    // `zig run` (the inner defer of `nested` prints 1 then 2 for both calls)
+    const text =
+        \\fn h(e: bool) !void {
+        \\    if (!e) return error.B;
+        \\}
+        \\fn early(c: bool) void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer {
+        \\            const seen = x;
+        \\            _ = seen;
+        \\        }
+        \\        if (c) return;
+        \\        x = 5;
+        \\    }
+        \\    const after = x;
+        \\    _ = after;
+        \\}
+        \\fn onError(e: bool) !void {
+        \\    comptime var x: u32 = 1;
+        \\    errdefer {
+        \\        const err_seen = x;
+        \\        _ = err_seen;
+        \\    }
+        \\    if (e) return error.A;
+        \\    x = 2;
+        \\    try h(e);
+        \\    x = 3;
+        \\}
+        \\fn nested(c: bool) void {
+        \\    comptime var x: u32 = 1;
+        \\    outer: {
+        \\        defer {
+        \\            const outer_seen = x;
+        \\            _ = outer_seen;
+        \\        }
+        \\        {
+        \\            defer {
+        \\                const inner_seen = x;
+        \\                _ = inner_seen;
+        \\            }
+        \\            if (c) break :outer;
+        \\            x = 2;
+        \\        }
+        \\    }
+        \\}
+        \\fn same(c: bool) void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer {
+        \\            const same_seen = x;
+        \\            _ = same_seen;
+        \\        }
+        \\        if (c) return;
+        \\        x = 1;
+        \\    }
+        \\}
+        \\fn known() void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer {
+        \\            const known_seen = x;
+        \\            _ = known_seen;
+        \\        }
+        \\        if (true) return;
+        \\        x = 5;
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", text);
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "seen", "u32", "u32 = 1, u32 = 5" },
+        .{ "after", "u32 = 5", "" },
+        .{ "err_seen", "u32", "u32 = 1, u32 = 2" },
+        .{ "outer_seen", "u32", "u32 = 1, u32 = 2" },
+        .{ "inner_seen", "u32", "u32 = 1, u32 = 2" },
+        .{ "same_seen", "u32 = 1", "" },
+        .{ "known_seen", "u32 = 1", "" },
+    };
+    for (cases) |c| {
+        testing.expectEqualStrings(c[1], try typeAt(&w, f.file, text, c[0], 0)) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+        testing.expectEqualStrings(c[2], try exitTypesAt(&w, f.file, text, c[0])) catch |err| {
+            std.debug.print("types of `{s}` at each exit\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "containers in a loop of a type function capture the values of each iteration" {
     // Prevents the containers of all iterations from sharing one type, which left the locals they
     // capture without a value and made the types of different iterations compare equal

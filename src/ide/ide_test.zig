@@ -9249,6 +9249,125 @@ test "an iteration that leaves the loop before a declaration is not used for it"
     try testing.expectEqualStrings("```zig\nconst F: type = u8\n```\n\ninferred from iteration 2 of the loop at main.zig:4", info.text);
 }
 
+test "hover in a defer body shows the value at one exit and counts or lists the others" {
+    // Prevents showing only the value at the end of the block; `zig run` prints seen=1 for the
+    // exit at `return` and seen=5 for the end of the block
+    const text =
+        \\fn f(early: bool) void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer {
+        \\            const seen = x;
+        \\            _ = seen;
+        \\        }
+        \\        if (early) return;
+        \\        x = 5;
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at: u32 = @intCast(std.mem.indexOf(u8, text, "seen =").?);
+    const counted = (try hover.hover(&r, added.file, at, &.{}, .count)) orelse return error.NoHover;
+    try testing.expectEqualStrings(
+        "```zig\nconst seen: u32 = 1\n```\n\ninferred from the exit at main.zig:8" ++
+            "\n\nTakes 1 other value at other exits of the block",
+        counted.text,
+    );
+    const full = (try hover.hover(&r, added.file, at, &.{}, .full)) orelse return error.NoHover;
+    try testing.expectEqualStrings(
+        "```zig\nconst seen: u32 = 1\n```\n\ninferred from the exit at main.zig:8" ++
+            "\n\n---\n\n```zig\nconst seen: u32 = 5\n```\n\ninferred from the end of the block at main.zig:10",
+        full.text,
+    );
+}
+
+test "a type read in a defer body resolves members at each exit that runs it" {
+    // Prevents resolving the member only at the end of the block: the compiler analyzes the body
+    // with T = A at the `return` and T = B at the end of the block
+    const text =
+        \\const A = struct {
+        \\    pub fn name() u32 {
+        \\        return 1;
+        \\    }
+        \\};
+        \\const B = struct {
+        \\    pub fn name() u32 {
+        \\        return 2;
+        \\    }
+        \\};
+        \\fn f(early: bool) void {
+        \\    comptime var T: type = A;
+        \\    {
+        \\        defer {
+        \\            const U = T;
+        \\            _ = U.name();
+        \\        }
+        \\        if (early) return;
+        \\        T = B;
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const info = (try hover.hover(&r, added.file, @intCast(std.mem.indexOf(u8, text, "U =").?), &.{}, .full)) orelse return error.NoHover;
+    try testing.expectEqualStrings(
+        "```zig\nconst U: type = A\n```\n\ninferred from the exit at main.zig:18" ++
+            "\n\n---\n\n```zig\nconst U: type = B\n```\n\ninferred from the end of the block at main.zig:20",
+        info.text,
+    );
+    const targets = try definition.definitionTargets(&r, added.file, @intCast(std.mem.indexOf(u8, text, "U.name").? + 2));
+    try testing.expectEqual(2, targets.len);
+    for (targets, [_]usize{ 0, 1 }) |t, k| {
+        const want = std.mem.indexOfPos(u8, text, if (k == 0) 0 else std.mem.indexOf(u8, text, "const B").?, "name").?;
+        try testing.expectEqual(want, t.start);
+    }
+}
+
+test "go to definition through a comptime var follows its assignments" {
+    // Prevents taking the namespace of a `comptime var` from its initializer: T is B at the call
+    const text =
+        \\const A = struct {
+        \\    pub fn name() u32 {
+        \\        return 1;
+        \\    }
+        \\};
+        \\const B = struct {
+        \\    pub fn name() u32 {
+        \\        return 2;
+        \\    }
+        \\};
+        \\fn f() void {
+        \\    comptime var T: type = A;
+        \\    T = B;
+        \\    _ = T.name();
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const targets = try definition.definitionTargets(&r, added.file, @intCast(std.mem.indexOf(u8, text, "T.name").? + 2));
+    try testing.expectEqual(1, targets.len);
+    try testing.expectEqual(std.mem.indexOfPos(u8, text, std.mem.indexOf(u8, text, "const B").?, "name").?, targets[0].start);
+}
+
 test "hover on a capture read through a container in the body shows the value of the chosen iteration" {
     // Prevents the capture read by the container from staying unknown in the iteration hover
     // infers (`p_via` was shown as the abstract `T`); expected values are the results of zig 0.17.0
