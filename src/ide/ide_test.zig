@@ -9390,6 +9390,55 @@ test "a type read in a defer body resolves members at each exit that runs it" {
     }
 }
 
+test "hover on a member read in a defer body shows the declaration at each exit" {
+    // Prevents showing the declaration at the first exit for every exit: at the end of the block
+    // U is B, whose `name` returns u32, and B's `name` is not an additional instance
+    const text =
+        \\const A = struct {
+        \\    pub fn name() u8 {
+        \\        return 1;
+        \\    }
+        \\};
+        \\const B = struct {
+        \\    pub fn name() u32 {
+        \\        return 2;
+        \\    }
+        \\};
+        \\fn f(early: bool) void {
+        \\    comptime var T: type = A;
+        \\    {
+        \\        defer {
+        \\            const U = T;
+        \\            _ = U.name();
+        \\        }
+        \\        if (early) return;
+        \\        T = B;
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at: u32 = @intCast(std.mem.indexOf(u8, text, "U.name").? + 2);
+    const counted = (try hover.hover(&r, added.file, at, &.{}, .count)) orelse return error.NoHover;
+    try testing.expectEqualStrings(
+        "```zig\npub fn name() u8\n```\n\ninferred from the exit at main.zig:18" ++
+            "\n\nTakes 1 other value at other exits of the block",
+        counted.text,
+    );
+    const full = (try hover.hover(&r, added.file, at, &.{}, .full)) orelse return error.NoHover;
+    try testing.expectEqualStrings(
+        "```zig\npub fn name() u8\n```\n\ninferred from the exit at main.zig:18" ++
+            "\n\n---\n\n```zig\npub fn name() u32\n```\n\ninferred from the end of the block at main.zig:20",
+        full.text,
+    );
+}
+
 test "go to definition through a comptime var follows its assignments" {
     // Prevents taking the namespace of a `comptime var` from its initializer: T is B at the call
     const text =

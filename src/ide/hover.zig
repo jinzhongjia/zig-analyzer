@@ -159,43 +159,63 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, 
     var out: std.Io.Writer.Allocating = .init(r.arena);
     const w = &out.writer;
     // In a defer body analyzed once per exit, the value at one exit, followed by the others
-    const exits = try exitValues(r, a, binding_id, expr_id, seeded_from);
+    const exits = try exitValues(r, a, def, binding_id, expr_id, seeded_from);
     var others: []const ExitValue = &.{};
+    // The declarations shown with the exits, which `writeOtherInstances` must not show again
+    var shown_at_exits: []const Def = &.{};
     // One value at every exit that the abstract inference already shows needs no exit
     if (exits.len > 1 or (exits.len == 1 and (exits[0].tv.ty != tv.ty or exits[0].tv.val != tv.val))) {
         const first = for (exits, 0..) |x, k| {
             if (seeded_from) |s| if (sameInstance(s, x.seed)) break k;
         } else 0;
+        def = exits[first].def;
         tv = exits[first].tv;
         seeded_from = exits[first].seed;
         var rest: std.ArrayList(ExitValue) = .empty;
         for (exits, 0..) |x, k| if (k != first) try rest.append(r.arena, x);
         others = rest.items;
+        var shown: std.ArrayList(Def) = .empty;
+        for (exits) |x| if (x.def) |d| try shown.append(r.arena, d);
+        shown_at_exits = shown.items;
     }
     if (!try writeBlock(w, r, a, def, tv, expr_id, seeded_from, false, opts)) return null;
     if (others.len > 0) switch (opts.instances) {
         .count => w.print("\n\nTakes {d} other value{s} at other exits of the block", .{ others.len, if (others.len == 1) "" else "s" }) catch return error.OutOfMemory,
         .full => for (others) |x| {
             w.writeAll("\n\n---\n\n") catch return error.OutOfMemory;
-            _ = try writeBlock(w, r, a, def, x.tv, expr_id, x.seed, false, opts);
+            _ = try writeBlock(w, r, a, x.def, x.tv, expr_id, x.seed, false, opts);
         },
     };
     if (expr_id) |e| switch (b.expr(e)) {
-        .field_access, .enum_literal => try writeOtherInstances(w, r, def, seeded_from, try definition.instanceDefsAt(r, file, offset), .{ .expr = e }, opts),
+        .field_access, .enum_literal => try writeOtherInstances(w, r, def, seeded_from, shown_at_exits, try definition.instanceDefsAt(r, file, offset), .{ .expr = e }, opts),
         else => {},
     };
     return .{ .text = out.written(), .start = tok.offset, .end = tok.offset + @as(u32, @intCast(tok.text.len)) };
 }
 
-const ExitValue = struct { seed: seed.Seed, tv: TypedValue };
+const ExitValue = struct {
+    seed: seed.Seed,
+    tv: TypedValue,
+    /// The declaration the name refers to at this exit: what `context.defOfKey` gives for the
+    /// member the exit's inference result resolves, not the abstract one; the binding's declaration
+    /// elsewhere
+    def: ?Def,
+};
 
 /// In a `defer` body that the compiler analyzes once per exit with different `comptime var`
 /// values (see `seed.exitSeeds`), the value of the binding or expression at each exit, each
-/// distinct value once with its first exit; empty elsewhere, and under a call-site instance
-/// (`shown` is not an exit), whose exits are not inferred separately
-fn exitValues(r: *Resolver, a: context.At, binding_id: ?Body.BindingId, expr_id: ?Body.ExprId, shown: ?seed.Seed) resolve.Error![]const ExitValue {
+/// distinct value and declaration once with its first exit; empty elsewhere, and under a call-site
+/// instance (`shown` is not an exit), whose exits are not inferred separately
+fn exitValues(r: *Resolver, a: context.At, def: ?Def, binding_id: ?Body.BindingId, expr_id: ?Body.ExprId, shown: ?seed.Seed) resolve.Error![]const ExitValue {
     if (binding_id == null and expr_id == null) return &.{};
     if (shown) |s| if (s.exit == null) return &.{};
+    // A member name can refer to a different declaration at each exit: its member comes from the
+    // exit's inference result (`At.member` prefers the abstract result, which has none for a name
+    // that only resolves under an exit)
+    const member = expr_id != null and switch (a.body.expr(expr_id.?)) {
+        .field_access, .enum_literal => true,
+        else => false,
+    };
     var out: std.ArrayList(ExitValue) = .empty;
     for (try seed.exitSeeds(r, a.file, a.item, a.body, a.res, a.rel)) |s| {
         const res = s.res;
@@ -204,10 +224,15 @@ fn exitValues(r: *Resolver, a: context.At, binding_id: ?Body.BindingId, expr_id:
         else
             res.uncoercedValue(expr_id.?);
         if (at_exit.ty == .unknown) continue;
+        const exit_def = if (member) blk: {
+            const i = @backingInt(expr_id.?);
+            const key = if (i < res.members.len) res.members[i] else null;
+            break :blk if (key) |k| try context.defOfKey(r, k) else null;
+        } else def;
         if (for (out.items) |x| {
-            if (x.tv.ty == at_exit.ty and x.tv.val == at_exit.val) break true;
+            if (x.tv.ty == at_exit.ty and x.tv.val == at_exit.val and std.meta.eql(x.def, exit_def)) break true;
         } else false) continue;
-        try out.append(r.arena, .{ .seed = s, .tv = at_exit });
+        try out.append(r.arena, .{ .seed = s, .tv = at_exit, .def = exit_def });
     }
     return out.items;
 }
@@ -308,24 +333,24 @@ fn sameInstance(x: seed.Seed, y: seed.Seed) bool {
 }
 
 /// The declarations that the name refers to under the other instances of the generic function
-/// containing it (`all`, see `definition.instanceDefsAt`), except the one shown: `shown`, or when
+/// containing it (`all`, see `definition.instanceDefsAt`), except the one shown (`shown`, or when
 /// the hover shows no declaration (a decl literal shows its value), the one under the instance
-/// the hover is inferred under (`shown_seed`). `.count` shows how many there are; `.full` shows
-/// each once, with the first instance that refers to it, in the order goto lists them.
-fn writeOtherInstances(w: *std.Io.Writer, r: *Resolver, shown: ?Def, shown_seed: ?seed.Seed, all: []const definition.InstanceDef, name: Name, opts: Options) resolve.Error!void {
+/// the hover is inferred under (`shown_seed`)) and the ones already shown as the value at an exit
+/// of a `defer` body (`shown_at_exits`). `.count` shows how many there are; `.full` shows each
+/// once, with the first instance that refers to it, in the order goto lists them.
+fn writeOtherInstances(w: *std.Io.Writer, r: *Resolver, shown: ?Def, shown_seed: ?seed.Seed, shown_at_exits: []const Def, all: []const definition.InstanceDef, name: Name, opts: Options) resolve.Error!void {
     var seen: std.ArrayList(Def) = .empty;
+    for (shown_at_exits) |d| if (!containsDef(seen.items, d)) try seen.append(r.arena, d);
     if (shown) |d| {
-        try seen.append(r.arena, d);
+        if (!containsDef(seen.items, d)) try seen.append(r.arena, d);
     } else if (shown_seed) |ss| for (all) |x| if (x.at.seeded) |s| if (sameInstance(s, ss)) {
-        try seen.append(r.arena, x.def);
+        if (!containsDef(seen.items, x.def)) try seen.append(r.arena, x.def);
         break;
     };
     var others: usize = 0;
     for (all) |x| {
         const s = x.at.seeded orelse continue;
-        if (for (seen.items) |d| {
-            if (std.meta.eql(d, x.def)) break true;
-        } else false) continue;
+        if (containsDef(seen.items, x.def)) continue;
         try seen.append(r.arena, x.def);
         others += 1;
         if (opts.instances == .count) continue;
@@ -339,6 +364,12 @@ fn writeOtherInstances(w: *std.Io.Writer, r: *Resolver, shown: ?Def, shown_seed:
     if (opts.instances == .count and others > 0) {
         w.print("\n\nRefers to {d} other declaration{s} under other instances; go to definition lists them", .{ others, if (others == 1) "" else "s" }) catch return error.OutOfMemory;
     }
+}
+
+/// Whether `defs` contains `d`
+fn containsDef(defs: []const Def, d: Def) bool {
+    for (defs) |x| if (std.meta.eql(x, d)) return true;
+    return false;
 }
 
 /// The file a value comes from with `@embedFile` and its size; its content when it is text of at
@@ -418,7 +449,7 @@ fn initFieldHover(r: *Resolver, file: FileId, tok: ast.SyntaxToken, e: Body.Expr
         try writeSource(w, r, s, opts.links);
     }
     if (try context.doc(r, def)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
-    try writeOtherInstances(w, r, def, a.seeded, try definition.instanceDefsAt(r, file, tok.offset), .{ .init_field = .{ .e = e, .k = k } }, opts);
+    try writeOtherInstances(w, r, def, a.seeded, &.{}, try definition.instanceDefsAt(r, file, tok.offset), .{ .init_field = .{ .e = e, .k = k } }, opts);
     return .{ .text = out.written(), .start = tok.offset, .end = tok.range().end };
 }
 
