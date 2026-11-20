@@ -3681,7 +3681,11 @@ const Evaluator = struct {
         return cell.v == .ip and ev.interned_cells.get(cell.v.ip) == cell;
     }
 
-    /// `++`: concatenation of arrays, strings, and tuples
+    /// `++`: concatenation of arrays, strings, and tuples (`Sema.zirArrayCat`). Two tuples give
+    /// a tuple; otherwise both sides are arrays, pointers to arrays or comptime-known slices, or
+    /// a tuple taken as an array of the other side's element type (`getArrayCatInfo`). The
+    /// result is an array of the peer type of the element types, with a sentinel when only one
+    /// side has one or both have the same, and a pointer to it when either side is a pointer.
     fn concat(ev: *Evaluator, lhs: Val, rhs: Val) EvalError!Val {
         const ip = ev.ip;
         if (lhs.v == .unknown or rhs.v == .unknown) return error.Abort;
@@ -3691,28 +3695,27 @@ const Evaluator = struct {
         const elems = try ev.allocElems(total);
         for (0..n) |i| elems[i] = try ev.elemAt(lhs, i);
         for (0..m) |i| elems[n + i] = try ev.elemAt(rhs, i);
-        const lt = try ev.concatArrayOf(lhs.ty, n);
-        const rt = try ev.concatArrayOf(rhs.ty, m);
-        var ty: Index = undefined;
-        if (ip.key(lt) == .array_type and ip.key(rt) == .array_type) {
-            const la = ip.key(lt).array_type;
-            const ra = ip.key(rt).array_type;
-            const sentinel = concatSentinel(la.sentinel, ra.sentinel);
-            const array = try ip.get(.{ .array_type = .{ .len = std.math.cast(u64, total) orelse return error.Abort, .child = la.child, .sentinel = sentinel } });
-            // If either side is a pointer, the result is a pointer to an array (a string literal)
-            ty = if (ip.key(lhs.ty) == .ptr_type or ip.key(rhs.ty) == .ptr_type) try ip.ptrTo(array, .one, true) else array;
-        } else {
+        if (ip.key(lhs.ty) == .tuple_type and ip.key(rhs.ty) == .tuple_type) {
             const types = try ev.a.alloc(Index, total);
             for (elems, types) |e, *t| t.* = e.ty;
-            ty = try ip.get(.{ .tuple_type = .{ .types = types, .values = try ev.comptimeFieldValues(elems) } });
+            return ev.makeAgg(try ip.get(.{ .tuple_type = .{ .types = types, .values = try ev.comptimeFieldValues(elems) } }), elems);
         }
+        const x = infer.concatOperand(ip, lhs.ty, rhs.ty, n) orelse return error.Abort;
+        const y = infer.concatOperand(ip, rhs.ty, lhs.ty, m) orelse return error.Abort;
+        const elem = concatElemType(ip, x.elem, y.elem) orelse return error.Abort;
+        // Sentinels are coerced to the element type before being compared
+        const xs: ?Index = if (x.sentinel) |v| try value.coerceValue(ip, v, elem) orelse return error.Abort else null;
+        const ys: ?Index = if (y.sentinel) |v| try value.coerceValue(ip, v, elem) orelse return error.Abort else null;
+        // The elements of a tuple, or of an array of another element type, are coerced to it
+        for (elems) |*e| e.* = try ev.concatElem(e.*, elem);
+        const array = try ip.get(.{ .array_type = .{ .len = std.math.cast(u64, total) orelse return error.Abort, .child = elem, .sentinel = concatSentinel(xs, ys) } });
+        const ty = if (x.is_ptr or y.is_ptr) try ip.ptrTo(array, .one, true) else array;
         // A pointer points to an anonymous constant holding the result (`uavRef` in
         // `Sema.zirArrayCat`). When both operands are interned, the result is interned as a string
         // literal is, so it is the same interned value as an equal literal and compares with
         // interned pointers as literals do. Otherwise it stays inside the interpreter in a
         // temporary cell: freezing the operands could copy what their pointers point to.
         if (ip.key(ty) == .ptr_type) {
-            const array = ip.key(ty).ptr_type.child;
             interned: {
                 if (lhs.v != .ip or rhs.v != .ip) break :interned;
                 const frozen = try ev.a.alloc(Index, total);
@@ -3731,17 +3734,15 @@ const Evaluator = struct {
         return ev.makeAgg(ty, elems);
     }
 
-    /// Array type of a `++` operand of type `t` with `len` elements: a pointer to an array yields
-    /// the array it points to, and a slice an array of its element type and sentinel
-    fn concatArrayOf(ev: *Evaluator, t: Index, len: usize) Error!Index {
-        return switch (ev.ip.key(t)) {
-            .ptr_type => |p| switch (p.size) {
-                .one => p.child,
-                .slice => ev.ip.get(.{ .array_type = .{ .len = std.math.cast(u64, len) orelse return .unknown, .child = p.child, .sentinel = p.sentinel } }),
-                .many, .c => t,
-            },
-            else => t,
-        };
+    /// Element `e` of a `++` operand coerced to the element type `elem` of the result. Only
+    /// integers and comptime_float values are converted to another number type (checking range
+    /// and exactness); other coercions are not evaluated.
+    fn concatElem(ev: *Evaluator, e: Val, elem: Index) EvalError!Val {
+        if (e.ty == elem) return e;
+        const ip = ev.ip;
+        const from_number = ip.isInt(e.ty) or e.ty == .comptime_float_type;
+        if (!from_number or !(ip.isInt(elem) or ip.isFloat(elem))) return error.Abort;
+        return ev.coerce(e, elem);
     }
 
     /// Pointer to a new storage cell (holding `target`); the cell is reachable only through this
@@ -7782,6 +7783,17 @@ pub fn writtenCallConv(r: *Resolver, body: *const Body, e: ExprId, v: ?Index) Er
 
 /// Sentinel of the result of `++` (matching the compiler): when both sides have one, they must
 /// be equal; when only one side has one, that side's sentinel
+/// Peer type of the element types of the arrays concatenated by `++`. The compiler resolves
+/// them as runtime peers: equal types, or fixed-width integers of which one holds the other
+/// (`[1]u8 ++ [1]u16` is `[2]u16`; `comptime_int` and `u8`, `u8` and `i8` are incompatible).
+/// Null for the other combinations, which are not evaluated.
+fn concatElemType(ip: *InternPool, a: Index, b: Index) ?Index {
+    if (a == b) return a;
+    if (a == .comptime_int_type or b == .comptime_int_type) return null;
+    if (ip.isInt(a) and ip.isInt(b)) return value.peerIntType(ip, a, b);
+    return null;
+}
+
 pub fn concatSentinel(a: ?Index, b: ?Index) ?Index {
     const x = a orelse return b;
     const y = b orelse return x;

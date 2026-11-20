@@ -4874,11 +4874,11 @@ fn isNonSlicePtr(ip: *InternPool, t: Index) bool {
     };
 }
 
-const ConcatOperand = struct { elem: Index, len: u64, sentinel: ?Index, is_ptr: bool };
+pub const ConcatOperand = struct { elem: Index, len: u64, sentinel: ?Index, is_ptr: bool };
 
 /// One side of `++`: an array, a pointer to an array, a slice of known length `slice_len`, or a
 /// tuple when the other side is indexable (taking the element type of the other side)
-fn concatOperand(ip: *InternPool, t: Index, other: Index, slice_len: ?u64) ?ConcatOperand {
+pub fn concatOperand(ip: *InternPool, t: Index, other: Index, slice_len: ?u64) ?ConcatOperand {
     switch (ip.key(t)) {
         .array_type => |a| return .{ .elem = a.child, .len = a.len, .sentinel = a.sentinel, .is_ptr = false },
         .ptr_type => |p| switch (p.size) {
