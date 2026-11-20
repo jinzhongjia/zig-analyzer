@@ -8,12 +8,19 @@ const offsets = @import("../util/offsets.zig");
 const ItemTree = @import("../syntax/ItemTree.zig");
 const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
 const ast = @import("../syntax/ast.zig");
+const resolve = @import("../names/resolve.zig");
+const Resolver = resolve.Resolver;
+const FileId = @import("../base/Vfs.zig").FileId;
+const symbol_kind = @import("../ide_db/symbol_kind.zig");
 
 /// Maximum nesting depth of symbols; deeper containers are not listed. Each symbol level nests
 /// two levels in JSON (the symbol and `children`), and `std.json.Stringify` panics when nesting
 /// exceeds 256 levels in builds with safety checks
 pub const max_levels = 100;
 
+/// The outline classified from syntax only: a function is a method when it is declared in a
+/// container other than a file, a `const` is classified by the container it declares, and a `var`
+/// is a variable
 pub fn documentSymbols(
     arena: Allocator,
     items: *const ItemTree,
@@ -21,19 +28,46 @@ pub fn documentSymbols(
     lines: offsets.LineIndex,
     enc: offsets.Encoding,
 ) Allocator.Error![]const types.DocumentSymbol {
-    var b: Builder = .{ .arena = arena, .items = items, .map = map, .lines = lines, .enc = enc };
+    var b: Builder = .{ .arena = arena, .types = null, .items = items, .map = map, .lines = lines, .enc = enc };
+    return b.container(0, 1) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => unreachable,
+    };
+}
+
+/// The outline with the declaration kinds that depend on the inferred type (`fn`, and a `const` or
+/// `var` whose value is a function) classified by `symbol_kind` (see `ofDecl`), the same as
+/// semantic highlighting
+pub fn documentSymbolsWithResolver(
+    arena: Allocator,
+    r: *Resolver,
+    file: FileId,
+    items: *const ItemTree,
+    map: *const ItemTree.AstIdMap,
+    lines: offsets.LineIndex,
+    enc: offsets.Encoding,
+) resolve.Error![]const types.DocumentSymbol {
+    var b: Builder = .{ .arena = arena, .types = .{ .r = r, .file = file }, .items = items, .map = map, .lines = lines, .enc = enc };
     return b.container(0, 1);
 }
 
+const Types = struct {
+    r: *Resolver,
+    file: FileId,
+};
+
 const Builder = struct {
     arena: Allocator,
+    /// Type information for the kinds of functions and function-valued declarations; null for a
+    /// syntax-only outline
+    types: ?Types,
     items: *const ItemTree,
     map: *const ItemTree.AstIdMap,
     lines: offsets.LineIndex,
     enc: offsets.Encoding,
 
     /// `level` is the level of the members (1 for the top level)
-    fn container(b: *Builder, index: u32, level: u32) Allocator.Error![]const types.DocumentSymbol {
+    fn container(b: *Builder, index: u32, level: u32) resolve.Error![]const types.DocumentSymbol {
         const kind = b.items.containers[index].kind;
         var out: std.ArrayList(types.DocumentSymbol) = .empty;
         var fields: u32 = 0;
@@ -50,7 +84,7 @@ const Builder = struct {
             const sel = if (name_tok) |t| t.range() else r;
             try out.append(b.arena, .{
                 .name = name,
-                .kind = symbolKind(b.items, i, kind),
+                .kind = try b.kindOf(i, kind),
                 .range = b.lines.range(r.start, r.end, b.enc),
                 .selectionRange = b.lines.range(sel.start, sel.end, b.enc),
                 .children = if (children.len == 0) null else children,
@@ -62,10 +96,25 @@ const Builder = struct {
     /// The containers a member declares (the fields of `const S = struct {...}`, of a field's
     /// struct type, or of the struct a function returns) become its child symbols; containers that
     /// are only lexically inside it (local types, call arguments, `?struct {...}`) are not listed
-    fn childrenOf(b: *Builder, item: u32, level: u32) Allocator.Error![]const types.DocumentSymbol {
+    fn childrenOf(b: *Builder, item: u32, level: u32) resolve.Error![]const types.DocumentSymbol {
         var out: std.ArrayList(types.DocumentSymbol) = .empty;
         for (b.items.valueContainers(item)) |ci| try out.appendSlice(b.arena, try b.container(ci, level));
         return out.items;
+    }
+
+    /// With type information, a function is a method only when its receiver is the container it is
+    /// declared in, and a `const` or `var` whose value is a function is a function; other kinds
+    /// and the syntax-only outline follow `symbolKind`
+    fn kindOf(b: *Builder, index: u32, container_kind: ItemTree.Container.Kind) resolve.Error!types.SymbolKind {
+        if (b.types) |t| {
+            const kind = (try symbol_kind.ofDecl(t.r, t.file, index)).kind;
+            switch (b.items.items[index].kind) {
+                .@"fn" => return if (kind == .method) .Method else .Function,
+                .@"const", .@"var" => if (kind == .function) return .Function,
+                else => {},
+            }
+        }
+        return symbolKind(b.items, index, container_kind);
     }
 };
 
@@ -159,6 +208,8 @@ const testing = std.testing;
 const Parse = @import("../syntax/Parse.zig");
 
 test documentSymbols {
+    const World = @import("../names/resolve_test.zig").World;
+    const database = @import("../database.zig");
     const text =
         \\const S = struct {
         \\    a: u32,
@@ -167,24 +218,33 @@ test documentSymbols {
         \\const E = enum { x };
         \\test "t" {}
     ;
-    const parse = try Parse.create(testing.allocator, text, .zig);
-    defer parse.destroy();
-    var items = try ItemTree.build(testing.allocator, parse.rootNode(), .zig);
-    defer items.deinit(testing.allocator);
-    var map = try ItemTree.AstIdMap.build(testing.allocator, &items, parse.rootNode());
-    defer map.deinit(testing.allocator);
-    var lines = try offsets.LineIndex.init(testing.allocator, text);
-    defer lines.deinit(testing.allocator);
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const lines = try offsets.LineIndex.init(w.arena.allocator(), text);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
-    const syms = try documentSymbols(arena.allocator(), &items, &map, lines, .utf16);
+    const syms = try documentSymbolsWithResolver(
+        arena.allocator(),
+        &r,
+        file,
+        try r.itemTree(file),
+        try ctx.get(database.syntax.FileAstIdMap, file),
+        lines,
+        .utf16,
+    );
     try testing.expectEqual(3, syms.len);
     try testing.expectEqualStrings("S", syms[0].name);
     try testing.expectEqual(types.SymbolKind.Struct, syms[0].kind);
     try testing.expectEqual(2, syms[0].children.?.len);
     try testing.expectEqual(types.SymbolKind.Field, syms[0].children.?[0].kind);
-    try testing.expectEqual(types.SymbolKind.Method, syms[0].children.?[1].kind);
+    // `f` has no receiver, so it is a function, as in semantic highlighting
+    try testing.expectEqual(types.SymbolKind.Function, syms[0].children.?[1].kind);
     try testing.expectEqual(types.SymbolKind.Enum, syms[1].kind);
     try testing.expectEqual(types.SymbolKind.EnumMember, syms[1].children.?[0].kind);
     try testing.expectEqualStrings("x", syms[1].children.?[0].name);

@@ -591,7 +591,7 @@ fn answered(h: *Harness, id: i64) bool {
 /// is a response too), and the request `id` has not got one by then. An answer from a load that
 /// has ended fails as `expectLoading` does.
 fn expectHeld(h: *Harness, uri: []const u8, id: i64) !void {
-    _ = try h.request("textDocument/documentSymbol", .{ .textDocument = .{ .uri = uri } });
+    _ = try h.request("textDocument/foldingRange", .{ .textDocument = .{ .uri = uri } });
     if (answered(h, id)) try expectLoading(h);
     try testing.expect(!answered(h, id));
 }

@@ -246,7 +246,7 @@ pub fn instanceDefsAt(r: *Resolver, file: FileId, offset: u32) resolve.Error![]c
         .field_access => |fa| blk: {
             if (a.rel < b.range(fa.lhs).end) return &.{};
             if (try r.evalNamespace(file, a.item, b, fa.lhs)) |ns| {
-                if (try r.memberDef(ns, fa.field orelse return &.{}) != null) return &.{};
+                if (try r.memberDef(ns, file, fa.field orelse return &.{}) != null) return &.{};
             }
             break :blk null;
         },
@@ -390,8 +390,8 @@ fn zonFieldAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?search.Sym
         .field_access => |fa| blk: {
             if (a.rel < a.body.range(fa.lhs).end) return null;
             const literals = try search.zonLiteralsOf(r, file, a.item, a.body, a.res, fa.lhs, a.rel);
-            if (literals.len == 0) return null;
-            break :blk .{ .literal = literals[0], .name = fa.field orelse return null };
+            if (literals.literals.len == 0) return null;
+            break :blk .{ .literal = literals.literals[0], .name = fa.field orelse return null };
         },
         .init => |x| blk: {
             const fi = for (x.fields) |fi| {
@@ -400,7 +400,7 @@ fn zonFieldAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?search.Sym
             const literals = if (r.isZon(file))
                 try r.arena.dupe(InternPool.ZonLiteral, &.{.{ .file = file, .path = try zonPath(r, a.body, e) orelse return null }})
             else
-                try search.zonLiteralsOf(r, file, a.item, a.body, a.res, e, a.rel);
+                (try search.zonLiteralsOf(r, file, a.item, a.body, a.res, e, a.rel)).literals;
             if (literals.len == 0) return null;
             break :blk .{ .literal = literals[0], .name = fi.name.? };
         },
@@ -614,7 +614,7 @@ fn callSiteOrigin(r: *Resolver, inst: Index, name: []const u8, visited: *std.Aut
     };
     const fn_key: database.hir.OwnerKey = .{ .file = ins.file, .item = ins.decl };
     const fn_body = try r.ctx.get(database.hir.ItemBody, fn_key);
-    const sites = try seed.allFound(r, fn_key);
+    const sites = (try seed.allFound(r, fn_key)).found;
     for (ins.args, 0..) |arg, k| {
         var path: std.ArrayList(u32) = .empty;
         var chain: std.ArrayList(Index) = .empty;
@@ -635,7 +635,7 @@ fn callSiteOrigin(r: *Resolver, inst: Index, name: []const u8, visited: *std.Aut
                 // Parameter of an outer generic function: the instances of the outer function
                 // whose argument value is the same as here
                 const outer_key = try r.ownerKey(p.file, p.item);
-                for (try seed.allFound(r, outer_key)) |outer| {
+                for ((try seed.allFound(r, outer_key)).found) |outer| {
                     const outer_inst = outer.inst orelse continue;
                     const outer_args = switch (ip.key(outer_inst)) {
                         .instance => |x| x.args,
@@ -693,7 +693,7 @@ fn declOf(r: *Resolver, file: FileId, item: u32, body: *const Body, e: Body.Expr
         .name_ref => |n| try r.resolveName(file, item, body, body.expr_scopes[@backingInt(e)], n),
         .field_access => |fa| blk: {
             const ns = try r.evalNamespace(file, item, body, fa.lhs) orelse return null;
-            break :blk try r.memberDef(ns, fa.field orelse return null);
+            break :blk try r.memberDef(ns, file, fa.field orelse return null);
         },
         else => null,
     };
@@ -1318,7 +1318,7 @@ pub fn defAt(r: *Resolver, file: FileId, offset: u32) resolve.Error!?Def {
             // The cursor is on the field name (not inside the left-hand expression)
             if (rel < b.range(fa.lhs).end) return null;
             if (try r.evalNamespace(file, item, b, fa.lhs)) |ns| {
-                if (try r.memberDef(ns, fa.field orelse return null)) |def| return def;
+                if (try r.memberDef(ns, file, fa.field orelse return null)) |def| return def;
             }
             // Via the type: fields, methods
             if (try memberViaTypes(r, file, tok.offset, e)) |def| return def;

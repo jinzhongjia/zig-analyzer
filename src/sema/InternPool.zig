@@ -393,6 +393,11 @@ pub const Key = union(enum) {
     /// whatever the values. Neither a type nor a value: only the `base` of pointer values refers
     /// to it.
     ptr_base: PtrBase,
+    /// Pointer of pointer type `ty` to the integer address `addr`, made by `@ptrFromInt` (the
+    /// compiler's `int` base address). It points to no comptime memory: it cannot be
+    /// dereferenced at comptime, compares by address, and is unequal to every pointer into
+    /// comptime memory.
+    ptr_int: struct { ty: Index, addr: u64 },
     /// A non-null value of optional type `ty` whose payload is itself represented as `null_value`
     /// (or as another `opt_payload`), such as a `??u8` holding a null `?u8`. Every other non-null
     /// optional is represented by its payload value, and `null_value` is the null of every
@@ -1294,6 +1299,13 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             const x: f128 = @bitCast(v.bits);
             switch (ip.key(v.ty)) {
                 .simple_type => |t| switch (t) {
+                    .c_longdouble => switch (if (ip.scalarAbi().types.get(.c_longdouble)) |a| a.bits else 128) {
+                        16 => try w.print("{d}", .{@as(f16, @floatCast(x))}),
+                        32 => try w.print("{d}", .{@as(f32, @floatCast(x))}),
+                        64 => try w.print("{d}", .{@as(f64, @floatCast(x))}),
+                        80 => try w.print("{d}", .{@as(f80, @floatCast(x))}),
+                        else => try w.print("{d}", .{x}),
+                    },
                     .f16 => try w.print("{d}", .{@as(f16, @floatCast(x))}),
                     .f32 => try w.print("{d}", .{@as(f32, @floatCast(x))}),
                     .f64 => try w.print("{d}", .{@as(f64, @floatCast(x))}),
@@ -1357,6 +1369,7 @@ pub fn print(ip: *InternPool, index: Index, w: *Io.Writer, container_name: anyty
             try w.writeAll("&");
             try ip.print(v.pointee, w, container_name);
         },
+        .ptr_int => |v| try w.print("@ptrFromInt(0x{x})", .{v.addr}),
         // Matches the compiler, which prints a non-null optional as its payload
         .opt_payload => |v| try ip.print(v.payload, w, container_name),
         .instance, .context => try w.writeAll("instance"),

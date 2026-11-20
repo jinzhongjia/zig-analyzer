@@ -235,6 +235,11 @@ pub fn build(b: *std.Build) void {
     // stops compiling unnoticed when the analyzer's interfaces change
     for ([_]*std.Build.Step.Compile{ check_imports, gen_lsp, gen_builtins, gen_manifest, corpus, sema_corpus, bench, release_smoke, changelog, homebrew_formula, aur_pkgbuild, patch_runner }) |tool| check.dependOn(&tool.step);
 
+    // The analyzer tests run in one process by default; with `-Dtest-shards=N` they are split over
+    // N processes by test name, and the build runner runs the processes in parallel
+    const test_shards = b.option(u32, "test-shards", "test and test-all: run the analyzer tests in this many processes (default 1)") orelse 1;
+    if (test_shards == 0) @panic("-Dtest-shards must be at least 1");
+
     // Tests that depend on a real zig (build system protocol, single-file compilation, end-to-end)
     // run only in test-all and test-stress: under `zig build test` zig is not found (see
     // `ZigEnv.query`), so these tests are skipped
@@ -263,7 +268,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&changelog_test_run.step);
     test_step.dependOn(&homebrew_formula_test_run.step);
     test_step.dependOn(&aur_pkgbuild_test_run.step);
-    test_step.dependOn(&runAnalyzerTests(b, analyzerTests(b, target, optimize, test_runner, tracy != null, false, null)).step);
+    addAnalyzerTestRuns(b, test_step, analyzerTests(b, target, optimize, test_runner, tracy != null, false, null), test_shards);
     const all_step = b.step("test-all", "Run all tests, including those that run the zig in PATH");
     all_step.dependOn(&generator_run.step);
     all_step.dependOn(&manifest_generator_run.step);
@@ -271,7 +276,7 @@ pub fn build(b: *std.Build) void {
     all_step.dependOn(&changelog_test_run.step);
     all_step.dependOn(&homebrew_formula_test_run.step);
     all_step.dependOn(&aur_pkgbuild_test_run.step);
-    all_step.dependOn(&runAnalyzerTests(b, analyzerTests(b, target, optimize, test_runner, tracy != null, true, null)).step);
+    addAnalyzerTestRuns(b, all_step, analyzerTests(b, target, optimize, test_runner, tracy != null, true, null), test_shards);
 
     // Stress verification (for concurrency-related changes): run the selected tests repeatedly, one
     // after another, in server mode; every run really executes, without cached results
@@ -372,6 +377,21 @@ fn runAnalyzerTests(b: *std.Build, tests: *std.Build.Step.Compile) *std.Build.St
     run.removeEnvironmentVariable("ZIG_GLOBAL_CACHE_DIR");
     run.removeEnvironmentVariable("ZIG_LOCAL_CACHE_DIR");
     return run;
+}
+
+/// Adds one run of `tests` per shard to `step`; the runs are independent, so the build runner
+/// executes them in parallel (up to its job limit). Shards are round-robin over the test list, so
+/// a new test joins one of them without a list to update, and adjacent tests (which tend to be
+/// equally expensive) go to different shards.
+fn addAnalyzerTestRuns(b: *std.Build, step: *std.Build.Step, tests: *std.Build.Step.Compile, shards: u32) void {
+    for (0..shards) |index| {
+        const run = runAnalyzerTests(b, tests);
+        if (shards > 1) {
+            run.setName(b.fmt("run test shard {d}/{d}", .{ index + 1, shards }));
+            run.addArg(b.fmt("--test-shard={d}/{d}", .{ index, shards }));
+        }
+        step.dependOn(&run.step);
+    }
 }
 
 /// Windows: threads take the executable's stack reserve as theirs, and the worker threads of

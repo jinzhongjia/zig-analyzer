@@ -398,12 +398,12 @@ fn findStringIn(ip: *InternPool, a: Allocator, v: Index, needle: []const u8, pat
 
 /// Field of a value (aggregates, unions, `len` of slices and arrays); null when it cannot be
 /// evaluated
-pub fn fieldValue(r: *Resolver, base: TypedValue, name: []const u8) Error!?TypedValue {
+pub fn fieldValue(r: *Resolver, from: FileId, base: TypedValue, name: []const u8) Error!?TypedValue {
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
     defer ev.deinit();
-    const v = ev.fieldAccess(Evaluator.thaw(base), name) catch |err| return abortToNull(err);
+    const v = ev.fieldAccess(from, Evaluator.thaw(base), name) catch |err| return abortToNull(err);
     const tv = ev.toTyped(v) catch |err| return abortToNull(err);
     return if (tv.val != null) tv else null;
 }
@@ -439,6 +439,22 @@ pub fn typeLayout(r: *Resolver, t: Index) Error!?value.Layout {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
     defer ev.deinit();
     return ev.typeLayout(t, 0) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => null,
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+/// `@ptrFromInt(addr)` with destination type `dest` (the result type without its error union):
+/// a pointer to the integer address (`InternPool.Key.ptr_int`), or null for address zero of an
+/// optional pointer. Null when the compiler reports an error (a destination that is not a
+/// pointer or optional pointer, an address outside usize, address zero of a pointer that does
+/// not allow it, an address not aligned for the pointer) and when the alignment is unknown.
+/// Address zero of a C pointer is not modeled.
+pub fn ptrFromInt(r: *Resolver, dest: Index, addr: i128) Error!?Index {
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    defer ev.deinit();
+    return ev.ptrFromInt(dest, addr) catch |err| switch (err) {
         error.Abort, error.Break, error.Continue, error.Return => null,
         error.Canceled => error.Canceled,
         error.OutOfMemory => error.OutOfMemory,
@@ -648,13 +664,22 @@ pub fn enumMemberNames(r: *Resolver, t: Index) Error![]const []const u8 {
     return try ev.enumNames(t) orelse &.{};
 }
 
-/// Member of a type (declarations, enum members)
-pub fn typeMember(r: *Resolver, t: Index, name: []const u8) Error!?TypedValue {
+/// Member of a type (declarations, enum members); `from` is the file of the member access
+pub fn typeMember(r: *Resolver, from: FileId, t: Index, name: []const u8) Error!?TypedValue {
+    return typeMemberValue(r, from, t, name);
+}
+
+/// Member of a compiler-known type in a structural lookup, with no use site
+pub fn typeMemberStructural(r: *Resolver, t: Index, name: []const u8) Error!?TypedValue {
+    return typeMemberValue(r, null, t, name);
+}
+
+fn typeMemberValue(r: *Resolver, from: ?FileId, t: Index, name: []const u8) Error!?TypedValue {
     var arena: std.heap.ArenaAllocator = .init(r.ctx.db.gpa);
     defer arena.deinit();
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
     defer ev.deinit();
-    const v = ev.typeMember(t, name) catch |err| return abortToNull(err);
+    const v = ev.typeMemberIn(from, t, name) catch |err| return abortToNull(err);
     return ev.toTyped(v) catch |err| abortToNull(err);
 }
 
@@ -1535,11 +1560,17 @@ const Evaluator = struct {
     /// right after them is known, as a sentinel: for a slice its own, which the language
     /// guarantees the storage holds there; for a many-item pointer that of the storage, since the
     /// pointer type does not bound the read (`[*]const u8` pointing to `"ab"` reads its `0`).
-    fn elemPastEnd(ev: *Evaluator, t: Index, storage: Index, i: usize, len: usize) EvalError!Val {
+    /// When the storage type is the pointer type, the elements were interned from the place the
+    /// pointer records (`basePlace`), whose storage is read instead: `[*]const u8` pointing to a
+    /// `[5:0]u8` declaration reads its `0`. `v` is the pointer.
+    fn elemPastEnd(ev: *Evaluator, v: Val, storage: Index, i: usize, len: usize) EvalError!Val {
+        const t = v.ty;
         if (i != len or !ev.readsPastEnd(t)) return error.Abort;
         const p = ev.ip.key(t).ptr_type;
-        const s = (if (p.size == .slice) p.sentinel else ev.seqSentinel(storage)) orelse return error.Abort;
-        return Val.of(p.child, s);
+        if (p.size == .slice) return Val.of(p.child, p.sentinel orelse return error.Abort);
+        if (ev.seqSentinel(storage)) |s| return Val.of(p.child, s);
+        const ref = try ev.basePlace(v) orelse return error.Abort;
+        return ev.elemAt(.{ .ty = t, .v = .{ .ref = ref } }, i);
     }
 
     /// Element `i`; unknown when the value is unknown
@@ -1580,10 +1611,10 @@ const Evaluator = struct {
                 return elem;
             },
             .ip => |x| switch (ev.ip.key(x)) {
-                .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else ev.elemPastEnd(v.ty, agg.ty, i, agg.elems.len),
+                .aggregate => |agg| return if (i < agg.elems.len) Val.of(ty, agg.elems[i]) else ev.elemPastEnd(v, agg.ty, i, agg.elems.len),
                 // Aggregates whose elements are all u8 are also represented as bytes (e.g. a
                 // value of `struct { short: ?u8 }`): use the declared type of the element
-                .bytes => |b| return if (i < b.bytes.len) Val.of(if (ty != .unknown) ty else .u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else ev.elemPastEnd(v.ty, b.ty, i, b.bytes.len),
+                .bytes => |b| return if (i < b.bytes.len) Val.of(if (ty != .unknown) ty else .u8_type, try ev.ip.get(.{ .int_value = .{ .ty = .u8_type, .value = b.bytes[i] } })) else ev.elemPastEnd(v, b.ty, i, b.bytes.len),
                 .ptr_value => |p| return ev.elemAt(ev.ptrValueTarget(v.ty, p.pointee), i),
                 // Field `i` of a union (the place of `&u.y`): only the active field has a value
                 .union_value => |u| {
@@ -1687,10 +1718,10 @@ const Evaluator = struct {
         var cell = ref.cell;
         for (ref.path, 0..) |i, depth| {
             // The sentinel of an array (`buf[buf.len] = 0` in std.fmt.comptimePrint) is part of
-            // the type: storing the same value changes nothing, storing another is an error
+            // the type: the compiler accepts a store of any value there, and reads still yield
+            // the type's sentinel
             if (depth == ref.path.len - 1) if (ev.sentinelElem(cell.ty, i)) |s| {
-                const x = try ev.freeze(try ev.coerce(v, s.ty)) orelse return error.Abort;
-                if (try eqlValues(ev.r, x, s.v.ip) != true) return error.Abort;
+                _ = try ev.coerce(v, s.ty);
                 return;
             };
             if (cell.v == .ip) if (ev.ip.key(cell.v.ip) == .union_value) return ev.storeUnionField(cell, i, ref.path[depth + 1 ..], v);
@@ -1837,7 +1868,7 @@ const Evaluator = struct {
             .missing, .other, .@"unreachable" => return error.Abort,
             .name_ref => |name| return ev.nameRef(f, e, name),
             .literal => |text| return if (ev.track != null) ev.trackedLiteral(f, e, text) else ev.literal(text),
-            .field_access => |fa| return ev.fieldAccess(try ev.eval(f, fa.lhs, null), fa.field orelse return error.Abort),
+            .field_access => |fa| return ev.fieldAccess(f.file, try ev.eval(f, fa.lhs, null), fa.field orelse return error.Abort),
             .enum_literal => |name| {
                 if (want) |t| if (try ev.declLiteral(t, name)) |v| return v;
                 return Val.of(.enum_literal_type, try ip.get(.{ .enum_literal = name }));
@@ -2146,9 +2177,11 @@ const Evaluator = struct {
 
     // ── Members ──────────────────────────────────────────────────────
 
-    fn fieldAccess(ev: *Evaluator, base: Val, name: []const u8) EvalError!Val {
+    /// `from`: the file of the member access for visibility; null in a structural lookup of a
+    /// compiler-known value, where no source name is checked
+    fn fieldAccess(ev: *Evaluator, from: ?FileId, base: Val, name: []const u8) EvalError!Val {
         const ip = ev.ip;
-        if (base.ty == .type_type) return ev.typeMember((try ev.ipOf(base)) orelse return error.Abort, name);
+        if (base.ty == .type_type) return ev.typeMemberIn(from, (try ev.ipOf(base)) orelse return error.Abort, name);
         var v = base;
         // Automatically dereference single-item pointers to non-arrays
         switch (ip.key(v.ty)) {
@@ -2158,7 +2191,7 @@ const Evaluator = struct {
             else => {},
         }
         // A pointer to a type (`tables.T` with `tables: *const type` in std.fmt.float)
-        if (v.ty == .type_type) return ev.typeMember((try ev.ipOf(v)) orelse return error.Abort, name);
+        if (v.ty == .type_type) return ev.typeMemberIn(from, (try ev.ipOf(v)) orelse return error.Abort, name);
         if (std.mem.eql(u8, name, "len")) if (ev.isSequence(v.ty)) {
             const n = try ev.elemCount(v) orelse return .{ .ty = .usize_type };
             return Val.of(.usize_type, try ip.get(.{ .int_value = .{ .ty = .usize_type, .value = n } }));
@@ -2223,13 +2256,15 @@ const Evaluator = struct {
         return .unknown;
     }
 
-    /// Members of a type: declarations, enum members, error set members
-    fn typeMember(ev: *Evaluator, t: Index, name: []const u8) EvalError!Val {
+    /// Members of a type: declarations, enum members, error set members. `from` is the file of
+    /// the member access for visibility; null in a structural lookup of compiler-known
+    /// declarations, which are checked as seen from their own file.
+    fn typeMemberIn(ev: *Evaluator, from: ?FileId, t: Index, name: []const u8) EvalError!Val {
         const ip = ev.ip;
         switch (ip.key(t)) {
             .container_type => {
                 const ns = try queries.namespaceOfType(ev.r, t) orelse return error.Abort;
-                const def = try ev.r.memberDef(ns, name) orelse return error.Abort;
+                const def = try ev.r.memberDef(ns, from orelse ns.file, name) orelse return error.Abort;
                 return thaw(try queries.defType(ev.r, def, null, queries.instOfType(ip, t)));
             },
             .error_set_type => return Val.of(t, try ip.get(.{ .error_value = name })),
@@ -2242,6 +2277,10 @@ const Evaluator = struct {
             else => {},
         }
         return error.Abort;
+    }
+
+    fn typeMemberStructural(ev: *Evaluator, t: Index, name: []const u8) EvalError!Val {
+        return ev.typeMemberIn(null, t, name);
     }
 
     /// decl literal: the declaration `.name` in the result type
@@ -2317,7 +2356,7 @@ const Evaluator = struct {
     }
 
     /// Method: a function declaration in the value's type (through a single-item pointer)
-    fn method(ev: *Evaluator, lhs: Val, name: []const u8) EvalError!?Val {
+    fn method(ev: *Evaluator, from: FileId, lhs: Val, name: []const u8) EvalError!?Val {
         var t = lhs.ty;
         switch (ev.ip.key(t)) {
             .ptr_type => |p| if (p.size == .one) {
@@ -2326,7 +2365,7 @@ const Evaluator = struct {
             else => {},
         }
         const ns = try queries.namespaceOfType(ev.r, t) orelse return null;
-        const def = try ev.r.memberDef(ns, name) orelse return null;
+        const def = try ev.r.memberDef(ns, from, name) orelse return null;
         const tv = try queries.defType(ev.r, def, null, queries.instOfType(ev.ip, t));
         if (ev.ip.key(tv.ty) != .fn_type) return null;
         return thaw(tv);
@@ -2337,11 +2376,11 @@ const Evaluator = struct {
     fn callExpr(ev: *Evaluator, f: *Frame, callee_e: ExprId, args: []const ExprId, want: ?Index) EvalError!Val {
         const ip = ev.ip;
         var self: ?Val = null;
-        const callee: Val = switch (f.body.expr(callee_e)) {
+        const callee_v: Val = switch (f.body.expr(callee_e)) {
             .field_access => |fa| blk: {
                 const name = fa.field orelse return error.Abort;
                 const lhs = try ev.eval(f, fa.lhs, null);
-                if (lhs.ty != .type_type) if (try ev.method(lhs, name)) |m| {
+                if (lhs.ty != .type_type) if (try ev.method(f.file, lhs, name)) |m| {
                     self = lhs;
                     // The receiver is passed as the type of the first parameter: take its address
                     // when a pointer is required
@@ -2354,7 +2393,7 @@ const Evaluator = struct {
                     };
                     break :blk m;
                 };
-                break :blk try ev.fieldAccess(lhs, name);
+                break :blk try ev.fieldAccess(f.file, lhs, name);
             },
             .enum_literal => |name| blk: {
                 const t = want orelse return error.Abort;
@@ -2362,10 +2401,8 @@ const Evaluator = struct {
             },
             else => try ev.eval(f, callee_e, null),
         };
-        const fty = switch (ip.key(callee.ty)) {
-            .fn_type => |ft| ft,
-            else => return error.Abort,
-        };
+        const callee = try ev.fnCallee(callee_v);
+        const fty = ip.key(callee.ty).fn_type;
         const skip: usize = if (self != null) 1 else 0;
         const vals = try ev.a.alloc(Val, args.len + skip);
         if (self) |s| vals[0] = s;
@@ -2374,6 +2411,21 @@ const Evaluator = struct {
             out.* = try ev.eval(f, a, pt);
         }
         return ev.callFn(callee, fty, vals);
+    }
+
+    /// The function a call calls when its callee is `v`: a function body, or a single-item
+    /// pointer to one, which the compiler calls through (`analyzeCall`)
+    fn fnCallee(ev: *Evaluator, v: Val) EvalError!Val {
+        const ip = ev.ip;
+        switch (ip.key(v.ty)) {
+            .fn_type => return v,
+            .ptr_type => |p| if (p.size == .one and ip.key(p.child) == .fn_type) {
+                const target = try ev.deref(v);
+                if (ip.key(target.ty) == .fn_type) return target;
+            },
+            else => {},
+        }
+        return error.Abort;
     }
 
     /// Calls a function value: through `CallEval` (results are cached) when all arguments can be
@@ -3251,7 +3303,19 @@ const Evaluator = struct {
     /// interpreter (string literals) record no place.
     /// Pointer arithmetic on interned data that records no place points into a cell holding
     /// that data (see `internedCell`).
+    /// A pointer to an integer address is compared by address (`value.eqlValues`), and is unequal
+    /// to every reference, which points into comptime memory.
     fn pointerEql(ev: *Evaluator, a_in: Val, b_in: Val) EvalError!?bool {
+        const ia = a_in.v == .ip and ev.ip.key(a_in.v.ip) == .ptr_int;
+        const ib = b_in.v == .ip and ev.ip.key(b_in.v.ip) == .ptr_int;
+        if (ia or ib) {
+            const other = if (ia) b_in else a_in;
+            return switch (other.v) {
+                .ref => false,
+                .ip => |x| value.eqlValues(ev.ip, if (ia) a_in.v.ip else b_in.v.ip, x),
+                else => null,
+            };
+        }
         if (a_in.v == .ip and b_in.v == .ip) {
             const x = a_in.v.ip;
             const y = b_in.v.ip;
@@ -3619,8 +3683,8 @@ const Evaluator = struct {
         const elems = try ev.allocElems(total);
         for (0..n) |i| elems[i] = try ev.elemAt(lhs, i);
         for (0..m) |i| elems[n + i] = try ev.elemAt(rhs, i);
-        const lt = ev.arrayOf(lhs.ty);
-        const rt = ev.arrayOf(rhs.ty);
+        const lt = try ev.concatArrayOf(lhs.ty, n);
+        const rt = try ev.concatArrayOf(rhs.ty, m);
         var ty: Index = undefined;
         if (ip.key(lt) == .array_type and ip.key(rt) == .array_type) {
             const la = ip.key(lt).array_type;
@@ -3659,6 +3723,19 @@ const Evaluator = struct {
         return ev.makeAgg(ty, elems);
     }
 
+    /// Array type of a `++` operand of type `t` with `len` elements: a pointer to an array yields
+    /// the array it points to, and a slice an array of its element type and sentinel
+    fn concatArrayOf(ev: *Evaluator, t: Index, len: usize) Error!Index {
+        return switch (ev.ip.key(t)) {
+            .ptr_type => |p| switch (p.size) {
+                .one => p.child,
+                .slice => ev.ip.get(.{ .array_type = .{ .len = std.math.cast(u64, len) orelse return .unknown, .child = p.child, .sentinel = p.sentinel } }),
+                .many, .c => t,
+            },
+            else => t,
+        };
+    }
+
     /// Pointer to a new storage cell (holding `target`); the cell is reachable only through this
     /// pointer and its copies, so with a `*const` type it never changes
     fn pointerToNew(ev: *Evaluator, ptr_ty: Index, target: Val) Error!Val {
@@ -3680,29 +3757,57 @@ const Evaluator = struct {
         };
     }
 
+    /// `-v`, `-%v` or `~v` on a scalar number
+    fn unary(ev: *Evaluator, op: SyntaxKind, v: Val) EvalError!Val {
+        const ip = ev.ip;
+        if (op == .minus and ip.isFloat(v.ty)) {
+            const x = ev.floatOf(v) orelse return error.Abort;
+            return Val.of(v.ty, try value.floatValue(ip, v.ty, -x) orelse return error.Abort);
+        }
+        if (ev.intOf(v)) |a| {
+            if (switch (op) {
+                .tilde => value.bitNot(ip, v.ty, a),
+                else => value.negate(ip, v.ty, a, op == .minus_percent),
+            }) |r| return Val.ofInt(v.ty, r);
+        }
+        if (value.isBigIntType(ip, v.ty)) {
+            const a = try ev.bigOf(v) orelse return error.Abort;
+            const r = try value.unaryBig(ip, ev.a, op, v.ty, a) orelse return error.Abort;
+            return Val.ofBig(v.ty, r);
+        }
+        return error.Abort;
+    }
+
+    /// Element-wise prefix operator on a vector (`Sema.zirNegate`, `Sema.zirBitNot`,
+    /// `Sema.zirBoolNot`): the scalar operator applied to each element, with the type of the
+    /// operand
+    fn vectorUnary(ev: *Evaluator, op: SyntaxKind, v: Val) EvalError!Val {
+        const vec = ev.ip.key(v.ty).vector_type;
+        if (v.v == .unknown or v.v == .undef) return error.Abort;
+        if ((op == .bang) != (vec.child == .bool_type)) return error.Abort;
+        const elems = try ev.allocElems(vec.len);
+        for (elems, 0..) |*o, i| {
+            const x = try ev.elemAt(v, i);
+            o.* = if (op == .bang) boolVal(!(try ev.condition(x)).yes) else try ev.unary(op, x);
+        }
+        return ev.makeAgg(v.ty, elems);
+    }
+
     fn prefix(ev: *Evaluator, f: *Frame, op: SyntaxKind, operand_e: ExprId, want: ?Index) EvalError!Val {
         const ip = ev.ip;
         switch (op) {
-            .bang => return boolVal(!(try ev.condition(try ev.eval(f, operand_e, .bool_type))).yes),
+            .bang => {
+                // A vector of bools is not coerced to `bool`
+                try ev.tick();
+                const v = try ev.evalInner(f, operand_e, .bool_type);
+                if (ip.key(v.ty) == .vector_type) return ev.vectorUnary(op, v);
+                return boolVal(!(try ev.condition(try ev.coerce(v, .bool_type))).yes);
+            },
             .minus, .minus_percent, .tilde => {
                 // Matches the compiler: the operand has no result type
                 const v = try ev.eval(f, operand_e, null);
-                if (op == .minus and ip.isFloat(v.ty)) {
-                    const x = ev.floatOf(v) orelse return error.Abort;
-                    return Val.of(v.ty, try value.floatValue(ip, v.ty, -x) orelse return error.Abort);
-                }
-                if (ev.intOf(v)) |a| {
-                    if (switch (op) {
-                        .tilde => value.bitNot(ip, v.ty, a),
-                        else => value.negate(ip, v.ty, a, op == .minus_percent),
-                    }) |r| return Val.ofInt(v.ty, r);
-                }
-                if (value.isBigIntType(ip, v.ty)) {
-                    const a = try ev.bigOf(v) orelse return error.Abort;
-                    const r = try value.unaryBig(ip, ev.a, op, v.ty, a) orelse return error.Abort;
-                    return Val.ofBig(v.ty, r);
-                }
-                return error.Abort;
+                if (ip.key(v.ty) == .vector_type) return ev.vectorUnary(op, v);
+                return ev.unary(op, v);
             },
             .ampersand => {
                 // `&s.*` for a slice `s`: a single-item pointer to its array, with the constness
@@ -3891,20 +3996,29 @@ const Evaluator = struct {
             },
             .field_access => |fa| {
                 const name = fa.field orelse return error.Abort;
-                const base = ev.placeOrPointee(f, fa.lhs, use) catch |err| switch (err) {
+                const base = (ev.placeOrPointee(f, fa.lhs, use) catch |err| switch (err) {
                     // `@This().x`, `@import("m.zig").x`: evaluating the type has no effects
-                    error.Abort => if (use == .address and isTypeBuiltin(f.body, fa.lhs)) return ev.memberPlace(try ev.eval(f, fa.lhs, null), name) else return err,
+                    error.Abort => if (use == .address and isTypeBuiltin(f.body, fa.lhs)) return ev.memberPlace(f.file, try ev.eval(f, fa.lhs, null), name) else return err,
                     else => return err,
-                };
+                }).ref;
                 const target = try ev.load(base);
-                if (use == .address and target.ty == .type_type) return ev.memberPlace(target, name);
+                if (use == .address and target.ty == .type_type) return ev.memberPlace(f.file, target, name);
                 const i = try ev.fieldIndex(target.ty, name) orelse return error.Abort;
                 return ev.extend(base, @intCast(i));
             },
             .index => |x| {
                 const base = try ev.placeOrPointee(f, x.lhs, use);
-                const i = try ev.evalInt(f, x.index, .usize_type);
-                return ev.extend(base, std.math.cast(u32, i) orelse return error.Abort);
+                const i = std.math.cast(u32, try ev.evalInt(f, x.index, .usize_type)) orelse return error.Abort;
+                // Index `len` of a range reached through a pointer with a sentinel is the
+                // element of the storage right after the range (`t[4] = 1` for
+                // `t = b[0..4 :0]` writes `b[4]`)
+                if (base.ref.window) |w| if (i == w.len and base.ptr_ty != null and ev.seqSentinel(base.ptr_ty.?) != null) {
+                    if (base.ref.as_array) return error.Abort;
+                    var past = base.ref;
+                    past.window = null;
+                    return ev.extend(past, std.math.cast(u32, @as(u64, w.start) + w.len) orelse return error.Abort);
+                };
+                return ev.extend(base.ref, i);
             },
             .deref => |x| {
                 const p = try ev.eval(f, x, null);
@@ -3926,10 +4040,13 @@ const Evaluator = struct {
         };
     }
 
+    /// A place, and the type of the pointer it was reached through (null for the place itself)
+    const PlaceThrough = struct { ref: Ref, ptr_ty: ?Index = null };
+
     /// Place; when its value is a pointer to storage of this evaluation, or for `&` to a place an
     /// interned pointer records (`basePlace`), the place it points to instead (automatic
     /// dereferencing)
-    fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId, use: PlaceUse) EvalError!Ref {
+    fn placeOrPointee(ev: *Evaluator, f: *Frame, e: ExprId, use: PlaceUse) EvalError!PlaceThrough {
         // A pointer computed by pointer arithmetic (`(p + 1)[0] = x`), returned by a call
         // (`std.mem.asBytes(&x)[i] = b`) or, for `&`, made by slicing (`&a[1..][0]`) is not a
         // place: the compiler takes the element pointer of the value, so the place is the one it
@@ -3942,28 +4059,28 @@ const Evaluator = struct {
                 if (use == .write and f.body.expr(e) == .slice) return error.Abort;
                 const p = try ev.eval(f, e, null);
                 return switch (p.v) {
-                    .ref => |r| ev.through(r, p.ty),
-                    else => if (use == .address and ev.ip.key(p.ty) == .ptr_type) try ev.basePlace(p) orelse error.Abort else error.Abort,
+                    .ref => |r| .{ .ref = ev.through(r, p.ty), .ptr_ty = p.ty },
+                    else => if (use == .address and ev.ip.key(p.ty) == .ptr_type) .{ .ref = try ev.basePlace(p) orelse return error.Abort } else error.Abort,
                 };
             },
             else => {},
         }
         const ref = try ev.placeFor(f, e, use);
         // The value of a range, or of a `*T` → `*[1]T` view, is an array, not a pointer
-        if (ref.window != null or ref.as_array) return ref;
+        if (ref.window != null or ref.as_array) return .{ .ref = ref };
         const v = try ev.load(ref);
         switch (v.v) {
-            .ref => |r| return ev.through(r, v.ty),
+            .ref => |r| return .{ .ref = ev.through(r, v.ty), .ptr_ty = v.ty },
             else => {},
         }
-        if (use == .address) if (try ev.basePlace(v)) |r| return r;
+        if (use == .address) if (try ev.basePlace(v)) |r| return .{ .ref = r };
         // A pointer that records no place, held by a declaration, a temporary or a copy, points to
         // storage outside it, whose identity is not known here. A local holding an interned
         // pointer is the base itself (element paths are taken through the pointer, see `elemAt`).
         return if (use == .address and ev.ip.key(v.ty) == .ptr_type and switch (ev.cellOrigin(ref.cell)) {
             .decl, .extern_decl, .thread_local, .temporary, .copy => true,
             .storage, .variable, .constant, .aligned_constant => false,
-        }) error.Abort else ref;
+        }) error.Abort else .{ .ref = ref };
     }
 
     /// The storage of local `b`: a variable is storage of this evaluation, and pointers to a
@@ -4063,11 +4180,11 @@ const Evaluator = struct {
     }
 
     /// `T.x`: the storage of declaration x of container type `t`
-    fn memberPlace(ev: *Evaluator, t: Val, name: []const u8) EvalError!Ref {
+    fn memberPlace(ev: *Evaluator, from: FileId, t: Val, name: []const u8) EvalError!Ref {
         const ty = try ev.ipOf(t) orelse return error.Abort;
         if (ev.ip.key(ty) != .container_type) return error.Abort;
         const ns = try queries.namespaceOfType(ev.r, ty) orelse return error.Abort;
-        const def = try ev.r.memberDef(ns, name) orelse return error.Abort;
+        const def = try ev.r.memberDef(ns, from, name) orelse return error.Abort;
         return switch (def) {
             .item => |it| ev.declPlace(it.file, it.item, queries.instOfType(ev.ip, ty)),
             else => error.Abort,
@@ -4206,8 +4323,10 @@ const Evaluator = struct {
             .ref => |r| r,
             else => return false,
         };
-        // A `*T` → `*[1]T` view without a range covers its only element
-        const w: Ref.Window = r.window orelse if (r.as_array) .{ .start = 0, .len = 1 } else return false;
+        const n = if (r.as_array) 1 else try ev.elemCount(try ev.load(.{ .cell = r.cell, .path = r.path })) orelse return error.Abort;
+        // A slice without a range (a `*T` → `*[1]T` view, or a slice coerced from an array
+        // pointer) covers the whole array
+        const w: Ref.Window = r.window orelse .{ .start = 0, .len = std.math.cast(u32, n) orelse return error.Abort };
         const rhs = try ev.evalInt(f, rhs_e, .usize_type);
         const len: i128 = switch (op) {
             .equal => rhs,
@@ -4215,7 +4334,6 @@ const Evaluator = struct {
             .minus_equal => @as(i128, w.len) - rhs,
             else => return error.Abort,
         };
-        const n = if (r.as_array) 1 else try ev.elemCount(try ev.load(.{ .cell = r.cell, .path = r.path })) orelse return error.Abort;
         if (len < 0 or w.start + len > n) return error.Abort;
         try ev.store(ref, .{ .ty = s.ty, .v = .{ .ref = .{ .cell = r.cell, .path = r.path, .window = .{ .start = w.start, .len = @intCast(len) }, .as_array = r.as_array, .immutable = r.immutable } } });
         return true;
@@ -4286,6 +4404,16 @@ const Evaluator = struct {
             const v = try ev.eval(f, se, child);
             break :blk try ev.freeze(v) orelse return error.Abort;
         } else null;
+        // The memory right after the range must hold an explicit sentinel ("value in memory does
+        // not match slice sentinel", also for undefined memory); memory known only at runtime is
+        // checked at runtime
+        if (explicit) |x| {
+            const at = try ev.elemAt(base, end);
+            if (at.v != .unknown) {
+                const m = try ev.freeze(at) orelse return error.Abort;
+                if (try eqlValues(ev.r, m, x) != true) return error.Abort;
+            }
+        }
         const sentinel: ?Index = if (explicit) |x| x else if (end == count) src_sentinel else null;
         // Range known at comptime: a pointer to an array
         const array = try ip.get(.{ .array_type = .{ .len = end - start, .child = child, .sentinel = sentinel } });
@@ -4701,6 +4829,12 @@ const Evaluator = struct {
             o.* = if (operand == .round_op) try ev.roundOperand(f, a, t) else try ev.eval(f, a, t);
         }
         if (try ev.pureBuiltin(name, vals)) |v| return v;
+        if (eq(u8, name, "@ptrFromInt")) {
+            if (vals.len != 1) return error.Abort;
+            const t = destType(ip, want, .eu) orelse return error.Abort;
+            const addr = ev.intOf(vals[0]) orelse return error.Abort;
+            return Val.of(t, try ev.ptrFromInt(t, addr));
+        }
         if (eq(u8, name, "@TypeOf")) {
             if (vals.len == 0) return error.Abort;
             var t = vals[0].ty;
@@ -4726,7 +4860,7 @@ const Evaluator = struct {
         }
         if (eq(u8, name, "@field")) {
             if (vals.len != 2) return error.Abort;
-            return ev.fieldAccess(vals[0], try ev.stringOf(vals[1]));
+            return ev.fieldAccess(f.file, vals[0], try ev.stringOf(vals[1]));
         }
         if (eq(u8, name, "@fieldParentPtr")) {
             if (vals.len != 2) return error.Abort;
@@ -4917,14 +5051,12 @@ const Evaluator = struct {
         }
         if (eq(u8, name, "@call")) {
             if (vals.len != 3) return error.Abort;
-            const fty = switch (ip.key(vals[1].ty)) {
-                .fn_type => |ft| ft,
-                else => return error.Abort,
-            };
+            const callee = try ev.fnCallee(vals[1]);
+            const fty = ip.key(callee.ty).fn_type;
             const n = try ev.elemCount(vals[2]) orelse return error.Abort;
             const call_args = try ev.a.alloc(Val, n);
             for (call_args, 0..) |*x, i| x.* = try ev.elemAt(vals[2], i);
-            return ev.callFn(vals[1], fty, call_args);
+            return ev.callFn(callee, fty, call_args);
         }
         return error.Abort;
     }
@@ -4959,6 +5091,19 @@ const Evaluator = struct {
             const l = try ev.typeLayout(try asType(vals[0]), 0) orelse return error.Abort;
             const n = if (eq(u8, name, "@sizeOf")) l.size else if (eq(u8, name, "@alignOf")) l.alignment else l.bits orelse return error.Abort;
             return try ev.int(.comptime_int_type, n);
+        }
+        // Only a pointer to an integer address is modeled; pointers into comptime memory have no
+        // address
+        if (eq(u8, name, "@intFromPtr")) {
+            if (vals.len != 1) return error.Abort;
+            const x = switch (vals[0].v) {
+                .ip => |x| x,
+                else => return null,
+            };
+            return switch (ip.key(x)) {
+                .ptr_int => |p| try ev.int(.usize_type, p.addr),
+                else => null,
+            };
         }
         if (eq(u8, name, "@intFromEnum") or eq(u8, name, "@backingInt")) {
             if (vals.len != 1) return error.Abort;
@@ -5224,7 +5369,7 @@ const Evaluator = struct {
             else => {},
         }
         const attrs = try ev.eval(f, args[3], try ev.member(fn_ty, "Attributes"));
-        cc = try callConv(ev.r, try ev.freeze(try ev.fieldAccess(attrs, "callconv")));
+        cc = try callConv(ev.r, try ev.freeze(try ev.fieldAccess(null, attrs, "callconv")));
         varargs = try ev.boolField(attrs, "varargs");
         return Val.ofType(try ip.get(.{ .fn_type = .{ .params = params, .ret = ret, .varargs = varargs, .cc = cc, .noalias_bits = noalias_bits } }));
     }
@@ -5347,6 +5492,34 @@ const Evaluator = struct {
         const eq = std.mem.eql;
         if (i == 0 and (eq(u8, name, "@as") or eq(u8, name, "@typeInfo") or eq(u8, name, "@sizeOf") or eq(u8, name, "@alignOf") or eq(u8, name, "@bitSizeOf") or eq(u8, name, "@offsetOf") or eq(u8, name, "@bitOffsetOf"))) return .type_type;
         return null;
+    }
+
+    /// See the public `ptrFromInt`
+    fn ptrFromInt(ev: *Evaluator, dest: Index, addr: i128) EvalError!Index {
+        const ip = ev.ip;
+        const optional = ip.key(dest) == .optional_type;
+        const ptr_ty = if (optional) ip.key(dest).optional_type else dest;
+        const p = switch (ip.key(ptr_ty)) {
+            .ptr_type => |p| p,
+            else => return error.Abort,
+        };
+        if (p.size == .slice) return error.Abort;
+        const bits = ip.pointerBits() orelse return error.Abort;
+        if (addr < 0 or (bits < 128 and addr >> @intCast(bits) != 0)) return error.Abort;
+        const a: u64 = std.math.cast(u64, addr) orelse return error.Abort;
+        if (a == 0) {
+            if (p.size == .c) return error.Abort;
+            if (optional) return .null_value;
+            if (!p.attrs.is_allowzero) return error.Abort;
+        }
+        const alignment: u64 = if (p.attrs.alignment != .natural)
+            p.attrs.alignment.bytes() orelse return error.Abort
+        else if (p.child == .anyopaque_type)
+            1
+        else
+            (try ev.typeLayout(p.child, 0) orelse return error.Abort).alignment;
+        if (alignment == 0 or a % alignment != 0) return error.Abort;
+        return ip.get(.{ .ptr_int = .{ .ty = ptr_ty, .addr = a } });
     }
 
     /// Whether pointer `v` cast to type `to` points to the same elements: values are not
@@ -6469,7 +6642,8 @@ const Evaluator = struct {
     }
 
     fn boolField(ev: *Evaluator, v: Val, name: []const u8) EvalError!bool {
-        const fv = ev.fieldAccess(v, name) catch |err| switch (err) {
+        // A field of a compiler-known attribute struct, not a namespace member at a use site
+        const fv = ev.fieldAccess(null, v, name) catch |err| switch (err) {
             error.Abort => return false,
             else => |x| return x,
         };
@@ -6483,7 +6657,7 @@ const Evaluator = struct {
         const fields = try ev.fieldsOf(v.ty) orelse return .unknown;
         for (fields) |fl| {
             if (!std.mem.eql(u8, fl.name, name)) continue;
-            const fv = ev.fieldAccess(v, name) catch |err| switch (err) {
+            const fv = ev.fieldAccess(null, v, name) catch |err| switch (err) {
                 error.Abort => return .unknown,
                 else => |x| return x,
             };
@@ -6532,7 +6706,7 @@ const Evaluator = struct {
         const ip = ev.ip;
         if (depth > max_layout_depth) return null;
         switch (ip.key(t)) {
-            .optional_type => |c| return value.optionalLayout(ip, c, try ev.typeLayout(c, depth + 1) orelse return null),
+            .optional_type => |c| return if (c == .noreturn_type) value.optional_noreturn_layout else value.optionalLayout(ip, c, try ev.typeLayout(c, depth + 1) orelse return null),
             .array_type => |a| return value.arrayLayout(try ev.typeLayout(a.child, depth + 1) orelse return null, a, try ev.hasBitRepr(a.child)),
             .error_union_type => |eu| return value.errorUnionLayout(ip, try ev.typeLayout(eu.payload, depth + 1) orelse return null),
             .container_type, .reified_type, .union_tag_type, .tuple_type, .anon_struct_type => {},
@@ -6895,7 +7069,7 @@ const Evaluator = struct {
         };
         const builtin_file = try ev.r.resolveImport(file, "builtin") orelse return null;
         const builtin_ty = try queries.containerType(ev.r, .{ .file = builtin_file, .container = 0 }, null);
-        const optimize = try ev.freeze(try ev.typeMember(builtin_ty, "optimize")) orelse return null;
+        const optimize = try ev.freeze(try ev.typeMemberStructural(builtin_ty, "optimize")) orelse return null;
         const name = switch (ev.ip.key(optimize)) {
             .enum_tag => |tag| tag.name,
             else => return null,
@@ -6922,9 +7096,9 @@ const Evaluator = struct {
         var any_comptime = false;
         for (aligns, comptimes, 0..) |*al, *ct, i| {
             const attr = try ev.elemAt(attrs, i);
-            const x = try ev.freeze(try ev.fieldAccess(attr, "align")) orelse return error.Abort;
+            const x = try ev.freeze(try ev.fieldAccess(null, attr, "align")) orelse return error.Abort;
             al.* = if (x == .null_value) 0 else try alignValue(ev.ip, x);
-            ct.* = !is_union and (try ev.condition(try ev.fieldAccess(attr, "comptime"))).yes;
+            ct.* = !is_union and (try ev.condition(try ev.fieldAccess(null, attr, "comptime"))).yes;
             any_align = any_align or al.* != 0;
             any_comptime = any_comptime or ct.*;
         }
@@ -6937,12 +7111,12 @@ const Evaluator = struct {
     fn stdType(ev: *Evaluator, path: []const []const u8) EvalError!Index {
         const std_root = try ev.r.ctx.get(database.ModuleGraph.StdRoot, ev.r.context) orelse return error.Abort;
         var t = try queries.containerType(ev.r, .{ .file = std_root, .container = 0 }, null);
-        for (path) |name| t = try asType(try ev.typeMember(t, name));
+        for (path) |name| t = try asType(try ev.typeMemberStructural(t, name));
         return t;
     }
 
     fn member(ev: *Evaluator, t: Index, name: []const u8) EvalError!Index {
-        return asType(try ev.typeMember(t, name));
+        return asType(try ev.typeMemberStructural(t, name));
     }
 
     /// Value of type `t`: fields given by name, the rest take their default values
@@ -7057,7 +7231,7 @@ const Evaluator = struct {
             .other => |v| v,
             .unknown => .unknown,
             .c => blk: {
-                const v = ev.typeMember(cc_ty, "c") catch |err| switch (err) {
+                const v = ev.typeMemberStructural(cc_ty, "c") catch |err| switch (err) {
                     error.Abort => break :blk .unknown,
                     else => |x| return x,
                 };
@@ -7569,7 +7743,7 @@ pub fn callConv(r: *Resolver, v: ?Index) Error!InternPool.CallConv {
         else => return .unknown,
     };
     if (InternPool.CallConv.fromName(u.tag)) |cc| return cc;
-    const c = try typeMember(r, u.ty, "c") orelse return .unknown;
+    const c = try typeMemberStructural(r, u.ty, "c") orelse return .unknown;
     const c_val = c.val orelse return .unknown;
     return if (c_val == val) .c else .{ .other = val };
 }

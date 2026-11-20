@@ -1216,8 +1216,8 @@ test "the sentinel element of an array" {
     , &.{
         .{ "read", "u8 = 0" },
         .{ "same", "[2:0]u8 = \"ab\"" },
-        // Storing a value other than the sentinel is a compile error
-        .{ "other", "[2:0]u8" },
+        // The compiler accepts storing another value; the sentinel stays part of the type
+        .{ "other", "[2:0]u8 = \"ab\"" },
     });
 }
 
@@ -1305,6 +1305,124 @@ test "the sentinel element read through pointers, slices and many-item pointers"
         .{ "range_past", "u8" },
         .{ "range_no_sentinel", "u8" },
         .{ "scanned", "usize = 4" },
+    });
+}
+
+test "stores into the sentinel position and explicit-sentinel slicing" {
+    try expectTypes(
+        \\const array_slot = blk: {
+        \\    var buf: [5:0]u8 = .{ 1, 2, 3, 4, 5 };
+        \\    buf[5] = 1;
+        \\    break :blk [2]u8{ buf[5], buf[0] };
+        \\};
+        \\const through_array_ptr = blk: {
+        \\    var b: [8]u8 = .{ 9, 9, 9, 9, 0, 9, 9, 9 };
+        \\    const t = b[0..4 :0];
+        \\    t[4] = 1;
+        \\    break :blk [2]u8{ b[4], t[4] };
+        \\};
+        \\const through_slice = blk: {
+        \\    var b: [8]u8 = .{ 9, 9, 9, 9, 0, 9, 9, 9 };
+        \\    const s: [:0]u8 = b[0..4 :0];
+        \\    s[4] = 1;
+        \\    break :blk [2]u8{ b[4], s[4] };
+        \\};
+        \\const same_through_slice = blk: {
+        \\    var b: [8]u8 = .{ 9, 9, 9, 9, 0, 9, 9, 9 };
+        \\    const s: [:0]u8 = b[0..4 :0];
+        \\    s[4] = 0;
+        \\    break :blk b[4];
+        \\};
+        \\const address_of_slot = blk: {
+        \\    var b: [8]u8 = .{ 9, 9, 9, 9, 0, 9, 9, 9 };
+        \\    const t = b[0..4 :0];
+        \\    const p = &t[4];
+        \\    p.* = 3;
+        \\    break :blk b[4];
+        \\};
+        \\const array_slot_through_slice = blk: {
+        \\    var buf: [5:0]u8 = .{ 1, 2, 3, 4, 5 };
+        \\    const s: [:0]u8 = buf[0..];
+        \\    s[5] = 1;
+        \\    break :blk [2]u8{ s[5], buf[5] };
+        \\};
+        \\const no_sentinel_slot = blk: {
+        \\    var b: [8]u8 = .{ 9, 9, 9, 9, 0, 9, 9, 9 };
+        \\    const t = b[0..4];
+        \\    t[4] = 1;
+        \\    break :blk b[4];
+        \\};
+        \\const mismatch = blk: {
+        \\    var b: [8]u8 = .{ 9, 9, 9, 9, 1, 9, 9, 9 };
+        \\    const t = b[0..4 :0];
+        \\    break :blk t[4];
+        \\};
+        \\const undefined_slot = blk: {
+        \\    var b: [8]u8 = undefined;
+        \\    const t = b[0..4 :0];
+        \\    t[0] = 1;
+        \\    break :blk t[0];
+        \\};
+        \\const constant_mismatch = blk: {
+        \\    const b = [_]u8{ 9, 9, 9, 9, 1 };
+        \\    const t = b[0..4 :0];
+        \\    break :blk t[0];
+        \\};
+        \\const constant_match = blk: {
+        \\    const b = [_]u8{ 9, 9, 9, 9, 0 };
+        \\    const t = b[0..4 :0];
+        \\    break :blk t[0];
+        \\};
+        \\fn g() void { _ = .{ array_slot, through_array_ptr, through_slice, same_through_slice, address_of_slot, array_slot_through_slice, no_sentinel_slot, mismatch, undefined_slot, constant_mismatch, constant_match }; }
+    , &.{
+        // The compiler accepts the store and reads the type's sentinel afterwards
+        .{ "array_slot", "[2]u8 = \"\\x00\\x01\"" },
+        // The store writes the memory; `*[4:0]u8` reads its type's sentinel there
+        .{ "through_array_ptr", "[2]u8 = \"\\x01\\x00\"" },
+        // A slice reads the memory there
+        .{ "through_slice", "[2]u8 = \"\\x01\\x01\"" },
+        .{ "same_through_slice", "u8 = 0" },
+        .{ "address_of_slot", "u8 = 3" },
+        .{ "array_slot_through_slice", "[2]u8 = \"\\x00\\x00\"" },
+        // Index `len` of `*[4]u8` is out of bounds
+        .{ "no_sentinel_slot", "u8" },
+        // "value in memory does not match slice sentinel"
+        .{ "mismatch", "u8" },
+        .{ "undefined_slot", "u8" },
+        .{ "constant_mismatch", "u8" },
+        .{ "constant_match", "u8 = 9" },
+    });
+}
+
+test "a many-item pointer into a declaration's sentinel array reads its sentinel" {
+    // The pointer value is interned with the pointer type, which has no sentinel: index `len`
+    // gave up instead of reading the sentinel of the declaration's array.
+    try expectTypes(
+        \\const buf: [5:0]u8 = .{ 1, 2, 3, 4, 5 };
+        \\const words: [3:7]u32 = .{ 1, 2, 3 };
+        \\const plain_buf: [5]u8 = .{ 1, 2, 3, 4, 5 };
+        \\const fp: [*]const u8 = &buf;
+        \\const cp: [*c]const u8 = &buf;
+        \\const wp: [*]const u32 = &words;
+        \\const pp: [*]const u8 = &plain_buf;
+        \\fn retPtr() [*]const u8 {
+        \\    return &buf;
+        \\}
+        \\const fs = fp[5];
+        \\const cy = cp[5];
+        \\const rz = retPtr()[5];
+        \\const off = (fp + 2)[3];
+        \\const wz = wp[3];
+        \\const past = fp[6];
+        \\const unterminated = pp[5];
+    , &.{
+        .{ "fs", "u8 = 0" },
+        .{ "cy", "u8 = 0" },
+        .{ "rz", "u8 = 0" },
+        .{ "off", "u8 = 0" },
+        .{ "wz", "u32 = 7" },
+        .{ "past", "u8" },
+        .{ "unterminated", "u8" },
     });
 }
 
@@ -1844,6 +1962,31 @@ test "a non-null optional holding a null optional is not null" {
         \\    const b: ?*const u8 = a;
         \\    break :blk b == null;
         \\};
+        \\const one_to_c = blk: {
+        \\    const a: ?*const u8 = null;
+        \\    const b: ?[*c]const u8 = a;
+        \\    break :blk b == null;
+        \\};
+        \\const many_to_c = blk: {
+        \\    const a: ?[*]const u8 = null;
+        \\    const b: ?[*c]const u8 = a;
+        \\    break :blk b == null;
+        \\};
+        \\const to_allowzero = blk: {
+        \\    const a: ?*const u8 = null;
+        \\    const b: ?*allowzero const u8 = a;
+        \\    break :blk b == null;
+        \\};
+        \\const allowzero_to_c = blk: {
+        \\    const a: ?*allowzero const u8 = null;
+        \\    const b: ?[*c]const u8 = a;
+        \\    break :blk b == null;
+        \\};
+        \\const c_to_const_c = blk: {
+        \\    const a: ?[*c]u8 = null;
+        \\    const b: ?[*c]const u8 = a;
+        \\    break :blk b == null;
+        \\};
     , &.{
         .{ "ret_eq", "bool = false" },
         .{ "ret_local_eq", "bool = false" },
@@ -1894,6 +2037,13 @@ test "a non-null optional holding a null optional is not null" {
         .{ "opt_eu_payload", "bool = true" },
         // An optional that coerces in memory keeps its null
         .{ "ptr_keep", "bool = true" },
+        // A pointer-like optional (`?*T`, `?[*]T`) to one with a null flag (`?[*c]T`,
+        // `?*allowzero T`) wraps: the null becomes a non-null optional holding a null pointer
+        .{ "one_to_c", "bool = false" },
+        .{ "many_to_c", "bool = false" },
+        .{ "to_allowzero", "bool = false" },
+        .{ "allowzero_to_c", "bool = true" },
+        .{ "c_to_const_c", "bool = true" },
     });
 }
 
@@ -3101,6 +3251,119 @@ test "containers in a function capture a comptime var where the body reaches the
         .{ "other_capture", "bool = false" },
         .{ "in_loop", "comptime_int = 3" },
     });
+}
+
+test "defer and errdefer write comptime vars at the exit of their block" {
+    // Prevents applying a deferred write at the defer statement and applying errdefer writes on
+    // the success path; expected values are the results of `zig run`
+    const text =
+        \\fn blockDefer() void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer x += 1;
+        \\        const y = x;
+        \\        const z = x + y;
+        \\        _ = .{ y, z };
+        \\    }
+        \\    const w = x;
+        \\    _ = w;
+        \\}
+        \\fn successErrdefer() !u32 {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        errdefer x += 10;
+        \\        const a = x;
+        \\        _ = a;
+        \\    }
+        \\    const b = x;
+        \\    return b;
+        \\}
+        \\fn prongDefer() void {
+        \\    comptime var x: u32 = 1;
+        \\    const c = true;
+        \\    if (c) {
+        \\        defer x += 1;
+        \\        const p = x;
+        \\        _ = p;
+        \\    }
+        \\    const q = x;
+        \\    _ = q;
+        \\}
+        \\fn fnScope() u32 {
+        \\    comptime var x: u32 = 1;
+        \\    defer x += 1;
+        \\    const r = x;
+        \\    return r;
+        \\}
+        \\fn bodyAtExit() void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer {
+        \\            x += 1;
+        \\            const in_defer = x;
+        \\            _ = in_defer;
+        \\        }
+        \\        x = 5;
+        \\    }
+        \\}
+        \\fn order() void {
+        \\    comptime var x: u32 = 1;
+        \\    {
+        \\        defer x *= 2;
+        \\        defer x += 1;
+        \\    }
+        \\    const ordered = x;
+        \\    _ = ordered;
+        \\}
+        \\fn labeled() void {
+        \\    comptime var x: u32 = 1;
+        \\    const v = blk: {
+        \\        defer x += 1;
+        \\        break :blk x;
+        \\    };
+        \\    const after_break = x;
+        \\    _ = .{ v, after_break };
+        \\}
+        \\fn loop() void {
+        \\    comptime var x: u32 = 0;
+        \\    inline for (0..3) |i| {
+        \\        defer x += 1;
+        \\        const cur = x;
+        \\        _ = .{ i, cur };
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", text);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "y", "u32 = 1" },
+        .{ "z", "u32 = 2" },
+        .{ "w", "u32 = 2" },
+        .{ "a", "u32 = 1" },
+        .{ "b", "u32 = 1" },
+        .{ "p", "u32 = 1" },
+        .{ "q", "u32 = 2" },
+        .{ "r", "u32 = 1" },
+        .{ "in_defer", "u32 = 6" },
+        .{ "ordered", "u32 = 4" },
+        .{ "v", "u32 = 1" },
+        .{ "after_break", "u32 = 2" },
+    };
+    for (cases) |c| {
+        testing.expectEqualStrings(c[1], try typeAt(&w, f.file, text, c[0], 0)) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+    for ([_][]const u8{ "u32 = 0", "u32 = 1", "u32 = 2" }, 0..) |want, n| {
+        testing.expectEqualStrings(want, try iterationTypeAt(&w, f.file, text, "cur", "i", @intCast(n))) catch |err| {
+            std.debug.print("type of `cur` in iteration {d}\n", .{n});
+            return err;
+        };
+    }
 }
 
 test "containers in a loop of a type function capture the values of each iteration" {
@@ -4458,6 +4721,27 @@ test "oversized layouts degrade to unknown instead of overflowing" {
     });
 }
 
+test "?noreturn has size 0 and alignment 1" {
+    // Prevents `?noreturn` layouts from being unknown because `noreturn` itself has no layout
+    try expectTypes(
+        \\const sz = @sizeOf(?noreturn);
+        \\const al = @alignOf(?noreturn);
+        \\const sz_nested = @sizeOf(??noreturn);
+        \\const al_nested = @alignOf(??noreturn);
+        \\const sz_array = @sizeOf([2]?noreturn);
+        \\const bits = @bitSizeOf(?noreturn);
+        \\const sz_bare = @sizeOf(noreturn);
+    , &.{
+        .{ "sz", "comptime_int = 0" },
+        .{ "al", "comptime_int = 1" },
+        .{ "sz_nested", "comptime_int = 1" },
+        .{ "al_nested", "comptime_int = 1" },
+        .{ "sz_array", "comptime_int = 0" },
+        .{ "bits", "comptime_int" },
+        .{ "sz_bare", "comptime_int" },
+    });
+}
+
 test "error code layouts follow the error limit" {
     // Prevents assuming 16-bit error codes when the compilation sets an error limit; expected
     // values are the results of zig 0.17.0 with `--error-limit 255`
@@ -4711,6 +4995,52 @@ test "float math builtins use the precision of the operand type" {
         .{ "mf", "f64 = 1" },
         .{ "mg", "f32 = -1.5" },
     });
+}
+
+/// c_longdouble arithmetic for `expectLongDouble`
+const long_double_src =
+    \\fn g() void {
+    \\    const lit = @as(c_longdouble, 1.5);
+    \\    const sq = @sqrt(@as(c_longdouble, 4));
+    \\    const div = @as(c_longdouble, 1) / 3;
+    \\    const ma = @mulAdd(c_longdouble, 2, 3, 4);
+    \\    const mx = @max(@as(c_longdouble, -2), 1);
+    \\    const ab = @abs(@as(c_longdouble, -2.5));
+    \\    _ = .{ lit, sq, div, ma, mx, ab };
+    \\}
+;
+
+/// `long_double_src` on `target`; `div` is `1 / 3` rounded to c_longdouble's width there
+fn expectLongDouble(target: InternPool.Target, div: []const u8) !void {
+    try expectTypesTargeted(target, long_double_src, &.{
+        .{ "lit", "c_longdouble = 1.5" },
+        .{ "sq", "c_longdouble = 2" },
+        .{ "div", div },
+        .{ "ma", "c_longdouble = 10" },
+        .{ "mx", "c_longdouble = 1" },
+        .{ "ab", "c_longdouble = 2.5" },
+    });
+}
+
+test "c_longdouble values are computed at the target's long double width" {
+    // Expected values are the results of zig 0.17.1 (long double is f80, f128 and f64 there)
+    try expectLongDouble(try targetOf("x86_64-linux-gnu", null), "c_longdouble = 0.33333333333333333334");
+    try expectLongDouble(try targetOf("aarch64-linux-musl", null), "c_longdouble = 0.3333333333333333333333333333333333");
+    try expectLongDouble(try targetOf("arm-linux-musleabihf", null), "c_longdouble = 0.3333333333333333");
+    // c_longdouble with another float type gives the fixed-width float of the wider width
+    const peer_src =
+        \\fn g() void {
+        \\    const peer = @as(c_longdouble, 1) + @as(f32, 0.5);
+        \\    _ = peer;
+        \\}
+    ;
+    try expectTypesTargeted(try targetOf("x86_64-linux-gnu", null), peer_src, &.{.{ "peer", "f80 = 1.5" }});
+    try expectTypesTargeted(try targetOf("aarch64-linux-musl", null), peer_src, &.{.{ "peer", "f128 = 1.5" }});
+    // Where long double is 64 bits, zig 0.17.1 folds a c_longdouble value coerced to f64 to 0
+    // (this gives `f64 = 0.5`), so no value is given
+    try expectTypesTargeted(try targetOf("arm-linux-musleabihf", null), peer_src, &.{.{ "peer", "f64" }});
+    // No value when the target's long double width is unknown
+    try expectTypesTargeted(.{ .scalar_abi = .unknown }, long_double_src, &.{ .{ "lit", "c_longdouble" }, .{ "div", "c_longdouble" } });
 }
 
 test "rounding builtins have their result type" {
@@ -5129,6 +5459,77 @@ test "peer types of different integer and float types" {
         .{ "b3", "i64" },
         .{ "skip", "u64" },
         .{ "next", "usize" },
+    });
+}
+
+test "an integer and a float peer at the float when the integer is comptime-known or fits" {
+    // Expected values are the results of zig 0.17.1: a comptime-known integer peers with any
+    // float; a runtime one only when every value of its type is exact in the widest float
+    // peer, otherwise the types are incompatible
+    try expectTypes(
+        \\fn five() u64 {
+        \\    return 5;
+        \\}
+        \\const S = struct {
+        \\    var gv: u64 = 5;
+        \\};
+        \\fn h(g: bool, x: f32, y: f64, h16: f16, u: u8, i: i24, w: u32, d: i64, v: u53) void {
+        \\    const k: u64 = 5;
+        \\    var kv: u64 = 5;
+        \\    _ = &kv;
+        \\    const kc = five();
+        \\    const z = @as(u64, @intFromBool(g));
+        \\    const n1 = if (g) kv else x;
+        \\    const n2 = if (g) kc else x;
+        \\    const n3 = if (g) S.gv else x;
+        \\    const n4 = if (g) z else x;
+        \\    const c1 = if (g) @as(i64, 1) else @as(f32, 2);
+        \\    const c2 = if (g) x else k;
+        \\    const c3 = if (g) @as(u64, 1) else h16;
+        \\    const r1 = if (g) u else x;
+        \\    const r2 = if (g) i else x;
+        \\    const r3 = if (g) w else x;
+        \\    const r4 = if (g) d else y;
+        \\    const r5 = if (g) v else y;
+        \\    const m1 = @TypeOf(w, x, y);
+        \\    const m2 = @TypeOf(@as(u64, 1), u, x);
+        \\    const m3 = @TypeOf(x, @as(u32, 1), 1.5);
+        \\    const m4 = @TypeOf(w, u, x);
+        \\    const m5 = @TypeOf(null, @as(u64, 1), x);
+        \\    const a1 = @as(u64, 1) + x;
+        \\    const s1 = switch (u) {
+        \\        0 => @as(u64, 1),
+        \\        1 => u,
+        \\        else => x,
+        \\    };
+        \\    const l1 = blk: {
+        \\        if (g) break :blk @as(u64, 1);
+        \\        break :blk x;
+        \\    };
+        \\    _ = .{ c1, c2, c3, r1, r2, r3, r4, r5, m1, m2, m3, m4, m5, a1, s1, l1, n1, n2, n3, n4 };
+        \\}
+    , &.{
+        .{ "c1", "f32" },
+        .{ "c2", "f32" },
+        .{ "c3", "f16" },
+        .{ "r1", "f32" },
+        .{ "r2", "f32" },
+        .{ "r3", "unknown" },
+        .{ "r4", "unknown" },
+        .{ "r5", "f64" },
+        .{ "m1", "type = f64" },
+        .{ "m2", "type = f32" },
+        .{ "m3", "type = f32" },
+        .{ "m4", "type" },
+        .{ "m5", "type = ?f32" },
+        .{ "a1", "f32" },
+        .{ "s1", "f32" },
+        .{ "l1", "f32" },
+        // Runtime integers, whose values the compiler does not know
+        .{ "n1", "unknown" },
+        .{ "n2", "unknown" },
+        .{ "n3", "unknown" },
+        .{ "n4", "unknown" },
     });
 }
 
@@ -6360,6 +6761,31 @@ test "concatenation in comptime keeps a sentinel that only one side has" {
         \\const cat = [2]u8{ 1, 2 } ++ "cd";
     , &.{
         .{ "cat", "*const [4:0]u8 = \"\\x01\\x02cd\"" },
+    });
+}
+
+test "concatenation of comptime-known slices gives a pointer to an array" {
+    try expectTypes(
+        \\const a: []const u8 = "ab";
+        \\const z: [:0]const u8 = "xyz";
+        \\const c = a ++ a;
+        \\const d = a ++ "y";
+        \\const e = "y" ++ a;
+        \\const h = z ++ a;
+        \\const j = a ++ .{'q'};
+        \\fn f(s: []const u8) void {
+        \\    const r = s ++ "x";
+        \\    _ = r;
+        \\}
+    , &.{
+        .{ "c", "*const [4]u8 = \"abab\"" },
+        .{ "d", "*const [3:0]u8 = \"aby\"" },
+        .{ "e", "*const [3:0]u8 = \"yab\"" },
+        // The sentinel of a sentinel-terminated slice is kept
+        .{ "h", "*const [5:0]u8 = \"xyzab\"" },
+        .{ "j", "*const [3]u8" },
+        // A runtime slice has no comptime-known length
+        .{ "r", "unknown" },
     });
 }
 
@@ -7965,6 +8391,54 @@ test "integer types wider than 128 bits are computed at arbitrary precision" {
     });
 }
 
+test "signed division truncates toward zero and a zero remainder folds" {
+    // Signed `/` and a `%` with a zero remainder gave no value.
+    // Expected values are the results of zig 0.17.1.
+    try expectTypes(
+        \\const ct_div = -7 / 2;
+        \\const ct_div_neg_rhs = 7 / -2;
+        \\const ct_rem_zero = -4 % 2;
+        \\const i64_div = @as(i64, -7) / 2;
+        \\const i64_div_neg_rhs = @as(i64, 7) / -2;
+        \\const i64_div_both_neg = @as(i64, -7) / -2;
+        \\const i64_rem_zero = @as(i64, -4) % 2;
+        \\const i64_rem_zero_neg_rhs = @as(i64, 4) % -2;
+        \\const i64_rem_neg = @as(i64, -7) % 2;
+        \\const i8_div_overflow = @as(i8, -128) / -1;
+        \\const i256_div = @as(i256, -7) / 2;
+        \\const i256_div_big = @as(i256, -(1 << 200)) / -3;
+        \\const i256_rem_zero = @as(i256, -4) % 2;
+        \\const i256_rem_neg = @as(i256, -7) % 2;
+        \\const i256_div_overflow = @as(i256, -(1 << 255)) / -1;
+        \\const in_block = comptime blk: {
+        \\    var x: i64 = -7;
+        \\    x /= 2;
+        \\    break :blk x;
+        \\};
+        \\fn g() void {
+        \\    _ = .{ ct_div, ct_div_neg_rhs, ct_rem_zero, i64_div, i64_div_neg_rhs, i64_div_both_neg, i64_rem_zero, i64_rem_zero_neg_rhs, i64_rem_neg, i8_div_overflow, i256_div, i256_div_big, i256_rem_zero, i256_rem_neg, i256_div_overflow, in_block };
+        \\}
+    , &.{
+        .{ "ct_div", "comptime_int = -3" },
+        .{ "ct_div_neg_rhs", "comptime_int = -3" },
+        .{ "ct_rem_zero", "comptime_int = 0" },
+        .{ "i64_div", "i64 = -3" },
+        .{ "i64_div_neg_rhs", "i64 = -3" },
+        .{ "i64_div_both_neg", "i64 = 3" },
+        .{ "i64_rem_zero", "i64 = 0" },
+        .{ "i64_rem_zero_neg_rhs", "i64 = 0" },
+        // The compiler rejects `%` with a negative operand and a nonzero remainder
+        .{ "i64_rem_neg", "i64" },
+        .{ "i8_div_overflow", "i8" },
+        .{ "i256_div", "i256 = -3" },
+        .{ "i256_div_big", "i256 = 535646014752996758513987364113720867507400997927597611767125" },
+        .{ "i256_rem_zero", "i256 = 0" },
+        .{ "i256_rem_neg", "i256" },
+        .{ "i256_div_overflow", "i256" },
+        .{ "in_block", "i64 = -3" },
+    });
+}
+
 test "builtins on integer types wider than 128 bits" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both)
     try expectTypes(
@@ -8291,7 +8765,7 @@ test "std.meta type functions" {
         \\    const slice = std.meta.Slice(*[10]i32);
         \\    const tags = std.meta.tags(E);
         \\    const field_ty = std.meta.fieldInfo(S, .x).type;
-        \\    const sliced = std.mem.SliceTo([:0]const u8, 0);
+        \\    const sliced = @TypeOf(std.mem.sliceTo("abc", 0));
         \\    _ = .{ child, elem, sent, tag_e, tag_u, active, FE, fe, DE, args, backing, slice, tags, field_ty, sliced };
         \\}
     , &.{
@@ -10889,6 +11363,22 @@ test "comptime evaluation: a *T coerced to *[1]T views the same place" {
         .{ "r_payload", "u8 = 8" },
     });
 }
+test "comptime evaluation: assigning len re-windows a slice coerced from an array pointer" {
+    // `s.len = n` on a slice without a range gave up instead of shortening it.
+    try expectTypes(
+        \\fn f() usize {
+        \\    var a = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+        \\    var s: []u8 = &a;
+        \\    s.len = 4;
+        \\    s[3] += 10;
+        \\    s.len += 2;
+        \\    return s.len * 1000 + @as(usize, s[3]) * 10 + a[3] / 14;
+        \\}
+        \\const r_len = f();
+    , &.{
+        .{ "r_len", "usize = 6141" },
+    });
+}
 test "comptime evaluation: @fieldParentPtr goes back from a field pointer to its parent" {
     try expectTypes(
         \\const S = struct { a: u8, b: u8 };
@@ -11475,6 +11965,31 @@ test "comptime evaluation: vector operators, @reduce, @select and @shuffle" {
         .{ "e_length", "unknown" },
         .{ "e_mask", "@Vector(1, u8)" },
         .{ "e_compound", "@Vector(2, u8)" },
+    });
+}
+
+test "comptime evaluation: unary vector operators" {
+    // Expected values are the results of zig 0.17.1: `-`, `-%`, `~` and `!` apply the scalar
+    // operator to each element
+    try expectTypes(
+        \\const neg = -@Vector(2, i8){ 1, -2 };
+        \\const neg_wrap = -%@Vector(2, i8){ -128, 3 };
+        \\const not_signed = ~@Vector(2, i4){ 0, -1 };
+        \\const not_unsigned = ~@Vector(3, u8){ 0, 1, 255 };
+        \\const not_bool = !@Vector(2, bool){ true, false };
+        \\const neg_float = -@Vector(2, f32){ 1.5, -2 };
+        \\const neg_wide = -@Vector(2, i200){ 1 << 150, -3 };
+        \\const e_overflow = -@Vector(2, i8){ -128, 3 };
+    , &.{
+        .{ "neg", "@Vector(2, i8) = .{ -1, 2 }" },
+        .{ "neg_wrap", "@Vector(2, i8) = .{ -128, -3 }" },
+        .{ "not_signed", "@Vector(2, i4) = .{ -1, 0 }" },
+        .{ "not_unsigned", "@Vector(3, u8) = .{ 255, 254, 0 }" },
+        .{ "not_bool", "@Vector(2, bool) = .{ false, true }" },
+        .{ "neg_float", "@Vector(2, f32) = .{ -1.5, 2 }" },
+        .{ "neg_wide", "@Vector(2, i200) = .{ -1427247692705959881058285969449495136382746624, 3 }" },
+        // Compile error: overflow of an element
+        .{ "e_overflow", "@Vector(2, i8)" },
     });
 }
 
@@ -12926,5 +13441,130 @@ test "comptime writes to the active field of a union update its payload" {
         .{ "v_nested", "u32 = 43" },
         // Writing an inactive field is a compile error
         .{ "v_inactive", "u16" },
+    });
+}
+
+test "comptime calls through function pointers" {
+    try expectTypes(
+        \\fn ftarget() u8 {
+        \\    return 4;
+        \\}
+        \\fn add(a: u8, b: u8) u8 {
+        \\    return a + b;
+        \\}
+        \\const VTable = struct { get: *const fn () u8 };
+        \\const vt: VTable = .{ .get = &ftarget };
+        \\fn direct() u8 {
+        \\    const p: *const fn () u8 = &ftarget;
+        \\    return p();
+        \\}
+        \\fn viaCall() u8 {
+        \\    const p: *const fn () u8 = &ftarget;
+        \\    return @call(.auto, p, .{});
+        \\}
+        \\fn viaDeref() u8 {
+        \\    const p: *const fn () u8 = &ftarget;
+        \\    return p.*();
+        \\}
+        \\fn viaOptional() u8 {
+        \\    const op: ?*const fn () u8 = &ftarget;
+        \\    return (op.?)();
+        \\}
+        \\fn withArgs() u8 {
+        \\    const p: *const fn (u8, u8) u8 = &add;
+        \\    return p(2, 3);
+        \\}
+        \\fn viaField() u8 {
+        \\    return vt.get();
+        \\}
+        \\const r_direct = comptime direct();
+        \\const r_call = comptime viaCall();
+        \\const r_deref = comptime viaDeref();
+        \\const r_optional = comptime viaOptional();
+        \\const r_args = comptime withArgs();
+        \\const r_field = comptime viaField();
+    , &.{
+        .{ "r_direct", "u8 = 4" },
+        .{ "r_call", "u8 = 4" },
+        .{ "r_deref", "u8 = 4" },
+        .{ "r_optional", "u8 = 4" },
+        .{ "r_args", "u8 = 5" },
+        .{ "r_field", "u8 = 4" },
+    });
+}
+
+test "comptime pointers made by @ptrFromInt compare by address" {
+    try expectTypes(
+        \\var g: u8 = 0;
+        \\const a: *u8 = @ptrFromInt(0x1000);
+        \\const b: *u8 = @ptrFromInt(0x1000);
+        \\const c: *u8 = @ptrFromInt(0x2000);
+        \\const k: *const u8 = @ptrFromInt(0x1000);
+        \\const eq = a == b;
+        \\const ne = a == c;
+        \\const neq = a != c;
+        \\const ck = a == k;
+        \\const glob = a == &g;
+        \\const addr = @intFromPtr(c);
+        \\const o: ?*u8 = @ptrFromInt(0x10);
+        \\const z: ?*u8 = @ptrFromInt(0);
+        \\const onull = o == null;
+        \\const znull = z == null;
+        \\const oaddr = @intFromPtr(o);
+        \\const az: *allowzero u8 = @ptrFromInt(0);
+        \\const azaddr = @intFromPtr(az);
+        \\const m: [*]u8 = @ptrFromInt(0x1000);
+        \\const m2: [*]u8 = @ptrFromInt(0x1000);
+        \\const meq = m == m2;
+        \\const maddr = @intFromPtr(m);
+        \\const deref = a.*;
+        \\const bad_zero: *u8 = @ptrFromInt(0);
+        \\const bad_align: *u32 = @ptrFromInt(0x1001);
+        \\const bad_zero_eq = bad_zero == a;
+        \\const bad_align_eq = bad_align == bad_align;
+    , &.{
+        .{ "eq", "bool = true" },
+        .{ "ne", "bool = false" },
+        .{ "neq", "bool = true" },
+        .{ "ck", "bool = true" },
+        .{ "glob", "bool = false" },
+        .{ "addr", "usize = 8192" },
+        .{ "onull", "bool = false" },
+        .{ "znull", "bool = true" },
+        .{ "oaddr", "usize = 16" },
+        .{ "azaddr", "usize = 0" },
+        .{ "meq", "bool = true" },
+        .{ "maddr", "usize = 4096" },
+        .{ "deref", "u8" },
+        .{ "bad_zero_eq", "bool" },
+        .{ "bad_align_eq", "bool" },
+    });
+}
+
+test "comptime calls compare @ptrFromInt pointers by address" {
+    // Operations on such pointers that are not modeled (casts, arithmetic) stay unknown
+    try expectTypes(
+        \\const s = "abc";
+        \\fn check() [5]bool {
+        \\    const a: *u8 = @ptrFromInt(0x1000);
+        \\    const b: *const u8 = @ptrFromInt(0x1000);
+        \\    const m: [*]const u8 = @ptrFromInt(0x3000);
+        \\    var x: u8 = 1;
+        \\    _ = &x;
+        \\    const o: ?*u8 = a;
+        \\    return .{ a == b, a == &x, m == s.ptr, o == null, @intFromPtr(a) == 0x1000 };
+        \\}
+        \\const r = check();
+        \\const pc: *align(1) u16 = @ptrCast(@as(*u8, @ptrFromInt(0x1000)));
+        \\const pc_addr = @intFromPtr(pc);
+        \\const m2: [*]u8 = @ptrFromInt(0x1000);
+        \\const step = m2 + 1;
+        \\const step_addr = @intFromPtr(step);
+        \\const shown: *u8 = @ptrFromInt(0x1000);
+    , &.{
+        .{ "r", "[5]bool = .{ true, false, false, false, true }" },
+        .{ "pc_addr", "usize" },
+        .{ "step_addr", "usize" },
+        .{ "shown", "*u8 = @ptrFromInt(0x1000)" },
     });
 }

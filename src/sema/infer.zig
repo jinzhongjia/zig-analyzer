@@ -374,6 +374,10 @@ const Inferrer = struct {
     var_levels: []u32 = &.{},
     /// See `Result.iteration_vars`
     iteration_vars: std.ArrayList(Result.IterationVar) = .empty,
+    /// `defer` / `errdefer` statements reached in the blocks being inferred, innermost last: the
+    /// compiler runs their bodies when leaving the block, so `block` infers them there (see
+    /// `runDefers`)
+    pending_defers: std.ArrayList(PendingDefer) = .empty,
     /// Inference mode (used to get the previous iteration's result in per-iteration inference)
     mode: Mode = .full,
     /// The owner is the root expression of a `.zon` file: values are converted to the result type
@@ -1125,7 +1129,7 @@ const Inferrer = struct {
                     }
                     return if (t) then else other;
                 }
-                const ty = try inf.peer(&.{ then.ty, other.ty });
+                const ty = try inf.peerValues(&.{ then, other });
                 try inf.peerLiteral(x.then, ty);
                 if (x.@"else") |el| try inf.peerLiteral(el, ty);
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(x.cond, ty)) try sameLiveValue(ip, &.{ then, other }, ty) else null };
@@ -1152,7 +1156,6 @@ const Inferrer = struct {
                 // jumps to other prongs, so no prong is chosen when it is present.
                 const chosen = if (label != null and inf.continuesTo(label.?)) null else try inf.chooseProng(s.prongs, operand);
                 if (label) |name| try inf.labels.append(inf.scratch, .{ .name = name, .is_loop = false, .expected = expected });
-                var types: std.ArrayList(Index) = .empty;
                 var values: std.ArrayList(TypedValue) = .empty;
                 var chosen_tv: TypedValue = .unknown;
                 if (chosen == null) inf.uncertain += 1;
@@ -1164,7 +1167,6 @@ const Inferrer = struct {
                     inf.captureBound(prong.capture);
                     const tv = try inf.inferArm(prong.body, expected, chosen != null and chosen.? != i);
                     if (chosen != null and chosen.? == i) chosen_tv = tv;
-                    try types.append(inf.scratch, tv.ty);
                     try values.append(inf.scratch, tv);
                 }
                 var break_exprs: []const ExprId = &.{};
@@ -1175,24 +1177,18 @@ const Inferrer = struct {
                     // inferred as not executing)
                     if (chosen != null) {
                         if (frame.types.items.len == 0) return chosen_tv;
-                        var live_types: std.ArrayList(Index) = .empty;
                         var live_values: std.ArrayList(TypedValue) = .empty;
-                        if (chosen_tv.ty != .noreturn_type) {
-                            try live_types.append(inf.scratch, chosen_tv.ty);
-                            try live_values.append(inf.scratch, chosen_tv);
-                        }
-                        try live_types.appendSlice(inf.scratch, frame.types.items);
+                        if (chosen_tv.ty != .noreturn_type) try live_values.append(inf.scratch, chosen_tv);
                         try live_values.appendSlice(inf.scratch, frame.values.items);
-                        const t = try inf.peer(live_types.items);
+                        const t = try inf.peerValues(live_values.items);
                         try inf.peerLiteral(s.prongs[chosen.?].body, t);
                         for (frame.exprs.items) |x| try inf.peerLiteral(x, t);
                         return .{ .ty = t, .val = sameValue(live_values.items, t) };
                     }
-                    try types.appendSlice(inf.scratch, frame.types.items);
                     try values.appendSlice(inf.scratch, frame.values.items);
                 }
                 if (chosen != null) return chosen_tv;
-                const ty = try inf.peer(types.items);
+                const ty = try inf.peerValues(values.items);
                 for (s.prongs) |prong| try inf.peerLiteral(prong.body, ty);
                 for (break_exprs) |x| try inf.peerLiteral(x, ty);
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(s.operand, ty)) try sameLiveValue(ip, values.items, ty) else null };
@@ -1434,7 +1430,7 @@ const Inferrer = struct {
             switch (ip.key(t)) {
                 .container_type => {
                     const ns = try queries.namespaceOfType(inf.r, t) orelse return .unknown;
-                    const def = try inf.r.memberDef(ns, name) orelse {
+                    const def = try inf.r.memberDef(ns, inf.file, name) orelse {
                         if (try inf.unionTagMember(e, t, ns, name)) |tv| return tv;
                         return try inf.otherBranchMember(e, lhs_e, t, name) orelse .unknown;
                     };
@@ -1443,7 +1439,7 @@ const Inferrer = struct {
                 },
                 .error_set_type => return .{ .ty = t, .val = try ip.get(.{ .error_value = name }) },
                 // Members of constructed enums (`@Enum`, the tag enum of a union(enum))
-                .reified_type, .union_tag_type => return try eval.typeMember(inf.r, t, name) orelse .unknown,
+                .reified_type, .union_tag_type => return try eval.typeMember(inf.r, inf.file, t, name) orelse .unknown,
                 // The value under the current configuration is not a container (`std.c.EVFILT`
                 // is void on linux)
                 else => return try inf.otherBranchMember(e, lhs_e, t, name) orelse .unknown,
@@ -1454,7 +1450,7 @@ const Inferrer = struct {
             if (try inf.otherBranchField(e, lhs_e, lhs.ty, name)) |x| tv = x;
         }
         // comptime-known values (structs, unions, tuples, `len`): extract the field value
-        if (tv.val == null and lhs.val != null) if (try eval.fieldValue(inf.r, lhs, name)) |fv| {
+        if (tv.val == null and lhs.val != null) if (try eval.fieldValue(inf.r, inf.file, lhs, name)) |fv| {
             return .{ .ty = if (tv.ty != .unknown) tv.ty else fv.ty, .val = fv.val };
         };
         if (tv.val == null and lhs.val == null) if (try inf.declInitFieldValue(lhs_e, name)) |fv| {
@@ -1519,7 +1515,7 @@ const Inferrer = struct {
         for (cands.items) |t| {
             if (t == current) continue;
             const ns = try queries.namespaceOfType(inf.r, t) orelse continue;
-            const def = try inf.r.memberDef(ns, name) orelse continue;
+            const def = try inf.r.memberDef(ns, inf.file, name) orelse continue;
             inf.members[@backingInt(e)] = try defKey(inf.r, def);
             return try queries.defType(inf.r, def, null, queries.instOfType(ip, t));
         }
@@ -1547,7 +1543,7 @@ const Inferrer = struct {
             const def: resolve.Def = if (fieldItem(tree, ns.container, name)) |fi|
                 .{ .item = .{ .file = ns.file, .item = fi } }
             else
-                try inf.r.memberDef(ns, name) orelse continue;
+                try inf.r.memberDef(ns, inf.file, name) orelse continue;
             inf.members[@backingInt(e)] = try defKey(inf.r, def);
             return try queries.defType(inf.r, def, null, queries.instOfType(ip, t));
         }
@@ -1584,7 +1580,7 @@ const Inferrer = struct {
                     return .{ .ty = (try queries.defType(inf.r, .{ .item = .{ .file = ns.file, .item = f } }, null, queries.instOfType(ip, t))).ty };
                 }
                 // Methods
-                const def = try inf.r.memberDef(ns, name) orelse return .unknown;
+                const def = try inf.r.memberDef(ns, inf.file, name) orelse return .unknown;
                 inf.members[@backingInt(e)] = try defKey(inf.r, def);
                 const tv = try queries.defType(inf.r, def, null, queries.instOfType(ip, t));
                 if (ip.key(tv.ty) == .fn_type) try inf.bound.put(inf.scratch, e, {});
@@ -1712,7 +1708,8 @@ const Inferrer = struct {
         var ns: Namespace = .{ .file = try inf.r.ctx.get(database.ModuleGraph.StdRoot, inf.r.context) orelse return null, .container = 0 };
         var t: Index = .unknown;
         for (path, 0..) |name, i| {
-            const def = try inf.r.memberDef(ns, name) orelse return null;
+            // A structural traversal of compiler-known standard library types: no use site
+            const def = try inf.r.memberDef(ns, ns.file, name) orelse return null;
             t = (try queries.defType(inf.r, def, null, null)).asType() orelse return null;
             if (i + 1 < path.len) ns = try queries.namespaceOfType(inf.r, t) orelse return null;
         }
@@ -1970,9 +1967,9 @@ const Inferrer = struct {
             const in_typeof = inf.in_typeof;
             inf.in_typeof = true;
             defer inf.in_typeof = in_typeof;
-            var types: std.ArrayList(Index) = .empty;
-            for (args) |a| try types.append(inf.scratch, (try inf.infer(a, null)).ty);
-            const t = try inf.peer(types.items);
+            var values: std.ArrayList(TypedValue) = .empty;
+            for (args) |a| try values.append(inf.scratch, try inf.infer(a, null));
+            const t = try inf.peerValues(values.items);
             return if (t == .unknown) typeUnknown() else TypedValue.ofType(t);
         }
         if (eq(u8, name, "@Int")) {
@@ -2082,7 +2079,12 @@ const Inferrer = struct {
         // Casts: the result type is determined by the expected type (with error union / optional
         // stripped as in the compiler's `resolveDestType`)
         if (eval.castDestStrip(name)) |strip| {
-            if (inf.destType(expected, strip)) |t| return .{ .ty = t };
+            if (inf.destType(expected, strip)) |t| {
+                if (eq(u8, name, "@ptrFromInt") and args.len == 1 and inf.dead == 0 and !inf.r.ctx.incomplete()) {
+                    if (value.intOf(ip, inf.get(args[0]).val)) |addr| return .{ .ty = t, .val = try eval.ptrFromInt(inf.r, t, addr) };
+                }
+                return .{ .ty = t };
+            }
             // `@alignCast` / `@addrSpaceCast` without a result type (an error in the compiler)
             // take the type of the argument
             if ((eq(u8, name, "@alignCast") or eq(u8, name, "@addrSpaceCast")) and args.len == 1) return .{ .ty = inf.get(args[0]).ty };
@@ -2147,6 +2149,7 @@ const Inferrer = struct {
             const n = if (eq(u8, name, "@offsetOf")) bits / 8 else bits;
             return .{ .ty = .comptime_int_type, .val = try ip.get(.{ .int_value = .{ .ty = .comptime_int_type, .value = n } }) };
         }
+        if (eq(u8, name, "@intFromPtr")) if (try inf.pureValue(name, args)) |tv| return tv;
         const simple = [_]struct { []const u8, Index }{
             .{ "@intFromPtr", .usize_type },
             .{ "@inComptime", .bool_type },
@@ -2399,6 +2402,7 @@ const Inferrer = struct {
 
     fn block(inf: *Inferrer, blk: Body.Block, expected: ?Index) Error!TypedValue {
         try inf.labels.append(inf.scratch, .{ .name = blk.label, .is_loop = false, .expected = expected });
+        const defers_start = inf.pending_defers.items.len;
         var last: Index = .void_type;
         var dead_rest = false;
         for (blk.stmts, 0..) |s, si| {
@@ -2410,6 +2414,7 @@ const Inferrer = struct {
             }
         }
         if (dead_rest) inf.dead -= 1;
+        try inf.runDefers(defers_start);
         var frame = inf.labels.pop().?;
         if (blk.label != null) {
             // Reaching the end of the block yields void
@@ -2417,7 +2422,7 @@ const Inferrer = struct {
                 try frame.types.append(inf.scratch, .void_type);
                 try frame.values.append(inf.scratch, .{ .ty = .void_type, .val = .void_value });
             }
-            const t = try inf.peer(frame.types.items);
+            const t = try inf.peerValues(frame.values.items);
             for (frame.exprs.items) |x| try inf.peerLiteral(x, t);
             return .{ .ty = t, .val = sameValue(frame.values.items, t) };
         }
@@ -2447,7 +2452,10 @@ const Inferrer = struct {
                 return .void_type;
             },
             .@"defer", .@"errdefer" => |e| {
-                _ = try inf.infer(e, null);
+                // A statement that does not execute registers nothing (see `runDefers`)
+                if (inf.dead > 0) {
+                    _ = try inf.infer(e, null);
+                } else try inf.pending_defers.append(inf.scratch, .{ .body = e, .on_error = s.kind == .@"errdefer" });
                 return .void_type;
             },
             .destructure => |d| {
@@ -2466,6 +2474,36 @@ const Inferrer = struct {
                 return .void_type;
             },
         }
+    }
+
+    /// A `defer` or `errdefer` statement whose block has been reached
+    const PendingDefer = struct { body: ExprId, on_error: bool };
+
+    /// Leaving a block: infers the bodies of its `defer` / `errdefer` statements registered from
+    /// `start` on, in reverse order, as the compiler runs them at every exit of the block. A
+    /// `return`, `break` or `continue` that leaves the block has already been inferred, so the
+    /// bodies see the `comptime var` values at the end of the block; each body has one result,
+    /// that of the exit reached by falling through. An `errdefer` runs only when the function
+    /// returns an error, after which the function's `comptime var`s are not read: its body is
+    /// inferred as at an error return here, and the `comptime var`s it assigns keep the values
+    /// they had before it.
+    fn runDefers(inf: *Inferrer, start: usize) Error!void {
+        var i = inf.pending_defers.items.len;
+        while (i > start) {
+            i -= 1;
+            const d = inf.pending_defers.items[i];
+            if (!d.on_error) {
+                _ = try inf.infer(d.body, null);
+                continue;
+            }
+            var vars: std.ArrayList(Body.BindingId) = .empty;
+            _ = try inf.outerComptimeVars(d.body, &vars);
+            const saved = try inf.scratch.alloc(?Index, vars.items.len);
+            for (vars.items, saved) |v, *old| old.* = inf.bindings[@backingInt(v)].val;
+            _ = try inf.infer(d.body, null);
+            for (vars.items, saved) |v, old| inf.bindings[@backingInt(v)].val = old;
+        }
+        inf.pending_defers.shrinkRetainingCapacity(start);
     }
 
     /// The `i`-th element of the destructuring `const a, const b = x;`: a field of a tuple, or an
@@ -3242,15 +3280,16 @@ const Inferrer = struct {
     /// comptime_int, giving 255, and only then converted to u8; `b + @intCast(y)` has no type).
     fn arith(inf: *Inferrer, op: SyntaxKind, lhs: TypedValue, rhs_e: ExprId) Error!TypedValue {
         const rhs = try inf.infer(rhs_e, null);
-        return inf.foldInt(op, try inf.peer(&.{ lhs.ty, rhs.ty }), lhs, rhs);
+        return inf.foldInt(op, try inf.peerValues(&.{ lhs, rhs }), lhs, rhs);
     }
 
     /// `++` (matches the compiler's `zirArrayCat`): concatenating tuples gives a tuple;
-    /// concatenating arrays and pointers to arrays gives an array, whose element type is the
-    /// peer of both sides' element types, or `*const [N]T` when either side is a pointer. When
+    /// concatenating arrays, pointers to arrays, and comptime-known slices gives an array, whose
+    /// element type is the peer of both sides' element types, or `*const [N]T` when either side
+    /// is a pointer. When
     /// the values of both sides are known, the interpreter evaluates the result.
     fn concat(inf: *Inferrer, e: ExprId, lhs: TypedValue, rhs: TypedValue) Error!TypedValue {
-        const ty = try inf.concatType(lhs.ty, rhs.ty);
+        const ty = try inf.concatType(lhs, rhs);
         if (ty == .unknown) return .unknown;
         if (lhs.val != null and rhs.val != null and inf.dead == 0 and !inf.r.ctx.incomplete()) {
             const tv = try eval.exprValue(inf.r, inf.file, inf.item, inf.body, e, inf.inst, inf.bindings, null, inf.branchQuota());
@@ -3267,8 +3306,10 @@ const Inferrer = struct {
         return if (tv.val != null and tv.ty == ty) tv else null;
     }
 
-    fn concatType(inf: *Inferrer, a: Index, b: Index) Error!Index {
+    fn concatType(inf: *Inferrer, lhs: TypedValue, rhs: TypedValue) Error!Index {
         const ip = inf.ip;
+        const a = lhs.ty;
+        const b = rhs.ty;
         if (ip.key(a) == .tuple_type and ip.key(b) == .tuple_type) {
             // comptime fields stay comptime fields
             const x = ip.key(a).tuple_type;
@@ -3280,8 +3321,8 @@ const Inferrer = struct {
         }
         // When concatenating a tuple with an array, the tuple is treated as an array with the
         // element type of the other side
-        const x = concatOperand(ip, a, b) orelse return .unknown;
-        const y = concatOperand(ip, b, a) orelse return .unknown;
+        const x = concatOperand(ip, a, b, try inf.sliceLen(lhs)) orelse return .unknown;
+        const y = concatOperand(ip, b, a, try inf.sliceLen(rhs)) orelse return .unknown;
         const elem = try inf.peer(&.{ x.elem, y.elem });
         if (elem == .unknown) return .unknown;
         // Sentinels are converted to the result's element type before being compared
@@ -3291,6 +3332,16 @@ const Inferrer = struct {
         const len = std.math.add(u64, x.len, y.len) catch return .unknown;
         const array = try ip.get(.{ .array_type = .{ .len = len, .child = elem, .sentinel = eval.concatSentinel(xs, ys) } });
         return if (x.is_ptr or y.is_ptr) ip.ptrTo(array, .one, true) else array;
+    }
+
+    /// Length of a slice whose value is known; null for other operands
+    fn sliceLen(inf: *Inferrer, tv: TypedValue) Error!?u64 {
+        switch (inf.ip.key(tv.ty)) {
+            .ptr_type => |p| if (p.size != .slice) return null,
+            else => return null,
+        }
+        if (tv.val == null) return null;
+        return try eval.elemCount(inf.r, tv);
     }
 
     /// Integer operations: the result type is `ty`; it carries a value when the values of both
@@ -3889,7 +3940,7 @@ const Inferrer = struct {
                 // A member of a namespace is a declaration
                 if (inf.get(fa.lhs).asType()) |t| {
                     const ns = try queries.namespaceOfType(inf.r, t) orelse return .{};
-                    return inf.defAttrs(try inf.r.memberDef(ns, field) orelse return .{});
+                    return inf.defAttrs(try inf.r.memberDef(ns, inf.file, field) orelse return .{});
                 }
                 return inf.fieldPlaceAttrs(fa.lhs, field, inf.get(e).ty);
             },
@@ -3975,7 +4026,28 @@ const Inferrer = struct {
     /// pointers, numbers, enum literals, optionals, pointers, arrays, vectors and tuples); unknown
     /// when the types cannot be unified
     pub fn peer(inf: *Inferrer, types: []const Index) Error!Index {
+        return inf.peerKnown(types, null);
+    }
+
+    /// Peer type resolution of values: like `peer`, and an integer whose value is known peers
+    /// with any float
+    fn peerValues(inf: *Inferrer, values: []const TypedValue) Error!Index {
+        const types = try inf.scratch.alloc(Index, values.len);
+        const known = try inf.scratch.alloc(bool, values.len);
+        for (values, types, known) |v, *t, *k| {
+            t.* = v.ty;
+            k.* = v.val != null;
+        }
+        return inf.peerKnown(types, known);
+    }
+
+    /// `peer`, where `known[i]` tells whether the value of peer `i` is comptime-known
+    fn peerKnown(inf: *Inferrer, types: []const Index, known: ?[]const bool) Error!Index {
         const ip = inf.ip;
+        if (floatPeer(ip, types, known)) |fp| {
+            const t, const has_null = fp;
+            return if (has_null and t != .unknown) ip.optionalOf(t) else t;
+        }
         var result: ?Index = null;
         var has_null = false;
         for (types) |t| {
@@ -4028,16 +4100,18 @@ const Inferrer = struct {
                 result = p;
                 continue;
             }
-            // Between floats, take the wider one (c_longdouble's bit width depends on the target)
+            // Between floats, take the wider one (c_longdouble's bit width depends on the target);
+            // two distinct types give the fixed-width float of that width, so c_longdouble with
+            // another float type is never the result (the compiler's `resolvePeerTypesInner`)
             if (ip.isFloat(cur) and ip.isFloat(t)) {
                 const x = value.floatBits(ip, cur) orelse return .unknown;
                 const y = value.floatBits(ip, t) orelse return .unknown;
-                if (y > x) result = t;
+                result = try value.fixedFloatType(ip, @max(x, y)) orelse return .unknown;
                 continue;
             }
-            // A fixed-width float with an integer: the float, when every value of the integer
-            // type is exact in it (a comptime-known integer value always is, but values are not
-            // part of peer resolution here)
+            // A fixed-width float with an integer among other kinds of peers (`floatPeer`
+            // resolves the peers that are all numbers): the float, when every value of the
+            // integer type is exact in it
             if (ip.isInt(cur) and t != .comptime_float_type and ip.isFloat(t)) {
                 if (!intFitsFloat(ip, cur, t)) return .unknown;
                 result = t;
@@ -4282,7 +4356,7 @@ fn leafAlternatives(r: *Resolver, a: Allocator, file: FileId, item: u32, body: *
             try leafAlternatives(r, a, file, item, body, exprs, fa.lhs, &bases, depth + 1);
             for (bases.items) |base| {
                 const ns = try queries.namespaceOfType(r, base) orelse continue;
-                const def = try r.memberDef(ns, name) orelse continue;
+                const def = try r.memberDef(ns, file, name) orelse continue;
                 const tv = try queries.defType(r, def, null, queries.instOfType(ip, base));
                 if (tv.asType()) |t| if (ip.key(t) == .container_type) try appendUnique(a, out, t);
                 const key = try defKey(r, def) orelse continue;
@@ -4315,7 +4389,7 @@ pub fn placeIsConst(r: *Resolver, file: FileId, item: u32, b: *const Body, types
             // `var` / `const` decides
             if (types.exprType(fa.lhs).asType()) |t| {
                 const ns = try queries.namespaceOfType(r, t) orelse return true;
-                const def = try r.memberDef(ns, fa.field orelse return true) orelse return true;
+                const def = try r.memberDef(ns, file, fa.field orelse return true) orelse return true;
                 return switch (def) {
                     .item => |it| (try r.itemTree(it.file)).items[it.item].kind != .@"var",
                     else => true,
@@ -4605,6 +4679,40 @@ fn runtimePtr(ip: *InternPool, t: Index) ?@FieldType(InternPool.Key, "ptr_type")
     };
 }
 
+/// Peer of numbers among which are fixed-width integers and floats (and possibly comptime
+/// numbers, null, noreturn and undefined): the widest float, and whether null is a peer. Matches
+/// the compiler: a comptime-known integer (`known`) peers with any float; a runtime one only when
+/// every value of its type is exact in that float, otherwise the types are incompatible and the
+/// result is unknown. Null when the peers are not such numbers.
+fn floatPeer(ip: *InternPool, types: []const Index, known: ?[]const bool) ?struct { Index, bool } {
+    var float: ?Index = null;
+    var has_int = false;
+    var has_null = false;
+    for (types) |t| switch (t) {
+        .noreturn_type, .undefined_type, .comptime_int_type, .comptime_float_type => {},
+        .null_type => has_null = true,
+        else => if (ip.isInt(t)) {
+            has_int = true;
+        } else if (ip.isFloat(t)) {
+            const cur = float orelse {
+                float = t;
+                continue;
+            };
+            const x = value.floatBits(ip, cur) orelse return .{ .unknown, has_null };
+            const y = value.floatBits(ip, t) orelse return .{ .unknown, has_null };
+            if (y > x) float = t;
+        } else return null,
+    };
+    const f = float orelse return null;
+    if (!has_int) return null;
+    for (types, 0..) |t, i| {
+        if (t == .comptime_int_type or !ip.isInt(t)) continue;
+        if (known) |k| if (k[i]) continue;
+        if (!intFitsFloat(ip, t, f)) return .{ .unknown, has_null };
+    }
+    return .{ f, has_null };
+}
+
 /// Whether every value of the integer type `int` is exact in the float type `float` (the
 /// compiler's peer resolution check for runtime integers)
 fn intFitsFloat(ip: *InternPool, int: Index, float: Index) bool {
@@ -4728,14 +4836,18 @@ fn isNonSlicePtr(ip: *InternPool, t: Index) bool {
 
 const ConcatOperand = struct { elem: Index, len: u64, sentinel: ?Index, is_ptr: bool };
 
-/// One side of `++`: an array, a pointer to an array, or a tuple when the other side is indexable
-/// (taking the element type of the other side)
-fn concatOperand(ip: *InternPool, t: Index, other: Index) ?ConcatOperand {
+/// One side of `++`: an array, a pointer to an array, a slice of known length `slice_len`, or a
+/// tuple when the other side is indexable (taking the element type of the other side)
+fn concatOperand(ip: *InternPool, t: Index, other: Index, slice_len: ?u64) ?ConcatOperand {
     switch (ip.key(t)) {
         .array_type => |a| return .{ .elem = a.child, .len = a.len, .sentinel = a.sentinel, .is_ptr = false },
-        .ptr_type => |p| if (p.size == .one) switch (ip.key(p.child)) {
-            .array_type => |a| return .{ .elem = a.child, .len = a.len, .sentinel = a.sentinel, .is_ptr = true },
-            else => {},
+        .ptr_type => |p| switch (p.size) {
+            .one => switch (ip.key(p.child)) {
+                .array_type => |a| return .{ .elem = a.child, .len = a.len, .sentinel = a.sentinel, .is_ptr = true },
+                else => {},
+            },
+            .slice => if (slice_len) |n| return .{ .elem = p.child, .len = n, .sentinel = p.sentinel, .is_ptr = true },
+            .many, .c => {},
         },
         .tuple_type => |tt| {
             const elem: Index = switch (ip.key(other)) {
