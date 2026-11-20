@@ -97,6 +97,164 @@ fn importedDocs(source: []const u8, label: []const u8) ![2][]const u8 {
     return .{ try testing.allocator.dupe(u8, info.text), try testing.allocator.dupe(u8, item.doc orelse "") };
 }
 
+test "hover shows the compiler's fully qualified name" {
+    // Expected values: zig 0.17.0 and 0.17.1 (identical) `Nav.fqn`, read from `@typeName` of
+    // containers declared at the same namespace (the compiler builds a declaration's name from
+    // its namespace's type name).
+    // A file's name is its path under the module root (`other.X`, not `main.other.X`).
+    const text =
+        \\//- /p/src/main.zig module:main
+        \\const other = @import("other.zig");
+        \\/// A wide integer.
+        \\pub const Wide = u64;
+        \\pub const S = struct {
+        \\    pub const Inner = struct {
+        \\        pub const Deep = struct {};
+        \\    };
+        \\    field: u8,
+        \\};
+        \\pub fn add(a: u32, b: u32) u32 { return a + b; }
+        \\fn Gen(comptime T: type) type {
+        \\    return struct {
+        \\        pub const Inner = struct { t: T };
+        \\        pub const value = 1;
+        \\    };
+        \\}
+        \\fn Shared(comptime T: type) type {
+        \\    _ = T;
+        \\    return struct {
+        \\        pub const Inner = struct {};
+        \\    };
+        \\}
+        \\fn LocalGen(comptime T: type) type {
+        \\    const L = struct {
+        \\        pub const Local = struct { u: T };
+        \\    };
+        \\    return L;
+        \\}
+        \\fn run(x: u32, items: []const u8) u32 {
+        \\    const local = x;
+        \\    for (items) |item| _ = item;
+        \\    _ = Wide;
+        \\    return local + add(x, 1);
+        \\}
+        \\const g = Gen(u16);
+        \\const gi = g.Inner;
+        \\const gv = g.value;
+        \\const si = Shared(u8).Inner;
+        \\const o = other.X;
+        \\const d = S.Inner.Deep;
+        \\const ll = LocalGen(u16).Local;
+        \\
+        \\//- /p/src/other.zig in:main
+        \\pub const X = struct {
+        \\    pub const Y = struct {};
+        \\};
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(text);
+    const main = f.file("/p/src/main.zig");
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const main_text = (try ctx.get(database.syntax.SourceText, main)).text;
+    const cases = [_]struct {
+        path: []const u8 = "/p/src/main.zig",
+        needle: []const u8,
+        extra: usize = 0,
+        /// Null: no `fqn:` line
+        fqn: ?[]const u8,
+    }{
+        // Root-file declarations, at the declaration and at a reference
+        .{ .needle = "Wide = u64", .fqn = "main.Wide" },
+        .{ .needle = "_ = Wide;", .extra = 4, .fqn = "main.Wide" },
+        .{ .needle = "fn add", .extra = 3, .fqn = "main.add" },
+        .{ .needle = "add(x, 1)", .extra = 0, .fqn = "main.add" },
+        .{ .needle = "fn Gen", .extra = 3, .fqn = "main.Gen" },
+        // Nested containers
+        .{ .needle = "Deep = struct", .fqn = "main.S.Inner.Deep" },
+        .{ .needle = "S.Inner.Deep;", .extra = 8, .fqn = "main.S.Inner.Deep" },
+        // A declaration in another file of the module
+        .{ .needle = "other.X;", .extra = 6, .fqn = "other.X" },
+        .{ .path = "/p/src/other.zig", .needle = "X = struct", .fqn = "other.X" },
+        // Declarations in a generic instance, through a type constant
+        .{ .needle = "g.Inner;", .extra = 2, .fqn = "main.Gen(u16).Inner" },
+        .{ .needle = "g.value;", .extra = 2, .fqn = "main.Gen(u16).value" },
+        // A container that is a local constant of a generic function is named after the function
+        // without its arguments, so the name is known without an instance too
+        .{ .needle = "Local = struct { u: T }", .fqn = "main.LocalGen.L.Local" },
+        .{ .needle = "u16).Local;", .extra = 5, .fqn = "main.LocalGen.L.Local" },
+        // No name without a concrete instance of the generic function
+        .{ .needle = "Inner = struct { t: T }", .fqn = null },
+        // The container of `Shared` does not capture `T`, so the compiler names its instances
+        // after a global counter
+        .{ .needle = "Shared(u8).Inner;", .extra = 11, .fqn = null },
+        // No name for fields, parameters, captures and local declarations
+        .{ .needle = "field: u8", .fqn = null },
+        .{ .needle = "x: u32, items", .fqn = null },
+        .{ .needle = "|item|", .extra = 1, .fqn = null },
+        .{ .needle = "const local", .extra = 6, .fqn = null },
+    };
+    for (cases) |c| {
+        const file = f.file(c.path);
+        const source = (try ctx.get(database.syntax.SourceText, file)).text;
+        const offset: u32 = @intCast(std.mem.indexOf(u8, source, c.needle).? + c.extra);
+        const info = try hover.hoverWith(&r, file, offset, .{ .fqn = true }) orelse {
+            std.debug.print("no hover at `{s}`\n", .{c.needle});
+            return error.NoHover;
+        };
+        if (c.fqn) |name| {
+            const line = try std.fmt.allocPrint(testing.allocator, "fqn: `{s}`", .{name});
+            defer testing.allocator.free(line);
+            testing.expect(std.mem.indexOf(u8, info.text, line) != null) catch |err| {
+                std.debug.print("hover at `{s}`: {s}\n", .{ c.needle, info.text });
+                return err;
+            };
+        } else testing.expect(std.mem.indexOf(u8, info.text, "fqn:") == null) catch |err| {
+            std.debug.print("hover at `{s}`: {s}\n", .{ c.needle, info.text });
+            return err;
+        };
+    }
+
+    // The name follows the code block and precedes the documentation
+    const wide = try hover.hoverWith(&r, main, @intCast(std.mem.indexOf(u8, main_text, "Wide = u64").?), .{ .fqn = true }) orelse return error.NoHover;
+    const fqn_at = std.mem.indexOf(u8, wide.text, "fqn: `main.Wide`").?;
+    try testing.expect(std.mem.indexOf(u8, wide.text, "```zig").? < fqn_at);
+    try testing.expect(fqn_at < std.mem.indexOf(u8, wide.text, "A wide integer.").?);
+
+    // Off by default: the same hover has no name
+    const off = try hover.hover(&r, main, @intCast(std.mem.indexOf(u8, main_text, "Wide = u64").?), &.{}, .count) orelse return error.NoHover;
+    try testing.expect(std.mem.indexOf(u8, off.text, "fqn:") == null);
+}
+
+test "hover shows the fully qualified name of a std declaration" {
+    // Expected values: zig 0.17.0 and 0.17.1 (identical); `@typeName(std.mem.Allocator)` is
+    // `mem.Allocator`.
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\const std = @import("std");
+        \\fn f() void {
+        \\    _ = std.mem.Allocator;
+        \\}
+        \\
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    try useRealStd(&w);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const info = try hover.hoverWith(&r, file, @intCast(std.mem.indexOf(u8, text, "Allocator").?), .{ .fqn = true }) orelse return error.NoHover;
+    testing.expect(std.mem.indexOf(u8, info.text, "fqn: `mem.Allocator`") != null) catch |err| {
+        std.debug.print("hover on std.mem.Allocator: {s}\n", .{info.text});
+        return err;
+    };
+}
+
 test "hover and completion on a constant that imports a file show the file's doc" {
     const cases = [_]struct { []const u8, []const u8, []const u8, []const u8 }{
         // A top-level constant importing a file

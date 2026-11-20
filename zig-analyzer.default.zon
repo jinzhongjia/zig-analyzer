@@ -130,6 +130,9 @@
     //       // .count: only how many there are; go to definition lists the declarations.
     //       // .full: the location and complete hover of each (signature, value, documentation).
     //       .instances = .count,
+    //       // Also show the compiler's fully qualified name of a container-level declaration
+    //       // after its signature (`fqn: main.Wide`).
+    //       .fqn = false,
     //   },
 
     // Completion (editor only):

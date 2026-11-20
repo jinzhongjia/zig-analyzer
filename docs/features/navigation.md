@@ -32,6 +32,14 @@ Hover, inlay hints, and completion details share `render.zig`.
 - Containers without a name in the source are displayed by their contents; a self-reference is `struct {...}`, so expansion always ends.
 - An enum displayed by its contents keeps what its declaration gives it: the tag type of `enum(T)`, the values written for members (as evaluated), and `_` when it is non-exhaustive (`enum(u8) { a = 1, b, _ }`). An enum constructed by `@Enum` shows its tag type and the value of every member.
 
+## Fully qualified name
+
+With `hover.fqn` (default `false`), hover adds the declaration's fully qualified name after the code block, before the instance note and documentation: `` fqn: `main.Wide` ``. This is the name the compiler gives the declaration (`Nav.fqn`), not the name of its value: for `pub const Wide = u64;` in the root file `main.zig`, it is `main.Wide`, while the value is `u64`.
+
+The name is the namespace of the declaration followed by its name. A file's namespace is its path under the root directory of the module, without the extension and with `.` for the separators (`main` for the root file `main.zig`, `mem` for `std/mem.zig`, `util.thing` for `util/thing.zig` in a module rooted above them); a file outside every module is its own root and uses its base name. A container's namespace is the compiler's name for the container type (`main.S.Inner`, `main.Gen(u16)`), so declarations inside a generic instance are qualified with the instance's arguments.
+
+Hover shows the name for container-level constants, variables, and functions, both at the declaration and at references to it, including through imports and modules (hover on `std.mem.Allocator` shows `mem.Allocator`). It shows no name for fields, enum members, tests, local constants and variables, parameters, and captures; nor when the compiler's name cannot be determined exactly: containers the compiler names after a global counter, and declarations inside a generic function's returned container hovered without a concrete instance. When the option is off, hover shows no name.
+
 ## Value display
 
 A declaration is displayed as `const x: T = v`. At a reference, `T` is the reference's own type, not its coerced result type. A tuple or anonymous struct with only comptime fields shows just the value.

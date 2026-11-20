@@ -374,6 +374,30 @@ pub fn typeName(r: *Resolver, a: std.mem.Allocator, t: Index) resolve.Error!?[]c
     return out.written();
 }
 
+/// The compiler's fully qualified name of the container-level declaration `item` of `file`, in
+/// the instance `inst` of the generic function enclosing it (null when not in one), allocated in
+/// `a`: the name of the type of its namespace followed by the declaration name (`main.Wide`,
+/// `mem.Allocator`, `main.Gen(u16).Inner`). Such a declaration's namespace is the file's root
+/// struct or a container, whose type name is what the compiler prepends to the declaration name
+/// (`Zcu.Namespace.internFullyQualifiedName`). Null for fields, tests, local declarations and
+/// other items that are not container-level declarations, and when the namespace or its instance
+/// cannot be determined exactly (see `typeName`).
+pub fn declName(r: *Resolver, a: std.mem.Allocator, file: FileId, item: u32, inst: ?Index) resolve.Error!?[]const u8 {
+    const tree = try r.itemTree(file);
+    if (item >= tree.items.len) return null;
+    const it = tree.items[item];
+    switch (it.kind) {
+        .@"fn", .@"const", .@"var" => {},
+        else => return null,
+    }
+    const name = it.name orelse return null;
+    const ns: Namespace = .{ .file = file, .container = it.container };
+    const ns_name = try typeName(r, a, try queries.containerType(r, ns, inst)) orelse return null;
+    // The compiler gives a declaration with an empty name its namespace's name
+    if (name.len == 0) return ns_name;
+    return std.mem.concat(a, u8, &.{ ns_name, ".", name }) catch return error.OutOfMemory;
+}
+
 /// Writes types and values in the format of the compiler's `Type.print` and `Value.print`
 const QualifiedNames = struct {
     r: *Resolver,
