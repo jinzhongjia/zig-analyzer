@@ -2512,11 +2512,9 @@ const Inferrer = struct {
     fn block(inf: *Inferrer, blk: Body.Block, e: ExprId, expected: ?Index) Error!TypedValue {
         try inf.labels.append(inf.scratch, .{ .name = blk.label, .is_loop = false, .expected = expected, .defers_start = inf.pending_defers.items.len });
         const defers_start = inf.pending_defers.items.len;
-        var last: Index = .void_type;
         var dead_rest = false;
         for (blk.stmts, 0..) |s, si| {
-            last = try inf.stmt(s);
-            if (last == .noreturn_type and !dead_rest) {
+            if (try inf.stmt(s) == .noreturn_type and !dead_rest) {
                 dead_rest = true;
                 if (inf.dead == 0 and si + 1 < blk.stmts.len) try inf.dead_spans.append(inf.scratch, .{ .start = s.end, .end = blk.stmts[blk.stmts.len - 1].end });
                 inf.dead += 1;
@@ -2529,7 +2527,7 @@ const Inferrer = struct {
         var frame = inf.labels.pop().?;
         if (blk.label != null) {
             // Reaching the end of the block yields void
-            if (last != .noreturn_type and inf.dead == 0) {
+            if (!dead_rest and inf.dead == 0) {
                 try frame.types.append(inf.scratch, .void_type);
                 try frame.values.append(inf.scratch, .{ .ty = .void_type, .val = .void_value });
             }
@@ -2537,7 +2535,9 @@ const Inferrer = struct {
             for (frame.exprs.items) |x| try inf.peerLiteral(x, t);
             return .{ .ty = t, .val = sameValue(frame.values.items, t) };
         }
-        return .{ .ty = if (last == .noreturn_type) .noreturn_type else .void_type };
+        // A noreturn statement before the last one (`if (comptime c) return;`) ends the block
+        // too: the compiler does not analyze the statements after it
+        return .{ .ty = if (dead_rest) .noreturn_type else .void_type };
     }
 
     fn stmt(inf: *Inferrer, s: Body.Stmt) Error!Index {
