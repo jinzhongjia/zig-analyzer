@@ -8735,6 +8735,71 @@ test "a vector element type must be an integer, float, bool or pointer" {
     });
 }
 
+test "vector builtins give no type for operands the compiler rejects" {
+    // `@reduce`, `@select` and `@shuffle` gave a result type for operands of the wrong shape.
+    // Expected results are those of zig 0.17.1, which rejects the `bad` calls.
+    try expectTypes(
+        \\fn f(x: @Vector(3, u32), y: @Vector(2, u32), xb: @Vector(2, bool), arr: [3]u32, pred: @Vector(3, bool), u1v: @Vector(3, u1)) void {
+        \\    const bad_reduce_array = @reduce(.Add, arr);
+        \\    const bad_reduce_empty = @reduce(.Add, @Vector(0, u8){});
+        \\    const bad_reduce_bool_add = @reduce(.Add, xb);
+        \\    const bad_reduce_bool_min = @reduce(.Min, xb);
+        \\    const bad_reduce_float_xor = @reduce(.Xor, @Vector(2, f32){ 1, 2 });
+        \\    const bad_reduce_scalar = @reduce(.Add, @as(u32, 1));
+        \\    const bad_select_scalar_pred = @select(u32, true, x, x);
+        \\    const bad_select_pred_elem = @select(u32, u1v, x, x);
+        \\    const bad_select_len = @select(u32, pred, x, y);
+        \\    const bad_select_scalar = @select(u32, pred, x, 5);
+        \\    const bad_shuffle_oob = @shuffle(u32, x, x, [2]i32{ 0, 3 });
+        \\    const bad_shuffle_oob_neg = @shuffle(u32, x, y, [2]i32{ 0, -3 });
+        \\    const bad_shuffle_undefined = @shuffle(u32, x, undefined, [2]i32{ 0, -1 });
+        \\    const bad_shuffle_wide = @shuffle(u32, x, x, [2]i64{ 0, 1 << 40 });
+        \\    const bad_shuffle_tuple_mask = @shuffle(u32, x, x, .{ 0, 2 });
+        \\    const bad_shuffle_bool_mask = @shuffle(u32, x, x, [2]bool{ true, false });
+        \\    const bad_shuffle_scalar = @shuffle(u32, 5, x, [2]i32{ 0, -1 });
+        \\    const ok_reduce = @reduce(.Max, x);
+        \\    const ok_reduce_bool = @reduce(.And, xb);
+        \\    const ok_reduce_float = @reduce(.Add, @Vector(2, f32){ 1, 2 });
+        \\    const ok_select_array = @select(u32, [3]bool{ true, false, true }, arr, x);
+        \\    const ok_select_tuple = @select(u32, pred, .{ 1, 2, 3 }, x);
+        \\    const ok_select_undefined = @select(u32, pred, undefined, x);
+        \\    const ok_shuffle_neg = @shuffle(u32, x, x, [2]i32{ 0, -3 });
+        \\    const ok_shuffle_lens = @shuffle(u32, x, y, [2]i32{ 2, -2 });
+        \\    const ok_shuffle_undefined = @shuffle(u32, x, undefined, [2]i32{ 0, 2 });
+        \\    const ok_shuffle_undef_elem = @shuffle(u32, x, x, [2]i32{ 0, undefined });
+        \\    _ = .{ bad_reduce_array, bad_reduce_empty, bad_reduce_bool_add, bad_reduce_bool_min, bad_reduce_float_xor, bad_reduce_scalar, bad_select_scalar_pred, bad_select_pred_elem, bad_select_len, bad_select_scalar, bad_shuffle_oob, bad_shuffle_oob_neg, bad_shuffle_undefined, bad_shuffle_wide, bad_shuffle_tuple_mask, bad_shuffle_bool_mask, bad_shuffle_scalar, ok_reduce, ok_reduce_bool, ok_reduce_float, ok_select_array, ok_select_tuple, ok_select_undefined, ok_shuffle_neg, ok_shuffle_lens, ok_shuffle_undefined, ok_shuffle_undef_elem };
+        \\}
+    , &.{
+        .{ "bad_reduce_array", "unknown" },
+        .{ "bad_reduce_empty", "unknown" },
+        .{ "bad_reduce_bool_add", "unknown" },
+        .{ "bad_reduce_bool_min", "unknown" },
+        .{ "bad_reduce_float_xor", "unknown" },
+        .{ "bad_reduce_scalar", "unknown" },
+        .{ "bad_select_scalar_pred", "unknown" },
+        .{ "bad_select_pred_elem", "unknown" },
+        .{ "bad_select_len", "unknown" },
+        .{ "bad_select_scalar", "unknown" },
+        .{ "bad_shuffle_oob", "unknown" },
+        .{ "bad_shuffle_oob_neg", "unknown" },
+        .{ "bad_shuffle_undefined", "unknown" },
+        .{ "bad_shuffle_wide", "unknown" },
+        .{ "bad_shuffle_tuple_mask", "unknown" },
+        .{ "bad_shuffle_bool_mask", "unknown" },
+        .{ "bad_shuffle_scalar", "unknown" },
+        .{ "ok_reduce", "u32" },
+        .{ "ok_reduce_bool", "bool" },
+        .{ "ok_reduce_float", "f32" },
+        .{ "ok_select_array", "@Vector(3, u32)" },
+        .{ "ok_select_tuple", "@Vector(3, u32)" },
+        .{ "ok_select_undefined", "@Vector(3, u32)" },
+        .{ "ok_shuffle_neg", "@Vector(2, u32)" },
+        .{ "ok_shuffle_lens", "@Vector(2, u32)" },
+        .{ "ok_shuffle_undefined", "@Vector(2, u32)" },
+        .{ "ok_shuffle_undef_elem", "@Vector(2, u32)" },
+    });
+}
+
 test "builtins on integer types wider than 128 bits" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both)
     try expectTypes(

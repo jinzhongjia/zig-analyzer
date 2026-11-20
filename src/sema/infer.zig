@@ -2128,12 +2128,14 @@ const Inferrer = struct {
             if (args.len != 4) return .unknown;
             const t = inf.get(args[0]).asType() orelse return .unknown;
             if (!value.isVectorElemType(ip, t)) return .unknown;
-            const n: ?u64 = switch (ip.key(inf.get(if (eq(u8, name, "@select")) args[1] else args[3]).ty)) {
-                .vector_type => |v| v.len,
-                .array_type => |a| a.len,
-                else => null,
+            const is_select = eq(u8, name, "@select");
+            const shape = switch (ip.key(inf.get(if (is_select) args[1] else args[3]).ty)) {
+                .vector_type => |v| .{ v.len, v.child },
+                .array_type => |a| .{ a.len, a.child },
+                else => return .unknown,
             };
-            const len = std.math.cast(u32, n orelse return .unknown) orelse return .unknown;
+            const len = std.math.cast(u32, shape[0]) orelse return .unknown;
+            if (!try inf.vectorOperandsFit(is_select, shape[1], len, args)) return .unknown;
             return .{ .ty = try ip.get(.{ .vector_type = .{ .len = len, .child = t } }) };
         }
         // Integer value of an error: as wide as the error codes, which the error limit sets
@@ -2313,9 +2315,68 @@ const Inferrer = struct {
         if (eq(u8, name, "@atomicLoad") or eq(u8, name, "@atomicRmw") or eq(u8, name, "@extern")) return .{ .ty = elem };
         if (eq(u8, name, "@cmpxchgStrong") or eq(u8, name, "@cmpxchgWeak")) return .{ .ty = try ip.optionalOf(elem) };
         if (eq(u8, name, "@mulAdd")) return try inf.pureValue(name, args) orelse .{ .ty = elem };
-        if (eq(u8, name, "@reduce")) return .{ .ty = if (args.len == 2) inf.elementType(inf.get(args[1]).ty) else .unknown };
+        if (eq(u8, name, "@reduce")) return .{ .ty = if (args.len == 2) inf.reduceType(inf.get(args[0]).val, inf.get(args[1]).ty) else .unknown };
         if (eq(u8, name, "@call")) return .{ .ty = if (args.len == 3) inf.fnReturnType(inf.get(args[1]).ty) else .unknown };
         return .{ .ty = .void_type };
+    }
+
+    /// Result type of `@reduce(op, v)` (`Sema.zirReduce`): the element type of the vector;
+    /// unknown where the compiler rejects the operand: not a vector, a vector without elements,
+    /// or elements `op` does not take (`.And`, `.Or` and `.Xor` take integers and bools, the
+    /// others integers and floats)
+    fn reduceType(inf: *Inferrer, op: ?Index, t: Index) Index {
+        const ip = inf.ip;
+        const vec = switch (ip.key(t)) {
+            .vector_type => |v| v,
+            else => return .unknown,
+        };
+        if (vec.len == 0) return .unknown;
+        const op_name: []const u8 = switch (ip.key(op orelse return vec.child)) {
+            .enum_literal => |n| n,
+            .enum_tag => |tag| tag.name,
+            else => return vec.child,
+        };
+        const c = vec.child;
+        const eql = std.mem.eql;
+        const bitwise = eql(u8, op_name, "And") or eql(u8, op_name, "Or") or eql(u8, op_name, "Xor");
+        const takes = if (bitwise) c == .bool_type or ip.isInt(c) else ip.isInt(c) or ip.isFloat(c);
+        return if (takes) c else .unknown;
+    }
+
+    /// Whether the operands of `@select(T, pred, a, b)` or `@shuffle(T, a, b, mask)` pass the
+    /// compiler's shape checks (`Sema.zirSelect`, `Sema.analyzeShuffle`), given the length and
+    /// element type of `pred` / `mask`: a `pred` of bools; `a` and `b` vectors, arrays or tuples
+    /// (`@select`: of the length of `pred`); for `@shuffle`, a mask of integers in the range of
+    /// i32 whose comptime-known elements select within `a` (`m >= 0`) or `b` (`~m`), where
+    /// `undefined` has no elements. Operands of unknown type or shape pass.
+    fn vectorOperandsFit(inf: *Inferrer, is_select: bool, elem: Index, len: u32, args: []const ExprId) Error!bool {
+        const ip = inf.ip;
+        if (is_select) {
+            if (elem != .unknown and elem != .bool_type) return false;
+        } else if (elem == .bool_type) return false;
+        const operands = if (is_select) args[2..4] else args[1..3];
+        var lens: [2]?u64 = undefined;
+        for (operands, &lens) |a, *n| {
+            const t = inf.get(a).ty;
+            n.* = switch (ip.key(t)) {
+                .vector_type => |v| v.len,
+                .array_type => |arr| arr.len,
+                .tuple_type => |tt| tt.types.len,
+                else => if (t == .undefined_type) (if (is_select) null else 0) else if (t == .bool_type or ip.isInt(t) or ip.isFloat(t)) return false else null,
+            };
+            if (is_select) if (n.*) |x| if (x != len) return false;
+        }
+        if (is_select) return true;
+        const mask = inf.get(args[3]);
+        if (mask.val == null) return true;
+        for (0..len) |i| {
+            const m = try eval.elemValue(inf.r, mask, i) orelse continue;
+            const raw = value.intOf(ip, m.val) orelse continue;
+            const index = std.math.cast(i32, raw) orelse return false;
+            const from = lens[if (index >= 0) 0 else 1] orelse continue;
+            if (@as(u64, @intCast(if (index >= 0) index else ~index)) >= from) return false;
+        }
+        return true;
     }
 
     /// Destination type of cast builtins: the expected type, with error union / optional stripped
