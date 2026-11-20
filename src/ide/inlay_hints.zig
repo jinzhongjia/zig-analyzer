@@ -1,5 +1,5 @@
-//! inlay hints: types of local variables without a type annotation; types of fields in
-//! initializers; parameter names at call sites (including builtin calls).
+//! inlay hints: types of local variables and captures without a type annotation; types of fields
+//! in initializers; parameter names at call sites (including builtin calls).
 
 const std = @import("std");
 const resolve = @import("../names/resolve.zig");
@@ -25,6 +25,8 @@ pub const Hint = struct {
 /// The `inlay_hints.*` configuration
 pub const Options = struct {
     types: bool = true,
+    /// Types of captures (`|x|`, `|*p|`, `|v, i|`, `|err|`); likewise not shown when `types` is off
+    capture_types: bool = true,
     /// Field types after the field names in initializers
     field_types: bool = true,
     /// Also show type hints when the type contains an anonymous container shown by its contents
@@ -69,8 +71,14 @@ fn bodyHints(r: *Resolver, a: context.At, start: u32, end: u32, opts: Options, o
     const b = a.body;
     const base = a.node.offset;
     if (opts.types) for (b.bindings, 0..) |binding, i| {
-        if (binding.kind != .local_const and binding.kind != .local_var) continue;
+        switch (binding.kind) {
+            .local_const, .local_var => {},
+            .capture => if (!opts.capture_types) continue,
+            .param => continue,
+        }
         if (binding.ty != null or binding.name.len == 0) continue;
+        // A bare `_` introduces no name; the escaped `@"_"` is a real name
+        if (binding.range.end - binding.range.start == 1 and std.mem.eql(u8, binding.name, "_")) continue;
         const at = base + binding.range.end;
         if (at < start or at > end) continue;
         // Abstract types in a generic function body (such as `T`) are shown as usual; a call-site

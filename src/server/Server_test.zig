@@ -1597,7 +1597,10 @@ test "inlay hint settings apply to requests and refresh the client when they cha
         \\}
         \\fn f() void {
         \\    const p: P = .{ .x = one(1) };
-        \\    _ = p;
+        \\    const o: ?u32 = 1;
+        \\    if (o) |captured| _ = captured;
+        \\    const v = o orelse 0;
+        \\    _ = .{ p, v };
         \\}
         \\
     ;
@@ -1607,7 +1610,7 @@ test "inlay hint settings apply to requests and refresh the client when they cha
         fn of(hh: *Harness) ![]const u8 {
             const resp = try hh.request("textDocument/inlayHint", .{
                 .textDocument = .{ .uri = "untitled:inlay-hints.zig" },
-                .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 8, .character = 0 } },
+                .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 12, .character = 0 } },
             });
             var out: std.ArrayList([]const u8) = .empty;
             for (resp.object.get("result").?.array.items) |hint| try out.append(hh.arena.allocator(), hint.object.get("label").?.string);
@@ -1625,13 +1628,36 @@ test "inlay hint settings apply to requests and refresh the client when they cha
     }.count;
     try testing.expectEqualStrings(": u32 n:", try labels(&h));
 
-    const before = refreshes(&h);
     // Only field_types changes: the pushed configuration replaces the whole configuration, and
     // the other settings are the same as at initialization
+    var before = refreshes(&h);
     try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .inlay_hints = .{ .types = false, .field_types = false, .exclude_single_argument = false } } } });
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expect(refreshes(&h) > before);
     try testing.expectEqualStrings("n:", try labels(&h));
+
+    // capture_types alone changes the hints of captures, and with types on it is mapped through
+    before = refreshes(&h);
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .inlay_hints = .{
+        .types = true,
+        .capture_types = false,
+        .field_types = false,
+        .exclude_single_argument = false,
+    } } } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(refreshes(&h) > before);
+    try testing.expectEqualStrings("n: : u32", try labels(&h));
+
+    before = refreshes(&h);
+    try h.notify("workspace/didChangeConfiguration", .{ .settings = .{ .@"zig-analyzer" = .{ .inlay_hints = .{
+        .types = true,
+        .capture_types = true,
+        .field_types = false,
+        .exclude_single_argument = false,
+    } } } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expect(refreshes(&h) > before);
+    try testing.expectEqualStrings("n: : u32 : u32", try labels(&h));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }

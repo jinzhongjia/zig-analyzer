@@ -7,6 +7,7 @@ Inlay hints are based on inference results and name resolution. How types are sh
 | Option | Default | Effect |
 |---|---|---|
 | `inlay_hints.types` | on | Inferred types of local variables without an annotation; constants whose value is a type get none |
+| `inlay_hints.capture_types` | on | Types of captures (`\|x\|`, `\|*p\|`, `\|v, i\|`, `\|err\|`); hidden when `types` is off |
 | `inlay_hints.field_types` | on | Field types in initializers; anonymous initializers without a result type get none |
 | `inlay_hints.anonymous_containers` | off | Also show type hints containing an anonymous container |
 | `inlay_hints.parameters` | on | Parameter names at calls |
@@ -17,6 +18,7 @@ Inlay hints are based on inference results and name resolution. How types are sh
 
 ## Behavior
 
+- **Captures** (`|x|`, `|*p|`, `|v, i|`, `|err|`) get type hints like local variables, in `if`, `while`, `for`, `switch` prongs and `catch`; `|_|` and captures whose value is a type get none. A heterogeneous `inline` loop (`inline for (.{ @as(u8, 1), @as(u16, 2) })`) has no single type and gets none. Captures in a generic body follow the same rules as local variables.
 - **Generic bodies**: when a type cannot be inferred, a call-site instance is used, and the tooltip names the call.
 - **Calls through function values** take names from the `fn (...)` type of the value's declaration or the function it is initialized with, the same as signature help.
 - **Builtins**: a table in `inlay_hints.zig` decides each multi-parameter builtin, showing names only when they add information; a newly added one is a compile error until the table decides it. Single-parameter builtins show names, subject to the single-argument rule.

@@ -8,9 +8,9 @@
 //!                "global_cache_path": "/home/me/.cache/zig" },
 //!       "build": { "enable": true, "args": ["-Dtarget=aarch64-linux"], "sub_projects": true },
 //!       "diagnostics": { "steps": ["check", "test"], "compiler": true, "inactive_code": false, "debounce_ms": 50 },
-//!       "inlay_hints": { "types": true, "field_types": true, "anonymous_containers": false, "parameters": true,
-//!                        "builtin_parameters": true, "exclude_single_argument": true, "hide_redundant_param_names": true,
-//!                        "max_length": 25 },
+//!       "inlay_hints": { "types": true, "capture_types": true, "field_types": true, "anonymous_containers": false,
+//!                        "parameters": true, "builtin_parameters": true, "exclude_single_argument": true,
+//!                        "hide_redundant_param_names": true, "max_length": 25 },
 //!       "semantic_tokens": { "mode": "full", "global_var": false },
 //!       "hover": { "instances": "count" },
 //!       "imports": { "derived": "with_import", "sort": "path" },
@@ -84,6 +84,9 @@ debounce_ms: u32 = 50,
 inactive_code: bool = false,
 /// inlay hints: inferred types
 inlay_types: bool = true,
+/// inlay hints: types of captures (`|x|`, `|*p|`, `|v, i|`, `|err|`) (likewise not shown when
+/// `inlay_types` is disabled)
+inlay_capture_types: bool = true,
 /// inlay hints: field types after the field names in initializer expressions
 inlay_field_types: bool = true,
 /// inlay hints: also show type hints when the type contains an anonymous container displayed by
@@ -257,6 +260,7 @@ const settings = [_]Setting{
     .{ .section = "diagnostics", .key = "inactive_code", .field = "inactive_code" },
     .{ .section = "diagnostics", .key = "debounce_ms", .field = "debounce_ms" },
     .{ .section = "inlay_hints", .key = "types", .field = "inlay_types" },
+    .{ .section = "inlay_hints", .key = "capture_types", .field = "inlay_capture_types" },
     .{ .section = "inlay_hints", .key = "field_types", .field = "inlay_field_types" },
     .{ .section = "inlay_hints", .key = "anonymous_containers", .field = "inlay_anonymous_containers" },
     .{ .section = "inlay_hints", .key = "parameters", .field = "inlay_parameters" },
@@ -662,10 +666,10 @@ test "parse: nested fields, optional wrapper" {
     try testing.expect(!c.sameBuild(&empty) and !c.sameZig(&empty));
 
     var no_compiler = try parseText(
-        \\{"diagnostics": {"compiler": false}, "inlay_hints": {"types": false}, "build": {"sub_projects": false}}
+        \\{"diagnostics": {"compiler": false}, "inlay_hints": {"types": false, "capture_types": false}, "build": {"sub_projects": false}}
     );
     defer no_compiler.deinit(testing.allocator);
-    try testing.expect(!no_compiler.compiler_diagnostics and !no_compiler.inlay_types and no_compiler.inlay_parameters);
+    try testing.expect(!no_compiler.compiler_diagnostics and !no_compiler.inlay_types and !no_compiler.inlay_capture_types and no_compiler.inlay_parameters);
     try testing.expect(!no_compiler.build_sub_projects and no_compiler.build_enable);
     try testing.expectEqual(0, no_compiler.warnings.len);
     try testing.expect(!no_compiler.sameBuild(&empty));

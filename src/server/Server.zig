@@ -3053,7 +3053,8 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     const build_was_enabled = server.config.build_enable;
     const sub_projects_changed = server.config.build_sub_projects != new.build_sub_projects;
     const watcher_changed = server.config.files_watcher != new.files_watcher;
-    const inlay_changed = server.config.inlay_types != new.inlay_types or server.config.inlay_field_types != new.inlay_field_types or
+    const inlay_changed = server.config.inlay_types != new.inlay_types or server.config.inlay_capture_types != new.inlay_capture_types or
+        server.config.inlay_field_types != new.inlay_field_types or
         server.config.inlay_anonymous_containers != new.inlay_anonymous_containers or
         server.config.inlay_parameters != new.inlay_parameters or server.config.inlay_builtin_parameters != new.inlay_builtin_parameters or
         server.config.inlay_exclude_single_argument != new.inlay_exclude_single_argument or
@@ -6813,6 +6814,7 @@ fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.Inla
         const c = &server.config;
         break :blk .{
             .types = c.inlay_types,
+            .capture_types = c.inlay_capture_types,
             .field_types = c.inlay_field_types,
             .anonymous_containers = c.inlay_anonymous_containers,
             .parameters = c.inlay_parameters,

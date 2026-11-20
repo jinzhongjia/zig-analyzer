@@ -5526,11 +5526,12 @@ test "inlay hint options" {
         \\    return n;
         \\}
         \\const P = struct { x: u32 };
-        \\fn f(dest: []u8, src: []const u8) void {
+        \\fn f(dest: []u8, src: []const u8, o: ?u32) void {
         \\    const a: u32 = 1;
         \\    const v = add(a, 2);
         \\    const p: P = .{ .x = one(v) };
         \\    @memcpy(dest, src);
+        \\    if (o) |captured| _ = captured;
         \\    _ = p;
         \\}
         \\
@@ -5543,16 +5544,17 @@ test "inlay hint options" {
     defer ctx.end();
     var r = resolver(&w, &ctx);
     const cases = [_]struct { inlay_hints.Options, []const u8 }{
-        // Default: types of local variables and fields; parameter names, with no hints for `a` and
-        // `dest`, which have the same names as the arguments, or for the single-argument call
-        // `one(v)`
-        .{ .{}, ": u32 b: : u32 source:" },
+        // Default: types of local variables, fields and captures; parameter names, with no hints
+        // for `a` and `dest`, which have the same names as the arguments, or for the
+        // single-argument call `one(v)`
+        .{ .{}, ": u32 b: : u32 source: : u32" },
         .{ .{ .types = false }, "b: : u32 source:" },
-        .{ .{ .field_types = false }, ": u32 b: source:" },
-        .{ .{ .parameters = false }, ": u32 : u32" },
-        .{ .{ .builtin_parameters = false }, ": u32 b: : u32" },
-        .{ .{ .exclude_single_argument = false }, ": u32 b: : u32 n: source:" },
-        .{ .{ .hide_redundant_param_names = false }, ": u32 a: b: : u32 dest: source:" },
+        .{ .{ .capture_types = false }, ": u32 b: : u32 source:" },
+        .{ .{ .field_types = false }, ": u32 b: source: : u32" },
+        .{ .{ .parameters = false }, ": u32 : u32 : u32" },
+        .{ .{ .builtin_parameters = false }, ": u32 b: : u32 : u32" },
+        .{ .{ .exclude_single_argument = false }, ": u32 b: : u32 n: source: : u32" },
+        .{ .{ .hide_redundant_param_names = false }, ": u32 a: b: : u32 dest: source: : u32" },
     };
     for (cases, 0..) |c, i| {
         const hints = try inlay_hints.inlayHints(&r, file, 0, @intCast(text.len), c[0]);
@@ -10266,4 +10268,154 @@ test "the outline classifies functions by receiver like semantic tokens" {
     try testing.expectEqual(SymbolKind.Method, syntax[0].children.?[1].kind);
     try testing.expectEqual(SymbolKind.Function, syntax[1].kind);
     try testing.expectEqual(SymbolKind.Constant, syntax[2].kind);
+}
+
+test "inlay hints: capture types" {
+    const text =
+        \\const Shape = union(enum) { circle: f32, rect: struct { w: u16, h: u16 } };
+        \\fn parse(s: []const u8) error{InvalidCharacter,Overflow}!u16 { _ = s; return 0; }
+        \\const It = struct { fn next(_: *It) ?u32 { return null; } };
+        \\fn f(sh: Shape, arr: [4]u8, slice: []u8, it: *It) void {
+        \\    switch (sh) {
+        \\        .circle => |radius| _ = radius,
+        \\        .rect => |rc| _ = rc,
+        \\    }
+        \\    if (parse("7")) |pv| { _ = pv; } else |perr| { _ = perr; }
+        \\    for (arr, 0..) |v, i| { _ = v; _ = i; }
+        \\    for (slice) |*p| { _ = p; }
+        \\    inline for (.{ u8, u16 }) |T| { _ = T; }
+        \\    inline for (.{ @as(u8, 1), @as(u16, 2) }) |hv| { _ = hv; }
+        \\    while (it.next()) |x| { _ = x; }
+        \\    _ = parse("1") catch |e| { _ = e; return; };
+        \\    for (arr) |_| {}
+        \\}
+        \\const U = union(enum) { a: u8, b: u16 };
+        \\fn g(u: U) void {
+        \\    switch (u) {
+        \\        inline else => |val, tag| { _ = val; _ = tag; },
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    // Same rules as local variables: the capture type in every kind of payload; an anonymous
+    // container only with `anonymous_containers`; no hint for a type value (`T`), a heterogeneous
+    // `inline` loop, or `|_|`
+    try testing.expectEqualStrings(
+        \\const Shape = union(enum) { circle: f32, rect: struct { w: u16, h: u16 } };
+        \\fn parse(s: []const u8) error{InvalidCharacter,Overflow}!u16 { _ = s; return 0; }
+        \\const It = struct { fn next(_: *It) ?u32 { return null; } };
+        \\fn f(sh: Shape, arr: [4]u8, slice: []u8, it: *It) void {
+        \\    switch (sh) {
+        \\        .circle => |radius: f32| _ = radius,
+        \\        .rect => |rc| _ = rc,
+        \\    }
+        \\    if (parse("7")) |pv: u16| { _ = pv; } else |perr: error{InvalidCharacter,Overflow}| { _ = perr; }
+        \\    for (arr, 0..) |v: u8, i: usize| { _ = v; _ = i; }
+        \\    for (slice) |*p: *u8| { _ = p; }
+        \\    inline for (.{ u8, u16 }) |T| { _ = T; }
+        \\    inline for (.{ @as(u8, 1), @as(u16, 2) }) |hv| { _ = hv; }
+        \\    while (it.next()) |x: u32| { _ = x; }
+        \\    _ = parse("1") catch |e: error{InvalidCharacter,Overflow}| { _ = e; return; };
+        \\    for (arr) |_| {}
+        \\}
+        \\const U = union(enum) { a: u8, b: u16 };
+        \\fn g(u: U) void {
+        \\    switch (u) {
+        \\        inline else => |val, tag: @typeInfo(U).@"union".tag_type.?| { _ = val; _ = tag; },
+        \\    }
+        \\}
+        \\
+    , try inlaid(&w, file, text, .{ .parameters = false }));
+    try testing.expectEqualStrings(
+        \\const Shape = union(enum) { circle: f32, rect: struct { w: u16, h: u16 } };
+        \\fn parse(s: []const u8) error{InvalidCharacter,Overflow}!u16 { _ = s; return 0; }
+        \\const It = struct { fn next(_: *It) ?u32 { return null; } };
+        \\fn f(sh: Shape, arr: [4]u8, slice: []u8, it: *It) void {
+        \\    switch (sh) {
+        \\        .circle => |radius: f32| _ = radius,
+        \\        .rect => |rc: struct { w: u16, h: u16 }| _ = rc,
+        \\    }
+        \\    if (parse("7")) |pv: u16| { _ = pv; } else |perr: error{InvalidCharacter,Overflow}| { _ = perr; }
+        \\    for (arr, 0..) |v: u8, i: usize| { _ = v; _ = i; }
+        \\    for (slice) |*p: *u8| { _ = p; }
+        \\    inline for (.{ u8, u16 }) |T| { _ = T; }
+        \\    inline for (.{ @as(u8, 1), @as(u16, 2) }) |hv| { _ = hv; }
+        \\    while (it.next()) |x: u32| { _ = x; }
+        \\    _ = parse("1") catch |e: error{InvalidCharacter,Overflow}| { _ = e; return; };
+        \\    for (arr) |_| {}
+        \\}
+        \\const U = union(enum) { a: u8, b: u16 };
+        \\fn g(u: U) void {
+        \\    switch (u) {
+        \\        inline else => |val, tag: @typeInfo(U).@"union".tag_type.?| { _ = val; _ = tag; },
+        \\    }
+        \\}
+        \\
+    , try inlaid(&w, file, text, .{ .parameters = false, .anonymous_containers = true }));
+    try testing.expectEqualStrings(text, try inlaid(&w, file, text, .{ .parameters = false, .capture_types = false }));
+    try testing.expectEqualStrings(text, try inlaid(&w, file, text, .{ .parameters = false, .types = false }));
+}
+
+test "inlay hints: capture types in a generic body" {
+    const text =
+        \\fn h(xs: anytype) void {
+        \\    for (xs) |hx| { _ = hx; }
+        \\}
+        \\fn k(comptime T: type, o: ?T) void {
+        \\    if (o) |ko| { _ = ko; }
+        \\}
+        \\test {
+        \\    const a = [_]u16{ 1, 2 };
+        \\    h(a);
+        \\    k(u8, null);
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    try testing.expectEqualStrings(
+        \\fn h(xs: anytype) void {
+        \\    for (xs) |hx: u16| { _ = hx; }
+        \\}
+        \\fn k(comptime T: type, o: ?T) void {
+        \\    if (o) |ko: T| { _ = ko; }
+        \\}
+        \\test {
+        \\    const a: [2]u16 = [_]u16{ 1, 2 };
+        \\    h(a);
+        \\    k(u8, null);
+        \\}
+        \\
+    , try inlaid(&w, file, text, .{ .parameters = false }));
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = struct {
+        fn f(needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, text, needle).?);
+        }
+    }.f;
+    var saw_hx = false;
+    var saw_ko = false;
+    for (try inlay_hints.inlayHints(&r, file, 0, @intCast(text.len), .{ .parameters = false })) |hint| {
+        // The element type comes from the call-site instance and names the call; the abstract
+        // parameter type `T` is shown as is
+        if (hint.offset == at("hx") + 2) {
+            try testing.expectEqualStrings(": u16", hint.label);
+            try testing.expectEqualStrings("inferred from the call at main.zig:9", hint.tooltip.?);
+            saw_hx = true;
+        }
+        if (hint.offset == at("ko") + 2) {
+            try testing.expectEqualStrings(": T", hint.label);
+            try testing.expect(hint.tooltip == null);
+            saw_ko = true;
+        }
+    }
+    try testing.expect(saw_hx and saw_ko);
 }

@@ -305,6 +305,11 @@
           "default": true,
           "markdownDescription": "Inferred types of local variables without a type annotation."
         },
+        "zig-analyzer.inlay_hints.capture_types": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Types of captures (`|x|`, `|*p|`, `|v, i|`, `|err|`). Needs `#zig-analyzer.inlay_hints.types#`."
+        },
         "zig-analyzer.inlay_hints.field_types": {
           "type": "boolean",
           "default": true,
