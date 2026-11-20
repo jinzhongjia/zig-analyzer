@@ -57,14 +57,16 @@ Measured serially on the 97 files in `docs/test-list.md` (ReleaseSafe, project l
 
 ### Auto-import
 
-Eight names needing an import are typed character by character at the end of the measured file, three times over; each character is an edit plus a completion. Ready is the time from the first completion until auto-import candidates appear. Memory is the peak resident memory.
+Eight names needing an import are typed character by character at the end of the measured file, three times over; each character is an edit plus a completion. Ready is the time from the first completion until auto-import candidates appear, with typing starting immediately from opening. Memory is the peak resident memory.
 
 | Project (measured file) | completion p50 | completion p95 | Ready | Resident memory |
 |---|---|---|---|---|
 | Cubyz (`src/graphics.zig`) | 3.5 ms | 5.1 ms | 1.6 s | 275 MB |
 | flow (`src/tui/mainview.zig`) | 4.9 ms | 7.0 ms | 1.3 s | 411 MB |
-| zig-analyzer (`src/sema/infer.zig`) | 4.3 ms | 6.7 ms | 0.7 s | 188 MB |
+| zig-analyzer (`src/sema/infer.zig`) | 12 ms | 15 ms | 1.8 s | 190 MB |
 | Zig compiler (`src/Sema.zig`, 35k lines) | 27 ms | 57 ms | 2.9 s | 680 MB |
+
+The index starts when the first Zig document opens and waits for the first project load, so a completion sent after the server is idle already has the candidates. On this repository (`src/sema/infer.zig`, Linux x86_64, ReleaseSafe, measured with an LSP client that opens the file and requests completion at `memeql`), opening the document and waiting for idle takes 1.66-1.72 s including project loading and indexing, with peak resident memory 209-216 MB; the first completion then includes `std.mem.eql` in 1.4-2.5 ms. When eight names are typed immediately from opening, candidates appear 1.76-1.95 s after the first completion, completion while the index runs is p50 2.5-3.2 ms and p95 11.2-13.7 ms, and peak resident memory is 188-190 MB.
 
 On `Sema.zig` with auto-import off, completion p50 is 12.5 ms and p95 30.7 ms, with about 510 MB. Typing whole paths (`memeql`) takes p50 24 ms and p95 44 ms. The first appearance of a candidate whose declaration must be evaluated is the slowest keystroke, at about 0.2 s.
 
@@ -77,7 +79,7 @@ On `Sema.zig` with auto-import off, completion p50 is 12.5 ms and p95 30.7 ms, w
 | on | 85 ms | 0.7 s (one keystroke: the first evaluation of the auto-import candidates) | about 410 MB |
 | off | 29 ms | 40 ms | about 320 MB |
 
-The auto-import index runs in the background after the first keystroke and covers the project files of the module graph and the user's files under the workspace roots (1.9 s on this project). The first completion after it is ready (the second keystroke above) no longer computes import sites for the project in the request:
+The auto-import index runs in the background after the first Zig document opens (once the first project load ends) and covers the project files of the module graph and the user's files under the workspace roots (1.9 s on this project). The first completion after it is ready (the second keystroke above) no longer computes import sites for the project in the request:
 
 | | completion | `ImportSites` | `ParseFile` |
 |---|---|---|---|
