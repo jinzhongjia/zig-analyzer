@@ -247,7 +247,11 @@ pub const Resolver = struct {
             },
             .local => |l| {
                 const b = try r.body(l.file, l.item);
-                const init = b.binding(l.binding).init orelse return null;
+                const binding = b.binding(l.binding);
+                // A `var` (a `comptime var` holding a type) can be assigned after its
+                // initializer: only inference knows its value at a use
+                if (binding.kind == .local_var) return null;
+                const init = binding.init orelse return null;
                 return r.evalDepth(l.file, l.item, b, init, depth + 1);
             },
         }

@@ -9249,6 +9249,38 @@ test "an iteration that leaves the loop before a declaration is not used for it"
     try testing.expectEqualStrings("```zig\nconst F: type = u8\n```\n\ninferred from iteration 2 of the loop at main.zig:4", info.text);
 }
 
+test "go to definition through a comptime var follows its assignments" {
+    // Prevents taking the namespace of a `comptime var` from its initializer: T is B at the call
+    const text =
+        \\const A = struct {
+        \\    pub fn name() u32 {
+        \\        return 1;
+        \\    }
+        \\};
+        \\const B = struct {
+        \\    pub fn name() u32 {
+        \\        return 2;
+        \\    }
+        \\};
+        \\fn f() void {
+        \\    comptime var T: type = A;
+        \\    T = B;
+        \\    _ = T.name();
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const targets = try definition.definitionTargets(&r, added.file, @intCast(std.mem.indexOf(u8, text, "T.name").? + 2));
+    try testing.expectEqual(1, targets.len);
+    try testing.expectEqual(std.mem.indexOfPos(u8, text, std.mem.indexOf(u8, text, "const B").?, "name").?, targets[0].start);
+}
+
 test "hover on a capture read through a container in the body shows the value of the chosen iteration" {
     // Prevents the capture read by the container from staying unknown in the iteration hover
     // infers (`p_via` was shown as the abstract `T`); expected values are the results of zig 0.17.0
