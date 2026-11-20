@@ -28,11 +28,12 @@ pub const Info = struct {
 
 /// How hover shows the declarations that a member name refers to under the other instances of the
 /// generic function containing it, when they differ from the one shown (see
-/// `definition.instanceDefsAt`)
+/// `definition.instanceDefsAt`), and the other values of a binding or expression in a `defer` body
+/// at the other exits that run it (see `exitValues`)
 pub const Instances = enum {
-    /// Only how many there are; goto lists them
+    /// Only how many there are; goto lists the declarations
     count,
-    /// The location and complete hover of each declaration
+    /// The location and complete hover of each declaration, the complete hover of each value
     full,
 };
 
@@ -137,12 +138,58 @@ fn semanticHover(r: *Resolver, file: FileId, offset: u32, tok: ast.SyntaxToken, 
 
     var out: std.Io.Writer.Allocating = .init(r.arena);
     const w = &out.writer;
+    // In a defer body analyzed once per exit, the value at one exit, followed by the others
+    const exits = try exitValues(r, a, binding_id, expr_id, seeded_from);
+    var others: []const ExitValue = &.{};
+    // One value at every exit that the abstract inference already shows needs no exit
+    if (exits.len > 1 or (exits.len == 1 and (exits[0].tv.ty != tv.ty or exits[0].tv.val != tv.val))) {
+        const first = for (exits, 0..) |x, k| {
+            if (seeded_from) |s| if (sameInstance(s, x.seed)) break k;
+        } else 0;
+        tv = exits[first].tv;
+        seeded_from = exits[first].seed;
+        var rest: std.ArrayList(ExitValue) = .empty;
+        for (exits, 0..) |x, k| if (k != first) try rest.append(r.arena, x);
+        others = rest.items;
+    }
     if (!try writeBlock(w, r, a, def, tv, expr_id, seeded_from, false, roots)) return null;
+    if (others.len > 0) switch (instances) {
+        .count => w.print("\n\nTakes {d} other value{s} at other exits of the block", .{ others.len, if (others.len == 1) "" else "s" }) catch return error.OutOfMemory,
+        .full => for (others) |x| {
+            w.writeAll("\n\n---\n\n") catch return error.OutOfMemory;
+            _ = try writeBlock(w, r, a, def, x.tv, expr_id, x.seed, false, roots);
+        },
+    };
     if (expr_id) |e| switch (b.expr(e)) {
         .field_access, .enum_literal => try writeOtherInstances(w, r, def, seeded_from, try definition.instanceDefsAt(r, file, offset), .{ .expr = e }, instances, roots),
         else => {},
     };
     return .{ .text = out.written(), .start = tok.offset, .end = tok.offset + @as(u32, @intCast(tok.text.len)) };
+}
+
+const ExitValue = struct { seed: seed.Seed, tv: TypedValue };
+
+/// In a `defer` body that the compiler analyzes once per exit with different `comptime var`
+/// values (see `seed.exitSeeds`), the value of the binding or expression at each exit, each
+/// distinct value once with its first exit; empty elsewhere, and under a call-site instance
+/// (`shown` is not an exit), whose exits are not inferred separately
+fn exitValues(r: *Resolver, a: context.At, binding_id: ?Body.BindingId, expr_id: ?Body.ExprId, shown: ?seed.Seed) resolve.Error![]const ExitValue {
+    if (binding_id == null and expr_id == null) return &.{};
+    if (shown) |s| if (s.exit == null) return &.{};
+    var out: std.ArrayList(ExitValue) = .empty;
+    for (try seed.exitSeeds(r, a.file, a.item, a.body, a.res, a.rel)) |s| {
+        const res = s.res;
+        const at_exit: TypedValue = if (binding_id) |id|
+            (if (@backingInt(id) < res.bindings.len) res.bindings[@backingInt(id)] else continue)
+        else
+            res.uncoercedValue(expr_id.?);
+        if (at_exit.ty == .unknown) continue;
+        if (for (out.items) |x| {
+            if (x.tv.ty == at_exit.ty and x.tv.val == at_exit.val) break true;
+        } else false) continue;
+        try out.append(r.arena, .{ .seed = s, .tv = at_exit });
+    }
+    return out.items;
 }
 
 /// The hover of `def`, or of the expression `e` when there is no definition, whose value is `tv`
@@ -176,21 +223,29 @@ fn writeBlock(w: *std.Io.Writer, r: *Resolver, a: context.At, def: ?Def, tv: Typ
 }
 
 /// Where the instance `s` comes from: `the call at file.zig:12`, or the iteration of each loop
-/// containing the position, outermost first
+/// and the exit of each `defer` body containing the position, outermost first
 fn writeSource(w: *std.Io.Writer, r: *Resolver, s: seed.Seed) resolve.Error!void {
     const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, s.file)).text;
-    const line = std.mem.count(u8, text[0..@min(s.offset, text.len)], "\n") + 1;
     const where = std.fs.path.basename(r.ctx.db.env.vfs.path(s.file));
     const n = s.iteration orelse {
+        const line = std.mem.count(u8, text[0..@min(s.offset, text.len)], "\n") + 1;
         w.print("the call at {s}:{d}", .{ where, line }) catch return error.OutOfMemory;
         return;
     };
     for (s.enclosing, 0..) |outer, i| {
-        const outer_line = std.mem.count(u8, text[0..@min(outer.offset, text.len)], "\n") + 1;
-        const sep = if (i + 1 < s.enclosing.len) ", " else " and ";
-        w.print("iteration {d} of the loop at {s}:{d}{s}", .{ outer.iteration + 1, where, outer_line, sep }) catch return error.OutOfMemory;
+        try writeStep(w, text, where, outer);
+        w.writeAll(if (i + 1 < s.enclosing.len) ", " else " and ") catch return error.OutOfMemory;
     }
-    w.print("iteration {d} of the loop at {s}:{d}", .{ n + 1, where, line }) catch return error.OutOfMemory;
+    try writeStep(w, text, where, .{ .offset = s.offset, .iteration = n, .exit = s.exit });
+}
+
+/// `iteration 2 of the loop at file.zig:12`, `the exit at file.zig:12` or `the end of the block
+/// at file.zig:12`
+fn writeStep(w: *std.Io.Writer, text: []const u8, where: []const u8, step: seed.Seed.LoopIteration) resolve.Error!void {
+    const line = std.mem.count(u8, text[0..@min(step.offset, text.len)], "\n") + 1;
+    if (step.exit) |x| {
+        w.print("{s} at {s}:{d}", .{ if (x.fall_through) "the end of the block" else "the exit", where, line }) catch return error.OutOfMemory;
+    } else w.print("iteration {d} of the loop at {s}:{d}", .{ step.iteration + 1, where, line }) catch return error.OutOfMemory;
 }
 
 /// A member name in hover: the member of a member access or a decl literal (`expr`), or the

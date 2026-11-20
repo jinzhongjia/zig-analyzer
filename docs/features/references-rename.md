@@ -8,7 +8,7 @@ The candidate files are those reaching the definition through an `@import` chain
 
 Document highlight checks only its own file and reports declarations and assignment targets as writes.
 
-A member access through a namespace chosen by build configuration, or in a region inferred per iteration, refers to the member of every choice; rename and fixes are refused when the choices have different members.
+A member access through a namespace chosen by build configuration, or in a region inferred per iteration or per exit of a `defer` body, refers to the member of every choice; rename and fixes are refused when the choices have different members.
 
 On a member name in a generic function that refers to a different declaration under each instance (a member of a comptime type parameter or of an `anytype` value), references and document highlight cover the references of each declaration it refers to under the instances whose code at the cursor compiles: the declarations goto lists. Code after a guard such as `if (!@hasDecl(T, "x")) @compileError(...)` does not compile under the instances the guard rejects, so their declarations are not included there. Rename works on one declaration and is refused when its uses also refer to others.
 

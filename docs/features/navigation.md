@@ -19,6 +19,8 @@ A member name can refer to a different declaration under each instance. Goto lis
 - `"count"` (default): how many other declarations there are (`Refers to 29 other declarations under other instances; go to definition lists them`). A loop over a list of types can select dozens, which goto lists better than a hover.
 - `"full"`: each other declaration once and in goto order, with its location and complete hover (code, value, call, documentation), separated by rules.
 
+In a `defer` body that the compiler analyzes once per exit with different `comptime var` values, hover shows the value of a binding or expression at its first exit (`inferred from the exit at main.zig:8`); `hover.instances` sets how the values at the other exits follow: `"count"` says how many other values there are (`Takes 1 other value at other exits of the block`), `"full"` shows the hover of each.
+
 A name that refers to the same declaration under every instance shows only that declaration. Finding the other declarations infers the body under every instance; its cost is described under Hover in generic function bodies in `docs/perf.md`.
 
 ## Type display
