@@ -93,6 +93,12 @@ pub const Result = struct {
     /// first exit (see `LoopSeed.exit`), in exit order. Absent for a body whose exits all have the
     /// same values. Here the body is inferred with the values the exits share, the others unknown.
     defer_exits: []const DeferExit = &.{},
+    /// With per-iteration inference of an `inline for` (`LoopSeed`), the exits in this iteration
+    /// of its body that run a `defer` / `errdefer` body registered before the loop and reading a
+    /// `comptime var` the loop modifies, in inference order. The inference of the whole loop
+    /// counts them per iteration, as the compiler unrolls the loop (see
+    /// `Inferrer.unrollDeferExits`).
+    loop_exits: []const LoopExit = &.{},
 
     pub const DeferExit = struct {
         /// The `defer` / `errdefer` body
@@ -103,6 +109,29 @@ pub const Result = struct {
         /// or the end of the block when `fall_through`
         at: u32,
         fall_through: bool,
+        /// For an exit inside `inline for` loops inferred as a whole, the iteration of each that
+        /// reaches it, outermost first (see `LoopExit`)
+        iterations: []const Iteration = &.{},
+
+        pub const Iteration = struct {
+            /// Position of the loop relative to the owner
+            loop: u32,
+            /// 0-based
+            index: u32,
+        };
+    };
+    pub const LoopExit = struct {
+        /// The `defer` / `errdefer` body
+        body: ExprId,
+        /// See `DeferExit.at`
+        at: u32,
+        /// The `comptime var`s the body reads, with their values at the exit (null when unknown)
+        /// and whether a defer run earlier at the exit assigns them
+        reads: []const Body.BindingId,
+        vals: []const ?Index,
+        tainted: []const bool,
+        /// See `DeferExit.iterations`: those of the loops inside this iteration's body
+        iterations: []const DeferExit.Iteration,
     };
     pub const Uncoerced = struct { expr: ExprId, tv: TypedValue };
     pub const LiteralExpected = struct {
@@ -133,7 +162,7 @@ pub const Result = struct {
     }
 
     pub fn eql(a: *const Result, b: *const Result) bool {
-        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.unknown_expected, b.unknown_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans) and deepEql(a.param_coercions, b.param_coercions) and deepEql(a.iteration_vars, b.iteration_vars) and deepEql(a.zon_imports, b.zon_imports) and deepEql(a.uncoerced, b.uncoerced) and deepEql(a.defer_exits, b.defer_exits);
+        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.unknown_expected, b.unknown_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans) and deepEql(a.param_coercions, b.param_coercions) and deepEql(a.iteration_vars, b.iteration_vars) and deepEql(a.zon_imports, b.zon_imports) and deepEql(a.uncoerced, b.uncoerced) and deepEql(a.defer_exits, b.defer_exits) and deepEql(a.loop_exits, b.loop_exits);
     }
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
@@ -172,6 +201,10 @@ pub const Mode = enum {
 /// its block: the compiler analyzes the body once per exit that runs it, each with the
 /// `comptime var` values of that exit. `index` counts the exits that run the body, in inference
 /// order (see `Result.defer_exits`). The inference stops once the body has been inferred there.
+///
+/// A while seed (see `whileLoop`) infers the `index`-th iteration of an `inline while`, which
+/// starts from the `comptime var` values the previous iteration left after the continue
+/// expression; only the counting of defer exits uses it (see `Inferrer.unrollDeferExits`).
 pub const LoopSeed = struct {
     binding: u32,
     index: u32,
@@ -179,6 +212,13 @@ pub const LoopSeed = struct {
     /// Set in `binding` of an exit seed; loop variables and prong captures are binding ids, which
     /// never have it
     const exit_flag: u32 = 1 << 31;
+    /// Set in `binding` of a while seed, like `exit_flag`
+    const while_flag: u32 = 1 << 30;
+
+    /// The seed inferring the `index`-th iteration of the `inline while` at `loop`
+    pub fn whileLoop(loop: ExprId, index: u32) LoopSeed {
+        return .{ .binding = while_flag | @backingInt(loop), .index = index };
+    }
 
     /// The seed inferring the `defer` / `errdefer` body `body` at its `index`-th exit
     pub fn exit(body: ExprId, index: u32) LoopSeed {
@@ -262,7 +302,10 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
     const zon_imports = try a.dupe(Result.ZonImport, inf.zon_imports.items);
     const uncoerced = try a.dupe(Result.Uncoerced, inf.uncoerced.items);
     const defer_exits = try a.dupe(Result.DeferExit, inf.defer_exits.items);
-    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .unknown_expected = unknown_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions, .iteration_vars = iteration_vars, .zon_imports = zon_imports, .uncoerced = uncoerced, .defer_exits = defer_exits };
+    for (defer_exits) |*x| x.iterations = try a.dupe(Result.DeferExit.Iteration, x.iterations);
+    const loop_exits = try a.alloc(Result.LoopExit, inf.loop_exits.items.len);
+    for (inf.loop_exits.items, loop_exits) |x, *o| o.* = .{ .body = x.body, .at = x.at, .reads = try a.dupe(Body.BindingId, x.reads), .vals = try a.dupe(?Index, x.vals), .tainted = try a.dupe(bool, x.tainted), .iterations = try a.dupe(Result.DeferExit.Iteration, x.iterations) };
+    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .unknown_expected = unknown_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions, .iteration_vars = iteration_vars, .zon_imports = zon_imports, .uncoerced = uncoerced, .defer_exits = defer_exits, .loop_exits = loop_exits };
 }
 
 /// Infers only one local binding or comptime expression in the member `owner` (see
@@ -419,6 +462,8 @@ const Inferrer = struct {
     pending_defers: std.ArrayList(PendingDefer) = .empty,
     /// See `Result.defer_exits`
     defer_exits: std.ArrayList(Result.DeferExit) = .empty,
+    /// See `Result.loop_exits`
+    loop_exits: std.ArrayList(Result.LoopExit) = .empty,
     /// Inference mode (used to get the previous iteration's result in per-iteration inference)
     mode: Mode = .full,
     /// The owner is the root expression of a `.zon` file: values are converted to the result type
@@ -1178,7 +1223,7 @@ const Inferrer = struct {
                 if (x.@"else") |el| try inf.peerLiteral(el, ty);
                 return .{ .ty = ty, .val = if (try inf.comptimeCond(x.cond, ty)) try sameLiveValue(ip, &.{ then, other }, ty) else null };
             },
-            .loop => |l| return inf.loop(l, expected),
+            .loop => |l| return inf.loop(l, e, expected),
             .@"switch" => |s| {
                 const operand = try inf.infer(s.operand, null);
                 // A tagged union is matched by its tag: prong items are inferred with the tag
@@ -2512,11 +2557,9 @@ const Inferrer = struct {
     fn block(inf: *Inferrer, blk: Body.Block, e: ExprId, expected: ?Index) Error!TypedValue {
         try inf.labels.append(inf.scratch, .{ .name = blk.label, .is_loop = false, .expected = expected, .defers_start = inf.pending_defers.items.len });
         const defers_start = inf.pending_defers.items.len;
-        var last: Index = .void_type;
         var dead_rest = false;
         for (blk.stmts, 0..) |s, si| {
-            last = try inf.stmt(s);
-            if (last == .noreturn_type and !dead_rest) {
+            if (try inf.stmt(s) == .noreturn_type and !dead_rest) {
                 dead_rest = true;
                 if (inf.dead == 0 and si + 1 < blk.stmts.len) try inf.dead_spans.append(inf.scratch, .{ .start = s.end, .end = blk.stmts[blk.stmts.len - 1].end });
                 inf.dead += 1;
@@ -2529,7 +2572,7 @@ const Inferrer = struct {
         var frame = inf.labels.pop().?;
         if (blk.label != null) {
             // Reaching the end of the block yields void
-            if (last != .noreturn_type and inf.dead == 0) {
+            if (!dead_rest and inf.dead == 0) {
                 try frame.types.append(inf.scratch, .void_type);
                 try frame.values.append(inf.scratch, .{ .ty = .void_type, .val = .void_value });
             }
@@ -2537,7 +2580,9 @@ const Inferrer = struct {
             for (frame.exprs.items) |x| try inf.peerLiteral(x, t);
             return .{ .ty = t, .val = sameValue(frame.values.items, t) };
         }
-        return .{ .ty = if (last == .noreturn_type) .noreturn_type else .void_type };
+        // A noreturn statement before the last one (`if (comptime c) return;`) ends the block
+        // too: the compiler does not analyze the statements after it
+        return .{ .ty = if (dead_rest) .noreturn_type else .void_type };
     }
 
     fn stmt(inf: *Inferrer, s: Body.Stmt) Error!Index {
@@ -2615,6 +2660,10 @@ const Inferrer = struct {
         writes: []const Body.BindingId,
         /// The exits reached so far that run the body, in inference order
         exits: std.ArrayList(ExitState) = .empty,
+        /// Inside an `inline for` inferred as a whole whose exits of this body are replaced by
+        /// those of each iteration (see `unrollDeferExits`): an exit reached there is not the
+        /// exit of an exit seed
+        unrolled: bool = false,
     };
 
     /// An exit that runs a defer body, with the values of the body's `reads` there
@@ -2626,6 +2675,8 @@ const Inferrer = struct {
         /// Parallel to `PendingDefer.reads`: a defer that runs earlier at this exit assigns the
         /// variable, so its value at the body is not the one recorded
         tainted: []const bool,
+        /// See `Result.DeferExit.iterations`
+        iterations: []const Result.DeferExit.Iteration = &.{},
 
         fn same(a: ExitState, b: ExitState) bool {
             for (a.vals, b.vals, a.tainted, b.tainted) |x, y, tx, ty| if (tx or ty or x != y) return false;
@@ -2660,7 +2711,7 @@ const Inferrer = struct {
             i -= 1;
             const d = &pending[i];
             if (d.on_error and !failing) continue;
-            if (inf.exitSeeded(d.body, @intCast(d.exits.items.len))) {
+            if (!d.unrolled and inf.exitSeeded(d.body, @intCast(d.exits.items.len))) {
                 // Inferring a body can grow `pending_defers` (blocks with defers in it): index it
                 // anew for each body
                 var j = inf.pending_defers.items.len;
@@ -2733,7 +2784,7 @@ const Inferrer = struct {
             } else try firsts.append(inf.scratch, k);
         }
         if (firsts.items.len > 1 and inf.dead == 0 and !inf.stopped) for (firsts.items) |k| {
-            try inf.defer_exits.append(inf.scratch, .{ .body = d.body, .index = @intCast(k), .at = exits[k].at, .fall_through = exits[k].fall_through });
+            try inf.defer_exits.append(inf.scratch, .{ .body = d.body, .index = @intCast(k), .at = exits[k].at, .fall_through = exits[k].fall_through, .iterations = exits[k].iterations });
         };
         const saved_reads = try inf.scratch.alloc(?Index, d.reads.len);
         for (d.reads, saved_reads, 0..) |v, *old, k| {
@@ -2788,7 +2839,7 @@ const Inferrer = struct {
         return .{ .ty = ty, .val = if (x == .runtime or x == .unknown) null else x };
     }
 
-    fn loop(inf: *Inferrer, l: Body.Loop, expected: ?Index) Error!TypedValue {
+    fn loop(inf: *Inferrer, l: Body.Loop, e: ExprId, expected: ?Index) Error!TypedValue {
         var iteration: ?u32 = null;
         // Position in `seeds` of the seed of this loop
         var seed_pos: ?usize = null;
@@ -2796,9 +2847,34 @@ const Inferrer = struct {
         // is modified by the loop) ends only through its breaks: the compiler analyzes only the
         // taken branch of the condition, so the `else` branch (`void` when absent) is not a peer
         var endless = false;
+        // A while seed whose iteration does not run (see `LoopSeed.whileLoop`)
+        var skipped = false;
         switch (l.kind) {
             .@"while" => {
+                // Inferring one iteration of an `inline while` (see `LoopSeed.whileLoop`): it
+                // starts from the values iteration n - 1 left, inferred in the same iterations of
+                // the enclosing loops
+                if (l.is_inline) {
+                    const binding = LoopSeed.whileLoop(e, 0).binding;
+                    seed_pos = for (inf.seeds, 0..) |sd, k| {
+                        if (sd.binding == binding) break k;
+                    } else null;
+                    if (seed_pos) |k| iteration = inf.seeds[k].index;
+                    if (iteration) |n| if (n > 0) {
+                        const prev = try inf.r.ctx.get(queries.Infer, .{
+                            .owner = .{ .file = inf.file, .item = try inf.body_owner() },
+                            .mode = inf.mode,
+                            .inst = try inf.seededInstance(inf.seeds[0..seed_pos.?]),
+                            .loop = .{ .binding = binding, .index = n - 1 },
+                        });
+                        for (prev.iteration_vars) |v| if (v.loop == binding) {
+                            inf.bindings[@backingInt(v.binding)].val = v.val;
+                        };
+                    };
+                }
                 const cond = try inf.infer(l.inputs[0], null);
+                // An iteration whose condition fails does not run the body
+                if (iteration != null and inf.condValue(cond) != true) skipped = true;
                 try inf.bindCaptures(l.capture, l.inputs[0], cond, .if_then);
                 try inf.bindCaptures(l.else_capture, l.inputs[0], cond, .if_else);
                 inf.captureBound(l.capture);
@@ -2835,6 +2911,7 @@ const Inferrer = struct {
                 inf.captureBound(l.capture);
             },
         }
+        const defer_loop = try inf.deferLoop(l, iteration, seed_pos);
         // Without per-iteration inference, the number of times the loop body runs is
         // undetermined: outer `comptime var`s modified by the loop body are unknown at the
         // start of any iteration
@@ -2842,24 +2919,45 @@ const Inferrer = struct {
             inf.uncertain += 1;
             try inf.forgetOuterComptimeVars(l.body);
         }
-        if (l.cont) |c| _ = try inf.infer(c, null);
+        // One iteration of a `while` runs the continue expression after the body
+        const cont_after = iteration != null and l.kind == .@"while";
+        if (l.cont) |c| if (!cont_after) {
+            _ = try inf.infer(c, null);
+        };
+        if (skipped) inf.dead += 1;
         // break values and the else branch take the loop's result type
         const outer_frames = inf.labels.items.len;
         const breaks_start = inf.label_breaks.items.len;
         try inf.labels.append(inf.scratch, .{ .name = l.label, .is_loop = true, .expected = expected, .defers_start = inf.pending_defers.items.len });
         _ = try inf.infer(l.body, null);
         var frame = inf.labels.pop().?;
+        if (l.cont) |c| if (cont_after) {
+            _ = try inf.infer(c, null);
+        };
+        if (skipped) inf.dead -= 1;
         if (iteration == null) inf.uncertain -= 1;
         // A break to the loop itself makes the loop produce a value, even when a comptime branch
         // of the body ends in a `return` (see `unrollInline`)
         const own_break = frame.types.items.len != 0;
-        if (try inf.unrollInline(l, iteration == null, outer_frames, breaks_start, own_break)) return .{ .ty = .noreturn_type };
+        var defer_stops = false;
+        if (defer_loop) |dl| {
+            if (iteration != null) {
+                try inf.recordLoopExits(dl);
+            } else {
+                defer_stops = try inf.unrollDeferExits(l, e, dl, own_break, own_break or inf.label_breaks.items.len > breaks_start);
+                if (inf.stopped) return .unknown;
+            }
+        }
+        if (try inf.unrollInline(l, iteration == null, outer_frames, breaks_start, own_break) or defer_stops) return .{ .ty = .noreturn_type };
         // After the loop, a modified `comptime var` holds its value after all iterations, but only
         // one iteration is inferred here: record its value at the end of this iteration (the next
         // iteration starts from it), then set it to unknown
         if (iteration != null) {
             var vars: std.ArrayList(Body.BindingId) = .empty;
             _ = try inf.outerComptimeVars(l.body, &vars);
+            if (l.kind == .@"while") if (l.cont) |c| {
+                _ = try inf.outerComptimeVars(c, &vars);
+            };
             for (vars.items) |v| {
                 try inf.iteration_vars.append(inf.scratch, .{ .loop = inf.seeds[seed_pos.?].binding, .binding = v, .val = inf.bindings[@backingInt(v)].val });
                 inf.bindings[@backingInt(v)].val = null;
@@ -2925,6 +3023,147 @@ const Inferrer = struct {
             frame.values.items[b.pos] = .{ .ty = t, .val = if (types.len == 0) null else sameValue(values.items, t) };
         }
         inf.label_breaks.shrinkRetainingCapacity(breaks_start);
+        return stops;
+    }
+
+    /// The pending defers whose exits in the `inline for` `l` are counted per iteration (see
+    /// `unrollDeferExits`), with the number of exits each had before the loop body
+    const DeferLoop = struct {
+        /// Indices into `pending_defers`
+        defers: []const usize,
+        exits_before: []const usize,
+        /// Number of iterations of an `inline for` inferred as a whole
+        iterations: ?usize,
+    };
+
+    /// The pending defers registered before the `inline for` `l` that read a `comptime var` its
+    /// body modifies: the compiler unrolls the loop, so each iteration that leaves their block
+    /// is its own exit, with that iteration's values. Inferring `l` as a whole (`iteration` is
+    /// null), their exits in it are replaced by those of each iteration; inferring the iteration
+    /// of this inference's own seed (`seed_pos`), they are recorded in `Result.loop_exits`. Null
+    /// when there is none, or when the number of iterations is not known.
+    fn deferLoop(inf: *Inferrer, l: Body.Loop, iteration: ?u32, seed_pos: ?usize) Error!?DeferLoop {
+        if (!l.is_inline or (l.kind == .@"for" and l.capture.len == 0) or inf.dead > 0 or inf.stopped) return null;
+        for (inf.pending_defers.items) |d| {
+            if (d.reads.len > 0) break;
+        } else return null;
+        if (iteration != null) {
+            // The seed of this inference's own loop is the last one that is not an exit seed
+            var own = inf.seeds.len;
+            while (own > 0 and inf.seeds[own - 1].deferBody() != null) own -= 1;
+            if (seed_pos.? + 1 != own) return null;
+        }
+        var vars: std.ArrayList(Body.BindingId) = .empty;
+        _ = try inf.outerComptimeVars(l.body, &vars);
+        if (l.cont) |c| _ = try inf.outerComptimeVars(c, &vars);
+        if (vars.items.len == 0) return null;
+        var defers: std.ArrayList(usize) = .empty;
+        var before: std.ArrayList(usize) = .empty;
+        for (inf.pending_defers.items, 0..) |d, i| {
+            // An enclosing loop already counts them per iteration
+            if (iteration == null and d.unrolled) continue;
+            for (d.reads) |v| {
+                if (std.mem.indexOfScalar(Body.BindingId, vars.items, v) != null) break;
+            } else continue;
+            try defers.append(inf.scratch, i);
+            try before.append(inf.scratch, d.exits.items.len);
+        }
+        if (defers.items.len == 0) return null;
+        // The iterations of a `while` are counted by inferring them until its condition fails
+        const n: ?usize = if (iteration != null or l.kind == .@"while") null else try inf.inlineIterations(l) orelse return null;
+        if (iteration == null) for (defers.items) |i| {
+            inf.pending_defers.items[i].unrolled = true;
+        };
+        return .{ .defers = defers.items, .exits_before = before.items, .iterations = n };
+    }
+
+    /// Records the exits of the defers of `dl` reached in this iteration (see `Result.loop_exits`)
+    fn recordLoopExits(inf: *Inferrer, dl: DeferLoop) Error!void {
+        for (dl.defers, dl.exits_before) |i, before| {
+            const d = inf.pending_defers.items[i];
+            for (d.exits.items[before..]) |x| try inf.loop_exits.append(inf.scratch, .{ .body = d.body, .at = x.at, .reads = d.reads, .vals = x.vals, .tainted = x.tainted, .iterations = x.iterations });
+        }
+    }
+
+    /// The `inline for` `l` inferred as a whole: replaces the exits of the defers of `dl` reached
+    /// in its body by those of each iteration the compiler analyzes, in order (see
+    /// `Result.loop_exits`). The compiler stops at an iteration whose body does not return (unless
+    /// a break to the loop itself, `own_break`, makes the loop produce a value), as in
+    /// `unrollInline`; returns whether it does. Otherwise, without breaks out of the loop
+    /// (`breaks`), the `comptime var`s the loop modifies take their values after the last
+    /// iteration, which later exits read. When this inference is the exit seed of one of the
+    /// exits, the body is inferred with its values there and the inference stops.
+    fn unrollDeferExits(inf: *Inferrer, l: Body.Loop, e: ExprId, dl: DeferLoop, own_break: bool, breaks: bool) Error!bool {
+        for (dl.defers) |i| inf.pending_defers.items[i].unrolled = false;
+        var seeds: std.ArrayList(LoopSeed) = .empty;
+        for (inf.seeds) |s| if (s.deferBody() == null) try seeds.append(inf.scratch, s);
+        const owner: hir.OwnerKey = .{ .file = inf.file, .item = try inf.body_owner() };
+        const inst = try inf.seededInstance(seeds.items);
+        const is_while = l.kind == .@"while";
+        const binding = if (is_while) LoopSeed.whileLoop(e, 0).binding else @backingInt(l.capture[0]);
+        const lists = try inf.scratch.alloc(std.ArrayList(ExitState), dl.defers.len);
+        @memset(lists, .empty);
+        var last: ?*const Result = null;
+        var stops = false;
+        var complete = true;
+        // An `inline while` runs until its condition fails; its iterations count against the
+        // branch quota, beyond which the compiler rejects the loop
+        const max = dl.iterations orelse inf.branchQuota();
+        for (0..max) |idx| {
+            const res = try inf.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = inf.mode, .inst = inst, .loop = .{ .binding = binding, .index = @intCast(idx) } });
+            if (res.exprs.len != inf.body.exprs.len) {
+                complete = false;
+                break;
+            }
+            if (is_while) {
+                const runs = inf.condValue(res.exprs[@backingInt(l.inputs[0])]) orelse {
+                    complete = false;
+                    break;
+                };
+                if (!runs) break;
+            }
+            for (res.loop_exits) |x| for (dl.defers, lists) |i, *list| {
+                const d = inf.pending_defers.items[i];
+                if (x.body != d.body) continue;
+                const vals = try inf.scratch.alloc(?Index, d.reads.len);
+                const tainted = try inf.scratch.alloc(bool, d.reads.len);
+                for (d.reads, vals, tainted) |v, *val, *t| {
+                    const k = std.mem.indexOfScalar(Body.BindingId, x.reads, v);
+                    val.* = if (k) |j| x.vals[j] else null;
+                    t.* = if (k) |j| x.tainted[j] else false;
+                }
+                const iterations = try inf.scratch.alloc(Result.DeferExit.Iteration, x.iterations.len + 1);
+                iterations[0] = .{ .loop = inf.body.range(e).start, .index = @intCast(idx) };
+                @memcpy(iterations[1..], x.iterations);
+                try list.append(inf.scratch, .{ .at = x.at, .fall_through = false, .vals = vals, .tainted = tainted, .iterations = iterations });
+            };
+            last = res;
+            if (!own_break and res.exprs[@backingInt(l.body)].ty == .noreturn_type) {
+                stops = true;
+                break;
+            }
+        } else if (is_while) {
+            complete = false;
+        }
+        if (complete) {
+            for (dl.defers, dl.exits_before, lists) |i, before, list| {
+                const d = &inf.pending_defers.items[i];
+                d.exits.shrinkRetainingCapacity(before);
+                try d.exits.appendSlice(inf.scratch, list.items);
+            }
+            if (!stops and !breaks) if (last) |res| for (res.iteration_vars) |v| if (v.loop == binding) {
+                inf.bindings[@backingInt(v.binding)].val = v.val;
+            };
+        } else stops = false;
+        for (dl.defers, dl.exits_before) |i, before| {
+            const d = inf.pending_defers.items[i];
+            for (d.exits.items[before..], before..) |x, k| if (inf.exitSeeded(d.body, @intCast(k))) {
+                for (d.reads, x.vals, x.tainted) |v, val, t| inf.bindings[@backingInt(v)].val = if (t) null else val;
+                _ = try inf.infer(d.body, null);
+                inf.stopped = true;
+                return false;
+            };
+        }
         return stops;
     }
 

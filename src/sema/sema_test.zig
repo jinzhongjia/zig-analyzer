@@ -3518,6 +3518,171 @@ test "a defer body reached from exits with different comptime var values is infe
     }
 }
 
+test "an exit inside an inline loop inferred as a whole counts once per iteration" {
+    // Prevents counting the exit once with the loop's comptime vars unknown; expected values are
+    // the copies the compiler analyzes (`@compileLog` with zig 0.17.1)
+    const text =
+        \\fn h(e: bool) !void {
+        \\    if (!e) return error.B;
+        \\}
+        \\fn m(c: bool) void {
+        \\    comptime var x: u32 = 0;
+        \\    {
+        \\        defer {
+        \\            const m_seen = x;
+        \\            _ = m_seen;
+        \\        }
+        \\        inline for (0..3) |i| {
+        \\            if (c and i == 1) return;
+        \\            x += 1;
+        \\        }
+        \\    }
+        \\}
+        \\fn every(c: bool) void {
+        \\    comptime var x: u32 = 0;
+        \\    {
+        \\        defer {
+        \\            const every_seen = x;
+        \\            _ = every_seen;
+        \\        }
+        \\        inline for (0..3) |_| {
+        \\            if (c) return;
+        \\            x += 1;
+        \\        }
+        \\        const after = x;
+        \\        _ = after;
+        \\    }
+        \\}
+        \\fn stop() void {
+        \\    comptime var x: u32 = 0;
+        \\    {
+        \\        defer {
+        \\            const stop_seen = x;
+        \\            _ = stop_seen;
+        \\        }
+        \\        inline for (0..3) |i| {
+        \\            if (i == 1) return;
+        \\            x += 1;
+        \\        }
+        \\    }
+        \\}
+        \\fn errs(e: bool) !void {
+        \\    comptime var x: u32 = 0;
+        \\    errdefer {
+        \\        const err_seen = x;
+        \\        _ = err_seen;
+        \\    }
+        \\    inline for (0..2) |_| {
+        \\        x += 1;
+        \\        try h(e);
+        \\    }
+        \\    x += 5;
+        \\}
+        \\fn nested(c: bool) void {
+        \\    comptime var x: u32 = 0;
+        \\    {
+        \\        defer {
+        \\            const nested_seen = x;
+        \\            _ = nested_seen;
+        \\        }
+        \\        inline for (0..2) |i| {
+        \\            inline for (0..2) |j| {
+        \\                if (c and i == 1 and j == 0) return;
+        \\                x += 1;
+        \\            }
+        \\        }
+        \\    }
+        \\}
+        \\fn w(c: bool) void {
+        \\    comptime var x: u32 = 0;
+        \\    {
+        \\        defer {
+        \\            const w_seen = x;
+        \\            _ = w_seen;
+        \\        }
+        \\        comptime var i: u32 = 0;
+        \\        inline while (i < 3) : (i += 1) {
+        \\            if (c and i == 1) return;
+        \\            x += 1;
+        \\        }
+        \\        const w_after = x;
+        \\        _ = w_after;
+        \\    }
+        \\}
+        \\fn wstop() void {
+        \\    comptime var x: u32 = 0;
+        \\    {
+        \\        defer {
+        \\            const wstop_seen = x;
+        \\            _ = wstop_seen;
+        \\        }
+        \\        comptime var i: u32 = 0;
+        \\        inline while (i < 3) : (i += 1) {
+        \\            if (i == 1) return;
+        \\            x += 1;
+        \\        }
+        \\    }
+        \\}
+        \\fn werr(e: bool) !void {
+        \\    comptime var i: u32 = 0;
+        \\    errdefer {
+        \\        const werr_seen = i;
+        \\        _ = werr_seen;
+        \\    }
+        \\    inline while (i < 2) {
+        \\        i += 1;
+        \\        try h(e);
+        \\    }
+        \\}
+        \\fn prong(c: bool, v: u2) void {
+        \\    comptime var x: u32 = 0;
+        \\    {
+        \\        defer {
+        \\            const prong_seen = x;
+        \\            _ = prong_seen;
+        \\        }
+        \\        switch (v) {
+        \\            inline 0...2 => |n| {
+        \\                if (c and n == 1) return;
+        \\            },
+        \\            else => {},
+        \\        }
+        \\        x = 5;
+        \\    }
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", text);
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "m_seen", "u32", "u32 = 1, u32 = 3" },
+        .{ "every_seen", "u32", "u32 = 0, u32 = 1, u32 = 2, u32 = 3" },
+        .{ "after", "u32 = 3", "" },
+        .{ "stop_seen", "u32 = 1", "" },
+        .{ "err_seen", "u32", "u32 = 1, u32 = 2" },
+        .{ "nested_seen", "u32", "u32 = 2, u32 = 4" },
+        .{ "w_seen", "u32", "u32 = 1, u32 = 3" },
+        .{ "w_after", "u32 = 3", "" },
+        .{ "wstop_seen", "u32 = 1", "" },
+        .{ "werr_seen", "u32", "u32 = 1, u32 = 2" },
+        // A store in an `inline` prong on a runtime operand is rejected by the compiler, so every
+        // copy of the prong has the same values at the exit
+        .{ "prong_seen", "u32", "u32 = 0, u32 = 5" },
+    };
+    for (cases) |c| {
+        testing.expectEqualStrings(c[1], try typeAt(&w, f.file, text, c[0], 0)) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+        testing.expectEqualStrings(c[2], try exitTypesAt(&w, f.file, text, c[0])) catch |err| {
+            std.debug.print("types of `{s}` at each exit\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "containers in a loop of a type function capture the values of each iteration" {
     // Prevents the containers of all iterations from sharing one type, which left the locals they
     // capture without a value and made the types of different iterations compare equal

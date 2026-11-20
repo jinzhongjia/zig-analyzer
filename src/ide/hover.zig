@@ -257,11 +257,19 @@ fn writeSource(w: *std.Io.Writer, r: *Resolver, s: seed.Seed, links: ?Links) res
 }
 
 /// `iteration 2 of the loop at file.zig:12`, `the exit at file.zig:12` or `the end of the block
-/// at file.zig:12`
+/// at file.zig:12`; an exit inside unrolled loops adds the iterations that reach it
+/// (`the exit at file.zig:13 in iteration 2 of the loop at file.zig:12`)
 fn writeStep(w: *std.Io.Writer, r: *Resolver, file: FileId, step: seed.Seed.LoopIteration, links: ?Links) resolve.Error!void {
     if (step.exit) |x| {
         w.print("{s} at ", .{if (x.fall_through) "the end of the block" else "the exit"}) catch return error.OutOfMemory;
-    } else w.print("iteration {d} of the loop at ", .{step.iteration + 1}) catch return error.OutOfMemory;
+        try writeLocation(w, r, file, step.offset, links);
+        for (x.iterations, 0..) |it, i| {
+            w.writeAll(if (i == 0) " in " else ", ") catch return error.OutOfMemory;
+            try writeStep(w, r, file, it, links);
+        }
+        return;
+    }
+    w.print("iteration {d} of the loop at ", .{step.iteration + 1}) catch return error.OutOfMemory;
     try writeLocation(w, r, file, step.offset, links);
 }
 
