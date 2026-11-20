@@ -372,6 +372,11 @@
           "default": "count",
           "markdownDescription": "In a generic function body, how hover shows the declarations a member name refers to under the other instances."
         },
+        "zig-analyzer.hover.fqn": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Also show the compiler's fully qualified name of a container-level declaration after its signature (`fqn: main.Wide`)."
+        },
         "zig-analyzer.completion.auto_import": {
           "type": "boolean",
           "default": true,

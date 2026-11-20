@@ -10,7 +10,9 @@ const definition = @import("definition.zig");
 const context = @import("context.zig");
 const render = @import("../sema/render.zig");
 const queries = @import("../sema/queries.zig");
-const TypedValue = @import("../sema/InternPool.zig").TypedValue;
+const InternPool = @import("../sema/InternPool.zig");
+const TypedValue = InternPool.TypedValue;
+const Index = InternPool.Index;
 const infer = @import("../sema/infer.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const Body = @import("../hir/Body.zig");
@@ -49,6 +51,9 @@ pub const Options = struct {
     /// `Vfs.shownPath`)
     roots: []const []const u8 = &.{},
     instances: Instances = .count,
+    /// Show the compiler's fully qualified name of a container-level declaration after its
+    /// signature (`fqn: main.Wide`)
+    fqn: bool = false,
     /// Null: locations are plain text
     links: ?Links = null,
 };
@@ -252,6 +257,11 @@ fn writeBlock(w: *std.Io.Writer, r: *Resolver, a: context.At, def: ?Def, tv: Typ
     else
         try render.exprAlloc(r, tv);
     w.print("```zig\n{s}\n```", .{code}) catch return error.OutOfMemory;
+    if (opts.fqn) if (def) |d| switch (d) {
+        .item => |it| if (try render.declName(r, r.arena, it.file, it.item, defInstance(a, e, seeded))) |name|
+            w.print("\n\nfqn: `{s}`", .{name}) catch return error.OutOfMemory,
+        else => {},
+    };
     if (embed) |x| writeEmbedded(w, r.ctx.db.env.vfs.shownPath(opts.roots, r.ctx.db.env.vfs.path(x.file)), x.text) catch return error.OutOfMemory;
     if (seeded) |s| {
         w.writeAll("\n\n") catch return error.OutOfMemory;
@@ -265,6 +275,31 @@ fn writeBlock(w: *std.Io.Writer, r: *Resolver, a: context.At, def: ?Def, tv: Typ
     }
     if (def) |d| if (try context.docOf(r, d, tv)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
     return true;
+}
+
+/// The instance of the container that declares the definition shown at `e`, when it is known: the
+/// container type of a member access (`Gen(u16).Inner`, also through pointers and optionals), or
+/// the call-site instance that the hover is inferred under (`seeded`)
+fn defInstance(a: context.At, e: ?Body.ExprId, seeded: ?seed.Seed) ?Index {
+    if (e) |x| switch (a.body.expr(x)) {
+        .field_access => |fa| {
+            // The type of the left-hand side under the instance the hover is inferred under
+            var at = a;
+            at.seeded = seeded;
+            const tv = at.exprType(fa.lhs);
+            var t = tv.asType() orelse tv.ty;
+            while (true) {
+                t = switch (a.ip.key(t)) {
+                    .ptr_type => |p| p.child,
+                    .optional_type => |c| c,
+                    else => break,
+                };
+            }
+            if (queries.instOfType(a.ip, t)) |inst| return inst;
+        },
+        else => {},
+    };
+    return if (seeded) |s| s.inst else null;
 }
 
 /// Where the instance `s` comes from: `the call at file.zig:12`, or the iteration of each loop
