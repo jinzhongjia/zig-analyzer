@@ -29,6 +29,16 @@ fn expectZonTree(source: []const u8, expected: []const u8) !void {
     try testing.expectEqualStrings(expected, actual);
 }
 
+/// Only the parse errors, one `error@offset: message` line each
+fn expectErrors(source: []const u8, expected: []const u8) !void {
+    const parse = try Parse.create(testing.allocator, source, .zig);
+    defer parse.destroy();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    for (parse.errors) |e| try out.writer.print("error@{d}: {s}\n", .{ e.offset, e.message });
+    try testing.expectEqualStrings(expected, out.written());
+}
+
 /// Lossless: the root node's text equals the source
 fn expectLossless(source: []const u8) !void {
     return expectLosslessIn(.zig, source);
@@ -380,6 +390,148 @@ test "recovery: errdefer takes no capture, like defer" {
         defer testing.allocator.free(expected);
         try testing.expectEqualStrings(expected, actual);
     }
+}
+
+test "recovery: each construct takes only its own capture forms" {
+    // `zig ast-check`: `catch` and `else` take `|x|`, `if` and `while` also `|*x|`, a switch prong
+    // also `|*x, i|`
+    try expectErrors("test { _ = e catch |*err| {}; }", "error@20: expected identifier\n");
+    try expectErrors("test { if (x) {} else |*e| {} }", "error@23: expected identifier\n");
+    try expectErrors("test { while (x) {} else |*e| {} }", "error@26: expected identifier\n");
+    try expectErrors("test { if (x) |*a, b| {} }", "error@17: expected '|'\n");
+    try expectErrors("test { while (x) |a, i| {} }", "error@19: expected '|'\n");
+    try expectErrors("test { switch (x) { else => |*a, *b| {} } }", "error@33: expected identifier\n");
+    try expectErrors("test { switch (x) { else => |a, b, c| {} } }", "error@33: expected '|'\n");
+    try expectErrors("test { switch (x) { else => |a,| {} } }", "error@31: expected identifier\n");
+    try expectNoErrors("test { if (x) |*a| {} else |e| {} while (x) |*a| {} else |e| {} }");
+    try expectNoErrors("test { switch (x) { else => |*a, i| {} } for (a, b, c) |*x, y, z,| {} }");
+    // The rejected `*` and extra captures bind nothing
+    try expectTree("test { if (x) |*a, b| {} }",
+        \\source_file@0..26
+        \\  test_decl@0..26
+        \\    keyword_test "test"
+        \\    block@5..26
+        \\      l_brace "{"
+        \\      if_expr@7..24
+        \\        keyword_if "if"
+        \\        l_paren "("
+        \\        name_ref@11..12
+        \\          identifier "x"
+        \\        r_paren ")"
+        \\        payload@14..21
+        \\          pipe "|"
+        \\          asterisk "*"
+        \\          identifier "a"
+        \\          error_node@17..20
+        \\            comma ","
+        \\            identifier "b"
+        \\          pipe "|"
+        \\        block@22..24
+        \\          l_brace "{"
+        \\          r_brace "}"
+        \\      r_brace "}"
+        \\error@17: expected '|'
+        \\
+    );
+    try expectTree("test { _ = e catch |*err| {}; }",
+        \\source_file@0..31
+        \\  test_decl@0..31
+        \\    keyword_test "test"
+        \\    block@5..31
+        \\      l_brace "{"
+        \\      expr_stmt@7..29
+        \\        assign_expr@7..28
+        \\          name_ref@7..8
+        \\            identifier "_"
+        \\          equal "="
+        \\          binary_expr@11..28
+        \\            name_ref@11..12
+        \\              identifier "e"
+        \\            keyword_catch "catch"
+        \\            payload@19..25
+        \\              pipe "|"
+        \\              error_node@20..21
+        \\                asterisk "*"
+        \\              identifier "err"
+        \\              pipe "|"
+        \\            block@26..28
+        \\              l_brace "{"
+        \\              r_brace "}"
+        \\        semicolon ";"
+        \\      r_brace "}"
+        \\error@20: expected identifier
+        \\
+    );
+}
+
+test "recovery: comparison operators cannot be chained" {
+    // `zig ast-check`: `comparison operators cannot be chained` at the second operator
+    try expectErrors("const x = a == b == c;", "error@17: comparison operators cannot be chained\n");
+    try expectErrors("const x = a < b != c;", "error@16: comparison operators cannot be chained\n");
+    try expectNoErrors("const x = a == b and c != d;\nconst y = (a == b) == c;\nconst z = a + b == c * d;\n");
+}
+
+test "recovery: the bit-range align form is only allowed on single-item pointers" {
+    // `zig ast-check`: `expected ')', found ':'` outside pointer types, `bit range only allowed on
+    // single item pointers` on many-item pointers and slices
+    try expectErrors("const S = struct { x: u3 align(1:0:3) };", "error@32: expected ')'\n");
+    try expectErrors("const g: u32 align(1:0:3) = 1;", "error@20: expected ')'\n");
+    try expectErrors("fn f() align(1:0:3) void {}", "error@14: expected ')'\n");
+    try expectErrors("const p: []align(1:0:3) u8 = undefined;", "error@18: bit range only allowed on single item pointers\n");
+    try expectErrors("const p: [*]align(1:0:3) u8 = undefined;", "error@19: bit range only allowed on single item pointers\n");
+    try expectErrors("const p: [*c]align(1:0:3) u8 = undefined;", "error@20: bit range only allowed on single item pointers\n");
+    try expectNoErrors("const q: *align(1:0:3) u8 = undefined;\nconst r: *const align(1:0:3) u8 = undefined;\n");
+    // The rejected bit range is not part of the align clause
+    try expectTree("const g: u32 align(1:0:3) = 1;",
+        \\source_file@0..30
+        \\  var_decl@0..30
+        \\    keyword_const "const"
+        \\    identifier "g"
+        \\    colon ":"
+        \\    name_ref@9..12
+        \\      identifier "u32"
+        \\    align_clause@13..25
+        \\      keyword_align "align"
+        \\      l_paren "("
+        \\      literal@19..20
+        \\        number_literal "1"
+        \\      error_node@20..24
+        \\        colon ":"
+        \\        literal@21..22
+        \\          number_literal "0"
+        \\        colon ":"
+        \\        literal@23..24
+        \\          number_literal "3"
+        \\      r_paren ")"
+        \\    equal "="
+        \\    literal@28..29
+        \\      number_literal "1"
+        \\    semicolon ";"
+        \\error@20: expected ')'
+        \\
+    );
+}
+
+test "recovery: inline and noinline only precede a function" {
+    // `zig ast-check`: `expected function, found 'var'`; the declaration is not indexed
+    try expectTree("inline var x: u32 = 1;",
+        \\source_file@0..22
+        \\  error_node@0..22
+        \\    keyword_inline "inline"
+        \\    keyword_var "var"
+        \\    identifier "x"
+        \\    colon ":"
+        \\    name_ref@14..17
+        \\      identifier "u32"
+        \\    equal "="
+        \\    literal@20..21
+        \\      number_literal "1"
+        \\    semicolon ";"
+        \\error@7: expected function
+        \\
+    );
+    try expectErrors("pub noinline const y = 1;", "error@13: expected function\n");
+    try expectNoErrors("export var x: u32 = 1;\npub inline fn f() void {}\nnoinline fn g() void {}\n");
 }
 
 /// Depth of the syntax tree (computed iteratively)

@@ -132,7 +132,11 @@ fn decl(p: *Parser, m: Marker) Error!void {
             try p.bump();
             _ = try p.eat(.string_literal);
         },
-        .keyword_export, .keyword_inline, .keyword_noinline => try p.bump(),
+        .keyword_export => try p.bump(),
+        .keyword_inline, .keyword_noinline => {
+            try p.bump();
+            if (!p.at(.keyword_fn)) return notFnDecl(p, m);
+        },
         else => {},
     }
     if (p.at(.keyword_fn)) {
@@ -157,6 +161,19 @@ fn decl(p: *Parser, m: Marker) Error!void {
     _ = try m.complete(p, .error_node);
 }
 
+/// After `inline` / `noinline`, which only precede a function: a variable declaration that
+/// follows is parsed into an `error_node`, so it declares nothing
+fn notFnDecl(p: *Parser, m: Marker) Error!void {
+    try p.err("expected function");
+    _ = try p.eat(.keyword_threadlocal);
+    if (p.at(.keyword_const) or p.at(.keyword_var)) {
+        try varDeclProto(p);
+        try varDeclInit(p);
+        _ = try p.expect(.semicolon);
+    }
+    _ = try m.complete(p, .error_node);
+}
+
 /// `(const|var) name [: Type] [align] [addrspace] [linksection]`;
 /// the current token must be const/var.
 fn varDeclProto(p: *Parser) Error!void {
@@ -165,7 +182,7 @@ fn varDeclProto(p: *Parser) Error!void {
     if (try p.eat(.colon)) {
         if (try typeExpr(p) == null) try p.err("expected type");
     }
-    _ = try byteAlign(p);
+    _ = try byteAlign(p, .byte);
     _ = try clause(p, .keyword_addrspace, .addrspace_clause);
     _ = try clause(p, .keyword_linksection, .linksection_clause);
 }
@@ -185,7 +202,7 @@ fn containerField(p: *Parser, m: Marker) Error!void {
         try p.bump();
     }
     if (try typeExpr(p) == null) try p.err("expected field type");
-    _ = try byteAlign(p);
+    _ = try byteAlign(p, .byte);
     if (try p.eat(.equal)) {
         if (try expr(p) == null) try p.err("expected expression");
     }
@@ -197,7 +214,7 @@ fn fnProto(p: *Parser) Error!CompletedMarker {
     try p.bump(); // fn
     _ = try p.eat(.identifier);
     try paramList(p);
-    _ = try byteAlign(p);
+    _ = try byteAlign(p, .byte);
     _ = try clause(p, .keyword_addrspace, .addrspace_clause);
     _ = try clause(p, .keyword_linksection, .linksection_clause);
     _ = try clause(p, .keyword_callconv, .callconv_clause);
@@ -294,17 +311,41 @@ fn param(p: *Parser) Error!void {
     _ = try m.complete(p, .param);
 }
 
-/// `align(expr)` or the bit-field form `align(expr:expr:expr)`
-fn byteAlign(p: *Parser) Error!CM {
+/// Where an align clause is, which decides whether the bit-range form `align(a:b:c)` is allowed
+const AlignSite = enum {
+    /// Declarations, fields and functions: only `align(a)`
+    byte,
+    /// Single-item pointer types
+    single_ptr,
+    /// Many-item pointer and slice types: the bit range is parsed but rejected
+    multi_ptr,
+};
+
+/// `align(expr)`, or `align(expr:expr:expr)` on a single-item pointer; a rejected bit range is
+/// wrapped in an `error_node`
+fn byteAlign(p: *Parser, site: AlignSite) Error!CM {
     if (!p.at(.keyword_align)) return null;
     const m = try p.start();
     try p.bump();
     _ = try p.expect(.l_paren);
     if (try expr(p) == null) try p.err("expected expression");
-    if (try p.eat(.colon)) {
+    if (p.at(.colon)) {
+        const e: ?Marker = switch (site) {
+            .single_ptr => null,
+            .byte => blk: {
+                try p.err("expected ')'");
+                break :blk try p.start();
+            },
+            .multi_ptr => blk: {
+                try p.err("bit range only allowed on single item pointers");
+                break :blk try p.start();
+            },
+        };
+        try p.bump();
         if (try expr(p) == null) try p.err("expected expression");
         _ = try p.expect(.colon);
         if (try expr(p) == null) try p.err("expected expression");
+        if (e) |em| _ = try em.complete(p, .error_node);
     }
     _ = try p.expect(.r_paren);
     return try m.complete(p, .align_clause);
@@ -574,7 +615,7 @@ fn ifExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
     _ = try p.expect(.l_paren);
     if (try expr(p) == null) try p.err("expected condition expression");
     _ = try p.expect(.r_paren);
-    try optPayload(p);
+    try optPayload(p, .ptr);
     try bodyAndElse(p, form, true);
     return m.complete(p, .if_expr);
 }
@@ -584,7 +625,7 @@ fn whileExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
     _ = try p.expect(.l_paren);
     if (try expr(p) == null) try p.err("expected condition expression");
     _ = try p.expect(.r_paren);
-    try optPayload(p);
+    try optPayload(p, .ptr);
     if (p.at(.colon)) {
         const cm = try p.start();
         try p.bump();
@@ -600,7 +641,7 @@ fn whileExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
 fn forExpr(p: *Parser, m: Marker, form: Form) Error!CompletedMarker {
     try p.bump(); // for
     try forInputs(p);
-    if (p.at(.pipe)) try optPayload(p) else try p.err("expected loop capture");
+    if (p.at(.pipe)) try optPayload(p, .list) else try p.err("expected loop capture");
     try bodyAndElse(p, form, false);
     return m.complete(p, .for_expr);
 }
@@ -697,7 +738,7 @@ fn elseClause(p: *Parser, form: Form, allow_payload: bool, required: bool) Error
     }
     const m = try p.start();
     try p.bump();
-    if (allow_payload) try optPayload(p);
+    if (allow_payload) try optPayload(p, .plain);
     switch (form) {
         .statement => try statement(p, false),
         .expr => if (try expr(p) == null) try p.err("expected expression"),
@@ -706,16 +747,50 @@ fn elseClause(p: *Parser, form: Form, allow_payload: bool, required: bool) Error
     _ = try m.complete(p, .else_clause);
 }
 
-/// `|x|`, `|*x|`, `|x, i|`, `|*a, b, c|`: all forms are accepted uniformly.
-fn optPayload(p: *Parser) Error!void {
+/// The capture forms of each construct, as in `std.zig.Parse`
+const PayloadForm = enum {
+    /// `catch` and `else`: `|x|`
+    plain,
+    /// `if` and `while`: `|x|` or `|*x|`
+    ptr,
+    /// Switch prong: `|x|`, `|*x|` or `|*x, i|`
+    ptr_index,
+    /// `for`: `|*a, b, c|`, a trailing comma allowed
+    list,
+};
+
+/// A capture of `form`; a `*` or extra captures the form does not allow are reported and
+/// wrapped in an `error_node`, so they bind nothing.
+fn optPayload(p: *Parser, form: PayloadForm) Error!void {
     if (!p.at(.pipe)) return;
     const m = try p.start();
     try p.bump();
-    while (true) {
-        _ = try p.eat(.asterisk);
+    const max_captures: usize = switch (form) {
+        .plain, .ptr => 1,
+        .ptr_index => 2,
+        .list => std.math.maxInt(usize),
+    };
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        if (p.at(.asterisk)) {
+            const ptr_allowed = switch (form) {
+                .plain => false,
+                .ptr, .list => true,
+                .ptr_index => index == 0,
+            };
+            if (ptr_allowed) try p.bump() else try p.errBump("expected identifier");
+        }
         _ = try p.expect(.identifier);
-        if (!try p.eat(.comma)) break;
-        if (p.at(.pipe)) break;
+        if (!p.at(.comma)) break;
+        if (index + 1 == max_captures) {
+            try p.err("expected '|'");
+            const e = try p.start();
+            while (p.at(.comma) or p.at(.asterisk) or p.at(.identifier)) try p.bump();
+            _ = try e.complete(p, .error_node);
+            break;
+        }
+        try p.bump();
+        if (form == .list and p.at(.pipe)) break;
     }
     _ = try p.expect(.pipe);
     _ = try m.complete(p, .payload);
@@ -783,7 +858,7 @@ fn switchProng(p: *Parser) Error!void {
         _ = try m.complete(p, .switch_prong);
         return;
     }
-    try optPayload(p);
+    try optPayload(p, .ptr_index);
     if (try singleAssignExpr(p) == null) try p.err("expected expression");
     _ = try m.complete(p, .switch_prong);
 }
@@ -845,7 +920,7 @@ fn binaryPrec(kind: SyntaxKind) ?u8 {
     return switch (kind) {
         .keyword_or => 10,
         .keyword_and => 20,
-        .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => 30,
+        .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => comparison_prec,
         .ampersand, .caret, .pipe, .keyword_orelse, .keyword_catch => 40,
         .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_left_pipe, .angle_bracket_angle_bracket_right => 50,
         .plus, .minus, .plus_plus, .plus_percent, .minus_percent, .plus_pipe, .minus_pipe => 60,
@@ -854,15 +929,24 @@ fn binaryPrec(kind: SyntaxKind) ?u8 {
     };
 }
 
+/// Precedence of the comparison operators, which do not associate
+const comparison_prec = 30;
+
 fn exprPrec(p: *Parser, min_prec: u8) Error!CM {
     var lhs = try prefixExpr(p) orelse return null;
+    var compared = false;
     while (true) {
         const op = p.peek();
         const prec = binaryPrec(op) orelse break;
         if (prec < min_prec) break;
+        if (prec == comparison_prec) {
+            // As in `std.zig.Parse`, a second comparison at the same level is an error
+            if (compared) try p.err("comparison operators cannot be chained");
+            compared = true;
+        }
         const m = try lhs.precede(p);
         try p.bump();
-        if (op == .keyword_catch) try optPayload(p);
+        if (op == .keyword_catch) try optPayload(p, .plain);
         if (try exprPrec(p, prec + 1) == null) try p.err("expected expression");
         lhs = try m.complete(p, .binary_expr);
     }
@@ -990,7 +1074,7 @@ fn typeExpr(p: *Parser) Error!CM {
         .asterisk => {
             const m = try p.start();
             try p.bump();
-            try ptrModifiers(p);
+            try ptrModifiers(p, .single_ptr);
             if (try typeExpr(p) == null) try p.err("expected type expression");
             return try m.complete(p, .ptr_type);
         },
@@ -1005,14 +1089,14 @@ fn typeExpr(p: *Parser) Error!CM {
                     try sentinel(p);
                 }
                 _ = try p.expect(.r_bracket);
-                try ptrModifiers(p);
+                try ptrModifiers(p, .multi_ptr);
                 if (try typeExpr(p) == null) try p.err("expected type expression");
                 return try m.complete(p, .ptr_type);
             }
             const has_len = try expr(p) != null;
             if (p.at(.colon)) try sentinel(p);
             _ = try p.expect(.r_bracket);
-            if (!has_len) try ptrModifiers(p);
+            if (!has_len) try ptrModifiers(p, .multi_ptr);
             if (try typeExpr(p) == null) try p.err("expected type expression");
             return try m.complete(p, if (has_len) .array_type else .slice_type);
         },
@@ -1035,9 +1119,9 @@ fn sentinel(p: *Parser) Error!void {
     _ = try m.complete(p, .sentinel);
 }
 
-fn ptrModifiers(p: *Parser) Error!void {
+fn ptrModifiers(p: *Parser, align_site: AlignSite) Error!void {
     while (true) switch (p.peek()) {
-        .keyword_align => _ = try byteAlign(p),
+        .keyword_align => _ = try byteAlign(p, align_site),
         .keyword_addrspace => _ = try clause(p, .keyword_addrspace, .addrspace_clause),
         .keyword_allowzero, .keyword_const, .keyword_volatile => try p.bump(),
         else => return,
