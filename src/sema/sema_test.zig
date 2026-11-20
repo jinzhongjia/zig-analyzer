@@ -13395,6 +13395,55 @@ test "operands of comparisons and arithmetic have no result type" {
     });
 }
 
+test "comptime calls through function pointers" {
+    try expectTypes(
+        \\fn ftarget() u8 {
+        \\    return 4;
+        \\}
+        \\fn add(a: u8, b: u8) u8 {
+        \\    return a + b;
+        \\}
+        \\const VTable = struct { get: *const fn () u8 };
+        \\const vt: VTable = .{ .get = &ftarget };
+        \\fn direct() u8 {
+        \\    const p: *const fn () u8 = &ftarget;
+        \\    return p();
+        \\}
+        \\fn viaCall() u8 {
+        \\    const p: *const fn () u8 = &ftarget;
+        \\    return @call(.auto, p, .{});
+        \\}
+        \\fn viaDeref() u8 {
+        \\    const p: *const fn () u8 = &ftarget;
+        \\    return p.*();
+        \\}
+        \\fn viaOptional() u8 {
+        \\    const op: ?*const fn () u8 = &ftarget;
+        \\    return (op.?)();
+        \\}
+        \\fn withArgs() u8 {
+        \\    const p: *const fn (u8, u8) u8 = &add;
+        \\    return p(2, 3);
+        \\}
+        \\fn viaField() u8 {
+        \\    return vt.get();
+        \\}
+        \\const r_direct = comptime direct();
+        \\const r_call = comptime viaCall();
+        \\const r_deref = comptime viaDeref();
+        \\const r_optional = comptime viaOptional();
+        \\const r_args = comptime withArgs();
+        \\const r_field = comptime viaField();
+    , &.{
+        .{ "r_direct", "u8 = 4" },
+        .{ "r_call", "u8 = 4" },
+        .{ "r_deref", "u8 = 4" },
+        .{ "r_optional", "u8 = 4" },
+        .{ "r_args", "u8 = 5" },
+        .{ "r_field", "u8 = 4" },
+    });
+}
+
 test "comptime pointers made by @ptrFromInt compare by address" {
     try expectTypes(
         \\var g: u8 = 0;
