@@ -288,7 +288,7 @@ pub fn stop(ws: *Workspace) void {
 }
 
 /// Maximum number of automatic restarts after consecutive maker crashes
-const max_crash_restarts = 3;
+pub const max_crash_restarts = 3;
 
 fn destroy(ws: *Workspace) void {
     const gpa = ws.gpa;
