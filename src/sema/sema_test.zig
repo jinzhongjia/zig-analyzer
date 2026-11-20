@@ -8578,6 +8578,64 @@ test "comptime_int remainder with a negative operand and a nonzero remainder giv
     });
 }
 
+test "an integer coerces to a float only when the float represents it exactly" {
+    // A comptime-known integer coerced to a float type was rounded.
+    // Expected values are the results of zig 0.17.1, which rejects the inexact coercions
+    // ("type 'f32' cannot represent integer value") but compares at comptime_float precision.
+    try expectTypes(
+        \\const f32_inexact: f32 = 16777217;
+        \\const f32_exact: f32 = 16777216;
+        \\const f32_neg_inexact: f32 = -16777217;
+        \\const f16_inexact: f16 = 2049;
+        \\const f64_inexact: f64 = 9007199254740993;
+        \\const f32_too_big: f32 = 1 << 128;
+        \\const f32_big_exact: f32 = 1 << 127;
+        \\const ct_inexact: comptime_float = (1 << 200) + 1;
+        \\const ct_exact: comptime_float = 1 << 200;
+        \\const u: u32 = 16777217;
+        \\const typed_inexact: f32 = u;
+        \\const arith_inexact = @as(f32, 1.0) + 16777217;
+        \\const arith_exact = @as(f32, 0.0) + 16777216;
+        \\const arith_ct_inexact = 1.5 + ((1 << 200) + 1);
+        \\const arr_inexact = [_]f32{16777217};
+        \\const cmp_eq = 16777217 == @as(f32, 16777216);
+        \\const cmp_gt = 16777217 > @as(f32, 16777216);
+        \\const cmp_big_eq = ((1 << 200) + 1) == @as(f128, 1 << 200);
+        \\const cmp_big_gt = ((1 << 200) + 1) > @as(f128, 0);
+        \\const float_from_int: f32 = @floatFromInt(16777217);
+        \\fn assign() f32 {
+        \\    var x: f32 = 0;
+        \\    x += 16777217;
+        \\    return x;
+        \\}
+        \\const assign_inexact = comptime assign();
+        \\fn g() void {
+        \\    _ = .{ f32_inexact, f32_exact, f32_neg_inexact, f16_inexact, f64_inexact, f32_too_big, f32_big_exact, ct_inexact, ct_exact, typed_inexact, arith_inexact, arith_exact, arith_ct_inexact, arr_inexact, cmp_eq, cmp_gt, cmp_big_eq, cmp_big_gt, float_from_int, assign_inexact };
+        \\}
+    , &.{
+        .{ "f32_inexact", "f32" },
+        .{ "f32_exact", "f32 = 16777216" },
+        .{ "f32_neg_inexact", "f32" },
+        .{ "f16_inexact", "f16" },
+        .{ "f64_inexact", "f64" },
+        .{ "f32_too_big", "f32" },
+        .{ "f32_big_exact", "f32 = 170141180000000000000000000000000000000" },
+        .{ "ct_inexact", "comptime_float" },
+        .{ "ct_exact", "comptime_float = 1606938044258990275541962092341162600000000000000000000000000" },
+        .{ "typed_inexact", "f32" },
+        .{ "arith_inexact", "f32" },
+        .{ "arith_exact", "f32 = 16777216" },
+        .{ "arith_ct_inexact", "comptime_float" },
+        .{ "arr_inexact", "[1]f32" },
+        .{ "cmp_eq", "bool = false" },
+        .{ "cmp_gt", "bool = true" },
+        .{ "cmp_big_eq", "bool = true" },
+        .{ "cmp_big_gt", "bool = true" },
+        .{ "float_from_int", "f32 = 16777216" },
+        .{ "assign_inexact", "f32" },
+    });
+}
+
 test "builtins on integer types wider than 128 bits" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both)
     try expectTypes(

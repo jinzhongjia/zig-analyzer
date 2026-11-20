@@ -3040,7 +3040,7 @@ const Evaluator = struct {
 
     /// Comparison `lhs op rhs` of evaluated operands. Matching the compiler, the operands are
     /// coerced to their peer type: an enum literal to the other side's enum (by tag name, never
-    /// as a decl literal; a name that is not a tag is a compile error), a comptime number to the
+    /// as a decl literal; a name that is not a tag is a compile error), a comptime_float to the
     /// other side's float type (rounding it), a function body to a pointer to the function
     /// (`functionOperand`). A tagged union compared with a tag keeps the literal as it is. Vectors
     /// are compared element by element.
@@ -4553,12 +4553,14 @@ const Evaluator = struct {
 
     /// Whether a comparison operand of type `t` is coerced to the other operand's type `other` by
     /// peer type resolution: an enum literal compared with an enum (or an optional enum), and a
-    /// comptime number compared with a float
+    /// comptime_float compared with a float
     fn peerOperand(ev: *Evaluator, t: Index, other: Index) bool {
         if (other == .unknown or other == t) return false;
         return switch (t) {
             .enum_literal_type => other != .enum_literal_type and !ev.isUnion(other),
-            .comptime_int_type, .comptime_float_type => ev.ip.isFloat(other),
+            // A comptime_int is compared with a float by value (at comptime_float precision),
+            // without the coercion's exactness requirement
+            .comptime_float_type => ev.ip.isFloat(other),
             else => false,
         };
     }

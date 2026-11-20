@@ -1814,7 +1814,14 @@ pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index 
             else => {},
         };
         const x = floatOf(ip, v) orelse return null;
-        return floatValue(ip, to, x);
+        const r = try floatValue(ip, to, x) orelse return null;
+        // An integer coerces only to a float that represents it exactly (the compiler reports
+        // "type 'f32' cannot represent integer value")
+        switch (ip.key(v)) {
+            .int_value, .big_int => if (!try representsInt(ip, v, r)) return null,
+            else => {},
+        }
+        return r;
     }
     // Floats with integer values (an integer-valued comptime_float can coerce to an integer
     // type)
@@ -1854,6 +1861,22 @@ pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index 
         else => {},
     };
     return v;
+}
+
+/// Whether the float value `f` equals the integer value `v` exactly
+fn representsInt(ip: *InternPool, v: Index, f: Index) Allocator.Error!bool {
+    const x: f128 = @bitCast(ip.key(f).float_value.bits);
+    if (@trunc(x) != x) return false;
+    var arena: std.heap.ArenaAllocator = .init(ip.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fx = try bigint.fromFloat(a, x) orelse return false;
+    const iv: bigint.Big = switch (ip.key(v)) {
+        .int_value => |i| if (isUnsigned128(ip, i.ty)) try bigint.fromUnsigned128(a, @bitCast(i.value)) else try bigint.fromInt(a, i.value),
+        .big_int => |b| .{ .limbs = b.limbs, .positive = b.positive },
+        else => unreachable,
+    };
+    return bigint.eql(fx, iv);
 }
 
 /// `coerceValue` for a value of type `from` (unknown when it is not known): an optional payload
