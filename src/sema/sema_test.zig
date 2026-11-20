@@ -2101,6 +2101,35 @@ test "a null C pointer coerced to an optional pointer is not null" {
     });
 }
 
+test "a non-null optional holding a null pointer is shown by its address" {
+    // A non-null `?[*c]T` holding a null C pointer was shown as `null`, like the optional's own
+    // null. Expected values are the results of zig 0.17.1, which prints the payload as
+    // `@ptrFromInt(0x0)`.
+    try expectTypes(
+        \\const c_null: [*c]const u8 = null;
+        \\const oc: ?[*c]const u8 = c_null;
+        \\const oc_is_null = oc == null;
+        \\const a: ?*const u8 = null;
+        \\const b: ?[*c]const u8 = a;
+        \\const p: ?*const u8 = null;
+        \\const q: ?*allowzero const u8 = p;
+        \\const arr = [1]?[*c]const u8{c_null};
+        \\const none: ?[*c]const u8 = null;
+        \\const inner: ?u8 = null;
+        \\const oo: ??u8 = inner;
+    , &.{
+        .{ "c_null", "[*c]const u8 = null" },
+        .{ "oc", "?[*c]const u8 = @ptrFromInt(0x0)" },
+        .{ "oc_is_null", "bool = false" },
+        .{ "b", "?[*c]const u8 = @ptrFromInt(0x0)" },
+        .{ "q", "?*allowzero const u8 = @ptrFromInt(0x0)" },
+        .{ "arr", "[1]?[*c]const u8 = .{ @ptrFromInt(0x0) }" },
+        .{ "none", "?[*c]const u8 = null" },
+        // The compiler prints a `??u8` holding a null `?u8` as `null` too
+        .{ "oo", "??u8 = null" },
+    });
+}
+
 test "comptime name builtins produce string literal types" {
     try expectTypes(
         \\const U = union(enum) { a: u8, b: u16 };
