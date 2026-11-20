@@ -88,7 +88,22 @@ pub const Result = struct {
     /// with `take(o: ?u8)` is `u8` (the compiler adds a separate coercion to `?u8`), `.red` coerced
     /// to `?Color` is a `Color`. `exprs` holds the coerced values.
     uncoerced: []const Uncoerced = &.{},
+    /// The exits of the `defer` / `errdefer` bodies that the compiler analyzes with different
+    /// `comptime var` values: one per group of exits reaching the body with the same values, its
+    /// first exit (see `LoopSeed.exit`), in exit order. Absent for a body whose exits all have the
+    /// same values. Here the body is inferred with the values the exits share, the others unknown.
+    defer_exits: []const DeferExit = &.{},
 
+    pub const DeferExit = struct {
+        /// The `defer` / `errdefer` body
+        body: ExprId,
+        /// `LoopSeed.index` of the exit seed
+        index: u32,
+        /// Position of the exit relative to the owner: the `return`, `break`, `continue` or `try`,
+        /// or the end of the block when `fall_through`
+        at: u32,
+        fall_through: bool,
+    };
     pub const Uncoerced = struct { expr: ExprId, tv: TypedValue };
     pub const LiteralExpected = struct {
         expr: ExprId,
@@ -118,7 +133,7 @@ pub const Result = struct {
     }
 
     pub fn eql(a: *const Result, b: *const Result) bool {
-        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.unknown_expected, b.unknown_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans) and deepEql(a.param_coercions, b.param_coercions) and deepEql(a.iteration_vars, b.iteration_vars) and deepEql(a.zon_imports, b.zon_imports) and deepEql(a.uncoerced, b.uncoerced);
+        return deepEql(a.exprs, b.exprs) and deepEql(a.bindings, b.bindings) and deepEql(a.members, b.members) and deepEql(a.ret, b.ret) and deepEql(a.field_refs, b.field_refs) and deepEql(a.literal_expected, b.literal_expected) and deepEql(a.unknown_expected, b.unknown_expected) and deepEql(a.inactive, b.inactive) and deepEql(a.dead_spans, b.dead_spans) and deepEql(a.param_coercions, b.param_coercions) and deepEql(a.iteration_vars, b.iteration_vars) and deepEql(a.zon_imports, b.zon_imports) and deepEql(a.uncoerced, b.uncoerced) and deepEql(a.defer_exits, b.defer_exits);
     }
 
     pub fn deinit(r: *Result, gpa: Allocator) void {
@@ -152,7 +167,30 @@ pub const Mode = enum {
 /// a value only in each unrolled iteration), see `Inferrer.iterationOf`. The seed still keeps
 /// the inference apart from the member's own one, which is in progress when a container in the
 /// loop body reads a loop variable.
-pub const LoopSeed = struct { binding: u32, index: u32 };
+///
+/// An exit seed (see `exit`) infers the body of a `defer` / `errdefer` statement at one exit of
+/// its block: the compiler analyzes the body once per exit that runs it, each with the
+/// `comptime var` values of that exit. `index` counts the exits that run the body, in inference
+/// order (see `Result.defer_exits`). The inference stops once the body has been inferred there.
+pub const LoopSeed = struct {
+    binding: u32,
+    index: u32,
+
+    /// Set in `binding` of an exit seed; loop variables and prong captures are binding ids, which
+    /// never have it
+    const exit_flag: u32 = 1 << 31;
+
+    /// The seed inferring the `defer` / `errdefer` body `body` at its `index`-th exit
+    pub fn exit(body: ExprId, index: u32) LoopSeed {
+        return .{ .binding = exit_flag | @backingInt(body), .index = index };
+    }
+
+    /// The `defer` / `errdefer` body of an exit seed; null for a loop or prong seed
+    pub fn deferBody(s: LoopSeed) ?ExprId {
+        if (s.binding & exit_flag == 0) return null;
+        return @fromBackingInt(s.binding & ~exit_flag);
+    }
+};
 
 /// The instance that carries the seeds `seeds` (outermost first) of member `owner` on top of
 /// `inst`, its instance without iteration: each seed wraps the previous instance in an iteration
@@ -223,7 +261,8 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
     const iteration_vars = try a.dupe(Result.IterationVar, inf.iteration_vars.items);
     const zon_imports = try a.dupe(Result.ZonImport, inf.zon_imports.items);
     const uncoerced = try a.dupe(Result.Uncoerced, inf.uncoerced.items);
-    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .unknown_expected = unknown_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions, .iteration_vars = iteration_vars, .zon_imports = zon_imports, .uncoerced = uncoerced };
+    const defer_exits = try a.dupe(Result.DeferExit, inf.defer_exits.items);
+    return .{ .arena = arena.state, .exprs = inf.exprs, .bindings = inf.bindings, .members = inf.members, .ret = ret, .field_refs = field_refs, .literal_expected = literal_expected, .unknown_expected = unknown_expected, .inactive = inactive, .dead_spans = dead_spans, .param_coercions = param_coercions, .iteration_vars = iteration_vars, .zon_imports = zon_imports, .uncoerced = uncoerced, .defer_exits = defer_exits };
 }
 
 /// Infers only one local binding or comptime expression in the member `owner` (see
@@ -378,6 +417,8 @@ const Inferrer = struct {
     /// compiler runs their bodies when leaving the block, so `block` infers them there (see
     /// `runDefers`)
     pending_defers: std.ArrayList(PendingDefer) = .empty,
+    /// See `Result.defer_exits`
+    defer_exits: std.ArrayList(Result.DeferExit) = .empty,
     /// Inference mode (used to get the previous iteration's result in per-iteration inference)
     mode: Mode = .full,
     /// The owner is the root expression of a `.zon` file: values are converted to the result type
@@ -414,6 +455,9 @@ const Inferrer = struct {
         /// The break value expressions: enum literals among them take the peer type (see
         /// `peerLiteral`)
         exprs: std.ArrayList(ExprId) = .empty,
+        /// `pending_defers` when the frame was entered: a jump to it leaves the blocks of the
+        /// defers registered after
+        defers_start: usize = 0,
     };
 
     /// The break `expr` (with the value `value`), recorded at `pos` in `types` and `values` of the
@@ -1105,7 +1149,7 @@ const Inferrer = struct {
             },
             .builtin_call => |bc| return inf.builtin(e, bc.name, bc.args, expected),
             .call => |c| return inf.call(c.callee, c.args, expected),
-            .block => |blk| return inf.block(blk, expected),
+            .block => |blk| return inf.block(blk, e, expected),
             .@"if" => |x| {
                 const cond = try inf.infer(x.cond, null);
                 try inf.bindCaptures(x.capture, x.cond, cond, .if_then);
@@ -1155,7 +1199,7 @@ const Inferrer = struct {
                 // comptime-known operand: only the matching prong executes. `continue :label`
                 // jumps to other prongs, so no prong is chosen when it is present.
                 const chosen = if (label != null and inf.continuesTo(label.?)) null else try inf.chooseProng(s.prongs, operand);
-                if (label) |name| try inf.labels.append(inf.scratch, .{ .name = name, .is_loop = false, .expected = expected });
+                if (label) |name| try inf.labels.append(inf.scratch, .{ .name = name, .is_loop = false, .expected = expected, .defers_start = inf.pending_defers.items.len });
                 var values: std.ArrayList(TypedValue) = .empty;
                 var chosen_tv: TypedValue = .unknown;
                 if (chosen == null) inf.uncertain += 1;
@@ -1209,7 +1253,7 @@ const Inferrer = struct {
                 return .{ .ty = try inf.peer(&.{ payload, rhs.ty }) };
             },
             .binary => |bin| return inf.binary(e, bin.op, bin.lhs, bin.rhs, expected),
-            .prefix => |p| return inf.prefix(p.op, p.operand, expected),
+            .prefix => |p| return inf.prefix(e, p.op, p.operand, expected),
             .assign => |a| {
                 const lhs = try inf.infer(a.lhs, null);
                 if (lhs.ty == .unknown) try inf.noteUnknownResult(a.rhs);
@@ -1289,6 +1333,7 @@ const Inferrer = struct {
             .@"return" => |v| {
                 const ret: TypedValue = if (v) |x| try inf.infer(x, inf.ret_type) else .{ .ty = .void_type };
                 if (inf.dead == 0) try inf.returns.append(inf.scratch, ret);
+                try inf.exitReached(0, inf.mayBeError(ret), inf.body.range(e).start);
                 return .{ .ty = .noreturn_type };
             },
             .@"break" => |br| {
@@ -1304,12 +1349,14 @@ const Inferrer = struct {
                     try frame.values.append(inf.scratch, brk);
                     if (br.value) |v| try frame.exprs.append(inf.scratch, v);
                 };
+                if (frame_index) |fi| try inf.exitReached(inf.labels.items[fi].defers_start, false, inf.body.range(e).start);
                 return .{ .ty = .noreturn_type };
             },
             .@"continue" => |c| {
                 // `continue :l value` of a labeled switch: the value is inferred with the type
                 // of the switch operand
                 if (c.value) |v| _ = try inf.infer(v, if (c.label) |l| inf.switchOperandType(e, l) else null);
+                if (inf.labelFrame(c.label)) |fi| try inf.exitReached(inf.labels.items[fi].defers_start, false, inf.body.range(e).start);
                 return .{ .ty = .noreturn_type };
             },
             .@"comptime" => |x| return inf.inferComptime(x, expected),
@@ -2462,8 +2509,8 @@ const Inferrer = struct {
 
     // ── Blocks and control flow ──────────────────────────────────────
 
-    fn block(inf: *Inferrer, blk: Body.Block, expected: ?Index) Error!TypedValue {
-        try inf.labels.append(inf.scratch, .{ .name = blk.label, .is_loop = false, .expected = expected });
+    fn block(inf: *Inferrer, blk: Body.Block, e: ExprId, expected: ?Index) Error!TypedValue {
+        try inf.labels.append(inf.scratch, .{ .name = blk.label, .is_loop = false, .expected = expected, .defers_start = inf.pending_defers.items.len });
         const defers_start = inf.pending_defers.items.len;
         var last: Index = .void_type;
         var dead_rest = false;
@@ -2476,7 +2523,9 @@ const Inferrer = struct {
             }
         }
         if (dead_rest) inf.dead -= 1;
-        try inf.runDefers(defers_start);
+        // Reaching the end of the block is an exit too; its position is the closing brace
+        const fall_through = !dead_rest and inf.dead == 0;
+        try inf.runDefers(defers_start, if (fall_through) inf.body.range(e).end -| 1 else null);
         var frame = inf.labels.pop().?;
         if (blk.label != null) {
             // Reaching the end of the block yields void
@@ -2517,7 +2566,13 @@ const Inferrer = struct {
                 // A statement that does not execute registers nothing (see `runDefers`)
                 if (inf.dead > 0) {
                     _ = try inf.infer(e, null);
-                } else try inf.pending_defers.append(inf.scratch, .{ .body = e, .on_error = s.kind == .@"errdefer" });
+                } else {
+                    var reads: std.ArrayList(Body.BindingId) = .empty;
+                    try inf.comptimeVarReads(e, &reads);
+                    var writes: std.ArrayList(Body.BindingId) = .empty;
+                    _ = try inf.outerComptimeVars(e, &writes);
+                    try inf.pending_defers.append(inf.scratch, .{ .body = e, .on_error = s.kind == .@"errdefer", .reads = reads.items, .writes = writes.items });
+                }
                 return .void_type;
             },
             .destructure => |d| {
@@ -2550,33 +2605,157 @@ const Inferrer = struct {
     }
 
     /// A `defer` or `errdefer` statement whose block has been reached
-    const PendingDefer = struct { body: ExprId, on_error: bool };
+    const PendingDefer = struct {
+        body: ExprId,
+        on_error: bool,
+        /// The `comptime var`s declared outside the body that it reads (see `comptimeVarReads`)
+        reads: []const Body.BindingId,
+        /// The `comptime var`s declared outside the body that it assigns (see
+        /// `outerComptimeVars`)
+        writes: []const Body.BindingId,
+        /// The exits reached so far that run the body, in inference order
+        exits: std.ArrayList(ExitState) = .empty,
+    };
+
+    /// An exit that runs a defer body, with the values of the body's `reads` there
+    const ExitState = struct {
+        at: u32,
+        fall_through: bool,
+        /// Parallel to `PendingDefer.reads`. Null when the value is unknown.
+        vals: []const ?Index,
+        /// Parallel to `PendingDefer.reads`: a defer that runs earlier at this exit assigns the
+        /// variable, so its value at the body is not the one recorded
+        tainted: []const bool,
+
+        fn same(a: ExitState, b: ExitState) bool {
+            for (a.vals, b.vals, a.tainted, b.tainted) |x, y, tx, ty| if (tx or ty or x != y) return false;
+            return true;
+        }
+    };
+
+    /// The value of a `return` or of the operand of `try` may be an error: the exit runs the
+    /// errdefers. A value whose error union type is not known runs none (the errdefer bodies are
+    /// still inferred, see `runDefers`).
+    fn mayBeError(inf: *const Inferrer, tv: TypedValue) bool {
+        if (tv.val) |v| return inf.ip.key(v) == .error_value;
+        return inf.ip.key(tv.ty) == .error_union_type or isErrorSet(inf.ip, tv.ty);
+    }
+
+    /// The exit seed of this inference is the `index`-th exit of the defer body `body`
+    fn exitSeeded(inf: *const Inferrer, body: ExprId, index: u32) bool {
+        for (inf.seeds) |s| if (s.deferBody() == body and s.index == index) return true;
+        return false;
+    }
+
+    /// A `return`, `break`, `continue` or `try` at `at` reached: it leaves the blocks of the
+    /// defers registered from `from` on, running their bodies innermost first (the errdefers
+    /// only when `failing`). Each body records the exit with the values it reads there. When
+    /// this inference is the exit seed of one of them at this exit (see `LoopSeed.exit`), the
+    /// bodies are inferred here as the compiler runs them, and the inference stops.
+    fn exitReached(inf: *Inferrer, from: usize, failing: bool, at: u32) Error!void {
+        if (inf.dead > 0 or inf.stopped) return;
+        const pending = inf.pending_defers.items[from..];
+        var i = pending.len;
+        while (i > 0) {
+            i -= 1;
+            const d = &pending[i];
+            if (d.on_error and !failing) continue;
+            if (inf.exitSeeded(d.body, @intCast(d.exits.items.len))) {
+                // Inferring a body can grow `pending_defers` (blocks with defers in it): index it
+                // anew for each body
+                var j = inf.pending_defers.items.len;
+                while (j > from + i) {
+                    j -= 1;
+                    const runs = inf.pending_defers.items[j];
+                    if (runs.on_error and !failing) continue;
+                    _ = try inf.infer(runs.body, null);
+                }
+                inf.stopped = true;
+                return;
+            }
+            const vals = try inf.scratch.alloc(?Index, d.reads.len);
+            const tainted = try inf.scratch.alloc(bool, d.reads.len);
+            for (d.reads, vals, tainted) |v, *val, *t| {
+                val.* = inf.bindings[@backingInt(v)].val;
+                t.* = for (pending[i + 1 ..]) |earlier| {
+                    if (earlier.on_error and !failing) continue;
+                    if (std.mem.indexOfScalar(Body.BindingId, earlier.writes, v) != null) break true;
+                } else false;
+            }
+            try d.exits.append(inf.scratch, .{ .at = at, .fall_through = false, .vals = vals, .tainted = tainted });
+        }
+    }
 
     /// Leaving a block: infers the bodies of its `defer` / `errdefer` statements registered from
-    /// `start` on, in reverse order, as the compiler runs them at every exit of the block. A
-    /// `return`, `break` or `continue` that leaves the block has already been inferred, so the
-    /// bodies see the `comptime var` values at the end of the block; each body has one result,
-    /// that of the exit reached by falling through. An `errdefer` runs only when the function
-    /// returns an error, after which the function's `comptime var`s are not read: its body is
-    /// inferred as at an error return here, and the `comptime var`s it assigns keep the values
-    /// they had before it.
-    fn runDefers(inf: *Inferrer, start: usize) Error!void {
+    /// `start` on, in reverse order, as the compiler runs them at every exit of the block. The
+    /// end of the block at `fall_through` is reached (null when the block does not end there); it
+    /// runs the defers, with the `comptime var` values as the defers run before have left them.
+    /// The `return`, `break`, `continue` and `try` that leave the block have recorded their exits
+    /// (see `exitReached`). A body read the same values at all its exits is inferred with them;
+    /// when they differ, the differing ones are unknown here and each group of exits with the
+    /// same values is inferred by an exit seed (see `Result.defer_exits`). Only the end of the
+    /// block continues after it: a `comptime var` the body does not assign keeps its value there,
+    /// one it assigns takes the result of the body. An `errdefer` runs only when the function
+    /// returns an error, after which the function's `comptime var`s are not read: the
+    /// `comptime var`s it assigns keep the values they had before it. A body that no exit runs
+    /// is still inferred, with the values here.
+    fn runDefers(inf: *Inferrer, start: usize, fall_through: ?u32) Error!void {
         var i = inf.pending_defers.items.len;
         while (i > start) {
             i -= 1;
-            const d = inf.pending_defers.items[i];
-            if (!d.on_error) {
-                _ = try inf.infer(d.body, null);
-                continue;
-            }
-            var vars: std.ArrayList(Body.BindingId) = .empty;
-            _ = try inf.outerComptimeVars(d.body, &vars);
-            const saved = try inf.scratch.alloc(?Index, vars.items.len);
-            for (vars.items, saved) |v, *old| old.* = inf.bindings[@backingInt(v)].val;
-            _ = try inf.infer(d.body, null);
-            for (vars.items, saved) |v, old| inf.bindings[@backingInt(v)].val = old;
+            const d = &inf.pending_defers.items[i];
+            if (fall_through) |at| if (!d.on_error and !inf.stopped) {
+                if (inf.exitSeeded(d.body, @intCast(d.exits.items.len))) {
+                    _ = try inf.infer(d.body, null);
+                    inf.stopped = true;
+                    break;
+                }
+                const vals = try inf.scratch.alloc(?Index, d.reads.len);
+                for (d.reads, vals) |v, *val| val.* = inf.bindings[@backingInt(v)].val;
+                const tainted = try inf.scratch.alloc(bool, d.reads.len);
+                @memset(tainted, false);
+                try d.exits.append(inf.scratch, .{ .at = at, .fall_through = true, .vals = vals, .tainted = tainted });
+            };
+            try inf.inferDeferBody(d.*);
         }
         inf.pending_defers.shrinkRetainingCapacity(start);
+    }
+
+    /// Infers the body of the pending defer `d` with the values its exits share (see
+    /// `runDefers`)
+    fn inferDeferBody(inf: *Inferrer, d: PendingDefer) Error!void {
+        const exits = d.exits.items;
+        // The first exit of each group of exits with the same values
+        var firsts: std.ArrayList(usize) = .empty;
+        for (exits, 0..) |x, k| {
+            for (firsts.items) |f| {
+                if (exits[f].same(x)) break;
+            } else try firsts.append(inf.scratch, k);
+        }
+        if (firsts.items.len > 1 and inf.dead == 0 and !inf.stopped) for (firsts.items) |k| {
+            try inf.defer_exits.append(inf.scratch, .{ .body = d.body, .index = @intCast(k), .at = exits[k].at, .fall_through = exits[k].fall_through });
+        };
+        const saved_reads = try inf.scratch.alloc(?Index, d.reads.len);
+        for (d.reads, saved_reads, 0..) |v, *old, k| {
+            const slot = &inf.bindings[@backingInt(v)];
+            old.* = slot.val;
+            if (exits.len == 0) continue;
+            slot.val = exits[0].vals[k];
+            for (exits) |x| if (x.tainted[k] or x.vals[k] != exits[0].vals[k]) {
+                slot.val = null;
+                break;
+            };
+        }
+        const saved_writes = try inf.scratch.alloc(?Index, d.writes.len);
+        for (d.writes, saved_writes) |v, *old| old.* = inf.bindings[@backingInt(v)].val;
+        _ = try inf.infer(d.body, null);
+        for (d.reads, saved_reads) |v, old| {
+            if (!d.on_error and std.mem.indexOfScalar(Body.BindingId, d.writes, v) != null) continue;
+            inf.bindings[@backingInt(v)].val = old;
+        }
+        if (d.on_error) for (d.writes, saved_writes) |v, old| {
+            inf.bindings[@backingInt(v)].val = old;
+        };
     }
 
     /// Stores `elem` into the destructure target `x`, which is written like the left-hand side of
@@ -2667,7 +2846,7 @@ const Inferrer = struct {
         // break values and the else branch take the loop's result type
         const outer_frames = inf.labels.items.len;
         const breaks_start = inf.label_breaks.items.len;
-        try inf.labels.append(inf.scratch, .{ .name = l.label, .is_loop = true, .expected = expected });
+        try inf.labels.append(inf.scratch, .{ .name = l.label, .is_loop = true, .expected = expected, .defers_start = inf.pending_defers.items.len });
         _ = try inf.infer(l.body, null);
         var frame = inf.labels.pop().?;
         if (iteration == null) inf.uncertain -= 1;
@@ -2982,6 +3161,19 @@ const Inferrer = struct {
         const list = out orelse return null;
         try list.append(inf.scratch, v);
         return true;
+    }
+
+    /// The `comptime var`s declared outside `e` that names within `e` refer to, each once
+    fn comptimeVarReads(inf: *Inferrer, e: ExprId, out: *std.ArrayList(Body.BindingId)) Error!void {
+        if (inf.var_levels.len == 0) return;
+        const b = inf.body;
+        const range = b.range(e);
+        for (b.exprs, b.expr_ranges, 0..) |x, rg, xi| {
+            if (x != .name_ref or rg.start < range.start or rg.end > range.end) continue;
+            const v = try inf.comptimeVarOf(@fromBackingInt(@as(u32, @intCast(xi)))) orelse continue;
+            if (range.contains(b.binding(v).range.start)) continue;
+            if (std.mem.indexOfScalar(Body.BindingId, out.items, v) == null) try out.append(inf.scratch, v);
+        }
     }
 
     fn assignsOuterComptimeVar(inf: *Inferrer, e: ExprId) Error!bool {
@@ -3474,7 +3666,7 @@ const Inferrer = struct {
         return .{ .ty = ty };
     }
 
-    fn prefix(inf: *Inferrer, op: SyntaxKind, operand_e: ExprId, expected: ?Index) Error!TypedValue {
+    fn prefix(inf: *Inferrer, e: ExprId, op: SyntaxKind, operand_e: ExprId, expected: ?Index) Error!TypedValue {
         const ip = inf.ip;
         switch (op) {
             .keyword_try => {
@@ -3490,6 +3682,8 @@ const Inferrer = struct {
                     try inf.literal_expected.append(inf.scratch, .{ .expr = operand_e, .ty = want });
                 };
                 const v = try inf.infer(operand_e, if (decl_call) expected else null);
+                // An error returns from the function, running every pending defer and errdefer
+                if (inf.mayBeError(v)) try inf.exitReached(0, true, inf.body.range(e).start);
                 const payload, _ = inf.unwrapErrorUnion(v.ty);
                 return .{ .ty = payload };
             },
