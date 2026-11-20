@@ -6893,7 +6893,7 @@ test "concatenation of comptime-known slices gives a pointer to an array" {
         .{ "e", "*const [3:0]u8 = \"yab\"" },
         // The sentinel of a sentinel-terminated slice is kept
         .{ "h", "*const [5:0]u8 = \"xyzab\"" },
-        .{ "j", "*const [3]u8" },
+        .{ "j", "*const [3]u8 = \"abq\"" },
         // A runtime slice has no comptime-known length
         .{ "r", "unknown" },
     });
@@ -7233,8 +7233,49 @@ test "concatenation follows the compiler" {
         .{ "c5", "struct { comptime comptime_int = 1, comptime bool = true, comptime *const [1:0]u8 = \"x\" }" },
         .{ "c6", "[2]u8 = \"\\x01\\x02\"" },
         .{ "c7", "*const [3]u8" },
-        .{ "c8", "[3]u8" },
+        .{ "c8", "[3]u8 = \"\\x01\\x02\\x03\"" },
         .{ "c9", "[2]u16 = .{ 1, 2 }" },
+    });
+}
+
+test "a tuple concatenated with an array takes the array's element type" {
+    // `.{ 1, 2 } ++ [1]u8{3}` built a tuple of mixed field types.
+    // Expected values are the results of zig 0.17.1.
+    try expectTypes(
+        \\const tuple_array = .{ 1, 2 } ++ [1]u8{3};
+        \\const array_tuple = [1]u8{3} ++ .{ 1, 2 };
+        \\const string_array = "ab" ++ [1]u8{'c'};
+        \\const tuple_string = .{ 1, 2 } ++ "ab";
+        \\const string_tuple = "ab" ++ .{ 1, 2 };
+        \\const sentinel_tuple = [2:0]u8{ 1, 2 } ++ .{3};
+        \\const tuple_sentinel = .{3} ++ [2:0]u8{ 1, 2 };
+        \\const tuple_ptr = .{ 1, 2 } ++ &[_]u8{3};
+        \\const empty_tuple = .{} ++ [1]u8{3};
+        \\const typed_fields = .{ @as(u8, 1), @as(u16, 2) } ++ [1]u8{3};
+        \\const tuple_floats = .{1} ++ [1]f32{3};
+        \\const tuple_tuple = .{ 1, 2 } ++ .{3};
+        \\const elem_peer = [1]u8{3} ++ [1]u16{1};
+        \\const bad_field = .{ 1, true } ++ [1]u8{3};
+        \\const bad_range = .{300} ++ [1]u8{3};
+        \\const bad_elems = [1]u8{3} ++ [1]i8{1};
+    , &.{
+        .{ "tuple_array", "[3]u8 = \"\\x01\\x02\\x03\"" },
+        .{ "array_tuple", "[3]u8 = \"\\x03\\x01\\x02\"" },
+        .{ "string_array", "*const [3:0]u8 = \"abc\"" },
+        .{ "tuple_string", "*const [4:0]u8 = \"\\x01\\x02ab\"" },
+        .{ "string_tuple", "*const [4:0]u8 = \"ab\\x01\\x02\"" },
+        .{ "sentinel_tuple", "[3:0]u8 = \"\\x01\\x02\\x03\"" },
+        .{ "tuple_sentinel", "[3:0]u8 = \"\\x03\\x01\\x02\"" },
+        .{ "tuple_ptr", "*const [3]u8 = \"\\x01\\x02\\x03\"" },
+        .{ "empty_tuple", "[1]u8 = \"\\x03\"" },
+        .{ "typed_fields", "[3]u8 = \"\\x01\\x02\\x03\"" },
+        .{ "tuple_floats", "[2]f32 = .{ 1, 3 }" },
+        .{ "tuple_tuple", "struct { comptime comptime_int = 1, comptime comptime_int = 2, comptime comptime_int = 3 } = .{ 1, 2, 3 }" },
+        .{ "elem_peer", "[2]u16 = .{ 3, 1 }" },
+        // The compiler rejects these: `true` and 300 are not u8 values, u8 and i8 have no peer
+        .{ "bad_field", "[3]u8" },
+        .{ "bad_range", "[2]u8" },
+        .{ "bad_elems", "unknown" },
     });
 }
 
