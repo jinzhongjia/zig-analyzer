@@ -136,7 +136,8 @@
     //   .completion = .{
     //       // In name completion, also offer reachable declarations and modules that are not
     //       // imported yet, adding the import when one is accepted, and members of visible
-    //       // namespaces matched by their whole path (`memeql` -> `std.mem.eql`).
+    //       // namespaces matched by their whole path (`memeql` -> `std.mem.eql`). The index for
+    //       // them starts when the first Zig document opens.
     //       .auto_import = true,
     //       // At most this many candidates besides the names in scope (members of local values and
     //       // auto-import candidates) per completion (the best ranked are kept; the list is marked
