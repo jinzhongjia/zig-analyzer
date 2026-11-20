@@ -19,6 +19,7 @@ const Resolver = resolve.Resolver;
 const Def = resolve.Def;
 const ItemTree = @import("../syntax/ItemTree.zig");
 const SyntaxNode = @import("../syntax/tree.zig").SyntaxNode;
+const SyntaxToken = @import("../syntax/tree.zig").SyntaxToken;
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const deepEql = @import("../util/deep_eql.zig").deepEql;
@@ -167,28 +168,84 @@ pub fn errorNameConflict(r: *Resolver, file: FileId, scope: []const FileId, old:
 
 /// First occurrence of the name as a string literal: reflection (`@field(x, "name")`,
 /// `@hasDecl(T, "name")`) and serialization refer to names by string, and renaming cannot update
-/// these strings. Test names (`test "name" {}`) do not count: they describe the test, and no code
-/// can look a declaration up through them
+/// these strings. Literals are compared by their decoded value; the lines of a multiline string
+/// literal are joined the way the compiler joins them. Test names (`test "name" {}`) do not count:
+/// they describe the test, and no code can look a declaration up through them
 pub fn stringReference(r: *Resolver, files: []const FileId, name: []const u8) resolve.Error!?Problem {
-    const quoted = try std.fmt.allocPrint(r.arena, "\"{s}\"", .{name});
     for (files) |f| {
-        const text = (try r.ctx.get(database.syntax.SourceText, f)).text;
-        var from: usize = 0;
-        while (std.mem.indexOfPos(u8, text, from, quoted)) |pos| : (from = pos + 1) {
-            // Skip occurrences in comments and identifiers of the form `@"name"`
-            const root = (try r.ctx.get(database.syntax.ParseFile, f)).rootNode();
-            const tok = root.tokenAtOffset(@intCast(pos)) orelse continue;
-            if (tok.kind != .string_literal or tok.offset != pos or tok.text.len != quoted.len) continue;
-            if (isTestName(root, tok.offset)) continue;
-            return .{
-                .file = f,
-                .offset = @intCast(pos),
-                .message = try std.fmt.allocPrint(r.arena, "`{s}` appears in a string literal, which may refer to it by name (as `@field` and serialization do) and would not be updated", .{name}),
-            };
-        }
+        const root = (try r.ctx.get(database.syntax.ParseFile, f)).rootNode();
+        var scan: StringScan = .{ .root = root, .name = name, .arena = r.arena };
+        try scan.scan(root);
+        try scan.flush();
+        if (scan.found) |offset| return .{
+            .file = f,
+            .offset = offset,
+            .message = try std.fmt.allocPrint(r.arena, "`{s}` appears in a string literal, which may refer to it by name (as `@field` and serialization do) and would not be updated", .{name}),
+        };
     }
     return null;
 }
+
+/// Token scan for a string literal whose decoded value is `name`. Trivia does not end a multiline
+/// literal: the compiler skips whitespace and comments between its lines
+const StringScan = struct {
+    root: SyntaxNode,
+    name: []const u8,
+    arena: Allocator,
+    /// Decoded value of the multiline literal being read
+    multiline: std.ArrayList(u8) = .empty,
+    multiline_start: u32 = 0,
+    in_multiline: bool = false,
+    /// Offset of the first matching literal
+    found: ?u32 = null,
+
+    fn scan(s: *StringScan, node: SyntaxNode) resolve.Error!void {
+        var it = node.children();
+        while (it.next()) |e| {
+            if (s.found != null) return;
+            switch (e) {
+                .token => |t| try s.token(t),
+                .node => |c| try s.scan(c),
+            }
+        }
+    }
+
+    fn token(s: *StringScan, t: SyntaxToken) resolve.Error!void {
+        switch (t.kind) {
+            .whitespace, .line_comment, .unknown => return,
+            .multiline_string_literal_line => {
+                if (s.in_multiline) {
+                    try s.multiline.append(s.arena, '\n');
+                } else {
+                    s.in_multiline = true;
+                    s.multiline_start = t.offset;
+                    s.multiline.clearRetainingCapacity();
+                }
+                // The token starts with `\\`; the rest is the line's contents
+                try s.multiline.appendSlice(s.arena, t.text[2..]);
+                return;
+            },
+            else => {},
+        }
+        try s.flush();
+        if (t.kind != .string_literal or isTestName(s.root, t.offset)) return;
+        if (std.mem.indexOfScalar(u8, t.text, '\\') == null) {
+            if (t.text.len == s.name.len + 2 and std.mem.eql(u8, t.text[1 .. t.text.len - 1], s.name)) s.found = t.offset;
+            return;
+        }
+        const value = std.zig.string_literal.parseAlloc(s.arena, t.text) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidLiteral => return,
+        };
+        if (std.mem.eql(u8, value, s.name)) s.found = t.offset;
+    }
+
+    fn flush(s: *StringScan) resolve.Error!void {
+        if (!s.in_multiline) return;
+        s.in_multiline = false;
+        if (std.mem.eql(u8, s.multiline.items, s.name)) s.found = s.multiline_start;
+    }
+};
 
 /// Whether the token at `offset` is a direct child of a test declaration, that is, its name
 fn isTestName(root: SyntaxNode, offset: u32) bool {

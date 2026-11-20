@@ -1,5 +1,6 @@
 //! Completion: after `a.`, lists the members of the namespace; after `.`, lists members by the
-//! expected type, and in initializers the fields not yet assigned; after `.@`, the same names
+//! expected type, and in initializers the fields not yet assigned (for a union, only while no
+//! field is assigned, since a union initializer takes exactly one); after `.@`, the same names
 //! quoted (`.@"name"`); after `error.`, lists error names; after `@`, lists builtins (not in `.zon`
 //! files); inside `@import("`, lists modules and files; after `break :` /
 //! `continue :`, lists labels; otherwise lists the names visible at the cursor (local names and
@@ -160,7 +161,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
             for (found.items) |candidate| {
                 // The core (`imports.complete`) has already rendered the path segment by segment;
                 // the whole qualified expression must not be escaped as an identifier again.
-                const filter = try completionFilter(r.arena, n, candidate.filter);
+                const filter = try completionFilter(r.arena, n.escaped_prefix, n.prefix, n.closed, candidate.filter);
                 if (visible_labels.get(candidate.label)) |i| {
                     // Only visible bindings are merged; auto-import items with the same name from
                     // different sources must remain separate choices.
@@ -222,9 +223,10 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
 /// auto-import candidates take their own scores (see `localMembers` and `imports.Candidate.score`);
 /// candidates whose type fits the expected type at the cursor are further multiplied by
 /// `expected_boost` (see `Expected`). From high to low, keeping the collection order among equal
-/// scores. Names in scope that do not match the input score 0, sort last, and are filtered by the
-/// client. The expected type only changes the order of the returned candidates, not which ones are
-/// kept (the limit applies to the unboosted scores)
+/// scores; among names in scope whose scores are equal, those whose spelling starts with the input
+/// in the same case come first. Names in scope that do not match the input score 0, sort last, and
+/// are filtered by the client. The expected type only changes the order of the returned
+/// candidates, not which ones are kept (the limit applies to the unboosted scores)
 fn rank(arena: Allocator, items: []Item, prefix: []const u8, expected: ?Expected) resolve.Error!void {
     var matcher: fuzzy.Matcher = try .init(arena, prefix);
     for (items) |*it| {
@@ -233,8 +235,21 @@ fn rank(arena: Allocator, items: []Item, prefix: []const u8, expected: ?Expected
             it.score *= expected_boost;
         };
     }
-    std.mem.sort(Item, items, {}, higherScore);
+    std.mem.sort(Item, items, Rank{ .prefix = prefix }, higherRank);
     for (items, 0..) |*it, i| it.sort = try std.fmt.allocPrint(arena, "{d:0>5}", .{i});
+}
+
+const Rank = struct {
+    /// The input; a name that starts with it in the same case is preferred among equal scores
+    prefix: []const u8,
+};
+
+fn higherRank(ctx: Rank, a: Item, b: Item) bool {
+    if (a.score != b.score) return a.score > b.score;
+    // Only names in scope take the case tie-break: member paths and auto-import candidates keep
+    // their own order among equal scores
+    if (a.weight == 0 or b.weight == 0) return false;
+    return std.mem.startsWith(u8, a.label, ctx.prefix) and !std.mem.startsWith(u8, b.label, ctx.prefix);
 }
 
 fn higherScore(_: void, a: Item, b: Item) bool {
@@ -320,11 +335,12 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
     var out: Collector = .{ .arena = r.arena };
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset > text.len) return .{ .context = .ignored };
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
 
     const literal = try commentOrString(r, file, offset);
     if (literal == .comment) return .{ .context = .ignored };
     if (literal == .quoted) return quotedName(r, file, offset, cursor_owner);
-    if (literal == .none and !paths_only) if (try project_config.valueCompletions(r, file, text, offset, (try r.ctx.get(database.syntax.ParseFile, file)).rootNode())) |values| {
+    if (literal == .none and !paths_only) if (try project_config.valueCompletions(r, file, text, offset, root)) |values| {
         out.member_mode = true;
         for (values.values) |v| try out.add(.{ .label = v.name, .kind = if (values.tags) .enum_member else .constant, .doc = v.doc });
         return .{ .items = out.items.items, .context = if (values.tags) .enum_literal else .ignored };
@@ -342,7 +358,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         for (builtins.entries) |*entry| try out.add(.{ .label = entry.name, .kind = .builtin, .replace = range, .detail = entry.signature, .doc = try builtins.documentation(r.arena, entry, dialect) });
         return .{ .items = out.items.items, .context = .builtin };
     };
-    if (importString(text, offset)) |start| {
+    if (try importString(r.arena, root, offset)) |start| {
         try importPaths(r, &out, file, text[start..offset], .{ .start = start, .end = stringContentEnd(text, offset) });
         return .{ .items = out.items.items, .context = .path };
     }
@@ -410,7 +426,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
                 return .{ .items = out.items.items, .context = .init_field };
             } else a.exprType(init).ty;
             if (fieldsType(r.ctx.db.env.ip, ty)) |t| {
-                try initFields(r, &out, t, x.fields);
+                try initFields(r, &out, t, x.fields, hasFieldName(x.fields));
                 return .{ .items = out.items.items, .context = .init_field };
             }
         }
@@ -431,7 +447,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
             const a = try context.atSeeded(r, file, offset, true) orelse return .{ .context = .init_field };
             const ty = if (x.ty == null) a.literalExpected(e) orelse return .{ .context = .init_field } else a.exprType(e).ty;
             const t = fieldsType(r.ctx.db.env.ip, ty) orelse return .{ .context = .init_field };
-            try initFields(r, &out, t, try std.mem.concat(r.arena, Body.FieldInit, &.{ x.fields[0..i], x.fields[i + 1 ..] }));
+            try initFields(r, &out, t, try std.mem.concat(r.arena, Body.FieldInit, &.{ x.fields[0..i], x.fields[i + 1 ..] }), hasFieldName(x.fields));
             return .{ .items = out.items.items, .context = .init_field };
         }
     };
@@ -477,13 +493,13 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
 }
 
 /// Completion at `.@` (the `@` at `at`): the names that complete right after the `.` (members,
-/// enum and decl literals, initializer fields), written as quoted identifiers that replace from
-/// the `@`. Nothing when name characters precede the cursor (`.@na` is no name)
+/// enum and decl literals, initializer fields, error names), written as quoted identifiers that
+/// replace from the `@`. Nothing when name characters precede the cursor (`.@na` is no name)
 fn quotedAfterDot(r: *Resolver, file: FileId, at: u32, offset: u32, cursor_owner: *imports.Owner) resolve.Error!Visible {
     if (offset != at + 1) return .{ .context = .ignored };
     var visible = try completeVisible(r, file, at, cursor_owner, false);
     switch (visible.context) {
-        .member, .enum_literal, .init_field => {},
+        .member, .enum_literal, .init_field, .error_name => {},
         else => return .{ .context = .ignored },
     }
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
@@ -573,6 +589,42 @@ const ImportPrefix = struct {
     closed: bool = false,
 };
 
+/// The text typed so far in an escaped identifier (`@"..."`, also unterminated): its raw
+/// spelling, the decoded prefix, and whether the cursor is at the end of the token (after the
+/// closing quote)
+const EscapedPrefix = struct {
+    raw: []const u8,
+    prefix: []const u8,
+    closed: bool,
+};
+
+/// Decodes the text typed so far in an escaped identifier; null when an escape sequence is cut
+/// off, since the name would be a guess
+fn escapedPrefix(arena: Allocator, text: []const u8, token: SyntaxToken, offset: u32) Allocator.Error!?EscapedPrefix {
+    const spelling = if (token.kind == .invalid) std.mem.trimEnd(u8, token.text, "\r\n") else token.text;
+    const token_end = token.offset + @as(u32, @intCast(spelling.len));
+    if (offset <= token.offset or offset > token_end) return null;
+    const raw = text[token.offset..offset];
+    const closed = token.kind == .identifier and offset == token_end;
+    if (raw.len <= 2) return .{ .raw = raw, .prefix = "", .closed = closed };
+    const literal: []const u8 = if (closed) raw[1..] else blk: {
+        const quoted = try arena.allocSentinel(u8, raw.len, 0);
+        @memcpy(quoted[0 .. raw.len - 1], raw[1..]);
+        quoted[raw.len - 1] = '"';
+        // The added closing quote must not be swallowed by an unfinished escape; only pass a
+        // single, lexically closed literal to the string decoder.
+        var tokenizer = std.zig.Tokenizer.init(quoted);
+        const checked = tokenizer.next();
+        if (checked.tag != .string_literal or checked.loc.end != quoted.len) return null;
+        break :blk quoted;
+    };
+    const prefix = std.zig.string_literal.parseAlloc(arena, literal) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidLiteral => return null,
+    };
+    return .{ .raw = raw, .prefix = prefix, .closed = closed };
+}
+
 /// Accepts only names in expressions; declaration names, member names, labels, and capture names
 /// are not direct tokens of a name_ref.
 fn importPrefix(arena: Allocator, root: SyntaxNode, text: []const u8, offset: u32) Allocator.Error!?ImportPrefix {
@@ -592,28 +644,14 @@ fn importPrefix(arena: Allocator, root: SyntaxNode, text: []const u8, offset: u3
     // An invalid token has no closing quote to delimit its end; keep the source after the cursor
     // instead of mistaking the following statements for part of the name and replacing them too.
     const end = if (token.kind == .invalid) offset else token_end;
-    const raw = text[token.offset..offset];
-    const closed = token.kind == .identifier and offset == end;
-    var prefix = raw;
+    var prefix = text[token.offset..offset];
+    var escaped_prefix: ?[]const u8 = null;
+    var closed = false;
     if (escaped) {
-        // Also match by the text typed so far when the cursor is inside the quotes; do not guess
-        // the name when an escape sequence is cut off.
-        if (raw.len <= 2) return null;
-        const literal: []const u8 = if (closed) raw[1..] else blk: {
-            const quoted = try arena.allocSentinel(u8, raw.len, 0);
-            @memcpy(quoted[0 .. raw.len - 1], raw[1..]);
-            quoted[raw.len - 1] = '"';
-            // The added closing quote must not be swallowed by an unfinished escape; only pass a
-            // single, lexically closed literal to the string decoder.
-            var tokenizer = std.zig.Tokenizer.init(quoted);
-            const checked = tokenizer.next();
-            if (checked.tag != .string_literal or checked.loc.end != quoted.len) return null;
-            break :blk quoted;
-        };
-        prefix = std.zig.string_literal.parseAlloc(arena, literal) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.InvalidLiteral => return null,
-        };
+        const typed = (try escapedPrefix(arena, text, token, offset)) orelse return null;
+        prefix = typed.prefix;
+        escaped_prefix = typed.raw;
+        closed = typed.closed;
     } else {
         if (std.zig.primitives.isPrimitive(token.text) or std.mem.eql(u8, token.text, "_")) return null;
     }
@@ -621,8 +659,8 @@ fn importPrefix(arena: Allocator, root: SyntaxNode, text: []const u8, offset: u3
     return .{
         .prefix = prefix,
         .range = .{ .start = token.offset, .end = end },
-        .escaped_prefix = if (escaped) raw else null,
-        .closed = escaped and closed,
+        .escaped_prefix = escaped_prefix,
+        .closed = closed,
     };
 }
 
@@ -644,14 +682,14 @@ fn isBareEnumOrUnionMember(arena: Allocator, root: SyntaxNode, offset: u32) Allo
 }
 
 /// The client filters from the start of the replace range; keep the quotes and escape spelling
-/// that the user typed instead of returning only the decoded name.
-fn completionFilter(arena: Allocator, name: ImportPrefix, target: []const u8) Allocator.Error![]const u8 {
-    const raw = name.escaped_prefix orelse return target;
+/// that the user typed instead of returning only the decoded name. `raw` is null for a name typed
+/// without quotes.
+fn completionFilter(arena: Allocator, raw: ?[]const u8, prefix: []const u8, closed: bool, target: []const u8) Allocator.Error![]const u8 {
+    const typed = raw orelse return target;
     // A candidate matched by path is filtered by its path (see `imports.Builder.filterOf`)
-    if (!std.ascii.startsWithIgnoreCase(target, name.prefix)) return target;
-    const closed = name.closed;
+    if (!std.ascii.startsWithIgnoreCase(target, prefix)) return target;
     return std.fmt.allocPrint(arena, "{s}{f}{s}", .{
-        raw, std.zig.fmtString(target[name.prefix.len..]), if (closed) "" else "\"",
+        typed, std.zig.fmtString(target[prefix.len..]), if (closed) "" else "\"",
     });
 }
 
@@ -1376,7 +1414,7 @@ const MemberSearch = struct {
         item.label = label.written();
         // The same as for auto-import candidates (see `imports.Builder.filterOf`)
         const filter = if (std.ascii.startsWithIgnoreCase(p.leaf.name, name.prefix)) p.leaf.name else item.label;
-        item.filter = try completionFilter(r.arena, name, filter);
+        item.filter = try completionFilter(r.arena, name.escaped_prefix, name.prefix, name.closed, filter);
         return item;
     }
 };
@@ -1801,28 +1839,56 @@ fn commentOrString(r: *Resolver, file: FileId, offset: u32) resolve.Error!enum {
 }
 
 /// Inside a quoted identifier (`@"my v|"`, also unterminated) at a reference (a name, the member
-/// name of a field access, an enum literal): the candidates at the same position with no name
-/// typed yet (the client filters them), replacing the quoted text (up to the closing quote when
-/// there is one) and filtered by their quoted spellings. No candidates at other names
-/// (declarations, labels, and so on), and no builtins: `@"@sizeOf"` is a name
+/// name of a field access, an enum literal, an error name): the candidates at the same position
+/// with no name typed yet (the client filters them), replacing the quoted text (up to the closing
+/// quote when there is one) and filtered by their quoted spellings. Error names are filtered by
+/// the decoded text inside the quotes, keeping the spelling typed so far. No candidates at other
+/// names (declarations, labels, and so on), and no builtins: `@"@sizeOf"` is a name
 fn quotedName(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Owner) resolve.Error!Visible {
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const tok = root.tokenAtOffset(offset - 1) orelse return .{ .context = .ignored };
     switch (tokenParent(root, tok.offset)) {
-        .name_ref, .field_access, .enum_literal => {},
+        .name_ref, .field_access, .enum_literal, .error_value => {},
         else => return .{ .context = .ignored },
     }
     var visible = try completeVisible(r, file, tok.offset, cursor_owner, false);
     const end: u32 = if (tok.kind == .identifier) @intCast(tok.offset + tok.text.len) else offset;
+    const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
+    const typed = if (visible.context == .error_name) (try escapedPrefix(r.arena, text, tok, offset)) else null;
     const items = try r.arena.dupe(Item, visible.items);
     for (items) |*it| {
         it.replace = .{ .start = tok.offset, .end = end };
-        it.filter = if (std.mem.startsWith(u8, it.label, "@\"")) it.label else try std.fmt.allocPrint(r.arena, "@\"{s}\"", .{it.label});
+        it.filter = if (typed) |t|
+            try quotedErrorFilter(r.arena, it.label, t)
+        else if (std.mem.startsWith(u8, it.label, "@\""))
+            it.label
+        else
+            try std.fmt.allocPrint(r.arena, "@\"{s}\"", .{it.label});
     }
     visible.items = items;
     // The expression at the cursor is the quoted name itself
     if (visible.at) |*a| a.rel = offset - a.node.offset;
     return visible;
+}
+
+/// The name of a completion label formatted by `std.zig.fmtId`: escaped names are `@"..."`
+fn decodedLabel(arena: Allocator, label: []const u8) Allocator.Error![]const u8 {
+    if (!std.mem.startsWith(u8, label, "@\"")) return label;
+    return std.zig.string_literal.parseAlloc(arena, label[1..]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidLiteral => return label,
+    };
+}
+
+/// The filter text of an error name inside `error.@"..."`: the spelling typed so far and the rest
+/// of the candidate's decoded name, so the client filters by the decoded prefix while keeping the
+/// quotes and escapes as typed. Names that do not match keep their quoted spelling.
+fn quotedErrorFilter(arena: Allocator, label: []const u8, typed: EscapedPrefix) Allocator.Error![]const u8 {
+    const name = try decodedLabel(arena, label);
+    if (std.ascii.startsWithIgnoreCase(name, typed.prefix)) {
+        return completionFilter(arena, typed.raw, typed.prefix, typed.closed, name);
+    }
+    return if (std.mem.startsWith(u8, label, "@\"")) label else std.fmt.allocPrint(arena, "@\"{s}\"", .{label});
 }
 
 /// Error names after `error.`: when the expected type is an error set (or error union), lists its
@@ -1869,25 +1935,27 @@ fn afterDot(text: []const u8, offset: u32) bool {
     return i > 0 and text[i - 1] == '.' and (i == 1 or text[i - 2] != '.');
 }
 
-/// Start of the string content when the cursor is in the string of `@import("` (the string may
-/// be unterminated; escaped quotes do not end it)
-fn importString(text: []const u8, offset: u32) ?u32 {
-    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..offset], '\n')) |i| i + 1 else 0;
-    var open: ?usize = null;
-    var i = line_start;
-    while (i < offset) : (i += 1) switch (text[i]) {
-        '"' => open = if (open == null) i + 1 else null,
-        '\\' => if (open != null) {
-            i += 1;
-        },
-        else => {},
-    };
-    const start: u32 = @intCast(open orelse return null);
-    var head = std.mem.trimEnd(u8, text[line_start .. start - 1], " \t");
-    if (!std.mem.endsWith(u8, head, "(")) return null;
-    head = std.mem.trimEnd(u8, head[0 .. head.len - 1], " \t");
-    if (!std.mem.endsWith(u8, head, "@import")) return null;
-    return start;
+/// Start of the string content when the cursor is in the string argument of an `@import` call
+/// (the string may be unterminated; escaped quotes do not end it). The call is found through the
+/// syntax tree, so it and the string may span lines.
+fn importString(arena: Allocator, root: SyntaxNode, offset: u32) Allocator.Error!?u32 {
+    if (offset == 0) return null;
+    const tok = root.tokenAtOffset(offset - 1) orelse return null;
+    switch (tok.kind) {
+        // A cursor after the closing quote is outside the string
+        .string_literal => if (offset >= tok.offset + tok.text.len) return null,
+        .invalid => if (tok.text.len == 0 or tok.text[0] != '"') return null,
+        else => return null,
+    }
+    const path = try root.coveringPath(arena, @intCast(tok.offset));
+    // The string is a direct argument: `builtin_call` > `arg_list` > `literal` (or `error_node`
+    // when the string is unterminated)
+    if (path.len < 3) return null;
+    const call = ast.cast(ast.BuiltinCall, path[path.len - 3]) orelse return null;
+    const name = call.name() orelse return null;
+    if (!std.mem.eql(u8, name.text, "@import")) return null;
+    if (path[path.len - 2].kind() != .arg_list) return null;
+    return @intCast(tok.offset + 1);
 }
 
 /// End of the content of the string literal holding `offset`: its closing quote, or `offset` when
@@ -2015,9 +2083,27 @@ fn fieldsType(ip: *InternPool, ty: Index) ?Index {
     };
 }
 
-/// Fields of the struct or union `t` (see `fieldsType`) that have not been assigned yet
-fn initFields(r: *Resolver, out: *Collector, t: Index, given: []const Body.FieldInit) resolve.Error!void {
+/// Whether the struct or union `t` (see `fieldsType`) is a union
+fn isUnion(ip: *InternPool, t: Index) bool {
+    return switch (ip.key(t)) {
+        .container_type => |c| c.kind == .@"union",
+        .reified_type => |rt| rt.kind == .@"union",
+        else => false,
+    };
+}
+
+/// Whether `fields` assigns at least one field name (the element at the cursor may be unnamed)
+fn hasFieldName(fields: []const Body.FieldInit) bool {
+    for (fields) |f| if (f.name != null) return true;
+    return false;
+}
+
+/// Fields of the struct or union `t` (see `fieldsType`) that `given` does not assign. A union
+/// initializer takes exactly one field, so a union offers none once the initializer names one
+/// (`named`)
+fn initFields(r: *Resolver, out: *Collector, t: Index, given: []const Body.FieldInit, named: bool) resolve.Error!void {
     const ip = r.ctx.db.env.ip;
+    if (named and isUnion(ip, t)) return;
     if (ip.key(t) == .reified_type) {
         outer: for (try eval.fieldNames(r, t)) |f| {
             for (given) |g| if (g.name) |n| if (std.mem.eql(u8, n, f.name)) continue :outer;
@@ -2592,7 +2678,7 @@ fn receivesFn(r: *Resolver, file: FileId, item: u32, fb: *const Body, param: Bod
         if (local != .local or local.local.binding != param) continue;
         const callee: resolve.Def = switch (fb.expr(call.callee)) {
             .name_ref => |n| try r.resolveName(file, item, fb, fb.expr_scopes[@backingInt(call.callee)], n),
-            .field_access => |fa| if (try r.evalNamespace(file, item, fb, fa.lhs)) |ns| try r.memberDef(ns, fa.field orelse continue) else null,
+            .field_access => |fa| if (try r.evalNamespace(file, item, fb, fa.lhs)) |ns| try r.memberDef(ns, file, fa.field orelse continue) else null,
             else => null,
         } orelse continue;
         const args_tuple = try stdDecl(r, file, &.{ "meta", "ArgsTuple" }) orelse break;
@@ -2885,7 +2971,7 @@ fn stdHas(r: *Resolver, file: FileId, path: []const []const u8) resolve.Error!bo
 fn stdDecl(r: *Resolver, file: FileId, path: []const []const u8) resolve.Error!?resolve.Def {
     var ns: Namespace = .{ .file = try r.resolveImport(file, "std") orelse return null, .container = 0 };
     for (path, 0..) |name, i| {
-        const def = try r.memberDef(ns, name) orelse return null;
+        const def = try r.memberDef(ns, file, name) orelse return null;
         if (i + 1 == path.len) return def;
         ns = try r.namespaceOf(def) orelse return null;
     }

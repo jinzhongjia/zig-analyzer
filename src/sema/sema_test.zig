@@ -4635,6 +4635,27 @@ test "oversized layouts degrade to unknown instead of overflowing" {
     });
 }
 
+test "?noreturn has size 0 and alignment 1" {
+    // Prevents `?noreturn` layouts from being unknown because `noreturn` itself has no layout
+    try expectTypes(
+        \\const sz = @sizeOf(?noreturn);
+        \\const al = @alignOf(?noreturn);
+        \\const sz_nested = @sizeOf(??noreturn);
+        \\const al_nested = @alignOf(??noreturn);
+        \\const sz_array = @sizeOf([2]?noreturn);
+        \\const bits = @bitSizeOf(?noreturn);
+        \\const sz_bare = @sizeOf(noreturn);
+    , &.{
+        .{ "sz", "comptime_int = 0" },
+        .{ "al", "comptime_int = 1" },
+        .{ "sz_nested", "comptime_int = 1" },
+        .{ "al_nested", "comptime_int = 1" },
+        .{ "sz_array", "comptime_int = 0" },
+        .{ "bits", "comptime_int" },
+        .{ "sz_bare", "comptime_int" },
+    });
+}
+
 test "error code layouts follow the error limit" {
     // Prevents assuming 16-bit error codes when the compilation sets an error limit; expected
     // values are the results of zig 0.17.0 with `--error-limit 255`
@@ -8284,6 +8305,54 @@ test "integer types wider than 128 bits are computed at arbitrary precision" {
     });
 }
 
+test "signed division truncates toward zero and a zero remainder folds" {
+    // Signed `/` and a `%` with a zero remainder gave no value.
+    // Expected values are the results of zig 0.17.1.
+    try expectTypes(
+        \\const ct_div = -7 / 2;
+        \\const ct_div_neg_rhs = 7 / -2;
+        \\const ct_rem_zero = -4 % 2;
+        \\const i64_div = @as(i64, -7) / 2;
+        \\const i64_div_neg_rhs = @as(i64, 7) / -2;
+        \\const i64_div_both_neg = @as(i64, -7) / -2;
+        \\const i64_rem_zero = @as(i64, -4) % 2;
+        \\const i64_rem_zero_neg_rhs = @as(i64, 4) % -2;
+        \\const i64_rem_neg = @as(i64, -7) % 2;
+        \\const i8_div_overflow = @as(i8, -128) / -1;
+        \\const i256_div = @as(i256, -7) / 2;
+        \\const i256_div_big = @as(i256, -(1 << 200)) / -3;
+        \\const i256_rem_zero = @as(i256, -4) % 2;
+        \\const i256_rem_neg = @as(i256, -7) % 2;
+        \\const i256_div_overflow = @as(i256, -(1 << 255)) / -1;
+        \\const in_block = comptime blk: {
+        \\    var x: i64 = -7;
+        \\    x /= 2;
+        \\    break :blk x;
+        \\};
+        \\fn g() void {
+        \\    _ = .{ ct_div, ct_div_neg_rhs, ct_rem_zero, i64_div, i64_div_neg_rhs, i64_div_both_neg, i64_rem_zero, i64_rem_zero_neg_rhs, i64_rem_neg, i8_div_overflow, i256_div, i256_div_big, i256_rem_zero, i256_rem_neg, i256_div_overflow, in_block };
+        \\}
+    , &.{
+        .{ "ct_div", "comptime_int = -3" },
+        .{ "ct_div_neg_rhs", "comptime_int = -3" },
+        .{ "ct_rem_zero", "comptime_int = 0" },
+        .{ "i64_div", "i64 = -3" },
+        .{ "i64_div_neg_rhs", "i64 = -3" },
+        .{ "i64_div_both_neg", "i64 = 3" },
+        .{ "i64_rem_zero", "i64 = 0" },
+        .{ "i64_rem_zero_neg_rhs", "i64 = 0" },
+        // The compiler rejects `%` with a negative operand and a nonzero remainder
+        .{ "i64_rem_neg", "i64" },
+        .{ "i8_div_overflow", "i8" },
+        .{ "i256_div", "i256 = -3" },
+        .{ "i256_div_big", "i256 = 535646014752996758513987364113720867507400997927597611767125" },
+        .{ "i256_rem_zero", "i256 = 0" },
+        .{ "i256_rem_neg", "i256" },
+        .{ "i256_div_overflow", "i256" },
+        .{ "in_block", "i64 = -3" },
+    });
+}
+
 test "builtins on integer types wider than 128 bits" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both)
     try expectTypes(
@@ -8610,7 +8679,7 @@ test "std.meta type functions" {
         \\    const slice = std.meta.Slice(*[10]i32);
         \\    const tags = std.meta.tags(E);
         \\    const field_ty = std.meta.fieldInfo(S, .x).type;
-        \\    const sliced = std.mem.SliceTo([:0]const u8, 0);
+        \\    const sliced = @TypeOf(std.mem.sliceTo("abc", 0));
         \\    _ = .{ child, elem, sent, tag_e, tag_u, active, FE, fe, DE, args, backing, slice, tags, field_ty, sliced };
         \\}
     , &.{
@@ -11208,6 +11277,22 @@ test "comptime evaluation: a *T coerced to *[1]T views the same place" {
         .{ "r_payload", "u8 = 8" },
     });
 }
+test "comptime evaluation: assigning len re-windows a slice coerced from an array pointer" {
+    // `s.len = n` on a slice without a range gave up instead of shortening it.
+    try expectTypes(
+        \\fn f() usize {
+        \\    var a = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+        \\    var s: []u8 = &a;
+        \\    s.len = 4;
+        \\    s[3] += 10;
+        \\    s.len += 2;
+        \\    return s.len * 1000 + @as(usize, s[3]) * 10 + a[3] / 14;
+        \\}
+        \\const r_len = f();
+    , &.{
+        .{ "r_len", "usize = 6141" },
+    });
+}
 test "comptime evaluation: @fieldParentPtr goes back from a field pointer to its parent" {
     try expectTypes(
         \\const S = struct { a: u8, b: u8 };
@@ -11794,6 +11879,31 @@ test "comptime evaluation: vector operators, @reduce, @select and @shuffle" {
         .{ "e_length", "unknown" },
         .{ "e_mask", "@Vector(1, u8)" },
         .{ "e_compound", "@Vector(2, u8)" },
+    });
+}
+
+test "comptime evaluation: unary vector operators" {
+    // Expected values are the results of zig 0.17.1: `-`, `-%`, `~` and `!` apply the scalar
+    // operator to each element
+    try expectTypes(
+        \\const neg = -@Vector(2, i8){ 1, -2 };
+        \\const neg_wrap = -%@Vector(2, i8){ -128, 3 };
+        \\const not_signed = ~@Vector(2, i4){ 0, -1 };
+        \\const not_unsigned = ~@Vector(3, u8){ 0, 1, 255 };
+        \\const not_bool = !@Vector(2, bool){ true, false };
+        \\const neg_float = -@Vector(2, f32){ 1.5, -2 };
+        \\const neg_wide = -@Vector(2, i200){ 1 << 150, -3 };
+        \\const e_overflow = -@Vector(2, i8){ -128, 3 };
+    , &.{
+        .{ "neg", "@Vector(2, i8) = .{ -1, 2 }" },
+        .{ "neg_wrap", "@Vector(2, i8) = .{ -128, -3 }" },
+        .{ "not_signed", "@Vector(2, i4) = .{ -1, 0 }" },
+        .{ "not_unsigned", "@Vector(3, u8) = .{ 255, 254, 0 }" },
+        .{ "not_bool", "@Vector(2, bool) = .{ false, true }" },
+        .{ "neg_float", "@Vector(2, f32) = .{ -1.5, 2 }" },
+        .{ "neg_wide", "@Vector(2, i200) = .{ -1427247692705959881058285969449495136382746624, 3 }" },
+        // Compile error: overflow of an element
+        .{ "e_overflow", "@Vector(2, i8)" },
     });
 }
 

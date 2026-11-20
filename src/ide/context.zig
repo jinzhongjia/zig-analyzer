@@ -125,8 +125,8 @@ pub fn atSeeded(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) re
 /// result, with `seeded` set to it
 pub fn allSeeded(r: *Resolver, a: At) resolve.Error![]const At {
     const seeds = try seed.allSeeds(r, a.file, a.item, a.body, a.res, a.rel);
-    const out = try r.arena.alloc(At, seeds.len);
-    for (seeds, out) |s, *x| {
+    const out = try r.arena.alloc(At, seeds.seeds.len);
+    for (seeds.seeds, out) |s, *x| {
         x.* = a;
         x.seeded = s;
     }
@@ -499,7 +499,7 @@ fn typeProto(r: *Resolver, a: At, e: Body.ExprId, hops: u32) resolve.Error!?Foun
             } else blk: {
                 const fa = b.expr(e).field_access;
                 const ns = try r.evalNamespace(a.file, a.item, b, fa.lhs) orelse return null;
-                break :blk try r.memberDef(ns, fa.field orelse return null);
+                break :blk try r.memberDef(ns, a.file, fa.field orelse return null);
             }) orelse return null;
             // An alias of a type: the type expression it is initialized with
             switch (def) {

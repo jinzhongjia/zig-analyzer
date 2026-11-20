@@ -5,9 +5,11 @@ const testing = std.testing;
 const resolve = @import("../names/resolve.zig");
 const World = @import("../names/resolve_test.zig").World;
 const database = @import("../database.zig");
+const offsets = @import("../util/offsets.zig");
 const hover = @import("hover.zig");
 const completion = @import("completion.zig");
 const definition = @import("definition.zig");
+const document_symbol = @import("document_symbol.zig");
 const signature_help = @import("signature_help.zig");
 const inlay_hints = @import("inlay_hints.zig");
 const inactive = @import("inactive.zig");
@@ -962,6 +964,21 @@ test "local member paths filter by the member name when it starts with the input
     for ((try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items) |it| {
         if (std.mem.eql(u8, it.label, "point.scale")) break try testing.expectEqualStrings("scale", it.filter.?);
     } else return error.MissingCompletion;
+}
+
+test "name completion ranks names whose case agrees before other ties" {
+    // With an all-lowercase input, `Mem` and `mem` score the same; the one whose case agrees with
+    // the input comes first.
+    const labels = try completionLabels(
+        \\const Mem = 1;
+        \\const mem = 2;
+        \\fn f() u32 {
+        \\    return mem<|>;
+        \\}
+        \\
+    );
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("mem Mem f", labels);
 }
 
 test "local member paths rank below scope names and above namespace members, deeper paths lower" {
@@ -2782,6 +2799,66 @@ test "references find the fields of a zon file whose import sites give several r
     }
 }
 
+test "zon field references report an incomplete generic function closure" {
+    // Prevents a use that is a hit under the explored instances from being accepted when the
+    // instances of the generic function grow without bound: the field may differ under the
+    // instances that are not explored
+    const main_text =
+        \\const raw = @import("cfg.zon");
+        \\fn read(v: anytype) comptime_int {
+        \\    return v.x;
+        \\}
+        \\fn grow(comptime T: type) void {
+        \\    _ = read(?T);
+        \\    other(?T);
+        \\}
+        \\fn other(comptime T: type) void {
+        \\    grow(T);
+        \\}
+        \\pub fn main() void {
+        \\    grow(u8);
+        \\    _ = read(raw);
+        \\}
+        \\
+    ;
+    const complete_text =
+        \\const raw = @import("cfg.zon");
+        \\fn read(v: anytype) comptime_int {
+        \\    return v.x;
+        \\}
+        \\pub fn main() void {
+        \\    _ = read(raw);
+        \\}
+        \\
+    ;
+    const zon_text = ".{ .x = 1 }\n";
+    const cases = [_]struct { text: []const u8, incomplete: bool }{
+        .{ .text = main_text, .incomplete = true },
+        .{ .text = complete_text, .incomplete = false },
+    };
+    for (cases) |c| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const main = (try w.fixture(try std.mem.concat(w.arena.allocator(), u8, &.{ "//- /p/main.zig module:app\n", c.text }))).file("/p/main.zig");
+        const zon_file = (try w.add("/p/cfg.zon", zon_text)).file;
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const symbols = try definition.symbolsAt(&r, zon_file, @intCast(std.mem.indexOf(u8, zon_text, "x").?));
+        var incomplete: ?search.Reference = null;
+        const refs = try search.symbolsReferences(&r, symbols, .{ .scope = &.{ main, zon_file }, .incomplete = &incomplete });
+        try testing.expectEqual(c.incomplete, incomplete != null);
+        // The use in `read` is found under the explored instances
+        const use = std.mem.indexOf(u8, c.text, "v.x").? + 2;
+        var found = false;
+        for (refs) |ref| if (ref.file == main and ref.start == use) {
+            found = true;
+        };
+        try testing.expect(found);
+    }
+}
+
 test "zon files have no result type unless their typed imports agree" {
     const cases = [_]struct { []const u8, []const u8 }{
         // No import site; only an import without a result type
@@ -3198,6 +3275,37 @@ test "build.zig.zon paths are completed relative to the build root" {
         }.lt);
         testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
             std.debug.print("build.zig.zon: `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "completion: @import paths when the string is on another line" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "lib.zig", .data = "" });
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "const m = @import(\n    \"li<|>\"\n);\n", "std builtin root lib.zig" },
+        .{ "const m = @import(\n    \"li<|>\");\n", "std builtin root lib.zig" },
+        .{ "const m = @import(\"li<|>\");\n", "std builtin root lib.zig" },
+        // A string that is not the argument of `@import` gets no paths
+        .{ "const m = other(\n    \"li<|>\"\n);\n", "" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const at = try w.addNative(try std.fs.path.join(w.arena.allocator(), &.{ dir, "main.zig" }), c[0]);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const items = (try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items;
+        var labels: std.ArrayList([]const u8) = .empty;
+        for (items) |it| try labels.append(w.arena.allocator(), it.label);
+        testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items)) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
             return err;
         };
     }
@@ -3927,6 +4035,27 @@ test "completion inside a quoted identifier offers the candidates of a plain pre
     }
 }
 
+test "completion: quoted error names after `error.@` and inside `error.@\"...\"`" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "const E = error{ Worse, Bad };\nfn f() E!void {\n    return error.@<|>;\n}\n", "@\"Bad\"@-1-0 @\"Worse\"@-1-0" },
+        // The prefix inside the quotes is decoded; candidates keep the spelling typed so far, so
+        // the client filters them by that spelling.
+        .{ "const E = error{ Worse, @\"some name\" };\nfn f() E!void {\n    return error.@\"so<|>me name\";\n}\n", "Worse@-4-8:@\"Worse\" @\"some name\"@-4-8:@\"some name\"" },
+        .{ "const E = error{ @\"some name\" };\nfn f() E!void {\n    return error.@\"\\x73ome na<|>me\";\n}\n", "@\"some name\"@-12-3:@\"\\x73ome name\"" },
+    };
+    for (cases, 0..) |c, i| {
+        const got = try completionEdits(c[0]);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+    const labels = try completionLabels("const E = error{ Worse, Bad };\nfn f() E!void {\n    return error.<|>;\n}\n");
+    defer testing.allocator.free(labels);
+    try testing.expectEqualStrings("Bad Worse", labels);
+}
+
 test "completion on the name of an existing initializer field lists the fields" {
     try expectCompletions(
         \\const S = struct { alpha: u32 = 0, beta: u32 = 0 };
@@ -3936,6 +4065,29 @@ test "completion on the name of an existing initializer field lists the fields" 
         .{ "fn f() void {\n    const local = 5;\n    const s1 = S{ .be<|> = 2 };\n    _ = .{ s1, local };\n}", "alpha beta" },
         .{ "fn f() void {\n    const local = 5;\n    const s1: S = .{ .a<|>lpha = 1 };\n    _ = .{ s1, local };\n}", "alpha beta" },
         .{ "fn f() void {\n    const local = 5;\n    const s1: S = .{ .alpha = 1, .b<|> = 2 };\n    _ = .{ s1, local };\n}", "beta" },
+    });
+}
+
+test "completion of union initializer fields stops once a field is assigned" {
+    try expectCompletions(
+        \\const U = union(enum) { ua: u32, ub: void };
+        \\const UU = union { ua: u32, ub: void };
+        \\const S = struct { ua: u32, ub: void };
+        \\
+    , &.{
+        // The empty initializer lists every field
+        .{ "const u: U = .{ .<|> };", "ua ub" },
+        .{ "const u: UU = .{ .<|> };", "ua ub" },
+        // A union initializer takes exactly one field, so after one is assigned there is
+        // nothing left to offer
+        .{ "const u: U = .{ .ua = 1, .<|> };", "" },
+        .{ "const u: U = .{ .ub = {}, .<|> };", "" },
+        .{ "const u: UU = .{ .ua = 1, .<|> };", "" },
+        .{ "const u: ?U = .{ .ua = 1, .<|> };", "" },
+        // A struct initializer takes any number of fields
+        .{ "const s: S = .{ .ua = 1, .<|> };", "ub" },
+        // The field of a nested initializer has its own type
+        .{ "const n: struct { u: U } = .{ .u = .{ .ua = 1, .<|> } };", "" },
     });
 }
 
@@ -9821,4 +9973,55 @@ test "goto and hover at a call on an abstract parameter in a branch inactive und
         const info = try hover.hover(&r, file, at, &.{}, .count) orelse return error.NoHover;
         try testing.expect(std.mem.startsWith(u8, info.text, c[2]));
     }
+}
+
+test "the outline classifies functions by receiver like semantic tokens" {
+    const SymbolKind = @import("../lsp/types.zig").SymbolKind;
+    const text =
+        \\const S = struct {
+        \\    fn helper(v: u32) u32 { return v; }
+        \\    fn dist(self: S) u32 { _ = self; return 0; }
+        \\};
+        \\fn add(a: u32) u32 { return a; }
+        \\const callback = add;
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const items = try r.itemTree(file);
+    const map = try ctx.get(database.syntax.FileAstIdMap, file);
+    const lines = try offsets.LineIndex.init(w.arena.allocator(), text);
+    const syms = try document_symbol.documentSymbolsWithResolver(
+        w.arena.allocator(),
+        &r,
+        file,
+        items,
+        map,
+        lines,
+        .utf16,
+    );
+    try testing.expectEqual(3, syms.len);
+    try testing.expectEqualStrings("S", syms[0].name);
+    try testing.expectEqual(SymbolKind.Struct, syms[0].kind);
+    const members = syms[0].children.?;
+    try testing.expectEqualStrings("helper", members[0].name);
+    try testing.expectEqual(SymbolKind.Function, members[0].kind);
+    try testing.expectEqualStrings("dist", members[1].name);
+    try testing.expectEqual(SymbolKind.Method, members[1].kind);
+    try testing.expectEqualStrings("add", syms[1].name);
+    try testing.expectEqual(SymbolKind.Function, syms[1].kind);
+    try testing.expectEqualStrings("callback", syms[2].name);
+    try testing.expectEqual(SymbolKind.Function, syms[2].kind);
+
+    // Without type information, the outline keeps the syntax-only classification
+    const syntax = try document_symbol.documentSymbols(w.arena.allocator(), items, map, lines, .utf16);
+    try testing.expectEqual(SymbolKind.Method, syntax[0].children.?[0].kind);
+    try testing.expectEqual(SymbolKind.Method, syntax[0].children.?[1].kind);
+    try testing.expectEqual(SymbolKind.Function, syntax[1].kind);
+    try testing.expectEqual(SymbolKind.Constant, syntax[2].kind);
 }

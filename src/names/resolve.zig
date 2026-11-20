@@ -136,7 +136,17 @@ pub const Resolver = struct {
     /// Resolves a name at `scope` of BodyOwner `item`
     pub fn resolveName(r: *Resolver, file: FileId, item: u32, b: *const Body, scope: Body.ScopeId, name: []const u8) Error!?Def {
         if (b.lookup(scope, name)) |binding| return .{ .local = .{ .file = file, .item = item, .binding = binding } };
-        return r.resolveContainerName(file, item, name);
+        const def = try r.resolveContainerName(file, item, name);
+        // A container-level variable does not see the declaration it initializes: `const x = x;`
+        // is an error. A function body may refer to the function itself (`fn f() { _ = f; }`).
+        if (def) |d| switch (d) {
+            .item => |it| if (it.file == file and it.item == item) switch ((try r.itemTree(file)).items[item].kind) {
+                .@"const", .@"var" => return null,
+                else => {},
+            },
+            .local, .file => {},
+        };
+        return def;
     }
 
     /// Container-level names: member declarations and, when the container is defined in a member's
@@ -174,11 +184,15 @@ pub const Resolver = struct {
         return tree.lookupDecl(container, name);
     }
 
-    /// `ns.name`: declarations, and for enums also their fields (`E.a`)
-    pub fn memberDef(r: *Resolver, ns: Namespace, name: []const u8) Error!?Def {
+    /// `ns.name`: declarations, and for enums also their fields (`E.a`). `from` is the file of
+    /// the member access: a declaration that is not `pub` is visible only from its own file.
+    pub fn memberDef(r: *Resolver, ns: Namespace, from: FileId, name: []const u8) Error!?Def {
         const tree = try r.itemTree(ns.file);
         if (ns.container >= tree.containers.len) return null;
-        if (lookupDecl(tree, ns.container, name)) |m| return .{ .item = .{ .file = ns.file, .item = m } };
+        if (lookupDecl(tree, ns.container, name)) |m| {
+            if (ns.file != from and !tree.items[m].flags.is_pub) return null;
+            return .{ .item = .{ .file = ns.file, .item = m } };
+        }
         if (tree.containers[ns.container].kind == .@"enum") {
             for (tree.containerMembers(ns.container)) |m| {
                 const it = tree.items[m];
@@ -202,7 +216,7 @@ pub const Resolver = struct {
             const value = b.value orelse return cur;
             cur = switch (b.expr(value)) {
                 .name_ref => |n| if (b.nameRefIsBuiltin(value)) null else try r.resolveName(it.file, it.item, b, b.expr_scopes[@backingInt(value)], n),
-                .field_access => |fa| if (try r.evalNamespace(it.file, it.item, b, fa.lhs)) |ns| try r.memberDef(ns, fa.field orelse return cur) else null,
+                .field_access => |fa| if (try r.evalNamespace(it.file, it.item, b, fa.lhs)) |ns| try r.memberDef(ns, it.file, fa.field orelse return cur) else null,
                 else => null,
             } orelse return cur;
         }
@@ -254,7 +268,7 @@ pub const Resolver = struct {
             },
             .field_access => |fa| {
                 const ns = try r.evalDepth(file, item, b, fa.lhs, depth + 1) orelse return null;
-                const def = try r.memberDef(ns, fa.field orelse return null) orelse return null;
+                const def = try r.memberDef(ns, file, fa.field orelse return null) orelse return null;
                 return r.namespaceOfDepth(def, depth + 1);
             },
             .builtin_call => |call| {
@@ -298,7 +312,31 @@ pub const Resolver = struct {
     pub fn resolveImport(r: *Resolver, file: FileId, name: []const u8) Error!?FileId {
         if (std.mem.endsWith(u8, name, ".zig") or std.mem.endsWith(u8, name, ".zon")) {
             const dir = std.fs.path.dirname(r.vfs().path(file)) orelse return null;
-            return try r.vfs().intern(try std.fs.path.join(r.arena, &.{ dir, name }));
+            const target = try Vfs.resolve(.native, r.arena, dir, name) orelse return null;
+            // A relative import may not leave the directory of the module root: the compiler
+            // reports `import of file outside module path` and compiles nothing from it. A file
+            // outside the module graph has no single module root here (build scripts are rooted
+            // at the build root, single-file roots are computed from imports), so its imports are
+            // not limited.
+            if (try r.ctx.get(ModuleGraph.Input, {})) |graph| if (graph.entry(file)) |e| {
+                var allowed = false;
+                for ([_][]const u32{ &.{e.module}, e.others }) |modules| for (modules) |m| {
+                    const root: ?FileId = if (m == ModuleGraph.std_module) blk: {
+                        // The standard library can have its own root in the compilation that
+                        // reached the file (its `zig_lib_dir`)
+                        const c = e.compile orelse break :blk graph.std_root;
+                        if (c >= graph.compiles.len) break :blk graph.std_root;
+                        break :blk graph.compiles[c].std_root orelse graph.std_root;
+                    } else graph.modules[m].root;
+                    const module_dir = std.fs.path.dirname(r.vfs().path(root orelse continue)) orelse continue;
+                    if (r.vfs().isUnder(target, module_dir)) {
+                        allowed = true;
+                        break;
+                    }
+                };
+                if (!allowed) return null;
+            };
+            return try r.vfs().intern(target);
         }
         if (r.context) |c| if (ModuleGraph.isContextName(name)) {
             const targets = try r.ctx.get(ModuleGraph.ContextImports, .{ .file = file, .context = c });
@@ -397,7 +435,7 @@ pub const Resolver = struct {
                 if (!std.mem.eql(u8, call.name, "@import") or try r.importTarget(cur_file, cur_body, call.args) != null) return &.{};
                 var out: std.ArrayList(Def) = .empty;
                 for (try r.importTargets(cur_file, cur_body, call.args)) |t| {
-                    try out.append(r.arena, try r.memberDef(.{ .file = t, .container = 0 }, name) orelse continue);
+                    try out.append(r.arena, try r.memberDef(.{ .file = t, .container = 0 }, file, name) orelse continue);
                 }
                 return out.items;
             },
@@ -545,7 +583,9 @@ pub const Resolver = struct {
         if (path.len == 0) return null;
         var ns: Namespace = .{ .file = file, .container = 0 };
         for (path[0 .. path.len - 1]) |name| {
-            ns = try r.namespaceOf(try r.memberDef(ns, name) orelse return null) orelse return null;
+            // A structural traversal of the same path in another module: the names are not
+            // written at a use site, so visibility is that of each namespace itself
+            ns = try r.namespaceOf(try r.memberDef(ns, ns.file, name) orelse return null) orelse return null;
         }
         const last = path[path.len - 1];
         const tree = try r.itemTree(ns.file);

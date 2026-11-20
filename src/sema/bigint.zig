@@ -264,8 +264,15 @@ pub fn binaryTyped(allocator: Allocator, op: SyntaxKind, t: IntType, a: Big, b: 
         .asterisk => fitTo(allocator, try binary(allocator, .asterisk, a, b) orelse return null, t, .check),
         .asterisk_percent => fitTo(allocator, try binary(allocator, .asterisk, a, b) orelse return null, t, .wrap),
         .asterisk_pipe => fitTo(allocator, try binary(allocator, .asterisk, a, b) orelse return null, t, .saturate),
-        // Signed `/` and `%` require @divTrunc etc., so only nonnegative operands are folded
-        .slash, .percent => if (!a.positive or !b.positive or b.eqlZero()) null else try binary(allocator, op, a, b),
+        // `/` truncates toward zero for every sign; the quotient of the minimum by -1 overflows
+        .slash => fitTo(allocator, try binary(allocator, .slash, a, b) orelse return null, t, .check),
+        // `%` with a negative operand is rejected by the compiler unless the remainder is zero
+        .percent => {
+            const r = try binary(allocator, .percent, a, b) orelse return null;
+            // A zero remainder of a negative dividend carries a negative sign
+            if (r.eqlZero()) return .{ .limbs = r.limbs, .positive = true };
+            return if (a.positive and b.positive) r else null;
+        },
         .ampersand, .pipe, .caret => try bitwise(allocator, op, t, a, b),
         .angle_bracket_angle_bracket_left => try shl(allocator, t, a, b, false),
         .angle_bracket_angle_bracket_left_pipe => try shl(allocator, t, a, b, true),

@@ -197,9 +197,10 @@ pub fn binaryInt(ip: *InternPool, op: SyntaxKind, ty: Index, a: i128, b: i128) ?
         .asterisk => mul(ip, ty, x, y, .check),
         .asterisk_percent => mul(ip, ty, x, y, .wrap),
         .asterisk_pipe => mul(ip, ty, x, y, .saturate),
-        // Signed `/` and `%` require @divTrunc etc., so only nonnegative operands are folded
-        .slash => if (y <= 0 or x < 0) null else fit(ip, ty, @divTrunc(x, y), .check),
-        .percent => if (y <= 0 or x < 0) null else fit(ip, ty, @rem(x, y), .check),
+        // `/` truncates toward zero for every sign. `%` with a negative operand is rejected by
+        // the compiler unless the remainder is zero.
+        .slash => if (y == 0) null else fit(ip, ty, @divTrunc(x, y), .check),
+        .percent => if (y == 0) null else if (@rem(x, y) == 0) 0 else if (y < 0 or x < 0) null else fit(ip, ty, @rem(x, y), .check),
         .ampersand => fit(ip, ty, x & y, .check),
         .pipe => fit(ip, ty, x | y, .check),
         .caret => fit(ip, ty, x ^ y, .check),
@@ -926,7 +927,7 @@ pub fn typeLayout(ip: *InternPool, t: Index) ?Layout {
             else
                 .{ .size = ptr_bytes, .alignment = alignment, .bits = pointer_bits };
         },
-        .optional_type => |c| optionalLayout(ip, c, typeLayout(ip, c) orelse return null),
+        .optional_type => |c| if (c == .noreturn_type) optional_noreturn_layout else optionalLayout(ip, c, typeLayout(ip, c) orelse return null),
         .array_type => |a| arrayLayout(typeLayout(ip, a.child) orelse return null, a, hasBitRepr(ip, a.child)),
         .error_union_type => |eu| errorUnionLayout(ip, typeLayout(ip, eu.payload) orelse return null),
         .vector_type => |v| vectorLayout(ip, v.len, v.child),
@@ -1028,6 +1029,10 @@ pub fn intLayout(ip: *InternPool, bits: u16) ?Layout {
     if (@min(natural, max_align.max) != alignment) return null;
     return .{ .size = std.mem.alignForward(u64, bytes, alignment), .alignment = alignment, .bits = bits };
 }
+
+/// `?noreturn`: it can only hold `null`, so it stores nothing, although `noreturn` itself has no
+/// layout; like other optionals of non-pointers it has no bit representation
+pub const optional_noreturn_layout: Layout = .{ .size = 0, .alignment = 1, .bits = null };
 
 /// `?T`: non-C pointers (including slices) and error sets represent null as zero and have the
 /// size of the payload; the rest add a flag after the payload, padded to the payload's alignment.
@@ -2032,7 +2037,10 @@ test "integer folding follows the type's width" {
     // the u8 shift of the machine integer)
     const u1000_t = try ip.intType(.unsigned, 1000);
     try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .angle_bracket_angle_bracket_right, u1000_t, 5, 300));
-    try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .slash, i8_t, -4, 2));
+    try testing.expectEqual(@as(?i128, -2), binaryInt(&ip, .slash, i8_t, -4, 2));
+    try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .slash, i8_t, -128, -1));
+    try testing.expectEqual(@as(?i128, 0), binaryInt(&ip, .percent, i8_t, -4, 2));
+    try testing.expectEqual(@as(?i128, null), binaryInt(&ip, .percent, i8_t, -5, 2));
     try testing.expectEqual(@as(?i128, null), negate(&ip, i8_t, -128, false));
     try testing.expectEqual(@as(?i128, -128), negate(&ip, i8_t, -128, true));
     try testing.expectEqual(@as(?i128, 0xfe), bitNot(&ip, u8_t, 1));

@@ -163,6 +163,85 @@ test "rename: names referenced by string literals" {
     try testing.expectEqual(null, try rename.stringReference(&r, &.{file}, "other"));
 }
 
+test "rename: multiline string keys are string references" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\const S = struct { fooBar: u32 };
+        \\fn f(s: S) void {
+        \\    _ = @field(s,
+        \\        \\fooBar
+        \\    );
+        \\}
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    const a = w.arena.allocator();
+    var ctx = w.db.beginRead(a);
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = a };
+    const p = (try rename.stringReference(&r, &.{file}, "fooBar")).?;
+    const got = try format(text, p);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("4:9 `fooBar` appears in a string literal, which may refer to it by name (as `@field` and serialization do) and would not be updated", got);
+}
+
+test "rename: escaped string keys are string references" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\const S = struct { x: u32 };
+        \\fn f(s: S) void {
+        \\    _ = @field(s, "\x78");
+        \\}
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    const a = w.arena.allocator();
+    var ctx = w.db.beginRead(a);
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = a };
+    const p = (try rename.stringReference(&r, &.{file}, "x")).?;
+    const got = try format(text, p);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("3:19 `x` appears in a string literal, which may refer to it by name (as `@field` and serialization do) and would not be updated", got);
+    // The escape decodes to `y`, not to the name being searched for
+    try testing.expectEqual(null, try rename.stringReference(&r, &.{file}, "y"));
+}
+
+test "rename: multiline string values are decoded before comparing" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\const S = struct { fooBar: u32, x: u32 };
+        \\fn f(s: S) void {
+        \\    _ = @field(s,
+        \\        \\y
+        \\    );
+        \\    _ = @field(s,
+        \\        \\foo
+        \\        \\Bar
+        \\    );
+        \\    _ = @field(s,
+        \\        \\x
+        \\        // a comment between the lines does not end the literal
+        \\        \\tail
+        \\    );
+        \\}
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    const a = w.arena.allocator();
+    var ctx = w.db.beginRead(a);
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = a };
+    // The lines decode to `y`, `foo\nBar` and `x\ntail`, so none equals these names
+    try testing.expectEqual(null, try rename.stringReference(&r, &.{file}, "x"));
+    try testing.expectEqual(null, try rename.stringReference(&r, &.{file}, "fooBar"));
+    try testing.expectEqual(null, try rename.stringReference(&r, &.{file}, "foo"));
+    try testing.expectEqual(null, try rename.stringReference(&r, &.{file}, "tail"));
+}
+
 test "rename: test names are not string references" {
     var w: World = undefined;
     try w.init();

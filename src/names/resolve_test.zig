@@ -416,6 +416,73 @@ test "imports: relative files, modules, std and root" {
     try testing.expectEqualStrings("Allocator eql", try w.complete(main.file, main.cursor));
 }
 
+test "relative imports may not leave the module root" {
+    // The compiler reports `import of file outside module path`: `/p/other.zig` is not part of
+    // the module rooted at `/p/src/main.zig`, so the import stays unknown.
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/src/main.zig module:app
+        \\const util = @import("util.zig");
+        \\pub fn main() void {
+        \\    util.run();
+        \\}
+        \\//- /p/src/util.zig in:app
+        \\const other = @import("../other.zig");
+        \\pub fn run() void {
+        \\    other.thing<|>;
+        \\}
+        \\//- /p/other.zig
+        \\pub const thing = 1;
+    );
+    const util = f.file("/p/src/util.zig");
+    try testing.expectEqualStrings("null", try w.goto(util, f.cursor.?.offset));
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    try testing.expectEqual(@as(?FileId, null), try r.resolveImport(util, "../other.zig"));
+}
+
+test "relative imports inside the module root resolve" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/src/main.zig module:app
+        \\pub const value = 1;
+        \\//- /p/src/a/util.zig in:app
+        \\const main = @import("../main.zig");
+        \\pub const value = main.value<|>;
+    );
+    const util = f.file("/p/src/a/util.zig");
+    try testing.expectEqualStrings("main.zig:value", try w.goto(util, f.cursor.?.offset));
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    try testing.expectEqual(@as(?FileId, f.file("/p/src/main.zig")), try r.resolveImport(util, "../main.zig"));
+}
+
+test "relative imports of a file outside the module graph resolve" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/src/main.zig module:app
+        \\//- /p/loose.zig
+        \\const sibling = @import("sibling.zig");
+        \\pub const value = sibling.value<|>;
+        \\//- /p/sibling.zig
+        \\pub const value = 1;
+    );
+    const loose = f.file("/p/loose.zig");
+    try testing.expectEqualStrings("sibling.zig:value", try w.goto(loose, f.cursor.?.offset));
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    try testing.expectEqual(@as(?FileId, f.file("/p/sibling.zig")), try r.resolveImport(loose, "sibling.zig"));
+}
+
 test "imports of a file in several modules" {
     var w: World = undefined;
     try w.init();
@@ -796,6 +863,62 @@ test "files that are not loaded are read from disk" {
     try testing.expectEqualStrings("other.zig:thing", try w.goto(file, @intCast(std.mem.indexOf(u8, text, "thing").?)));
 }
 
+test "a container-level variable does not resolve its own name in its initializer" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const at = struct {
+        fn of(t: []const u8, needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, t, needle).?);
+        }
+    }.of;
+
+    // The compiler rejects `const x = x;`, `var x = x;` and the same reference from a block in the
+    // initializer: the declaration depends on itself. goto must report no definition.
+    const own = "const x = x;\n";
+    const own_file = try w.add("/p/own.zig", own);
+    try testing.expectEqualStrings("null", try w.goto(own_file.file, at(own, "x;")));
+
+    const variable = "var x = x;\n";
+    const variable_file = try w.add("/p/variable.zig", variable);
+    try testing.expectEqualStrings("null", try w.goto(variable_file.file, at(variable, "x;")));
+
+    const block = "const x = blk: { const y = x; break :blk 1; };\n";
+    const block_file = try w.add("/p/block.zig", block);
+    try testing.expectEqualStrings("null", try w.goto(block_file.file, at(block, "x;")));
+
+    const nested_own = "const S = struct { const x = x; };\n";
+    const nested_own_file = try w.add("/p/nested_own.zig", nested_own);
+    try testing.expectEqualStrings("null", try w.goto(nested_own_file.file, at(nested_own, "x; }")));
+
+    // Container-level forward references are legal.
+    const forward = "const a = b;\nconst b = 1;\n";
+    const forward_file = try w.add("/p/forward.zig", forward);
+    try testing.expectEqualStrings("forward.zig:b", try w.goto(forward_file.file, at(forward, "b;")));
+
+    // A function body may refer to the function itself.
+    const recursive = "fn f() void { _ = f; }\n";
+    const recursive_file = try w.add("/p/recursive.zig", recursive);
+    try testing.expectEqualStrings("recursive.zig:f", try w.goto(recursive_file.file, at(recursive, "f; }")));
+
+    // Nested bodies are separate items, so they still see the declaration they belong to.
+    const nested_fn = "const x = struct { fn f() void { _ = x; } };\n";
+    const nested_fn_file = try w.add("/p/nested_fn.zig", nested_fn);
+    try testing.expectEqualStrings("nested_fn.zig:x", try w.goto(nested_fn_file.file, at(nested_fn, "x; }")));
+
+    const nested_const = "const x = struct { const y = x; };\n";
+    const nested_const_file = try w.add("/p/nested_const.zig", nested_const);
+    try testing.expectEqualStrings("nested_const.zig:x", try w.goto(nested_const_file.file, at(nested_const, "x; }")));
+
+    const field = "const x = struct { a: u32 = blk: { _ = x; break :blk 1; } };\n";
+    const field_file = try w.add("/p/field.zig", field);
+    try testing.expectEqualStrings("field.zig:x", try w.goto(field_file.file, at(field, "x; break")));
+
+    const other = "const x = 1;\nconst y = x;\n";
+    const other_file = try w.add("/p/other.zig", other);
+    try testing.expectEqualStrings("other.zig:x", try w.goto(other_file.file, at(other, "x;")));
+}
+
 test "alias targets distinguish bare primitives from escaped declarations" {
     var w: World = undefined;
     try w.init();
@@ -823,4 +946,77 @@ test "alias targets distinguish bare primitives from escaped declarations" {
         (try r.namespaceOf(.{ .item = .{ .file = added.file, .item = escaped } })).?,
         (try r.namespaceOf(.{ .item = .{ .file = added.file, .item = quoted } })).?,
     );
+}
+
+test "members of another file resolve only when pub" {
+    // `other.hidden` is a compile error, not a reference to the declaration
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/other.zig
+        \\const hidden: u32 = 1;
+        \\pub const shown: u32 = 2;
+        \\pub const E = enum { a, b };
+        \\//- /p/main.zig
+        \\const other = @import("other.zig");
+        \\const alias = other;
+        \\test {
+        \\    _ = other.hidden;
+        \\    _ = other.shown;
+        \\    _ = other.E.a;
+        \\    _ = alias.hidden;
+        \\    _ = alias.shown;
+        \\    other.<|>
+        \\}
+    );
+    const main = f.file("/p/main.zig");
+    const text = blk: {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        break :blk try w.arena.allocator().dupe(u8, (try ctx.get(database.syntax.SourceText, main)).text);
+    };
+    const at = struct {
+        fn of(t: []const u8, needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, t, needle).?);
+        }
+    }.of;
+    try testing.expectEqualStrings("null", try w.goto(main, at(text, "hidden;")));
+    try testing.expectEqualStrings("other.zig:shown", try w.goto(main, at(text, "shown;")));
+    // Enum fields are not gated by `pub`
+    try testing.expectEqualStrings("other.zig:a", try w.goto(main, at(text, "a;")));
+    // The same through an alias
+    try testing.expectEqualStrings("null", try w.goto(main, at(text, "alias.hidden") + 6));
+    try testing.expectEqualStrings("other.zig:shown", try w.goto(main, at(text, "alias.shown") + 6));
+    // Completion offers only pub declarations of another file
+    try testing.expectEqualStrings("E shown", try w.complete(main, f.cursor.?.offset));
+}
+
+test "members of the same file resolve through a self-import" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/self.zig
+        \\const self = @import("self.zig");
+        \\const hidden: u32 = 1;
+        \\pub const shown: u32 = 2;
+        \\test {
+        \\    _ = self.hidden;
+        \\    _ = self.shown;
+        \\}
+    );
+    const self_file = f.file("/p/self.zig");
+    const text = blk: {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        break :blk try w.arena.allocator().dupe(u8, (try ctx.get(database.syntax.SourceText, self_file)).text);
+    };
+    const at = struct {
+        fn of(t: []const u8, needle: []const u8) u32 {
+            return @intCast(std.mem.indexOf(u8, t, needle).?);
+        }
+    }.of;
+    try testing.expectEqualStrings("self.zig:hidden", try w.goto(self_file, at(text, "hidden;")));
+    try testing.expectEqualStrings("self.zig:shown", try w.goto(self_file, at(text, "shown;")));
 }
