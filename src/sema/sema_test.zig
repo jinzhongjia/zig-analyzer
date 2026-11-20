@@ -8549,6 +8549,338 @@ test "signed division truncates toward zero and a zero remainder folds" {
     });
 }
 
+test "comptime_int remainder with a negative operand and a nonzero remainder gives no value" {
+    // A comptime_int `%` with a negative operand was folded like `@rem`.
+    // Expected values are the results of zig 0.17.1, which rejects the nonzero remainders.
+    try expectTypes(
+        \\const neg_lhs = -7 % 3;
+        \\const neg_rhs = 7 % -3;
+        \\const neg_both = -7 % -3;
+        \\const zero_neg_lhs = -4 % 2;
+        \\const zero_neg_rhs = 4 % -2;
+        \\const big_neg_lhs = -(1 << 100) % 3;
+        \\const big_neg_rhs = (1 << 100) % -3;
+        \\const big_zero = -(1 << 100) % 2;
+        \\const positive = 7 % 3;
+        \\fn g() void {
+        \\    _ = .{ neg_lhs, neg_rhs, neg_both, zero_neg_lhs, zero_neg_rhs, big_neg_lhs, big_neg_rhs, big_zero, positive };
+        \\}
+    , &.{
+        .{ "neg_lhs", "comptime_int" },
+        .{ "neg_rhs", "comptime_int" },
+        .{ "neg_both", "comptime_int" },
+        .{ "zero_neg_lhs", "comptime_int = 0" },
+        .{ "zero_neg_rhs", "comptime_int = 0" },
+        .{ "big_neg_lhs", "comptime_int" },
+        .{ "big_neg_rhs", "comptime_int" },
+        .{ "big_zero", "comptime_int = 0" },
+        .{ "positive", "comptime_int = 1" },
+    });
+}
+
+test "an integer coerces to a float only when the float represents it exactly" {
+    // A comptime-known integer coerced to a float type was rounded.
+    // Expected values are the results of zig 0.17.1, which rejects the inexact coercions
+    // ("type 'f32' cannot represent integer value") but compares at comptime_float precision.
+    try expectTypes(
+        \\const f32_inexact: f32 = 16777217;
+        \\const f32_exact: f32 = 16777216;
+        \\const f32_neg_inexact: f32 = -16777217;
+        \\const f16_inexact: f16 = 2049;
+        \\const f64_inexact: f64 = 9007199254740993;
+        \\const f32_too_big: f32 = 1 << 128;
+        \\const f32_big_exact: f32 = 1 << 127;
+        \\const ct_inexact: comptime_float = (1 << 200) + 1;
+        \\const ct_exact: comptime_float = 1 << 200;
+        \\const u: u32 = 16777217;
+        \\const typed_inexact: f32 = u;
+        \\const arith_inexact = @as(f32, 1.0) + 16777217;
+        \\const arith_exact = @as(f32, 0.0) + 16777216;
+        \\const arith_ct_inexact = 1.5 + ((1 << 200) + 1);
+        \\const arr_inexact = [_]f32{16777217};
+        \\const cmp_eq = 16777217 == @as(f32, 16777216);
+        \\const cmp_gt = 16777217 > @as(f32, 16777216);
+        \\const cmp_big_eq = ((1 << 200) + 1) == @as(f128, 1 << 200);
+        \\const cmp_big_gt = ((1 << 200) + 1) > @as(f128, 0);
+        \\const float_from_int: f32 = @floatFromInt(16777217);
+        \\fn assign() f32 {
+        \\    var x: f32 = 0;
+        \\    x += 16777217;
+        \\    return x;
+        \\}
+        \\const assign_inexact = comptime assign();
+        \\fn g() void {
+        \\    _ = .{ f32_inexact, f32_exact, f32_neg_inexact, f16_inexact, f64_inexact, f32_too_big, f32_big_exact, ct_inexact, ct_exact, typed_inexact, arith_inexact, arith_exact, arith_ct_inexact, arr_inexact, cmp_eq, cmp_gt, cmp_big_eq, cmp_big_gt, float_from_int, assign_inexact };
+        \\}
+    , &.{
+        .{ "f32_inexact", "f32" },
+        .{ "f32_exact", "f32 = 16777216" },
+        .{ "f32_neg_inexact", "f32" },
+        .{ "f16_inexact", "f16" },
+        .{ "f64_inexact", "f64" },
+        .{ "f32_too_big", "f32" },
+        .{ "f32_big_exact", "f32 = 170141180000000000000000000000000000000" },
+        .{ "ct_inexact", "comptime_float" },
+        .{ "ct_exact", "comptime_float = 1606938044258990275541962092341162600000000000000000000000000" },
+        .{ "typed_inexact", "f32" },
+        .{ "arith_inexact", "f32" },
+        .{ "arith_exact", "f32 = 16777216" },
+        .{ "arith_ct_inexact", "comptime_float" },
+        .{ "arr_inexact", "[1]f32" },
+        .{ "cmp_eq", "bool = false" },
+        .{ "cmp_gt", "bool = true" },
+        .{ "cmp_big_eq", "bool = true" },
+        .{ "cmp_big_gt", "bool = true" },
+        .{ "float_from_int", "f32 = 16777216" },
+        .{ "assign_inexact", "f32" },
+    });
+}
+
+test "a store through a const pointer or to an immutable place gives no value" {
+    // Stores through `*const` and `[]const` pointers and to constants changed the stored place.
+    // Expected values are the results of zig 0.17.1, which rejects the `bad` functions.
+    try expectTypes(
+        \\fn badSlice() u8 { var a = [4]u8{ 1, 2, 3, 4 }; const s: []const u8 = a[0..]; s[0] = 9; return a[0]; }
+        \\fn badDeref() u8 { var x: u8 = 1; const p: *const u8 = &x; p.* = 9; return x; }
+        \\fn badCompound() u8 { var x: u8 = 1; const p: *const u8 = &x; p.* += 1; return x; }
+        \\fn badConstant() u8 { const c: u8 = 1; @constCast(&c).* = 9; return c; }
+        \\fn badMemcpy() u8 { var a = [2]u8{ 1, 2 }; const s: []const u8 = &a; @memcpy(s, &[_]u8{ 3, 4 }); return a[0]; }
+        \\fn badMemset() u8 { var a = [2]u8{ 1, 2 }; const s: []const u8 = &a; @memset(s, 7); return a[0]; }
+        \\fn okDeref() u8 { var x: u8 = 1; const p = &x; p.* = 9; return x; }
+        \\fn okConstCast() u8 { var x: u8 = 1; const p: *const u8 = &x; @constCast(p).* = 9; return x; }
+        \\fn okMemcpy() u8 { var a = [2]u8{ 1, 2 }; const s: []u8 = &a; @memcpy(s, &[_]u8{ 3, 4 }); return a[0]; }
+        \\fn okIndex() u8 { var a = [2]u8{ 1, 2 }; const p: *const [2]u8 = &a; const q: *[2]u8 = @constCast(p); q[1] = 5; return a[1]; }
+        \\const bad_slice = comptime badSlice();
+        \\const bad_deref = comptime badDeref();
+        \\const bad_compound = comptime badCompound();
+        \\const bad_constant = comptime badConstant();
+        \\const bad_memcpy = comptime badMemcpy();
+        \\const bad_memset = comptime badMemset();
+        \\const ok_deref = comptime okDeref();
+        \\const ok_const_cast = comptime okConstCast();
+        \\const ok_memcpy = comptime okMemcpy();
+        \\const ok_index = comptime okIndex();
+        \\const var_slice_ty = comptime blk: {
+        \\    var a = [2]u8{ 1, 2 };
+        \\    const s = a[0..];
+        \\    s[0] = 3;
+        \\    break :blk .{ @TypeOf(s), a[0] };
+        \\};
+        \\const const_slice_ty = comptime blk: {
+        \\    const a = [2]u8{ 1, 2 };
+        \\    break :blk @TypeOf(a[0..]);
+        \\};
+    , &.{
+        .{ "bad_slice", "u8" },
+        .{ "bad_deref", "u8" },
+        .{ "bad_compound", "u8" },
+        .{ "bad_constant", "u8" },
+        .{ "bad_memcpy", "u8" },
+        .{ "bad_memset", "u8" },
+        .{ "ok_deref", "u8 = 9" },
+        .{ "ok_const_cast", "u8 = 9" },
+        .{ "ok_memcpy", "u8 = 3" },
+        .{ "ok_index", "u8 = 5" },
+        // Slicing a variable array gives a pointer that can write it
+        .{ "var_slice_ty", "struct { comptime type = *[2]u8, comptime u8 = 3 } = .{ *[2]u8, 3 }" },
+        .{ "const_slice_ty", "type = *const [2]u8" },
+    });
+}
+
+test "a vector element type must be an integer, float, bool or pointer" {
+    // `@Vector` built vectors of any element type, and their arithmetic was evaluated.
+    // Expected values are the results of zig 0.17.1, which rejects the `bad` element types
+    // ("expected integer, float, bool, or pointer for the vector element type").
+    try expectTypes(
+        \\const E = enum { a, b };
+        \\const bad_comptime_int = @Vector(3, comptime_int);
+        \\const bad_comptime_float = @Vector(2, comptime_float);
+        \\const bad_optional = @Vector(2, ?u8);
+        \\const bad_enum = @Vector(2, E);
+        \\const bad_slice = @Vector(2, []u8);
+        \\const bad_optional_slice = @Vector(2, ?[]u8);
+        \\const bad_allowzero_optional = @Vector(2, ?*allowzero u8);
+        \\const bad_vector = @Vector(2, @Vector(2, u8));
+        \\const bad_size = @sizeOf(@Vector(2, ?u8));
+        \\const bad_select = @select(comptime_int, @Vector(2, bool){ true, false }, .{ 1, 2 }, .{ 3, 4 });
+        \\const bad_shuffle = @shuffle(comptime_int, .{ 1, 2 }, .{ 3, 4 }, .{ 0, 1 });
+        \\const ok_int = @Vector(2, u0);
+        \\const ok_float = @Vector(2, f80);
+        \\const ok_bool = @Vector(2, bool);
+        \\const ok_ptr = @Vector(2, *u8);
+        \\const ok_many = @Vector(2, [*c]u8);
+        \\const ok_optional_ptr = @Vector(2, ?*u8);
+        \\const ok_fn_ptr = @Vector(2, *const fn () void);
+        \\const ok_select = @select(u8, @Vector(2, bool){ true, false }, [2]u8{ 1, 2 }, [2]u8{ 3, 4 });
+    , &.{
+        .{ "bad_comptime_int", "type" },
+        .{ "bad_comptime_float", "type" },
+        .{ "bad_optional", "type" },
+        .{ "bad_enum", "type" },
+        .{ "bad_slice", "type" },
+        .{ "bad_optional_slice", "type" },
+        .{ "bad_allowzero_optional", "type" },
+        .{ "bad_vector", "type" },
+        .{ "bad_size", "comptime_int" },
+        .{ "bad_select", "unknown" },
+        .{ "bad_shuffle", "unknown" },
+        .{ "ok_int", "type = @Vector(2, u0)" },
+        .{ "ok_float", "type = @Vector(2, f80)" },
+        .{ "ok_bool", "type = @Vector(2, bool)" },
+        .{ "ok_ptr", "type = @Vector(2, *u8)" },
+        .{ "ok_many", "type = @Vector(2, [*c]u8)" },
+        .{ "ok_optional_ptr", "type = @Vector(2, ?*u8)" },
+        .{ "ok_fn_ptr", "type = @Vector(2, *const fn () void)" },
+        .{ "ok_select", "@Vector(2, u8) = .{ 1, 4 }" },
+    });
+}
+
+test "vector builtins give no type for operands the compiler rejects" {
+    // `@reduce`, `@select` and `@shuffle` gave a result type for operands of the wrong shape.
+    // Expected results are those of zig 0.17.1, which rejects the `bad` calls.
+    try expectTypes(
+        \\fn f(x: @Vector(3, u32), y: @Vector(2, u32), xb: @Vector(2, bool), arr: [3]u32, pred: @Vector(3, bool), u1v: @Vector(3, u1)) void {
+        \\    const bad_reduce_array = @reduce(.Add, arr);
+        \\    const bad_reduce_empty = @reduce(.Add, @Vector(0, u8){});
+        \\    const bad_reduce_bool_add = @reduce(.Add, xb);
+        \\    const bad_reduce_bool_min = @reduce(.Min, xb);
+        \\    const bad_reduce_float_xor = @reduce(.Xor, @Vector(2, f32){ 1, 2 });
+        \\    const bad_reduce_scalar = @reduce(.Add, @as(u32, 1));
+        \\    const bad_select_scalar_pred = @select(u32, true, x, x);
+        \\    const bad_select_pred_elem = @select(u32, u1v, x, x);
+        \\    const bad_select_len = @select(u32, pred, x, y);
+        \\    const bad_select_scalar = @select(u32, pred, x, 5);
+        \\    const bad_shuffle_oob = @shuffle(u32, x, x, [2]i32{ 0, 3 });
+        \\    const bad_shuffle_oob_neg = @shuffle(u32, x, y, [2]i32{ 0, -3 });
+        \\    const bad_shuffle_undefined = @shuffle(u32, x, undefined, [2]i32{ 0, -1 });
+        \\    const bad_shuffle_wide = @shuffle(u32, x, x, [2]i64{ 0, 1 << 40 });
+        \\    const bad_shuffle_tuple_mask = @shuffle(u32, x, x, .{ 0, 2 });
+        \\    const bad_shuffle_bool_mask = @shuffle(u32, x, x, [2]bool{ true, false });
+        \\    const bad_shuffle_scalar = @shuffle(u32, 5, x, [2]i32{ 0, -1 });
+        \\    const ok_reduce = @reduce(.Max, x);
+        \\    const ok_reduce_bool = @reduce(.And, xb);
+        \\    const ok_reduce_float = @reduce(.Add, @Vector(2, f32){ 1, 2 });
+        \\    const ok_select_array = @select(u32, [3]bool{ true, false, true }, arr, x);
+        \\    const ok_select_tuple = @select(u32, pred, .{ 1, 2, 3 }, x);
+        \\    const ok_select_undefined = @select(u32, pred, undefined, x);
+        \\    const ok_shuffle_neg = @shuffle(u32, x, x, [2]i32{ 0, -3 });
+        \\    const ok_shuffle_lens = @shuffle(u32, x, y, [2]i32{ 2, -2 });
+        \\    const ok_shuffle_undefined = @shuffle(u32, x, undefined, [2]i32{ 0, 2 });
+        \\    const ok_shuffle_undef_elem = @shuffle(u32, x, x, [2]i32{ 0, undefined });
+        \\    _ = .{ bad_reduce_array, bad_reduce_empty, bad_reduce_bool_add, bad_reduce_bool_min, bad_reduce_float_xor, bad_reduce_scalar, bad_select_scalar_pred, bad_select_pred_elem, bad_select_len, bad_select_scalar, bad_shuffle_oob, bad_shuffle_oob_neg, bad_shuffle_undefined, bad_shuffle_wide, bad_shuffle_tuple_mask, bad_shuffle_bool_mask, bad_shuffle_scalar, ok_reduce, ok_reduce_bool, ok_reduce_float, ok_select_array, ok_select_tuple, ok_select_undefined, ok_shuffle_neg, ok_shuffle_lens, ok_shuffle_undefined, ok_shuffle_undef_elem };
+        \\}
+    , &.{
+        .{ "bad_reduce_array", "unknown" },
+        .{ "bad_reduce_empty", "unknown" },
+        .{ "bad_reduce_bool_add", "unknown" },
+        .{ "bad_reduce_bool_min", "unknown" },
+        .{ "bad_reduce_float_xor", "unknown" },
+        .{ "bad_reduce_scalar", "unknown" },
+        .{ "bad_select_scalar_pred", "unknown" },
+        .{ "bad_select_pred_elem", "unknown" },
+        .{ "bad_select_len", "unknown" },
+        .{ "bad_select_scalar", "unknown" },
+        .{ "bad_shuffle_oob", "unknown" },
+        .{ "bad_shuffle_oob_neg", "unknown" },
+        .{ "bad_shuffle_undefined", "unknown" },
+        .{ "bad_shuffle_wide", "unknown" },
+        .{ "bad_shuffle_tuple_mask", "unknown" },
+        .{ "bad_shuffle_bool_mask", "unknown" },
+        .{ "bad_shuffle_scalar", "unknown" },
+        .{ "ok_reduce", "u32" },
+        .{ "ok_reduce_bool", "bool" },
+        .{ "ok_reduce_float", "f32" },
+        .{ "ok_select_array", "@Vector(3, u32)" },
+        .{ "ok_select_tuple", "@Vector(3, u32)" },
+        .{ "ok_select_undefined", "@Vector(3, u32)" },
+        .{ "ok_shuffle_neg", "@Vector(2, u32)" },
+        .{ "ok_shuffle_lens", "@Vector(2, u32)" },
+        .{ "ok_shuffle_undefined", "@Vector(2, u32)" },
+        .{ "ok_shuffle_undef_elem", "@Vector(2, u32)" },
+    });
+}
+
+test "@hasDecl on a type that is not a container gives no value" {
+    // `@hasDecl(u8, "foo")` was false.
+    // Expected values are the results of zig 0.17.1, which rejects the `bad` operands
+    // ("expected struct, enum, union, or opaque").
+    try expectTypes(
+        \\const Inner = struct {
+        \\    pub const x = 1;
+        \\    const priv_const = 2;
+        \\};
+        \\const bad_int = @hasDecl(u8, "foo");
+        \\const bad_optional = @hasDecl(?u8, "foo");
+        \\const bad_pointer = @hasDecl(*Inner, "x");
+        \\const bad_error_set = @hasDecl(error{A}, "A");
+        \\const bad_array = @hasDecl([2]u8, "len");
+        \\const ok_pub = @hasDecl(Inner, "x");
+        \\const ok_private = @hasDecl(Inner, "priv_const");
+        \\const ok_missing = @hasDecl(Inner, "y");
+        \\const ok_anyopaque = @hasDecl(anyopaque, "foo");
+        \\const ok_tuple = @hasDecl(struct { u8 }, "foo");
+        \\const ok_anon = @hasDecl(@TypeOf(.{ .a = 1 }), "a");
+        \\const ok_reified = @hasDecl(@Struct(.auto, null, &.{}, &.{}, &.{}), "foo");
+        \\const ok_opaque = @hasDecl(opaque {}, "foo");
+    , &.{
+        .{ "bad_int", "bool" },
+        .{ "bad_optional", "bool" },
+        .{ "bad_pointer", "bool" },
+        .{ "bad_error_set", "bool" },
+        .{ "bad_array", "bool" },
+        .{ "ok_pub", "bool = true" },
+        .{ "ok_private", "bool = false" },
+        .{ "ok_missing", "bool = false" },
+        .{ "ok_anyopaque", "bool = false" },
+        .{ "ok_tuple", "bool = false" },
+        .{ "ok_anon", "bool = false" },
+        .{ "ok_reified", "bool = false" },
+        .{ "ok_opaque", "bool = false" },
+    });
+}
+
+test "@Struct and @Union give no type for specs the compiler rejects" {
+    // `@Struct` and `@Union` built a type from any spec.
+    // Expected values are the results of zig 0.17.1, which rejects the `bad` specs when the call
+    // is analyzed; the packed backing integer is checked only when the layout is resolved.
+    try expectTypes(
+        \\const bad_backing_auto = @Struct(.auto, u32, &.{"a"}, &.{u1}, &.{.{}});
+        \\const bad_backing_extern = @Struct(.@"extern", u32, &.{"a"}, &.{u32}, &.{.{}});
+        \\const bad_extern_union_tag = @Union(.@"extern", enum { a }, &.{"a"}, &.{u8}, &.{.{}});
+        \\const Mismatch = @Struct(.@"packed", u32, &.{ "a", "b" }, &.{ u1, u2 }, &.{ .{}, .{} });
+    , &.{
+        .{ "bad_backing_auto", "type" },
+        .{ "bad_backing_extern", "type" },
+        .{ "bad_extern_union_tag", "type" },
+        .{ "Mismatch", "type = Mismatch" },
+    });
+    // The field attributes are read through `std.builtin.Type`
+    try expectStdTypes(
+        \\const Mismatch = @Struct(.@"packed", u32, &.{ "a", "b" }, &.{ u1, u2 }, &.{ .{}, .{} });
+        \\const bad_mismatch_size = @sizeOf(Mismatch);
+        \\const ok_packed = @sizeOf(@Struct(.@"packed", u3, &.{ "a", "b" }, &.{ u1, u2 }, &.{ .{}, .{} }));
+        \\const ok_union = @sizeOf(@Union(.auto, enum { a }, &.{"a"}, &.{u8}, &.{.{}}));
+        \\const ok_packed_union = @sizeOf(@Union(.@"packed", u8, &.{"a"}, &.{u8}, &.{.{}}));
+        \\const bad_comptime_no_default = @Struct(.auto, null, &.{"a"}, &.{u8}, &.{.{ .@"comptime" = true }});
+        \\const bad_extern_comptime = @Struct(.@"extern", null, &.{"a"}, &.{u8}, &.{.{ .@"comptime" = true, .default_value_ptr = &@as(u8, 3) }});
+        \\const bad_packed_align = @Struct(.@"packed", null, &.{"a"}, &.{u8}, &.{.{ .@"align" = 4 }});
+        \\const bad_packed_union_align = @Union(.@"packed", null, &.{"a"}, &.{u8}, &.{.{ .@"align" = 4 }});
+        \\const ok_comptime = @sizeOf(@Struct(.auto, null, &.{"a"}, &.{u8}, &.{.{ .@"comptime" = true, .default_value_ptr = &@as(u8, 3) }}));
+        \\const ok_aligned = @alignOf(@Struct(.auto, null, &.{"a"}, &.{u8}, &.{.{ .@"align" = 4 }}));
+    , &.{
+        .{ "bad_comptime_no_default", "type" },
+        .{ "bad_extern_comptime", "type" },
+        .{ "bad_packed_align", "type" },
+        .{ "bad_packed_union_align", "type" },
+        .{ "bad_mismatch_size", "comptime_int" },
+        .{ "ok_packed", "comptime_int = 1" },
+        .{ "ok_union", "comptime_int = 1" },
+        .{ "ok_packed_union", "comptime_int = 1" },
+        .{ "ok_comptime", "comptime_int = 0" },
+        .{ "ok_aligned", "comptime_int = 4" },
+    });
+}
+
 test "builtins on integer types wider than 128 bits" {
     // Expected values are the results of zig 0.17.0 and 0.17.1 (the same in both)
     try expectTypes(

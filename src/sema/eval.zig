@@ -1702,6 +1702,10 @@ const Evaluator = struct {
     }
 
     fn store(ev: *Evaluator, ref: Ref, v: Val) EvalError!void {
+        // A constant place, or one reached through a `*const` pointer, cannot be written (the
+        // compiler reports "cannot assign to constant"), nor can an immutable cell through a
+        // pointer `@constCast` made writable
+        if (ref.is_const or ref.immutable) return error.Abort;
         // Comptime code cannot write a container-level declaration: a constant, or a variable
         // whose contents are known only at runtime
         if (ev.cell_decls.contains(ref.cell)) return error.Abort;
@@ -3040,7 +3044,7 @@ const Evaluator = struct {
 
     /// Comparison `lhs op rhs` of evaluated operands. Matching the compiler, the operands are
     /// coerced to their peer type: an enum literal to the other side's enum (by tag name, never
-    /// as a decl literal; a name that is not a tag is a compile error), a comptime number to the
+    /// as a decl literal; a name that is not a tag is a compile error), a comptime_float to the
     /// other side's float type (rounding it), a function body to a pointer to the function
     /// (`functionOperand`). A tagged union compared with a tag keeps the literal as it is. Vectors
     /// are compared element by element.
@@ -4245,7 +4249,7 @@ const Evaluator = struct {
             .deref => |x| {
                 const p = try ev.eval(f, x, null);
                 ref = switch (p.v) {
-                    .ref => |r| r,
+                    .ref => |r| ev.through(r, p.ty),
                     else => return error.Abort,
                 };
                 old = try ev.deref(p);
@@ -4401,10 +4405,6 @@ const Evaluator = struct {
         const end = if (s.end) |e| std.math.cast(usize, try ev.evalInt(f, e, .usize_type)) orelse return error.Abort else count;
         if (start > end or end > count) return error.Abort;
         const child = ev.elemTypeOf(base.ty, 0);
-        const is_const = switch (ip.key(base.ty)) {
-            .ptr_type => |p| p.is_const,
-            else => true,
-        };
         // Consistent with the inference path: an explicit sentinel takes precedence; slicing to
         // the end keeps the sentinel of the source array
         const src_sentinel = ev.seqSentinel(base.ty);
@@ -4423,12 +4423,18 @@ const Evaluator = struct {
             }
         }
         const sentinel: ?Index = if (explicit) |x| x else if (end == count) src_sentinel else null;
+        const slice_target = try ev.sliceTarget(f, s.lhs, base);
+        const is_const = switch (ip.key(base.ty)) {
+            .ptr_type => |p| p.is_const,
+            // Slicing an array takes its address: writable when the array is a variable
+            else => if (slice_target) |t| t.is_const else true,
+        };
         // Range known at comptime: a pointer to an array
         const array = try ip.get(.{ .array_type = .{ .len = end - start, .child = child, .sentinel = sentinel } });
         const ptr_ty = try ip.ptrTo(array, .one, is_const);
         // Slicing storage of a local variable (or reached through a pointer): reference a range of
         // the original storage, so writes are reflected in the original array
-        if (try ev.sliceTarget(f, s.lhs, base)) |target| {
+        if (slice_target) |target| {
             const offset = if (target.window) |tw| tw.start else 0;
             var ref = target;
             ref.window = .{ .start = std.math.cast(u32, offset + start) orelse return error.Abort, .len = std.math.cast(u32, end - start) orelse return error.Abort };
@@ -4553,12 +4559,14 @@ const Evaluator = struct {
 
     /// Whether a comparison operand of type `t` is coerced to the other operand's type `other` by
     /// peer type resolution: an enum literal compared with an enum (or an optional enum), and a
-    /// comptime number compared with a float
+    /// comptime_float compared with a float
     fn peerOperand(ev: *Evaluator, t: Index, other: Index) bool {
         if (other == .unknown or other == t) return false;
         return switch (t) {
             .enum_literal_type => other != .enum_literal_type and !ev.isUnion(other),
-            .comptime_int_type, .comptime_float_type => ev.ip.isFloat(other),
+            // A comptime_int is compared with a float by value (at comptime_float precision),
+            // without the coercion's exactness requirement
+            .comptime_float_type => ev.ip.isFloat(other),
             else => false,
         };
     }
@@ -4885,7 +4893,14 @@ const Evaluator = struct {
                 if (value.sliceArrayHasField(ip, t, field)) |has| return boolVal(has);
                 return boolVal(try ev.fieldIndex(t, field) != null or (value.isEnumType(ip, t) and try ev.isEnumMember(t, field)));
             }
-            const ns = try queries.namespaceOfType(ev.r, t) orelse return boolVal(false);
+            // Only a struct, enum, union or opaque has declarations ("expected struct, enum,
+            // union, or opaque"); those without source code have none
+            switch (ip.key(t)) {
+                .container_type => {},
+                .tuple_type, .anon_struct_type, .reified_type, .union_tag_type => return boolVal(false),
+                else => return if (t == .anyopaque_type) boolVal(false) else error.Abort,
+            }
+            const ns = try queries.namespaceOfType(ev.r, t) orelse return error.Abort;
             const tree = try ev.r.itemTree(ns.file);
             const m = Resolver.lookupDecl(tree, ns.container, field) orelse return boolVal(false);
             return boolVal(tree.items[m].flags.is_pub);
@@ -4910,7 +4925,9 @@ const Evaluator = struct {
         if (eq(u8, name, "@Vector")) {
             if (vals.len != 2) return error.Abort;
             const len = std.math.cast(u32, try ev.intArg(vals[0])) orelse return error.Abort;
-            return Val.ofType(try ip.get(.{ .vector_type = .{ .len = len, .child = try asType(vals[1]) } }));
+            const child = try asType(vals[1]);
+            if (!value.isVectorElemType(ip, child)) return error.Abort;
+            return Val.ofType(try ip.get(.{ .vector_type = .{ .len = len, .child = child } }));
         }
         if (eq(u8, name, "@Tuple")) {
             if (vals.len != 1) return error.Abort;
@@ -4960,6 +4977,14 @@ const Evaluator = struct {
             if (types.len != names.len) return error.Abort;
             const is_union = eq(u8, name, "@Union");
             const attrs = try ev.reifiedAttrs(vals[4], names.len, is_union);
+            // Specs the compiler rejects when it analyzes the call: a backing integer of a struct
+            // that is not packed, an enum tag of an extern union, aligned fields of a packed
+            // container, comptime fields of an extern struct or without a default value. A packed
+            // backing integer that does not match the fields is reported only when the layout is
+            // resolved, which then gives no layout.
+            if (tag != .null_value and (if (is_union) layout == .@"extern" else layout != .@"packed")) return error.Abort;
+            if (layout == .@"packed" and attrs.aligns.len != 0) return error.Abort;
+            if (attrs.comptimes.len != 0 and (layout == .@"extern" or attrs.comptime_without_default)) return error.Abort;
             return Val.ofType(try ev.reify(f, e, .{
                 .kind = if (is_union) .@"union" else .@"struct",
                 .layout = layout,
@@ -5014,7 +5039,7 @@ const Evaluator = struct {
         if (eq(u8, name, "@memcpy")) {
             if (vals.len != 2) return error.Abort;
             const dest = switch (vals[0].v) {
-                .ref => |r| r,
+                .ref => |r| ev.through(r, vals[0].ty),
                 else => return error.Abort,
             };
             const n = try ev.elemCount(vals[1]) orelse return error.Abort;
@@ -5028,7 +5053,7 @@ const Evaluator = struct {
         if (eq(u8, name, "@memset")) {
             if (vals.len != 2) return error.Abort;
             const dest = switch (vals[0].v) {
-                .ref => |r| r,
+                .ref => |r| ev.through(r, vals[0].ty),
                 else => return error.Abort,
             };
             const n = try ev.elemCount(vals[0]) orelse return error.Abort;
@@ -5041,7 +5066,7 @@ const Evaluator = struct {
         if (eq(u8, name, "@memmove")) {
             if (vals.len != 2) return error.Abort;
             const dest = switch (vals[0].v) {
-                .ref => |r| r,
+                .ref => |r| ev.through(r, vals[0].ty),
                 else => return error.Abort,
             };
             // Source and destination may overlap: read all elements before writing
@@ -5132,11 +5157,15 @@ const Evaluator = struct {
         }
         if (eq(u8, name, "@select")) {
             if (vals.len != 4) return error.Abort;
-            return try ev.select(try asType(vals[0]), vals[1], vals[2], vals[3]);
+            const elem = try asType(vals[0]);
+            if (!value.isVectorElemType(ip, elem)) return error.Abort;
+            return try ev.select(elem, vals[1], vals[2], vals[3]);
         }
         if (eq(u8, name, "@shuffle")) {
             if (vals.len != 4) return error.Abort;
-            return try ev.shuffle(try asType(vals[0]), vals[1], vals[2], vals[3]);
+            const elem = try asType(vals[0]);
+            if (!value.isVectorElemType(ip, elem)) return error.Abort;
+            return try ev.shuffle(elem, vals[1], vals[2], vals[3]);
         }
         if (eq(u8, name, "@min") or eq(u8, name, "@max")) {
             if (vals.len == 0) return error.Abort;
@@ -7050,7 +7079,13 @@ const Evaluator = struct {
         return .{ .size = value.alignForward(size, alignment) orelse return null, .alignment = alignment, .bits = null };
     }
 
-    const ReifiedAttrs = struct { aligns: []const u64 = &.{}, comptimes: []const bool = &.{}, unknown: bool = false };
+    const ReifiedAttrs = struct {
+        aligns: []const u64 = &.{},
+        comptimes: []const bool = &.{},
+        /// A comptime field has no default value
+        comptime_without_default: bool = false,
+        unknown: bool = false,
+    };
 
     /// Whether an untagged auto union has a hidden tag for safety checks (matching the compiler's
     /// `wantSafeTypes`): it does when the optimize mode of its module is Debug or ReleaseSafe. When
@@ -7102,15 +7137,25 @@ const Evaluator = struct {
         const comptimes = try ev.a.alloc(bool, n);
         var any_align = false;
         var any_comptime = false;
+        var comptime_without_default = false;
         for (aligns, comptimes, 0..) |*al, *ct, i| {
             const attr = try ev.elemAt(attrs, i);
             const x = try ev.freeze(try ev.fieldAccess(null, attr, "align")) orelse return error.Abort;
             al.* = if (x == .null_value) 0 else try alignValue(ev.ip, x);
             ct.* = !is_union and (try ev.condition(try ev.fieldAccess(null, attr, "comptime"))).yes;
+            if (ct.*) {
+                const default = try ev.fieldAccess(null, attr, "default_value_ptr");
+                if (default.v == .unknown) return error.Abort;
+                if (ev.isNullRepr(default) or default.is(.null_value)) comptime_without_default = true;
+            }
             any_align = any_align or al.* != 0;
             any_comptime = any_comptime or ct.*;
         }
-        return .{ .aligns = if (any_align) aligns else &.{}, .comptimes = if (any_comptime) comptimes else &.{} };
+        return .{
+            .aligns = if (any_align) aligns else &.{},
+            .comptimes = if (any_comptime) comptimes else &.{},
+            .comptime_without_default = comptime_without_default,
+        };
     }
 
     // ── @typeInfo ────────────────────────────────────────────────────

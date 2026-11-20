@@ -1814,7 +1814,14 @@ pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index 
             else => {},
         };
         const x = floatOf(ip, v) orelse return null;
-        return floatValue(ip, to, x);
+        const r = try floatValue(ip, to, x) orelse return null;
+        // An integer coerces only to a float that represents it exactly (the compiler reports
+        // "type 'f32' cannot represent integer value")
+        switch (ip.key(v)) {
+            .int_value, .big_int => if (!try representsInt(ip, v, r)) return null,
+            else => {},
+        }
+        return r;
     }
     // Floats with integer values (an integer-valued comptime_float can coerce to an integer
     // type)
@@ -1854,6 +1861,22 @@ pub fn coerceValue(ip: *InternPool, v: Index, to: Index) Allocator.Error!?Index 
         else => {},
     };
     return v;
+}
+
+/// Whether the float value `f` equals the integer value `v` exactly
+fn representsInt(ip: *InternPool, v: Index, f: Index) Allocator.Error!bool {
+    const x: f128 = @bitCast(ip.key(f).float_value.bits);
+    if (@trunc(x) != x) return false;
+    var arena: std.heap.ArenaAllocator = .init(ip.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fx = try bigint.fromFloat(a, x) orelse return false;
+    const iv: bigint.Big = switch (ip.key(v)) {
+        .int_value => |i| if (isUnsigned128(ip, i.ty)) try bigint.fromUnsigned128(a, @bitCast(i.value)) else try bigint.fromInt(a, i.value),
+        .big_int => |b| .{ .limbs = b.limbs, .positive = b.positive },
+        else => unreachable,
+    };
+    return bigint.eql(fx, iv);
 }
 
 /// `coerceValue` for a value of type `from` (unknown when it is not known): an optional payload
@@ -1979,6 +2002,18 @@ pub fn optionalCoercion(ip: *InternPool, from: Index, to: Index) ?OptionalCoerci
         // as address 0, while `?[*c]T` and `?*allowzero T` need a separate flag, so `?*T` to
         // `?[*c]T` wraps (a non-null optional holding a null C pointer)
         else => if (a == .unknown) null else if (isPtrLikePayload(ip, a) != isPtrLikePayload(ip, b)) .wrap else .keep,
+    };
+}
+
+/// Whether `t` can be the element type of a vector (`Sema.checkVectorElemType`): a runtime
+/// integer, float or bool, a pointer other than a slice, or a pointer-like optional
+pub fn isVectorElemType(ip: *InternPool, t: Index) bool {
+    if (t == .comptime_int_type or t == .comptime_float_type) return false;
+    if (t == .bool_type or ip.isInt(t) or ip.isFloat(t)) return true;
+    return switch (ip.key(t)) {
+        .ptr_type => |p| p.size != .slice,
+        .optional_type => |child| isPtrLikePayload(ip, child) and ip.key(child).ptr_type.size != .slice,
+        else => false,
     };
 }
 
