@@ -12,7 +12,7 @@
 //!                        "parameters": true, "builtin_parameters": true, "exclude_single_argument": true,
 //!                        "hide_redundant_param_names": true, "max_length": 25 },
 //!       "semantic_tokens": { "mode": "full", "global_var": false },
-//!       "hover": { "instances": "count", "fqn": false },
+//!       "hover": { "instances": "count", "layout": true, "fqn": false },
 //!       "imports": { "derived": "with_import", "sort": "path" },
 //!       "completion": { "auto_import": true, "max_auto_imports": 128, "snippets": true, "argument_placeholders": true },
 //!       "sema": { "callsite_seeding": true, "wait_for_project": false },
@@ -114,6 +114,9 @@ semantic_tokens_global_var: bool = false,
 /// Hover in a generic function body: how the declarations that a member name refers to under the
 /// other instances are shown, when they differ from the one shown
 hover_instances: HoverInstances = .count,
+/// Whether hover shows the size and alignment of a type, and the offset of a struct field, when
+/// the layout is fully known
+hover_layout: bool = true,
 /// Hover: also show the compiler's fully qualified name of a container-level declaration
 /// (`fqn: main.Wide`) after its signature; off because it often repeats the signature
 hover_fqn: bool = false,
@@ -290,6 +293,7 @@ const settings = [_]Setting{
     .{ .section = "semantic_tokens", .key = "mode", .field = "semantic_tokens_mode" },
     .{ .section = "semantic_tokens", .key = "global_var", .field = "semantic_tokens_global_var" },
     .{ .section = "hover", .key = "instances", .field = "hover_instances" },
+    .{ .section = "hover", .key = "layout", .field = "hover_layout" },
     .{ .section = "hover", .key = "fqn", .field = "hover_fqn" },
     .{ .section = "imports", .key = "derived", .field = "imports_derived" },
     .{ .section = "imports", .key = "sort", .field = "imports_sort" },
@@ -725,6 +729,13 @@ test "parse: nested fields, optional wrapper" {
     try testing.expectEqual(HoverInstances.full, full_hover.hover_instances);
     try testing.expect(full_hover.hover_fqn);
     try testing.expectEqual(0, full_hover.warnings.len);
+    try testing.expect(empty.hover_layout);
+    var no_layout = try parseText(
+        \\{"hover": {"layout": false}}
+    );
+    defer no_layout.deinit(testing.allocator);
+    try testing.expect(!no_layout.hover_layout);
+    try testing.expectEqual(0, no_layout.warnings.len);
 
     try testing.expect(empty.completion_snippets and empty.completion_argument_placeholders);
     var no_snippets = try parseText(

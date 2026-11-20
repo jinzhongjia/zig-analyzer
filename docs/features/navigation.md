@@ -51,6 +51,14 @@ A value of a non-exhaustive enum that no member has is shown as the compiler pri
 - **`@embedFile`**: a value directly from it is shown as the call, not its bytes. Hover adds the resolved file and size, and the text when it is short, valid text. Values computed from the content keep the cut display.
 - **Inlay hints** are inline, with nested anonymous containers as `struct {...}`. A type hint is at most about `inlay_hints.max_length` characters (default 25, 0 for no limit), and may exceed that by one list item.
 
+### Size and alignment
+
+Hover on a type value also shows its size and alignment, after the code block and before the inferred-from note and the documentation: `size: 8 · align: 4`. The values are computed by the analyzer's own layout algorithm, which follows the compiler's rules for field reordering, `extern`, `packed`, tuples, unions (including the hidden tag of an untagged union under the optimize mode), and the target's integer, pointer, and vector layouts. Hovering a field name of a non-packed struct adds `offset: 8`, its byte offset; packed structs and comptime fields show none.
+
+Nothing is shown for comptime-only types (`type`, `comptime_int`, `fn () void`, a struct with a `type` field), opaque types, `noreturn`, abstract generic parameters, and modules (a file is a struct type whose 0-byte size is not meaningful). A target-dependent layout is also omitted when the target parameters for the file do not determine it (see Target-dependent layout in `docs/design.md`).
+
+`hover.layout` (default on) turns both lines off.
+
 ## Fields of `.zon` values
 
 Goto on a field of a value imported from a `.zon` file reads the literal from the type of the value and goes to the name in the file, including through a copy, a parameter of a generic function (one target per instance), and the items of a tuple being iterated.

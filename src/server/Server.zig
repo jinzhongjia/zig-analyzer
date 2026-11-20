@@ -6870,6 +6870,7 @@ fn hover(server: *Server, r: *Resolver, arena: Allocator, params: types.HoverPar
     const info = try ide.hover.hoverWith(r, at.file, at.offset, .{
         .roots = try server.rootsAlloc(arena),
         .instances = server.config.hover_instances,
+        .layout = server.config.hover_layout,
         .fqn = server.config.hover_fqn,
         // Links to source locations open the file at the line in the client; plain text has none
         .links = if (server.hover_markdown) .{ .ctx = server, .uri = hoverUri } else null,

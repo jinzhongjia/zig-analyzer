@@ -579,6 +579,22 @@ pub fn stringValue(r: *Resolver, tv: TypedValue) Error!?[]const u8 {
     };
 }
 
+/// Layout modifier of a container declaration (`struct`, `extern struct`, `packed struct`);
+/// null when it is not a container or cannot be evaluated
+pub fn containerLayout(r: *Resolver, t: Index) Error!?InternPool.Reified.Layout {
+    var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
+    defer ev.deinit();
+    const decl = ev.containerSyntax(t) catch |err| switch (err) {
+        error.Abort, error.Break, error.Continue, error.Return => return null,
+        error.Canceled => return error.Canceled,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    switch (r.ctx.db.env.ip.key(t)) {
+        .container_type, .reified_type => return decl.layout,
+        else => return null,
+    }
+}
+
 /// Bit offset of a struct field (`@bitOffsetOf`); null when it cannot be evaluated
 pub fn bitOffsetOf(r: *Resolver, t: Index, field: []const u8) Error!?u64 {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
