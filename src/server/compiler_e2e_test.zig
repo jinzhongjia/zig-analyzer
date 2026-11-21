@@ -2598,6 +2598,21 @@ test "settings: zig.lib_path: std resolves under it and zig runs with it, removi
 test "notifications of project files with the contents the project started with do not restart it" {
     // FSEvents reports writes made shortly before the stream started: each restarted the project
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    for (0..Harness.crash_attempts) |_| {
+        notifyUnchangedProjectFiles() catch |err| switch (err) {
+            // A `zig build` counted after the notifications may come from the restart after a
+            // maker crash: run again with a new project
+            error.MakerCrashed => continue,
+            else => |e| return e,
+        };
+        return;
+    }
+    return error.MakerCrashedInEveryAttempt;
+}
+
+/// One attempt of the test above; error.MakerCrashed when the project was restarted after its maker
+/// crashed before the `zig build` runs were counted (see `Harness.restartedAfterCrash`)
+fn notifyUnchangedProjectFiles() !void {
     var project = try fixture.Project.create(&.{
         .{ .path = "build.zig", .text = simple_build },
         .{ .path = "main.zig", .text = "pub fn main() void {}\n" },
@@ -2623,6 +2638,8 @@ test "notifications of project files with the contents the project started with 
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "zigw", .data = script, .flags = .{ .permissions = .executable_file } });
     try initializeWith(&h, project.root, false, try settingsValue(&h, .{ .zig = .{ .path = zigw } }));
     try waitIdle(&h);
+    const instance = h.holdVisibleInstance();
+    defer instance.release();
     const before = try zigCalls(&h, calls);
     try testing.expect(hasLine(before, "build "));
 
@@ -2631,7 +2648,9 @@ test "notifications of project files with the contents the project started with 
     for ([_][]const u8{ "build.zig.zon", "zig-analyzer.zon" }) |name| try changes.append(a, .{ .uri = try za.base.uri.fromPath(a, try project.path(a, name)), .type = 3 });
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = changes.items });
     try waitIdle(&h);
-    for ((try zigCalls(&h, calls))[before.len..]) |line| try testing.expect(!std.mem.eql(u8, line, "build "));
+    const after = (try zigCalls(&h, calls))[before.len..];
+    if (h.restartedAfterCrash(instance)) return error.MakerCrashed;
+    for (after) |line| try testing.expect(!std.mem.eql(u8, line, "build "));
 
     // A change still restarts it
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "build.zig", .data = simple_build ++ "\n" });
