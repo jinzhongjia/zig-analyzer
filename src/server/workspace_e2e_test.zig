@@ -461,32 +461,6 @@ fn publishCount(h: *Harness, uri: []const u8) !usize {
     return n;
 }
 
-/// The visible instance of the only project, with a reference held (dropped with `release`): its
-/// address is not reused by a later instance while it is compared with
-fn holdVisibleInstance(h: *Harness) *Workspace {
-    h.server.workspaces_mutex.lockUncancelable(testing.io);
-    defer h.server.workspaces_mutex.unlock(testing.io);
-    const ws = h.server.workspaces.items[0];
-    ws.acquire();
-    return ws;
-}
-
-/// Whether the only project was restarted because its maker crashed since `since` was its visible
-/// instance. The Zig 0.17 maker can panic right after a build, also after `waitIdle` has returned
-/// (see docs/zig-maker-build-request-race.md): the new instance then loads, configures and builds
-/// the project once more. `compiles` leaves out that build, but the write transactions and
-/// publishes counted since then are not only the server's response to what the test did. The new
-/// instance is registered before it does any of that (see `Server.restartWorkspace`): checked
-/// after counting, this sees every restart the counts include. A restart for any other reason
-/// returns false, and the counts then show it.
-fn restartedAfterCrash(h: *Harness, since: *const Workspace) bool {
-    h.server.workspaces_mutex.lockUncancelable(testing.io);
-    defer h.server.workspaces_mutex.unlock(testing.io);
-    const visible = h.server.workspaces.items[0];
-    const current = visible.successor orelse visible;
-    return current != since and current.crash_restarts != 0;
-}
-
 /// What `rewriteWithSameContent` compares after each rewrite
 const Counts = struct {
     builds: u64,
@@ -499,12 +473,8 @@ const Counts = struct {
     }
 };
 
-/// Attempts of the test below. A maker crash cuts short more of them with few cores and a busy CPU;
-/// only an attempt it cuts short runs again.
-const crash_attempts = 10;
-
 test "rewriting files on disk without changing their content is not a change" {
-    for (0..crash_attempts) |_| {
+    for (0..Harness.crash_attempts) |_| {
         rewriteWithSameContent() catch |err| switch (err) {
             // What the counts show is not only the server's response to the rewrites: run again
             // with a new project
@@ -517,7 +487,7 @@ test "rewriting files on disk without changing their content is not a change" {
 }
 
 /// One attempt of the test above; error.MakerCrashed when the project was restarted after its maker
-/// crashed before the counts were compared (see `restartedAfterCrash`)
+/// crashed before the counts were compared (see `Harness.restartedAfterCrash`)
 fn rewriteWithSameContent() !void {
     var project = try fixture.Project.create(&fixture.basic);
     defer project.deinit();
@@ -530,7 +500,7 @@ fn rewriteWithSameContent() !void {
     try h.notify("initialized", Empty{});
     try open(&h, try za.base.uri.fromPath(a, try project.path(a, "src/main.zig")), fixture.basic[1].text);
     _ = try h.request("zig-analyzer/waitIdle", {});
-    const instance = holdVisibleInstance(&h);
+    const instance = h.holdVisibleInstance();
     defer instance.release();
     const lib_path = try project.path(a, "src/lib.zig");
     const lib_uri = try za.base.uri.fromPath(a, lib_path);
@@ -545,7 +515,7 @@ fn rewriteWithSameContent() !void {
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = lib_uri, .type = 2 }} });
     _ = try h.request("zig-analyzer/waitIdle", {});
     const first = try Counts.of(&h, lib_uri);
-    if (restartedAfterCrash(&h, instance)) return error.MakerCrashed;
+    if (h.restartedAfterCrash(instance)) return error.MakerCrashed;
     try testing.expectEqual(before.builds + 1, first.builds);
     try testing.expectEqual(before.writes, first.writes);
 
@@ -556,7 +526,7 @@ fn rewriteWithSameContent() !void {
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{ .{ .uri = lib_uri, .type = 3 }, .{ .uri = lib_uri, .type = 1 } } });
     _ = try h.request("zig-analyzer/waitIdle", {});
     const second = try Counts.of(&h, lib_uri);
-    if (restartedAfterCrash(&h, instance)) return error.MakerCrashed;
+    if (h.restartedAfterCrash(instance)) return error.MakerCrashed;
     try testing.expectEqual(first.builds, second.builds);
     try testing.expectEqual(before.writes, second.writes);
     try testing.expectEqual(first.published, second.published);

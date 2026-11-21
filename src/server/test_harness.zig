@@ -7,6 +7,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const Server = @import("Server.zig");
+const Workspace = @import("Workspace.zig");
 const za = @import("../zig_analyzer.zig");
 const transport = za.lsp.transport;
 
@@ -260,5 +261,36 @@ pub const Harness = struct {
             try result.put(a, uri[std.mem.lastIndexOfScalar(u8, uri, '/').? + 1 ..], lines);
         }
         return result;
+    }
+
+    /// Attempts of a test that runs again with a new project when `restartedAfterCrash` says its
+    /// counts are not only the server's response to what the test did. A maker crash cuts short
+    /// more of them with few cores and a busy CPU; only an attempt it cuts short runs again.
+    pub const crash_attempts = 10;
+
+    /// The visible instance of the only project, with a reference held (dropped with `release`):
+    /// its address is not reused by a later instance while it is compared with
+    pub fn holdVisibleInstance(h: *Harness) *Workspace {
+        h.server.workspaces_mutex.lockUncancelable(testing.io);
+        defer h.server.workspaces_mutex.unlock(testing.io);
+        const ws = h.server.workspaces.items[0];
+        ws.acquire();
+        return ws;
+    }
+
+    /// Whether the only project was restarted because its maker crashed since `since` was its
+    /// visible instance. The Zig 0.17 maker can panic right after a build, also after `waitIdle`
+    /// has returned (see docs/zig-maker-build-request-race.md): the new instance then loads,
+    /// configures and builds the project once more. What a test counts since then (`zig build`
+    /// runs, write transactions, publishes) is not only the server's response to what the test
+    /// did. The new instance is registered before it does any of that (see
+    /// `Server.restartWorkspace`): checked after counting, this sees every restart the counts
+    /// include. A restart for any other reason returns false, and the counts then show it.
+    pub fn restartedAfterCrash(h: *Harness, since: *const Workspace) bool {
+        h.server.workspaces_mutex.lockUncancelable(testing.io);
+        defer h.server.workspaces_mutex.unlock(testing.io);
+        const visible = h.server.workspaces.items[0];
+        const current = visible.successor orelse visible;
+        return current != since and current.crash_restarts != 0;
     }
 };
