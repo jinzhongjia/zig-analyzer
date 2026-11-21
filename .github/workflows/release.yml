@@ -20,6 +20,12 @@ jobs:
     # The environment holds the signing key: checking it here fails a release that could not be
     # signed before anything is built
     environment: release
+    permissions:
+      contents: read
+      # Reads the CI runs of the parent commit
+      actions: read
+    outputs:
+      reuse-ci: ${{ steps.ci.outputs.reuse }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,11 +47,39 @@ jobs:
         run: |
           test -n "$MINISIGN_SECRET_KEY" || { echo "::error::the secret MINISIGN_SECRET_KEY of the environment release is not set"; exit 1; }
           test -f minisign.pub || { echo "::error::minisign.pub is missing"; exit 1; }
+      # A release commit that changes only CHANGELOG.md and the version in build.zig.zon on a
+      # commit whose push to main passed CI: no test reads either, and the smoke test checks the
+      # version, so that run stands for the tagged commit and CI is not run again
+      - name: The CI of the parent commit applies
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          reuse=false
+          if [ "$(git rev-list --parents -n 1 "$GITHUB_SHA" | wc -w)" -eq 2 ]; then
+            parent=$(git rev-parse "$GITHUB_SHA^")
+            other=$(git diff --name-only "$parent" "$GITHUB_SHA" | grep -vxE 'CHANGELOG\.md|build\.zig\.zon' || true)
+            zon=$(git diff -U0 "$parent" "$GITHUB_SHA" -- build.zig.zon | grep -E '^[-+]' | grep -vE '^(\+\+\+|---) ' | grep -vE '^[-+] *\.version = "[^"]*",$' || true)
+            # A push to main runs every CI job and matrix entry
+            passed=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$parent&event=push&status=success" --jq '.total_count')
+            if [ -z "$other" ] && [ -z "$zon" ] && [ "$passed" -gt 0 ]; then
+              reuse=true
+              echo "CI passed on the parent commit $parent, and the tagged commit changes only CHANGELOG.md and the version: CI is not run again"
+            else
+              echo "The tagged commit changes more than CHANGELOG.md and the version, or the push of $parent to main has not passed CI: CI runs on the tagged commit"
+            fi
+          else
+            echo "The tagged commit is a merge or has no parent: CI runs on the tagged commit"
+          fi
+          echo "reuse=$reuse" >> "$GITHUB_OUTPUT"
 
-  # The whole CI on the tagged commit: a release is never built from a commit that fails it
+  # The whole CI on the tagged commit, unless the CI of its parent applies (see check): a release
+  # is never built from a commit that fails it
   ci:
     name: CI
     needs: check
+    if: needs.check.outputs.reuse-ci != 'true'
     uses: ./.github/workflows/ci.yml
 
   build:
@@ -155,7 +189,9 @@ jobs:
 
   release:
     name: Publish the release
-    needs: [ci, smoke]
+    needs: [check, ci, smoke]
+    # ci is skipped when the CI of the parent commit applies
+    if: ${{ !cancelled() && needs.smoke.result == 'success' && (needs.ci.result == 'success' || (needs.ci.result == 'skipped' && needs.check.outputs.reuse-ci == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     environment: release
@@ -272,7 +308,7 @@ jobs:
   homebrew:
     name: Update the Homebrew formula
     needs: release
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ !cancelled() && needs.release.result == 'success' && !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: release
@@ -315,7 +351,7 @@ jobs:
   aur:
     name: Update the AUR package
     needs: release
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ !cancelled() && needs.release.result == 'success' && !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release

@@ -10,7 +10,10 @@ Pushing it runs `.github/workflows/release.yml`:
 
 1. **check**: the tag is annotated, on `main`, matches `.version` in `build.zig.zon`, and
    `CHANGELOG.md` has a section for the version; the signing key is set up.
-2. **ci**: the whole CI (`ci.yml`) on the tagged commit.
+2. **ci**: the whole CI (`ci.yml`) on the tagged commit. Skipped when the tagged commit has one
+   parent, changes only `CHANGELOG.md` and the `.version` line of `build.zig.zon`, and the push of
+   the parent to `main` passed CI (`check` says which in the log of its last step): that run
+   stands for the tagged commit.
 3. **build**: ReleaseSafe and ReleaseFast executables cross-compiled for x86_64 / aarch64 ×
    Linux / macOS / Windows (12 archives).
 4. **smoke**: each archive unpacked on a runner of its platform and checked over LSP
@@ -65,14 +68,17 @@ Check the tag does not exist yet: `git tag -l vX.Y.Z` and `git ls-remote --tags 
 
 ## 3. Check CI
 
-The CI run of `main` should have passed; the release workflow runs it again on the tagged commit
-and refuses to publish otherwise, but a failure found now saves the tag:
+The CI run of `main` must have passed and completed: the release commit (step 5) then changes
+only the changelog and the version, and the release workflow uses that run instead of running CI
+again. Without it (still running, cancelled, or failed), the workflow runs the whole CI on the
+tagged commit, which takes about an hour, and refuses to publish if it fails:
 
 ```sh
 gh run list --workflow ci.yml --branch main --commit "$(git rev-parse main)"
 ```
 
-Stop on a failure and report it.
+Stop on a failure and report it; wait for a run in progress. Put nothing but the changelog and
+the version in the release commit.
 
 ## 4. Write the changelog
 
@@ -121,7 +127,8 @@ gh run list --workflow release.yml --limit 1
 gh run watch <run id> --exit-status
 ```
 
-The CI part takes about an hour. If no run starts within a few minutes, tell the user; the tag is
+Building, the smoke tests, and publishing take about 20 minutes; when CI runs too (see step 2 of
+the workflow above), about an hour. If no run starts within a few minutes, tell the user; the tag is
 pushed but there is no release yet. Do not build and upload the release by hand unless the user
 asks.
 
