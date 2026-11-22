@@ -193,6 +193,16 @@ jobs:
         with:
           version: ${{ matrix.zig }}
           cache-key: test-${{ matrix.optimize }}
+      # The tests run zig without the cache directory overrides of setup-zig (see
+      # `runAnalyzerTests` in build.zig), so the fixture builds use the default global cache
+      # directory; without it, each shard first compiles what every build links (compiler_rt and
+      # the like). Its content depends only on the zig version and the system, so the key does
+      # not change with the commit.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: matrix.suite == 'test-all'
+        with:
+          path: ${{ runner.os == 'Windows' && '~/AppData/Local/zig' || '~/.cache/zig' }}
+          key: fixture-zig-cache-v1-${{ matrix.os }}-${{ matrix.zig }}-${{ matrix.optimize }}
       - name: zig build ${{ matrix.suite }} (in ${{ matrix.shards }} shards)
         run: zig build ${{ matrix.suite }} -Doptimize=${{ matrix.optimize }} -Dtest-shards=${{ matrix.shards }} --summary all
 

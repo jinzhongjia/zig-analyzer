@@ -308,6 +308,12 @@ pub const TestHooks = if (@import("builtin").is_test) struct {
     /// (`moduleGraphUnchanged`) in its read transaction, before anything is compared, so that a
     /// test can make a write transaction wait for the lock during the comparison
     graph: ?*OnceGate = null,
+    /// Whether the auto-import index is built ahead of the first completion (see
+    /// `requestAutoImportIndex`). Off, a completion still builds it when it needs it, but the
+    /// first completion after opening has no auto-imports. Indexing the standard library takes
+    /// most of the time of a short test that waits for the server to be idle: tests turn it on
+    /// only when they check auto-imports.
+    eager_imports: bool = false,
 } else struct {};
 
 const Indexing = struct {
@@ -1336,6 +1342,7 @@ fn hasOpenZigDocument(server: *Server) bool {
 /// every place that ends it (startup, a project's first load, a restart during a first load) calls
 /// this too. Until startup ends, which follows the configuration pull, it does nothing.
 pub fn requestAutoImportIndex(server: *Server) void {
+    if (@import("builtin").is_test and !server.hooks.eager_imports) return;
     if (!server.autoImportEnabled()) return;
     if (!server.hasOpenZigDocument()) return;
     // The module graph and the files it covers are final only after the first project load: an

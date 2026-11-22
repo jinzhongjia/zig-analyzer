@@ -1160,26 +1160,8 @@ test "single-file mode: stopping ends a compile in progress and the processes it
     try testing.expectError(error.Stopped, zig.compile(&compiles));
 }
 
-test "single-file mode: the compiler and the processes it started end when the server goes away" {
-    // A server that was killed or crashed left the compiler running
-    if (native_os == .windows) return error.SkipZigTest;
-    var zig: HangingZig = try .create("");
-    defer zig.deinit();
-    var compiles: SingleFileCompiles = .{};
-    var task = try testing.io.concurrent(HangingZig.compile, .{ &zig, &compiles });
-    defer task.cancel(testing.io) catch {};
-    const pgid = try HangingZig.serverGone(&compiles);
-    // The processes may end before the compile request is written to zig or after it. Either
-    // error means that zig is gone, and the compile ends the group in the same way; the next two
-    // tests take each of the two paths
-    task.await(testing.io) catch |err| switch (err) {
-        error.WriteFailed, error.EndOfStream => {},
-        else => return err,
-    };
-    try @import("fixture.zig").expectGroupGone(pgid);
-}
-
 test "single-file mode: the compiler and the processes it started end when the server goes away before the compile is requested" {
+    // A server that was killed or crashed left the compiler running
     if (native_os == .windows) return error.SkipZigTest;
     var zig: HangingZig = try .create("");
     defer zig.deinit();
