@@ -283,7 +283,7 @@ function! s:status(result) abort
         \ ['Max RSS', a:result.max_rss_kb > 0 ? s:bytes(a:result.max_rss_kb * 1024) : 'unknown'],
         \ ['Heap', a:result.heap_bytes > 0 ? s:bytes(a:result.heap_bytes) : 'not counted'],
         \ ['InternPool', printf('%d items, %s', a:result.intern_pool_items, s:bytes(a:result.intern_pool_bytes))],
-        \ ['Incomplete', printf('%d by cycles, %d by stack depth', get(l:causes, 'cycle', 0), get(l:causes, 'stack', 0))],
+        \ ['Incomplete', printf('%d by cycles, %d by stack depth, %d by unavailable tools', get(l:causes, 'cycle', 0), get(l:causes, 'stack', 0), get(l:causes, 'unavailable', 0))],
         \ ])
 
   let l:a = get(a:result, 'allocator', v:null)

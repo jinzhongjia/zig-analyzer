@@ -248,7 +248,7 @@ interface StatusResult {
     classes: { size: number; pages: number; live: number; allocs: number; occupancy: number[] }[];
   } | null;
   queries: Query[];
-  incomplete_causes?: { cycle: number; stack: number };
+  incomplete_causes?: { cycle: number; stack: number; unavailable?: number };
 }
 
 function status(result: StatusResult): View {
@@ -263,7 +263,7 @@ function status(result: StatusResult): View {
     ["Max RSS", result.max_rss_kb > 0 ? bytes(result.max_rss_kb * 1024) : "unknown"],
     ["Heap", result.heap_bytes > 0 ? bytes(result.heap_bytes) : "not counted"],
     ["InternPool", `${result.intern_pool_items} items, ${bytes(result.intern_pool_bytes)}`],
-    ["Incomplete", `${causes.cycle} by cycles, ${causes.stack} by stack depth`],
+    ["Incomplete", `${causes.cycle} by cycles, ${causes.stack} by stack depth, ${causes.unavailable ?? 0} by unavailable tools`],
   ]);
 
   const a = result.allocator;
