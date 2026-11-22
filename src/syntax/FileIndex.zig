@@ -76,6 +76,28 @@ fn walkImports(a: Allocator, node: SyntaxNode, imports: *std.ArrayList([]const u
     while (it.nextNode()) |c| try walkImports(a, c, imports);
 }
 
+/// An `@import("...")` with its decoded string and the range of the string literal
+pub const ImportSite = struct { name: []const u8, start: u32, end: u32 };
+
+/// The `@import("...")` calls in the tree, in order of appearance, allocated in `a`
+pub fn importSites(a: Allocator, root: SyntaxNode) Allocator.Error![]const ImportSite {
+    var sites: std.ArrayList(ImportSite) = .empty;
+    try walkImportSites(a, root, &sites);
+    return sites.items;
+}
+
+fn walkImportSites(a: Allocator, node: SyntaxNode, sites: *std.ArrayList(ImportSite)) Allocator.Error!void {
+    if (ast.cast(ast.BuiltinCall, node)) |call| if (call.name()) |n| if (std.mem.eql(u8, n.text, "@import")) {
+        var args = call.args();
+        if (args.next()) |arg| if (arg.firstToken()) |t| if (t.kind == .string_literal) {
+            const range = t.range();
+            if (std.zig.string_literal.parseAlloc(a, t.text)) |str| try sites.append(a, .{ .name = str, .start = range.start, .end = range.end }) else |_| {}
+        };
+    };
+    var it = node.children();
+    while (it.nextNode()) |c| try walkImportSites(a, c, sites);
+}
+
 pub fn deinit(index: *FileIndex, gpa: Allocator) void {
     var arena = index.arena.promote(gpa);
     arena.deinit();
@@ -215,4 +237,19 @@ test build {
     const imports = try importStrings(arena.allocator(), p.rootNode());
     try std.testing.expectEqual(2, imports.len);
     try std.testing.expectEqualStrings("lib/a.zig", imports[1]);
+}
+
+test importSites {
+    const text =
+        \\const std = @import("std");
+        \\const dep = @import("d\x65p");
+    ;
+    const p = try Parse.create(std.testing.allocator, text, .zig);
+    defer p.destroy();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const sites = try importSites(arena.allocator(), p.rootNode());
+    try std.testing.expectEqual(2, sites.len);
+    try std.testing.expectEqualStrings("dep", sites[1].name);
+    try std.testing.expectEqualStrings("\"d\\x65p\"", text[sites[1].start..sites[1].end]);
 }

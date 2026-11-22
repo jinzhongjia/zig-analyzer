@@ -19,6 +19,7 @@ const live = database.live;
 const ide = za.ide;
 const compiler = za.diagnostics.compiler;
 const Workspace = @import("Workspace.zig");
+const dependency_packages = za.project.packages;
 const Resolver = za.names.resolve.Resolver;
 const Config = @import("../Config.zig");
 
@@ -156,6 +157,7 @@ pub fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file:
         diags = try appendLint(server, ctx, arena, file, lines, rules, diags);
     };
     if (text != null) diags = try appendUnloadedProjectHint(server, arena, file, lines, diags);
+    if (text != null) diags = try appendUnfetchedDependencies(server, ctx, arena, file, lines, diags);
     if (text != null) if (is_zon and std.mem.eql(u8, std.fs.path.basename(server.vfs.path(file)), Config.project_file)) {
         diags = try appendProjectConfigProblems(server, arena, lines, diags);
     };
@@ -298,6 +300,70 @@ fn appendUnloadedProjectHint(server: *Server, arena: Allocator, file: Vfs.FileId
                 "since only the project's build can resolve its imports by name; add the directory to the workspace folders to load the project", .{dir}) },
     };
     return out;
+}
+
+/// An `@import` in build.zig of a dependency that is not fetched (see `unfetchedImports`)
+pub const UnfetchedImport = struct {
+    /// The string literal
+    start: u32,
+    end: u32,
+    name: []const u8,
+    lazy: bool,
+    /// Root of the project whose `zig build --fetch` fetches it
+    root: []const u8,
+};
+
+/// The `@import`s in a build.zig of the dependencies its build.zig.zon gives by `.hash` that are
+/// not fetched (see `Workspace.unfetchedDependencies`)
+pub fn unfetchedImports(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) ![]const UnfetchedImport {
+    const path = server.vfs.path(file);
+    if (!std.mem.eql(u8, std.fs.path.basename(path), "build.zig")) return &.{};
+    // A fetched package is not edited and its dependencies are fetched through the project
+    if (server.fileOrigin(file) != .user) return &.{};
+    const dir = std.fs.path.dirname(path) orelse return &.{};
+    var deps: []const dependency_packages.Unfetched = &.{};
+    var root: []const u8 = "";
+    {
+        const list = try project_set.workspaceList(server, server.gpa);
+        defer project_set.releaseList(server, server.gpa, list);
+        for (list) |ws| {
+            deps = try ws.unfetchedDependencies(arena, dir);
+            if (deps.len != 0) {
+                root = try arena.dupe(u8, ws.root);
+                break;
+            }
+        }
+    }
+    if (deps.len == 0) return &.{};
+    const parse = try ctx.get(syntax_q.ParseFile, file);
+    var out: std.ArrayList(UnfetchedImport) = .empty;
+    for (try za.syntax.FileIndex.importSites(arena, parse.rootNode())) |site| for (deps) |d| {
+        if (!std.mem.eql(u8, site.name, d.name)) continue;
+        try out.append(arena, .{ .start = site.start, .end = site.end, .name = d.name, .lazy = d.lazy, .root = root });
+        break;
+    };
+    return out.items;
+}
+
+/// A warning on each `@import` in build.zig of a dependency that is not fetched: the import does
+/// not resolve, and the configure fails, until it is fetched
+fn appendUnfetchedDependencies(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, lines: offsets.LineIndex, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+    const found = try unfetchedImports(server, ctx, arena, file);
+    if (found.len == 0) return diags;
+    var out: std.ArrayList(types.Diagnostic) = .empty;
+    try out.appendSlice(arena, diags);
+    for (found) |u| try out.append(arena, .{
+        .range = lines.range(u.start, u.end, server.encoding),
+        .severity = .Warning,
+        .code = .{ .string = ide.hints.unfetched_dependency_code },
+        .source = ide.hints.source,
+        .message = .{ .string = if (u.lazy)
+            try std.fmt.allocPrint(arena, "lazy dependency `{s}` is not fetched, so this import does not resolve: zig build fetches a lazy dependency only when the build asks for it " ++
+                "(`b.lazyDependency`, `b.lazyImport`); `zig build --fetch=all` fetches it", .{u.name})
+        else
+            try std.fmt.allocPrint(arena, "dependency `{s}` is not fetched, so this import does not resolve: `zig build --fetch` fetches it", .{u.name}) },
+    });
+    return out.items;
 }
 
 /// Inactive code is shown only for open files: it requires inferring all members of the file

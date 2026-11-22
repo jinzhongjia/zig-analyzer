@@ -23,6 +23,8 @@ const HandlerError = Server.HandlerError;
 const Outcome = Server.Outcome;
 const apply_edit_prefix = Server.apply_edit_prefix;
 const fetch_hash_command = Server.fetch_hash_command;
+const fetch_dependencies_command = Server.fetch_dependencies_command;
+const project_set = @import("../project_set.zig");
 const not_editable = rename.not_editable;
 
 const log = std.log.scoped(.server);
@@ -137,6 +139,7 @@ pub fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types
         }
     };
     if (server.caps.apply_edit and wantsKind(only, types.CodeActionKind.QuickFix)) try dependencyHashActions(server, arena, file, doc_uri, text, start, end, &out);
+    if (wantsKind(only, types.CodeActionKind.QuickFix)) try unfetchedDependencyActions(server, r, arena, file, lines, start, end, params.context.diagnostics, &out);
     return out.items;
 }
 
@@ -178,6 +181,50 @@ fn dependencyHashActions(
             .arguments = try arena.dupe(types.LSPAny, &.{.{ .object = arguments }}),
         },
     } });
+}
+
+/// A code action on an `@import` in build.zig of a dependency that is not fetched: runs
+/// `zig build --fetch` (`--fetch=all` for a lazy dependency) in the project when the user picks it,
+/// so the network request starts only then (see `fetchDependencies`)
+fn unfetchedDependencyActions(
+    server: *Server,
+    r: *Resolver,
+    arena: Allocator,
+    file: Vfs.FileId,
+    lines: za.util.offsets.LineIndex,
+    start: u32,
+    end: u32,
+    client_diagnostics: []const types.Diagnostic,
+    out: *std.ArrayList(CodeActionItem),
+) !void {
+    for (try file_diagnostics.unfetchedImports(server, r.ctx, arena, file)) |u| {
+        if (u.end < start or u.start > end) continue;
+        const title = if (u.lazy) "fetch the dependencies, lazy ones included (`zig build --fetch=all`)" else "fetch the dependencies (`zig build --fetch`)";
+        const arguments: std.json.ObjectMap = try .init(arena, &.{ "root", "all" }, &.{
+            .{ .string = u.root },
+            .{ .bool = u.lazy },
+        });
+        var action: types.CodeAction = .{
+            .title = title,
+            .kind = types.CodeActionKind.QuickFix,
+            .command = .{
+                .title = title,
+                .command = fetch_dependencies_command,
+                .arguments = try arena.dupe(types.LSPAny, &.{.{ .object = arguments }}),
+            },
+        };
+        // Link the same warning sent by the client
+        const range = lines.range(u.start, u.end, server.encoding);
+        for (client_diagnostics) |d| {
+            const c = d.code orelse continue;
+            if (c == .string and std.mem.eql(u8, c.string, ide.hints.unfetched_dependency_code) and std.meta.eql(d.range, range)) {
+                action.diagnostics = try arena.dupe(types.Diagnostic, &.{d});
+                break;
+            }
+        }
+        try out.append(arena, .{ .CodeAction = action });
+        return;
+    }
 }
 
 /// Data kept between `textDocument/codeAction` and `codeAction/resolve` (`CodeAction.data`) for
@@ -290,6 +337,7 @@ const FetchHashArgs = struct {
 /// `workspace/applyEdit`. Runs on a background task, outside any read transaction, because the
 /// download can take a long time; the edit is computed after it, against the manifest as it is then.
 pub fn executeCommand(server: *Server, arena: Allocator, params: types.ExecuteCommandParams) HandlerError!types.ResultType("workspace/executeCommand") {
+    if (std.mem.eql(u8, params.command, fetch_dependencies_command)) return fetchDependencies(server, arena, params);
     if (!std.mem.eql(u8, params.command, fetch_hash_command)) return error.InvalidParams;
     const arguments = params.arguments orelse return error.InvalidParams;
     if (arguments.len == 0) return error.InvalidParams;
@@ -365,6 +413,69 @@ pub fn executeCommand(server: *Server, arena: Allocator, params: types.ExecuteCo
     return null;
 }
 
+/// The argument of `fetch_dependencies_command`
+const FetchDependenciesArgs = struct {
+    /// Project root
+    root: []const u8,
+    /// Lazy dependencies too (`--fetch=all`)
+    all: bool = false,
+};
+
+/// Runs `zig build --fetch` in a project with its build arguments, then restarts the project so
+/// that it configures with the fetched packages. Runs on a background task, outside any read
+/// transaction, because the download can take a long time.
+fn fetchDependencies(server: *Server, arena: Allocator, params: types.ExecuteCommandParams) HandlerError!types.ResultType("workspace/executeCommand") {
+    const arguments = params.arguments orelse return error.InvalidParams;
+    if (arguments.len == 0) return error.InvalidParams;
+    const args = std.json.parseFromValueLeaky(FetchDependenciesArgs, arena, arguments[0], .{ .ignore_unknown_fields = true }) catch return error.InvalidParams;
+    const list = try project_set.workspaceList(server, server.gpa);
+    defer project_set.releaseList(server, server.gpa, list);
+    const ws = for (list) |w| {
+        if (server.vfs.samePath(w.root, args.root)) break w;
+    } else return error.InvalidParams;
+    const name = std.fs.path.basename(ws.root);
+
+    var progress = server.progress.begin(server, try std.fmt.allocPrint(arena, "fetching the dependencies of {s}", .{name}), false);
+    defer if (progress) |p| server.progress.end(server, p, "failed");
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ ws.env.zig_exe, "build", if (args.all) "--fetch=all" else "--fetch", "--build-file", try std.fs.path.join(arena, &.{ ws.root, "build.zig" }) });
+    try argv.appendSlice(arena, ws.config.build_args);
+    const result = std.process.run(server.gpa, server.io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = ws.root },
+        .environ_map = ws.env.childEnviron(),
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+        // Large downloads may take a while; a hung one must end
+        .timeout = .{ .duration = .{ .raw = Io.Duration.fromSeconds(600), .clock = .awake } },
+    }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        server.showWarning(try std.fmt.allocPrint(arena, "cannot fetch the dependencies of {s}: {s}", .{ name, switch (err) {
+            error.FileNotFound, error.AccessDenied, error.InvalidExe => "the zig executable cannot be run",
+            error.Timeout => "zig build --fetch timed out",
+            else => @errorName(err),
+        } }));
+        return null;
+    };
+    defer server.gpa.free(result.stdout);
+    defer server.gpa.free(result.stderr);
+    const ok = switch (result.term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
+    if (!ok) {
+        log.info("{s}: zig build --fetch failed:\n{s}", .{ ws.root, result.stderr });
+        server.showWarning(try std.fmt.allocPrint(arena, "cannot fetch the dependencies of {s}: {s}", .{ name, firstErrorLine(result.stderr) orelse "zig build --fetch failed" }));
+        return null;
+    }
+    server.progress.end(server, progress, "fetched");
+    progress = null;
+    log.info("{s}: dependencies fetched, restarting", .{ws.root});
+    project_set.restartWorkspace(server, ws, 0);
+    return null;
+}
+
 /// Reports why a dependency hash could not be computed or applied
 fn warnFetch(server: *Server, arena: Allocator, dependency: []const u8, reason: []const u8) Allocator.Error!void {
     server.showWarning(try std.fmt.allocPrint(arena, "cannot fetch the hash of `{s}`: {s}", .{ dependency, reason }));
@@ -381,6 +492,21 @@ fn fetchedHash(stdout: []const u8) ?[]const u8 {
     const hash = last orelse return null;
     for (hash) |c| if (std.ascii.isWhitespace(c) or c == '"' or c == '\\') return null;
     return hash;
+}
+
+/// The first line of `stderr` with an error, without its location (zig follows it with the source
+/// line and a caret); the last non-empty line when none has one
+fn firstErrorLine(stderr: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, stderr, '\n');
+    while (lines.next()) |line| if (std.mem.indexOf(u8, line, "error: ")) |i| {
+        return std.mem.trim(u8, line[i + "error: ".len ..], " \t\r");
+    };
+    return errorLine(stderr);
+}
+
+test firstErrorLine {
+    try std.testing.expectEqualStrings("hash mismatch", firstErrorLine("build.zig.zon:1:2: error: hash mismatch\n  .hash = \"x\"\n  ^~~\n").?);
+    try std.testing.expectEqualStrings("boom", firstErrorLine("note\nboom\n").?);
 }
 
 /// The last non-empty line of `stderr`, as the reason shown to the user

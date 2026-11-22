@@ -12,6 +12,8 @@ pub const source = "zig-analyzer";
 pub const inactive_code = "inactive";
 /// Code of the hint on a private declaration that no code in its file uses
 pub const unused_code = "unused.declaration";
+/// Code of the warning on an `@import` in build.zig of a dependency that is not fetched
+pub const unfetched_dependency_code = "build.unfetched_dependency";
 
 /// Families whose hints a suppression comment may name. Naming hints use `naming.<rule>`, lint
 /// hints `lint.<rule>`.
