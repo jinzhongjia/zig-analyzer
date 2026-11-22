@@ -2,6 +2,7 @@
 //! agree with the compiler, as well as the build progress notifications.
 
 const std = @import("std");
+const project_set = @import("project_set.zig");
 const testing = std.testing;
 const za = @import("../zig_analyzer.zig");
 const fixture = za.project.fixture;
@@ -484,7 +485,7 @@ const gate_timeout_s = 300;
 /// gate (zig cannot write its global cache, cannot compile build.zig, ...) and will never reach it:
 /// fails, printing what the server reported.
 fn expectLoading(h: *Harness) !void {
-    if (h.server.projectsPending()) return;
+    if (project_set.projectsPending(&h.server)) return;
     std.debug.print("the server is not loading the project, but build() has not reached the gate\n", .{});
     // Lets the server publish what it has to say about the load
     waitIdle(h) catch |err| std.debug.print("zig-analyzer/waitIdle failed: {t}\n", .{err});
@@ -2688,7 +2689,7 @@ test "settings: invalid zig paths fall back to zig env with a message, zig.built
     // Paths from the server are normalized (on Windows, `\` separators and an uppercase drive
     // letter), so the expected paths are normalized the same way before comparing
     try testing.expectEqualStrings(try std.fs.path.resolveAlloc(a, &.{ project.env.std_dir, "std.zig" }), try stdRoot(&h));
-    try testing.expectEqualStrings(project.env.global_cache_dir, h.server.zigEnv().?.global_cache_dir);
+    try testing.expectEqualStrings(project.env.global_cache_dir, project_set.zigEnv(&h.server).?.global_cache_dir);
     const generated = try definitionPath(&h, uri, builtin_main, "mode;");
     try testing.expect(std.mem.startsWith(u8, generated, try std.fs.path.resolveAlloc(a, &.{project.env.global_cache_dir})));
 

@@ -6,7 +6,7 @@
 const std = @import("std");
 const Vfs = @import("../base/Vfs.zig");
 const Durability = @import("../db/engine.zig").Durability;
-const isVirtual = @import("Server.zig").isVirtual;
+const isVirtual = @import("doc_sync.zig").isVirtual;
 
 pub const Origin = enum {
     /// Documents not on disk (`untitled:`, etc.)

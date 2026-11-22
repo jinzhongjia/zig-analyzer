@@ -11,6 +11,7 @@ const origin = @import("../origin.zig");
 const Resolver = za.names.resolve.Resolver;
 
 const Server = @import("../Server.zig");
+const doc_sync = @import("../doc_sync.zig");
 const references = @import("references.zig");
 const HandlerError = Server.HandlerError;
 const Outcome = Server.Outcome;
@@ -300,7 +301,7 @@ pub fn workspaceEdit(server: *Server, r: *Resolver, arena: Allocator, files: []c
         if (annotated) {
             const edits = try arena.alloc(DocumentEdit, fe.edits.len);
             for (fe.edits, edits) |e, *o| o.* = .{ .AnnotatedTextEdit = .{ .range = try m.range(fe.file, e.start, e.end), .newText = e.text, .annotationId = confirm.?.id } };
-            try documents.append(arena, .{ .TextDocumentEdit = .{ .textDocument = .{ .uri = file_uri, .version = server.docVersion(fe.file) }, .edits = edits } });
+            try documents.append(arena, .{ .TextDocumentEdit = .{ .textDocument = .{ .uri = file_uri, .version = doc_sync.docVersion(server, fe.file) }, .edits = edits } });
         } else {
             const edits = try arena.alloc(types.TextEdit, fe.edits.len);
             for (fe.edits, edits) |e, *o| o.* = .{ .range = try m.range(fe.file, e.start, e.end), .newText = e.text };

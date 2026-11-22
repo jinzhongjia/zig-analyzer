@@ -240,7 +240,7 @@ pub fn main(init: std.process.Init) !u8 {
 fn builtinTarget(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !InternPool.Target {
     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4 * 1024 * 1024));
     defer gpa.free(text);
-    return za.Server.targetOfBuiltin(text);
+    return za.Server.indexing.targetOfBuiltin(text);
 }
 
 /// Generic function: has a comptime (including an implicit `T: type`) or anytype parameter, or

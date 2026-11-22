@@ -13,6 +13,7 @@ const ModuleGraph = za.names.ModuleGraph;
 const Resolver = za.names.resolve.Resolver;
 
 const Server = @import("../Server.zig");
+const indexing = @import("../indexing.zig");
 const HandlerError = Server.HandlerError;
 
 /// A completion item kind the client supports (see `clientSymbolKind`)
@@ -36,7 +37,7 @@ pub fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types
     const text = lines.text;
     const line = lines.lineAt(params.position.line);
     const offset: u32 = @intCast(if (line) |l| l.offset(params.position.character, server.encoding) else text.len);
-    const auto_import = server.autoImportEnabled();
+    const auto_import = indexing.autoImportEnabled(server);
     // Auto-imports are not offered until the index has been built for the current module graph, and
     // the result is marked incomplete: the client requests again as the user types, and they are
     // offered then. Indexing starts when a Zig document opens (with auto-import on; see
@@ -44,7 +45,7 @@ pub fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types
     // where a name could be imported. If the index is still not built and no indexing is in
     // progress (the previous round failed, or the task could not start), it starts again.
     const imports_ready = auto_import and
-        server.index.imports_basis.load(.acquire) == Server.importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
+        server.index.imports_basis.load(.acquire) == indexing.importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
     const max_auto_imports, const snippets, const placeholders = blk: {
         server.config_mutex.lockUncancelable(server.io);
         defer server.config_mutex.unlock(server.io);
@@ -70,7 +71,7 @@ pub fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types
     const imports_waiting = auto_import and !imports_ready and result.import_position;
     if (imports_waiting) {
         const first = !server.index.imports_wanted.swap(true, .acq_rel);
-        if (first or !server.index.rerun.running.load(.acquire)) server.scheduleIndexingFromRead();
+        if (first or !server.index.rerun.running.load(.acquire)) indexing.scheduleIndexingFromRead(server);
     }
     const out = try arena.alloc(types.CompletionItem, result.items.len);
     var ranges: CompletionRanges = .{ .text = text, .line = line, .encoding = server.encoding, .lines = lines };

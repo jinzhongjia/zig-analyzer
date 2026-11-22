@@ -7,6 +7,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const Server = @import("Server.zig");
+const project_set = @import("project_set.zig");
 const Workspace = @import("Workspace.zig");
 const za = @import("../zig_analyzer.zig");
 const transport = za.lsp.transport;
@@ -284,7 +285,7 @@ pub const Harness = struct {
     /// configures and builds the project once more. What a test counts since then (`zig build`
     /// runs, write transactions, publishes) is not only the server's response to what the test
     /// did. The new instance is registered before it does any of that (see
-    /// `Server.restartWorkspace`): checked after counting, this sees every restart the counts
+    /// `project_set.restartWorkspace`): checked after counting, this sees every restart the counts
     /// include. A restart for any other reason returns false, and the counts then show it.
     pub fn restartedAfterCrash(h: *Harness, since: *const Workspace) bool {
         h.server.workspaces_mutex.lockUncancelable(testing.io);
