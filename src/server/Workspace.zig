@@ -104,8 +104,10 @@ resolve_set: ?CompileSet.Result = null,
 /// Build scripts (see `CompileSet.buildScripts`) of the project and of its dependency packages
 /// with a build.zig (see `dependency_packages.discover`): all of them are compiled into the
 /// configure program, so a change to any of them reconfigures. Computed when the background task
-/// starts, from the current text of the files (open files use their buffers, the rest are read
-/// from disk); valid even when reading the build graph fails
+/// starts and again once the build graph is read (the maker fetches the dependency packages
+/// before it configures, so on a fresh checkout they appear on disk only then), from the current
+/// text of the files (open files use their buffers, the rest are read from disk); valid even when
+/// reading the build graph fails
 build_scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
 /// The modules of the build scripts (one per package, rooted at its build.zig and importing the
 /// build.zig modules of its dependencies by name) and the files that belong to them, computed
@@ -762,6 +764,9 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 _ = try ws.server.vfs.intern(input.path);
             };
             if (ws.model.?.configure_inputs.len != 0) file_changes.resyncWatcher(ws.server);
+            // The maker has fetched the dependency packages by now; the module graph takes the
+            // build scripts with the compile set below
+            try ws.computeBuildScripts();
             try ws.recomputeCompileSet();
             // If the old instance has no model worth keeping, there is no need to wait for the
             // whole build to finish
