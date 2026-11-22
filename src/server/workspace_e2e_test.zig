@@ -179,12 +179,12 @@ test "the server watches files on disk: directories a build creates do not sched
     // reports the creation of the fixture's files) have been handled
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = "pub fn goodbye() void {}\n" });
     try waitWatched(&h, Labels{ .uri = main_uri, .text = main_text, .after = "    lib.", .want = "goodbye" });
-    const scans = h.server.scan_generation.load(.acquire);
+    const scans = h.server.scan.rerun.generation.load(.acquire);
     for ([_][]const u8{ "zig-out/bin", ".zig-cache/o/0123", ".zig-cache/tmp" }) |sub| try project.tmp.dir.createDirPath(testing.io, sub);
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = lib_path, .data = "pub fn again() void {}\n" });
     try waitWatched(&h, Labels{ .uri = main_uri, .text = main_text, .after = "    lib.", .want = "again" });
     // A scan for them would find nothing new, and find references and rename would wait for it
-    try testing.expectEqual(scans, h.server.scan_generation.load(.acquire));
+    try testing.expectEqual(scans, h.server.scan.rerun.generation.load(.acquire));
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
 }
@@ -287,10 +287,10 @@ test "the server watches files on disk: a directory moved into the workspace joi
     try h.notify("exit", {});
 }
 
-/// The generation of the last finished pass of the workspace file scan (see `Server.scan_done`):
+/// The generation of the last finished pass of the workspace file scan (see `Server.Scans.done`):
 /// increases with each pass
 fn scanDone(h: *Harness) u64 {
-    return h.server.scan_done.load(.acquire);
+    return h.server.scan.done.load(.acquire);
 }
 
 /// The references to the declaration at the end of `needle` in `uri` include one in the file whose
@@ -316,10 +316,10 @@ fn waitScanAfter(h: *Harness, after: u64) !void {
 /// within 10 seconds
 fn waitScanPass(h: *Harness, after: u64) !void {
     const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(10));
-    h.server.scan_wait_mutex.lockUncancelable(testing.io);
-    defer h.server.scan_wait_mutex.unlock(testing.io);
-    while (h.server.scan_done.load(.acquire) <= after) {
-        h.server.scan_wait_cond.waitTimeout(testing.io, &h.server.scan_wait_mutex, .{ .deadline = .{ .raw = deadline, .clock = .awake } }) catch return error.ChangeNotNoticed;
+    h.server.scan.mutex.lockUncancelable(testing.io);
+    defer h.server.scan.mutex.unlock(testing.io);
+    while (h.server.scan.done.load(.acquire) <= after) {
+        h.server.scan.cond.waitTimeout(testing.io, &h.server.scan.mutex, .{ .deadline = .{ .raw = deadline, .clock = .awake } }) catch return error.ChangeNotNoticed;
     }
 }
 
@@ -755,10 +755,10 @@ test "shutdown returns while a workspace scan waits for the watch task, which wa
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try project.path(a, "lib.zig"), .data = "pub const value = 2;\n" });
     pause.entered.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } }) catch return error.ChangeNotNoticed;
     // A workspace scan ends meanwhile: it holds the busy count until the watch task handles it
-    const generation = h.server.scan_generation.load(.acquire) + 1;
+    const generation = h.server.scan.rerun.generation.load(.acquire) + 1;
     h.server.scheduleScan();
     const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(60));
-    while (h.server.scan_done.load(.acquire) < generation) {
+    while (h.server.scan.done.load(.acquire) < generation) {
         if (std.Io.Clock.awake.now(testing.io).durationTo(deadline).nanoseconds <= 0) return error.ScanNotDone;
         try testing.io.sleep(.fromMilliseconds(5), .awake);
     }

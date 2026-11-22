@@ -146,8 +146,8 @@ test "references, highlight, rename and workspace symbol" {
         // as it was when the request started, then searches every file. Answering at once
         // searched only the files indexed so far, silently leaving out the others (here lib.zig,
         // which is not open).
-        h.server.indexing.store(true, .release);
-        const target = h.server.index_generation.fetchAdd(1, .monotonic) + 1;
+        h.server.index.rerun.running.store(true, .release);
+        const target = h.server.index.rerun.generation.fetchAdd(1, .monotonic) + 1;
         const waiting = try h.send("workspace/symbol", .{ .query = "hel" });
         // A waiting request can be canceled
         const canceled = try h.send("workspace/symbol", .{ .query = "hel" });
@@ -158,15 +158,15 @@ test "references, highlight, rename and workspace symbol" {
             try testing.expect(!(id == .integer and id.integer == waiting));
         };
         {
-            h.server.index_mutex.lockUncancelable(testing.io);
-            defer h.server.index_mutex.unlock(testing.io);
-            h.server.symbols_indexed = target;
-            h.server.index_cond.broadcast(testing.io);
+            h.server.index.mutex.lockUncancelable(testing.io);
+            defer h.server.index.mutex.unlock(testing.io);
+            h.server.index.symbols = target;
+            h.server.index.cond.broadcast(testing.io);
         }
         const during = (try h.response(waiting)).object.get("result").?.array.items;
         try testing.expectEqual(1, during.len);
         try testing.expectEqualStrings("hello", during[0].object.get("name").?.string);
-        h.server.indexing.store(false, .release);
+        h.server.index.rerun.running.store(false, .release);
     }
 
     // code action: unused local constant
@@ -474,10 +474,10 @@ test "rename waits for a scan of the workspace folders in progress instead of fa
     defer h.server.hooks.request = null;
     const id = try h.send("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = position(scale_text, "scale"), .newName = "double" });
     try gate.entered.wait(testing.io);
-    const scans = h.server.scan_generation.load(.acquire);
+    const scans = h.server.scan.rerun.generation.load(.acquire);
     try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "other.zig", .data = "const lib = @import(\"lib.zig\");\ntest {\n    _ = lib.scale(1);\n}\n" });
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = try za.base.uri.fromPath(a, try project.path(a, "other.zig")), .type = 1 }} });
-    while (h.server.scan_generation.load(.acquire) == scans) std.Thread.yield() catch {};
+    while (h.server.scan.rerun.generation.load(.acquire) == scans) std.Thread.yield() catch {};
     gate.release.set(testing.io);
     // Answered after the scan, with the new file, instead of failing with "the workspace folders
     // are still being searched"

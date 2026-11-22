@@ -192,7 +192,7 @@ test "auto-import indexing restarts when an earlier pass did not finish" {
     const params = .{ .textDocument = .{ .uri = uri }, .position = try position(source, "Widgxx", 4, .utf16) };
     try waitAutoImport(&h);
     try testing.expect(importedWidget(try h.request("textDocument/completion", params)) != null);
-    h.server.imports_basis.store(std.math.maxInt(u64), .release);
+    h.server.index.imports_basis.store(std.math.maxInt(u64), .release);
     const pending = try h.request("textDocument/completion", params);
     try testing.expect(pending.object.get("result").?.object.get("isIncomplete").?.bool);
     _ = try h.request("zig-analyzer/waitIdle", {});
@@ -370,8 +370,8 @@ test "disabled auto-import does not build or query the import index" {
     const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = try position(text, "Widg", 4, .utf16) });
     try testing.expect(response.object.get("result").? == .array);
     _ = try h.request("zig-analyzer/waitIdle", {});
-    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), h.server.imports_basis.load(.acquire));
-    try testing.expect(!h.server.imports_wanted.load(.acquire));
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), h.server.index.imports_basis.load(.acquire));
+    try testing.expect(!h.server.index.imports_wanted.load(.acquire));
     try testing.expectEqual(@as(i64, 0), importQueryKeys(try h.request("zig-analyzer/status", {})));
     _ = try h.request("shutdown", {});
 }
@@ -435,12 +435,12 @@ test "completion does not run auto-import indexing inside its read transaction" 
     // The index was built when the document opened: make it stale, so this completion has to start
     // indexing again. Changed while the server is idle: neither the completion request nor the
     // task it starts can be spawned, so both can only run in place
-    h.server.imports_basis.store(std.math.maxInt(u64), .release);
+    h.server.index.imports_basis.store(std.math.maxInt(u64), .release);
     threaded.concurrent_limit = .nothing;
     errdefer threaded.concurrent_limit = .unlimited;
     const response = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = try position(text, "st;", 2, .utf16) });
     try testing.expect(response.object.get("result").?.object.get("isIncomplete").?.bool);
-    try testing.expectEqual(std.math.maxInt(u64), h.server.imports_basis.load(.acquire));
+    try testing.expectEqual(std.math.maxInt(u64), h.server.index.imports_basis.load(.acquire));
     const busy = blk: {
         h.server.busy_mutex.lockUncancelable(testing.io);
         defer h.server.busy_mutex.unlock(testing.io);

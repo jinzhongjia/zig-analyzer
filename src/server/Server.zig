@@ -51,6 +51,7 @@ const log = std.log.scoped(.server);
 const Server = @This();
 const ClientCaps = @import("ClientCaps.zig");
 const SingleFiles = @import("SingleFiles.zig");
+const Rerun = @import("Rerun.zig");
 
 io: Io,
 gpa: Allocator,
@@ -171,8 +172,6 @@ graph_mutex: Io.Mutex = .init,
 /// builtin.zig files are named by the hash of their contents, so a path always has the same
 /// contents.
 builtin_targets: std.AutoHashMapUnmanaged(Vfs.FileId, za.sema.InternPool.Target) = .empty,
-/// Generation of background indexing: incremented on every module graph update
-index_generation: std.atomic.Value(u64) = .init(0),
 /// Config option `sema.callsite_seeding` (read by the IDE layer through `Env`)
 callsite_seeding: std.atomic.Value(bool) = .init(true),
 /// Config option `build.sub_projects`, readable where `config_mutex` cannot be taken (with
@@ -205,41 +204,10 @@ edits: std.AutoHashMapUnmanaged(Vfs.FileId, Edit) = .empty,
 /// Live diagnostics that diagnostic publishing precomputes outside the read transaction (picked up
 /// by `AstCheck` through `Env`)
 live_prepared: live.Prepared = undefined,
-/// Whether an indexing task is running (only one runs at a time)
-indexing: std.atomic.Value(bool) = .init(false),
-/// Completion has run at a name that can be auto-imported: only after that is the auto-import
-/// index built. Sessions without completion (browsing, goto) do not expand the public export
-/// closure of the standard library for it.
-imports_wanted: std.atomic.Value(bool) = .init(false),
-/// Composition of the module graph when the auto-import index was last completed (see
-/// `importsBasis`; `imports_pending` until it has been completed). When it differs at completion
-/// time, auto-import is not offered and the result is marked incomplete, so the client requests
-/// again as the user types: this avoids expanding the public export closures of the standard
-/// library and the projects for new modules synchronously inside a request. It does not change
-/// when the module graph only gains or loses files (such as generated files produced by a build);
-/// new files are indexed on demand during completion.
-imports_basis: std.atomic.Value(u64) = .init(imports_pending),
-/// Highest `index_generation` whose workspace symbol index has been built (the first step of an
-/// indexing pass). Workspace symbol requests wait for the generation current when they start, so
-/// that they do not parse the bulk of the files in one read transaction, nor answer with only part
-/// of them. Protected by `index_mutex`; `index_cond` is signaled when it advances, when indexing
-/// stops, and when requests are canceled.
-symbols_indexed: u64 = 0,
-index_mutex: Io.Mutex = .init,
-index_cond: Io.Condition = .init,
-/// Generation of the workspace file scan (see `scheduleScan`): incremented whenever the source
-/// files under the root directories may have changed
-scan_generation: std.atomic.Value(u64) = .init(0),
-/// Generation of the last finished scan (0 before the first one); it only grows, since scans run
-/// one at a time. The search scope is complete when it equals `scan_generation` (see
-/// `scopeIncomplete`).
-scan_done: std.atomic.Value(u64) = .init(0),
-/// Whether a scan task is running (only one runs at a time)
-scanning: std.atomic.Value(bool) = .init(false),
-/// `scan_wait_cond` is signaled when a scan finishes, when requests are canceled, and on shutdown
-/// (see `waitScans`)
-scan_wait_mutex: Io.Mutex = .init,
-scan_wait_cond: Io.Condition = .init,
+/// Background indexing (see `scheduleIndexing`)
+index: Indexing = .{},
+/// Scans of the workspace for source files (see `scheduleScan`)
+scan: Scans = .{},
 config_mutex: Io.Mutex = .init,
 config: Config = .{},
 /// What the client supports, read from `initialize` (accessed only on the main loop)
@@ -337,6 +305,45 @@ const PublishQueue = struct {
     workers: usize = 0,
     /// Files queued or being published; see `publishFiles`
     files: std.AutoHashMapUnmanaged(Vfs.FileId, PublishState) = .empty,
+};
+
+const Indexing = struct {
+    /// Counts the module graph updates: a pass indexes the module graph as of its generation or
+    /// later
+    rerun: Rerun = .{},
+    /// Completion has run at a name that can be auto-imported: only after that is the auto-import
+    /// index built. Sessions without completion (browsing, goto) do not expand the public export
+    /// closure of the standard library for it.
+    imports_wanted: std.atomic.Value(bool) = .init(false),
+    /// Composition of the module graph when the auto-import index was last completed (see
+    /// `importsBasis`; `imports_pending` until it has been completed). When it differs at
+    /// completion time, auto-import is not offered and the result is marked incomplete, so the
+    /// client requests again as the user types: this avoids expanding the public export closures
+    /// of the standard library and the projects for new modules synchronously inside a request. It
+    /// does not change when the module graph only gains or loses files (such as generated files
+    /// produced by a build); new files are indexed on demand during completion.
+    imports_basis: std.atomic.Value(u64) = .init(imports_pending),
+    /// Highest generation whose workspace symbol index has been built (the first step of an
+    /// indexing pass). Workspace symbol requests wait for the generation current when they start,
+    /// so that they do not parse the bulk of the files in one read transaction, nor answer with
+    /// only part of them. Protected by `mutex`; `cond` is signaled when it advances, when indexing
+    /// stops, and when requests are canceled.
+    symbols: u64 = 0,
+    mutex: Io.Mutex = .init,
+    cond: Io.Condition = .init,
+};
+
+const Scans = struct {
+    /// Counts the times the source files under the root directories may have changed
+    rerun: Rerun = .{},
+    /// Generation of the last finished scan (0 before the first one); it only grows, since scans
+    /// run one at a time. The search scope is complete when it equals the generation of `rerun`
+    /// (see `scopeIncomplete`).
+    done: std.atomic.Value(u64) = .init(0),
+    /// `cond` is signaled when a scan finishes, when requests are canceled, and on shutdown (see
+    /// `waitScans`)
+    mutex: Io.Mutex = .init,
+    cond: Io.Condition = .init,
 };
 
 /// Every field is protected by `mutex`
@@ -1322,7 +1329,7 @@ pub fn requestAutoImportIndex(server: *Server) void {
     // The module graph and the files it covers are final only after the first project load: an
     // index built earlier would be built again after the graph changes
     if (server.projectsPending()) return;
-    if (server.imports_wanted.swap(true, .acq_rel)) return;
+    if (server.index.imports_wanted.swap(true, .acq_rel)) return;
     server.scheduleIndexing();
 }
 
@@ -1338,8 +1345,7 @@ const index_batch = 8;
 /// build; a running task is not interrupted, and when it finds after a pass that the module graph
 /// has changed, it does another pass (indexes already built hit the cache directly).
 fn scheduleIndexing(server: *Server) void {
-    _ = server.index_generation.fetchAdd(1, .monotonic);
-    if (server.indexing.swap(true, .acq_rel)) return;
+    if (!server.index.rerun.schedule()) return;
     server.busyBegin();
     spawn(server.io, &server.bg_group, indexTask, .{server});
 }
@@ -1361,33 +1367,31 @@ fn scheduleIndexingTask(server: *Server) Io.Cancelable!void {
 fn indexTask(server: *Server) Io.Cancelable!void {
     defer server.busyEnd();
     while (true) {
-        const generation = server.index_generation.load(.monotonic);
+        const generation = server.index.rerun.begin();
         server.indexOnce(generation) catch |err| {
-            server.stopIndexing();
+            server.index.rerun.stop();
+            server.wakeSymbolWaiters();
             return err;
         };
-        if (server.index_generation.load(.monotonic) != generation) continue;
-        server.stopIndexing();
-        // Updated again after the flag was released, and no other task took over: continue
-        if (server.index_generation.load(.monotonic) == generation) {
-            server.requestRefresh();
-            return;
+        const next = server.index.rerun.finish(generation);
+        // The task stopped running at least for a moment: wake the workspace symbol requests
+        // waiting for the index (see `waitSymbolIndex`)
+        if (next != .again) server.wakeSymbolWaiters();
+        switch (next) {
+            .again, .resumed => {},
+            .done => {
+                server.requestRefresh();
+                return;
+            },
+            .taken_over => return,
         }
-        if (server.indexing.swap(true, .acq_rel)) return;
     }
 }
 
-/// Clears `indexing` and wakes the workspace symbol requests waiting for the index (see
-/// `waitSymbolIndex`)
-fn stopIndexing(server: *Server) void {
-    server.indexing.store(false, .release);
-    server.wakeSymbolWaiters();
-}
-
 fn wakeSymbolWaiters(server: *Server) void {
-    server.index_mutex.lockUncancelable(server.io);
-    defer server.index_mutex.unlock(server.io);
-    server.index_cond.broadcast(server.io);
+    server.index.mutex.lockUncancelable(server.io);
+    defer server.index.mutex.unlock(server.io);
+    server.index.cond.broadcast(server.io);
 }
 
 /// Waits until the workspace symbol index covers the module graph as it is now: returns at once
@@ -1395,12 +1399,12 @@ fn wakeSymbolWaiters(server: *Server) void {
 /// finishing (shutting down, out of memory), in which case the request computes what is missing
 /// itself. Returns whether it waited.
 fn waitSymbolIndex(server: *Server, pending: *const Pending) bool {
-    const target = server.index_generation.load(.monotonic);
-    server.index_mutex.lockUncancelable(server.io);
-    defer server.index_mutex.unlock(server.io);
+    const target = server.index.rerun.generation.load(.monotonic);
+    server.index.mutex.lockUncancelable(server.io);
+    defer server.index.mutex.unlock(server.io);
     var waited = false;
-    while (server.indexing.load(.acquire) and server.symbols_indexed < target and !pending.cancel.load(.acquire)) {
-        server.index_cond.waitUncancelable(server.io, &server.index_mutex);
+    while (server.index.rerun.running.load(.acquire) and server.index.symbols < target and !pending.cancel.load(.acquire)) {
+        server.index.cond.waitUncancelable(server.io, &server.index.mutex);
         waited = true;
     }
     return waited;
@@ -1412,8 +1416,7 @@ fn waitSymbolIndex(server: *Server, pending: *const Pending) bool {
 /// indexing, a running task does another pass when this is called again meanwhile. Must not be
 /// called inside a read or write transaction: the task may run inline.
 pub fn scheduleScan(server: *Server) void {
-    _ = server.scan_generation.fetchAdd(1, .acq_rel);
-    if (server.scanning.swap(true, .acq_rel)) return;
+    if (!server.scan.rerun.schedule()) return;
     server.busyBegin();
     spawn(server.io, &server.bg_group, scanTask, .{server});
 }
@@ -1421,18 +1424,17 @@ pub fn scheduleScan(server: *Server) void {
 fn scanTask(server: *Server) Io.Cancelable!void {
     defer server.busyEnd();
     while (true) {
-        const generation = server.scan_generation.load(.acquire);
+        const generation = server.scan.rerun.begin();
         server.scanOnce() catch |err| switch (err) {
             error.OutOfMemory => log.err("out of memory while scanning the workspace for source files", .{}),
         };
         if (@import("builtin").is_test and server.hooks.rescan.load(.acquire)) server.scheduleScan();
-        server.scan_done.store(generation, .release);
+        server.scan.done.store(generation, .release);
         server.wakeScanWaiters();
-        if (server.scan_generation.load(.acquire) != generation) continue;
-        server.scanning.store(false, .release);
-        // Scheduled again after the flag was released, and no other task took over: continue
-        if (server.scan_generation.load(.monotonic) == generation) return;
-        if (server.scanning.swap(true, .acq_rel)) return;
+        switch (server.scan.rerun.finish(generation)) {
+            .again, .resumed => {},
+            .done, .taken_over => return,
+        }
     }
 }
 
@@ -1443,19 +1445,19 @@ fn scanTask(server: *Server) Io.Cancelable!void {
 /// files keep being created, a scan is always pending, and waiting for no scan to be pending would
 /// not end. The wait is the rest of the walk in progress and at most one more.
 fn waitScans(server: *Server, pending: *Pending) void {
-    const target = server.scan_generation.load(.acquire);
+    const target = server.scan.rerun.generation.load(.acquire);
     pending.scans_awaited = target;
-    server.scan_wait_mutex.lockUncancelable(server.io);
-    defer server.scan_wait_mutex.unlock(server.io);
-    while (server.scan_done.load(.acquire) < target and !pending.cancel.load(.acquire) and !server.isShuttingDown()) {
-        server.scan_wait_cond.wait(server.io, &server.scan_wait_mutex) catch break;
+    server.scan.mutex.lockUncancelable(server.io);
+    defer server.scan.mutex.unlock(server.io);
+    while (server.scan.done.load(.acquire) < target and !pending.cancel.load(.acquire) and !server.isShuttingDown()) {
+        server.scan.cond.wait(server.io, &server.scan.mutex) catch break;
     }
 }
 
 fn wakeScanWaiters(server: *Server) void {
-    server.scan_wait_mutex.lockUncancelable(server.io);
-    defer server.scan_wait_mutex.unlock(server.io);
-    server.scan_wait_cond.broadcast(server.io);
+    server.scan.mutex.lockUncancelable(server.io);
+    defer server.scan.mutex.unlock(server.io);
+    server.scan.cond.broadcast(server.io);
 }
 
 /// Starts the projects of the sub-projects recorded in `wait` (see `subProjectGap`) and waits until
@@ -1527,7 +1529,7 @@ fn scanOnce(server: *Server) Allocator.Error!void {
     server.scheduleIndexing();
 }
 
-/// One indexing pass over the module graph as of `generation` (see `index_generation`) or later
+/// One indexing pass over the module graph as of `generation` (see `index.rerun.generation`) or later
 fn indexOnce(server: *Server, generation: u64) Io.Cancelable!void {
     var pc: panic_context.Text = .{};
     pc.enter("workspace symbol indexing", .{});
@@ -1562,12 +1564,12 @@ fn indexOnce(server: *Server, generation: u64) Io.Cancelable!void {
     // request.
     if (!try server.indexBatches(files, "Indexing", false)) return;
     {
-        server.index_mutex.lockUncancelable(server.io);
-        defer server.index_mutex.unlock(server.io);
-        server.symbols_indexed = @max(server.symbols_indexed, generation);
-        server.index_cond.broadcast(server.io);
+        server.index.mutex.lockUncancelable(server.io);
+        defer server.index.mutex.unlock(server.io);
+        server.index.symbols = @max(server.index.symbols, generation);
+        server.index.cond.broadcast(server.io);
     }
-    if (!(server.imports_wanted.load(.acquire) and server.autoImportEnabled())) return;
+    if (!(server.index.imports_wanted.load(.acquire) and server.autoImportEnabled())) return;
     // When warming up fails (out of memory), the index is not marked usable: the next completion
     // retries, instead of the closures being expanded synchronously in a request
     if (!server.indexImportRoots()) return;
@@ -1587,7 +1589,7 @@ fn indexOnce(server: *Server, generation: u64) Io.Cancelable!void {
         };
         break;
     }
-    if (server.autoImportEnabled()) server.imports_basis.store(basis, .release);
+    if (server.autoImportEnabled()) server.index.imports_basis.store(basis, .release);
 }
 
 /// Indexes `files` batch by batch (the auto-import index with `auto_import`, otherwise the
@@ -1634,7 +1636,7 @@ fn indexBatches(server: *Server, files: []const Vfs.FileId, title: []const u8, a
     return true;
 }
 
-/// The auto-import index has not been fully built yet (see `imports_basis`)
+/// The auto-import index has not been fully built yet (see `index.imports_basis`)
 const imports_pending = std.math.maxInt(u64);
 
 /// The composition of the module graph that determines the auto-import index: the standard
@@ -3028,7 +3030,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     if (inlay_changed) server.requestInlayRefresh();
     if (semantic_changed) server.requestSemanticRefresh();
     if (imports_enabled) {
-        if (server.imports_wanted.load(.acquire)) server.scheduleIndexing();
+        if (server.index.imports_wanted.load(.acquire)) server.scheduleIndexing();
         server.requestAutoImportIndex();
     }
     if (build_changed) {
@@ -6279,7 +6281,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     // where a name could be imported. If the index is still not built and no indexing is in
     // progress (the previous round failed, or the task could not start), it starts again.
     const imports_ready = auto_import and
-        server.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
+        server.index.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
     const max_auto_imports, const snippets, const placeholders = blk: {
         server.config_mutex.lockUncancelable(server.io);
         defer server.config_mutex.unlock(server.io);
@@ -6304,8 +6306,8 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     });
     const imports_waiting = auto_import and !imports_ready and result.import_position;
     if (imports_waiting) {
-        const first = !server.imports_wanted.swap(true, .acq_rel);
-        if (first or !server.indexing.load(.acquire)) server.scheduleIndexingFromRead();
+        const first = !server.index.imports_wanted.swap(true, .acq_rel);
+        if (first or !server.index.rerun.running.load(.acquire)) server.scheduleIndexingFromRead();
     }
     const out = try arena.alloc(types.CompletionItem, result.items.len);
     var ranges: CompletionRanges = .{ .text = text, .line = line, .encoding = server.encoding, .lines = lines };
@@ -6567,12 +6569,12 @@ threadlocal var handler_scans_awaited: u64 = 0;
 /// instead: the request waits for the scans scheduled so far, which takes a moment, and runs again
 /// (see `waitScans`). Once it has waited, the scans it waited for are enough.
 fn scopeIncomplete(server: *Server) error{ScanPending}!?[]const u8 {
-    const scheduled = server.scan_generation.load(.acquire);
+    const scheduled = server.scan.rerun.generation.load(.acquire);
     if (scheduled == 0)
         return "the workspace folders are still being searched for source files, so not all files that may refer to it are known yet";
     if (server.rootProjectsLoading()) return "the project is still loading, so not all files that may refer to it are known yet";
     const needed = if (handler_scans_awaited != 0) handler_scans_awaited else scheduled;
-    if (server.scan_done.load(.acquire) < needed) return error.ScanPending;
+    if (server.scan.done.load(.acquire) < needed) return error.ScanPending;
     return null;
 }
 
@@ -7999,6 +8001,7 @@ test {
     _ = Progress;
     _ = Config;
     _ = SemanticCache;
+    _ = Rerun;
     _ = watch;
     _ = client_process;
     _ = origin;
