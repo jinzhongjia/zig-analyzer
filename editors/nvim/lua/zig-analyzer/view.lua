@@ -236,7 +236,7 @@ function renderers.status(result)
     { 'Max RSS', result.max_rss_kb > 0 and bytes(result.max_rss_kb * 1024) or 'unknown' },
     { 'Heap', result.heap_bytes > 0 and bytes(result.heap_bytes) or 'not counted' },
     { 'InternPool', ('%d items, %s'):format(result.intern_pool_items, bytes(result.intern_pool_bytes)) },
-    { 'Incomplete', ('%d by cycles, %d by stack depth'):format(causes.cycle or 0, causes.stack or 0) },
+    { 'Incomplete', ('%d by cycles, %d by stack depth, %d by unavailable tools'):format(causes.cycle or 0, causes.stack or 0, causes.unavailable or 0) },
   })
 
   local a = result.allocator
