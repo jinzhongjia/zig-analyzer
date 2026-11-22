@@ -67,7 +67,7 @@ jobs:
                 # A change to CI itself is tested by running all of it
                 .github/workflows/ci.yml) all; full=true ;;
                 # The VS Code extension checks its settings against the server's settings table
-                src/server/Config.zig) zig=true; vscode=true ;;
+                src/Config.zig) zig=true; vscode=true ;;
                 src/*|tools/*|build.zig|build.zig.zon|zig-analyzer.default.zon) zig=true ;;
                 # Every editor checks its release key against the repository's
                 minisign.pub) vscode=true; zed=true; nvim=true; vim=true; emacs=true ;;

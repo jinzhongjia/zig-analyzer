@@ -493,7 +493,7 @@ fn finishLoading(ws: *Workspace) void {
     }
     ws.server.wakeProjectWaiters();
     ws.server.requestAutoImportIndex();
-    ws.server.reconcileSingle();
+    ws.server.single.reconcile();
 }
 
 /// Whether to publish live diagnostics: yes before the compile set is computed; afterwards for
@@ -567,7 +567,7 @@ pub fn configureInputDirs(ws: *Workspace, arena: Allocator, out: *std.ArrayList(
 
 // ── Background task ──────────────────────────────────────────────────
 
-/// Test hook (`Server.maker_exit_pause`): holds the reading task of a project once, when the
+/// Test hook (`Server.TestHooks.maker_exit`): holds the reading task of a project once, when the
 /// maker's stream has ended and before the exit is handled
 pub const ExitPause = struct {
     /// Set when the reading task has stopped
@@ -577,7 +577,7 @@ pub const ExitPause = struct {
 
 fn testExitPause(ws: *Workspace) void {
     if (!@import("builtin").is_test) return;
-    const pause = ws.server.maker_exit_pause.swap(null, .acq_rel) orelse return;
+    const pause = ws.server.hooks.maker_exit.swap(null, .acq_rel) orelse return;
     pause.entered.set(ws.server.io);
     pause.release.waitUncancelable(ws.server.io);
 }
@@ -1122,7 +1122,7 @@ fn promote(ws: *Workspace, stage: Server.PromoteStage) void {
     old.mutex.unlock(ws.server.io);
     defer ws.gpa.free(stale);
     ws.server.publishFiles(stale, true);
-    ws.server.reconcileSingle();
+    ws.server.single.reconcile();
 }
 
 /// Result of the most recent build: when it was stored (Unix milliseconds), the number of files
@@ -1306,7 +1306,7 @@ fn recomputeLocked(ws: *Workspace) Allocator.Error!void {
     if (!ws.server.isVisible(ws)) return;
     ws.server.updateModuleGraph();
     ws.server.publishOpenFiles();
-    ws.server.reconcileSingle();
+    ws.server.single.reconcile();
 }
 
 /// Computes the build scripts of the project and of its dependency packages (see

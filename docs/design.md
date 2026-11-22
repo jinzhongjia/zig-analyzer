@@ -41,7 +41,7 @@ zig-analyzer is a language server (LSP) for Zig 0.17. Current stage: feature-com
 ## Layers
 
 ```
-server/       LSP main loop, scheduling, cancellation, workspace and project management, configuration
+server/       LSP main loop, scheduling, cancellation, workspace and project management
 ide/          hover · completion · goto · refs · rename · inlay hints · code actions · naming · unused · lint …
 ide_db/       reference search · call-site seeds
 sema/         InternPool · type inference · comptime interpreter · type rendering
@@ -58,6 +58,7 @@ lsp/          types generated from metaModel.json · JSON-RPC · transport
 
 - Each layer depends only on the layers below it; tests may reference higher layers to drive end-to-end scenarios.
 - All queries are registered in `database.zig` to form a single `Db` type. The names layer and the layers above it obtain `Db.Ctx` and the queries of the lower layers through it.
+- `Config.zig` (the settings and the project configuration file) sits beside `database.zig`: its settings use types of the IDE layers, and the IDE layer reads its schema to complete `zig-analyzer.zon`.
 
 ---
 
@@ -330,7 +331,7 @@ At startup `zig env` gives the lib, std, and global cache directories; when it f
 
 - `zig.lib_path` and `zig.global_cache_path` override them after validation and are passed through `ZIG_LIB_DIR` and `ZIG_GLOBAL_CACHE_DIR` to every zig process started after `zig env` (the build runner, single-file compiles, the builtin.zig generation, and the `zig ast-check` of live diagnostics), so all use the same standard library as name resolution.
 - `zig.builtin_path` replaces `builtin` only for files in no project.
-- Changes are applied again, restarting projects when the directories change. A replaced environment is freed only at exit, since running tasks may still use it.
+- Changes are applied again, restarting projects when the directories change. The effective environment, whether its lib directory is Zig's own source tree, and the default builtin.zig are published together as one immutable `Server.Toolchain`, so readers see values that belong together without a lock; a replaced toolchain or environment is freed only at exit, since running tasks may still use it.
 
 ### Version coupling
 
@@ -346,6 +347,10 @@ The `Configuration` format and in-process AstGen come from the standard library 
 ---
 
 ## Server and concurrency (`server/`)
+
+`Server` groups its state with the lock that protects it: client capabilities (`ClientCaps`, written once at `initialize`), open documents (`Documents`), the diagnostic publish queue and what was last sent (`PublishQueue`, `Sent`), single-file mode (`SingleFiles`), and background indexing and workspace scans (`Indexing`, `Scans`). Indexing and scans run one pass at a time (`Rerun`): scheduling during a pass makes the running task do another one. Test hooks (`Server.hooks`) exist only in test builds.
+
+Settings read on hot paths, inside queries, or under locks that come before `config_mutex` (`slow_request_ms`, `debounce_ms`, `max_intern_pool_mb`, `callsite_seeding`, `sub_projects_enabled`, `poll_interval_ms`) are also kept in atomics, written together when the configuration is applied.
 
 ### Write transactions
 
@@ -372,7 +377,7 @@ Edit-triggered publishing is debounced per file; live diagnostics are computed o
 
 ### Configuration
 
-Options come from the client (`initializationOptions`, `workspace/configuration`), and a project-root `zig-analyzer.zon` can override project options; `src/server/Config.zig` describes each option. Pulled or pushed settings replace the current ones; a `null` section in a pull reply leaves them in effect.
+Options come from the client (`initializationOptions`, `workspace/configuration`), and a project-root `zig-analyzer.zon` can override project options; `src/Config.zig` describes each option. Pulled or pushed settings replace the current ones; a `null` section in a pull reply leaves them in effect.
 
 ### Exit
 

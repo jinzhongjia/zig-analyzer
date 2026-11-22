@@ -12,7 +12,7 @@ const ast = @import("../syntax/ast.zig");
 const SyntaxToken = ast.SyntaxToken;
 const Body = @import("../hir/Body.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
-const Config = @import("../server/Config.zig");
+const Config = @import("../Config.zig");
 const manifest = @import("manifest.zig");
 
 const default_config: [:0]const u8 = @embedFile("default_config");

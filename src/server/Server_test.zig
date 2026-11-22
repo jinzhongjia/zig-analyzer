@@ -271,7 +271,7 @@ test "close: a non-file document is cleared when the result computed on open is 
     try h.start();
     defer h.finish();
     var gate: Server.OnceGate = .{};
-    h.server.publish_gate = &gate;
+    h.server.hooks.publish = &gate;
     // Lets the held publish finish when the test fails before releasing it
     defer gate.release.set(testing.io);
     _ = try h.request("initialize", .{ .capabilities = Empty{} });
@@ -1007,8 +1007,8 @@ test "reclaiming type information does not cancel in-flight requests and runs on
     var bits: u16 = 1;
     while (h.server.ip.bytes() < 2 * 1024 * 1024) : (bits += 1) _ = try h.server.ip.intType(.unsigned, bits);
     var gate: Server.TestGate = .{ .method = "textDocument/semanticTokens/full", .point = .in_read };
-    h.server.test_gate = &gate;
-    defer h.server.test_gate = null;
+    h.server.hooks.request = &gate;
+    defer h.server.hooks.request = null;
     defer gate.release.set(testing.io);
     const held = try h.send("textDocument/semanticTokens/full", doc);
     try gate.entered.wait(testing.io);
@@ -1059,13 +1059,13 @@ test "type information that one request needs is not reclaimed until it is twice
 
     // The request itself pushes the InternPool to twice the limit
     var gate: Server.TestGate = .{ .method = "textDocument/hover", .point = .in_read };
-    h.server.test_gate = &gate;
+    h.server.hooks.request = &gate;
     const big = try h.send("textDocument/hover", at);
     try gate.entered.wait(testing.io);
     var bits: u16 = 1;
     while (h.server.ip.bytes() < 2 * 1024 * 1024) : (bits += 1) _ = try h.server.ip.intType(.unsigned, bits);
     gate.release.set(testing.io);
-    h.server.test_gate = null;
+    h.server.hooks.request = null;
     _ = try h.response(big);
     while (inFlight(&h.server, big)) std.Thread.yield() catch {};
     const items = h.server.ip.count();
@@ -1112,8 +1112,8 @@ test "a request whose task starts after a later edit is not answered on the edit
     _ = try h.request("zig-analyzer/waitIdle", {});
 
     var gate: Server.TestGate = .{ .method = "textDocument/hover", .point = .before_read };
-    h.server.test_gate = &gate;
-    defer h.server.test_gate = null;
+    h.server.hooks.request = &gate;
+    defer h.server.hooks.request = null;
     defer gate.release.set(testing.io);
     const hover = try h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
     try gate.entered.wait(testing.io);
@@ -1153,8 +1153,8 @@ test "exit and the end of input cancel the requests in flight instead of waiting
 
         // The request stays at the gate until it is canceled
         var gate: Server.TestGate = .{ .method = "textDocument/semanticTokens/full", .point = .in_read };
-        h.server.test_gate = &gate;
-        defer h.server.test_gate = null;
+        h.server.hooks.request = &gate;
+        defer h.server.hooks.request = null;
         defer gate.release.set(testing.io);
         const held = try h.send("textDocument/semanticTokens/full", .{ .textDocument = .{ .uri = uri } });
         try gate.entered.wait(testing.io);
@@ -1203,18 +1203,13 @@ test "a module graph update does not cancel the folding and selection requests i
         const expected = try std.json.Stringify.valueAlloc(a, (try h.request(r[0], r[1])).object.get("result").?, .{});
 
         var gate: Server.TestGate = .{ .method = r[0], .point = .in_read };
-        h.server.test_gate = &gate;
-        defer h.server.test_gate = null;
+        h.server.hooks.request = &gate;
+        defer h.server.hooks.request = null;
         defer gate.release.set(testing.io);
         const held = try h.send(r[0], r[1]);
         try gate.entered.wait(testing.io);
         // Another default builtin.zig changes the module graph, as a zig environment query does
-        {
-            h.server.env_mutex.lockUncancelable(testing.io);
-            defer h.server.env_mutex.unlock(testing.io);
-            if (h.server.default_builtin) |p| testing.allocator.free(p);
-            h.server.default_builtin = try std.fmt.allocPrint(testing.allocator, "/zig-analyzer-test/builtin-{d}.zig", .{i});
-        }
+        try setDefaultBuiltin(&h.server, try std.fmt.allocPrint(testing.allocator, "/zig-analyzer-test/builtin-{d}.zig", .{i}));
         const update = try std.Thread.spawn(.{}, Server.updateModuleGraph, .{&h.server});
         defer update.join();
         // The update waits for the held request
@@ -1251,18 +1246,13 @@ test "a request interrupted by an update the server made on its own is answered,
     _ = try h.request("zig-analyzer/waitIdle", {});
 
     var gate: Server.TestGate = .{ .method = "textDocument/hover", .point = .in_read };
-    h.server.test_gate = &gate;
-    defer h.server.test_gate = null;
+    h.server.hooks.request = &gate;
+    defer h.server.hooks.request = null;
     defer gate.release.set(testing.io);
     const hover = try h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
     try gate.entered.wait(testing.io);
     // Another default builtin.zig changes the module graph, as a zig environment query does
-    {
-        h.server.env_mutex.lockUncancelable(testing.io);
-        defer h.server.env_mutex.unlock(testing.io);
-        if (h.server.default_builtin) |p| testing.allocator.free(p);
-        h.server.default_builtin = try testing.allocator.dupe(u8, "/zig-analyzer-test/builtin-retry.zig");
-    }
+    try setDefaultBuiltin(&h.server, try testing.allocator.dupe(u8, "/zig-analyzer-test/builtin-retry.zig"));
     const update = try std.Thread.spawn(.{}, Server.updateModuleGraph, .{&h.server});
     defer update.join();
     // The update waits for the held request, whose reads are canceled from here on
@@ -1298,8 +1288,8 @@ test "a request canceled by a write the server made on its own reads again only 
     _ = try h.request("zig-analyzer/waitIdle", {});
 
     var gate: Server.TestGate = .{ .method = "textDocument/hover", .point = .in_read };
-    h.server.test_gate = &gate;
-    defer h.server.test_gate = null;
+    h.server.hooks.request = &gate;
+    defer h.server.hooks.request = null;
     defer gate.release.set(testing.io);
     const hover = try h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
     try gate.entered.wait(testing.io);
@@ -1351,8 +1341,8 @@ test "a request interrupted by a later edit is answered with ContentModified" {
     _ = try h.request("zig-analyzer/waitIdle", {});
 
     var gate: Server.TestGate = .{ .method = "textDocument/hover", .point = .in_read };
-    h.server.test_gate = &gate;
-    defer h.server.test_gate = null;
+    h.server.hooks.request = &gate;
+    defer h.server.hooks.request = null;
     defer gate.release.set(testing.io);
     const hover = try h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
     try gate.entered.wait(testing.io);
@@ -2268,8 +2258,8 @@ fn releaseWithWriteWaiting(server: *Server, gate: *Server.OnceGate) !std.Thread 
 /// the server's comparison with the known text, then waits until the server is idle
 fn changeWhileWriteWaits(h: anytype, document_uri: []const u8) !void {
     var gate: Server.OnceGate = .{};
-    h.server.compare_gate = &gate;
-    defer h.server.compare_gate = null;
+    h.server.hooks.compare = &gate;
+    defer h.server.hooks.compare = null;
     // Lets the held comparison finish when the test fails before releasing it
     defer gate.release.set(testing.io);
     try h.notify("workspace/didChangeWatchedFiles", .{ .changes = &.{.{ .uri = document_uri, .type = 2 }} });
@@ -2342,8 +2332,8 @@ test "a module graph update compared while a write transaction waits for the loc
     const writes = h.server.db.writes.load(.monotonic);
 
     var gate: Server.OnceGate = .{};
-    h.server.graph_gate = &gate;
-    defer h.server.graph_gate = null;
+    h.server.hooks.graph = &gate;
+    defer h.server.hooks.graph = null;
     {
         const updater = try std.Thread.spawn(.{}, Server.updateModuleGraph, .{&h.server});
         // Lets the held comparison finish when the test fails before releasing it
@@ -2579,4 +2569,10 @@ test "case-variant URIs of one file: each keeps its text and gets the diagnostic
     try testing.expectEqualStrings("disk", names[0]);
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
+}
+
+/// Replaces the default builtin.zig of the current toolchain, taking ownership of `path`
+fn setDefaultBuiltin(server: *Server, path: []const u8) !void {
+    const current = server.toolchain.load(.acquire);
+    try server.setToolchain(.{ .env = current.env, .source_tree = current.source_tree, .default_builtin = path });
 }
