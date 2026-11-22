@@ -9224,6 +9224,125 @@ test "completion: no snippets outside zig source files" {
     }
 }
 
+test "completion: no names in scope at declaration, capture, label, error-set, and non-tuple member positions" {
+    // Regression: typing a new declaration name (`pub const pani|`) offered existing declarations
+    // from the enclosing scope (`panic`, `panicFn`).
+    const header =
+        \\pub const panic = 1;
+        \\fn panicFn() void {}
+        \\const MyType = u32;
+        \\
+    ;
+    // Positions where no completion items at all (neither names in scope nor keywords) belong
+    const empty_cases = [_][]const u8{
+        "pub const pani<|>",
+        "pub const <|>",
+        "pub const pani<|> = 1;",
+        "pub var pani<|>",
+        "const pani<|>",
+        "pub const x <|>",
+        "pub fn pani<|>",
+        "fn pani<|>() void {}",
+        "fn f(pani<|>: u8) void {}",
+        "fn f(comptime <|>) void {}",
+        "fn f() void {\n    const pani<|>\n}",
+        "fn f() void {\n    const <|>\n}",
+        "fn f() void {\n    var pani<|> = 1;\n}",
+        "fn f() void {\n    const a, const pani<|> = .{ 1, 2 };\n}",
+        "fn f(o: ?u8) void {\n    if (o) |pani<|>| {}\n}",
+        "fn f(o: ?u8) void {\n    if (o) |<|>| {}\n}",
+        "fn f(xs: []const u8) void {\n    for (xs) |pani<|>| {}\n}",
+        "fn f(o: ?u8) void {\n    while (o) |pani<|>| {}\n}",
+        "fn f(e: anyerror!u8) void {\n    _ = e catch |pani<|>| 0;\n}",
+        "fn f(x: u8) void {\n    switch (x) {\n        else => |pani<|>| {},\n    }\n}",
+        "fn f() void {\n    pani<|>: {}\n}",
+        "const S = struct {\n    pani<|>: u8,\n};",
+        "const S = struct {\n    a: u8,\n    <|>\n    b: u8,\n};",
+        "const E = enum {\n    pani<|> = 1,\n};",
+        "const E = error{\n    pani<|>\n};",
+        "const E = error{\n    <|>\n};",
+        "fn f() void {\n    const x = 15<|>;\n    _ = x;\n}",
+        "fn f() void {\n    const x = 1.5<|>;\n    _ = x;\n}",
+        "fn f(x: u8) void {\n    switch (x) {\n        else =<|>> {},\n    }\n}",
+    };
+    for (empty_cases, 0..) |case, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", try std.mem.concat(w.arena.allocator(), u8, &.{ header, case, "\n" }));
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const result = try completion.complete(&r, added.file, added.cursor, .{ .snippets = true });
+        testing.expectEqual(@as(usize, 0), result.items.len) catch |err| {
+            std.debug.print("empty case {d}: `{s}` (got {d} items, first `{s}`)\n", .{ i, case, result.items.len, result.items[0].label });
+            return err;
+        };
+        try testing.expect(!result.is_incomplete);
+    }
+
+    // Positions that admit keywords/snippets, but not names in scope
+    const keyword_only_cases = [_][]const u8{
+        "pani<|>",
+        "pub <|>",
+        "fn f(<|>) void {}",
+        "fn f(a: u8, <|>) void {}",
+        "const S = struct {\n    pub <|>\n};",
+        "const S = struct {\n    a: u8,\n    <|>\n};",
+        "const E = enum {\n    pani<|>\n};",
+        "const U = union(enum) {\n    pani<|>\n};",
+        "const O = opaque {\n    <|>\n};",
+    };
+    for (keyword_only_cases, 0..) |case, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", try std.mem.concat(w.arena.allocator(), u8, &.{ header, case, "\n" }));
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const result = try completion.complete(&r, added.file, added.cursor, .{ .snippets = true });
+        try testing.expect(result.items.len > 0);
+        try testing.expect(!result.is_incomplete);
+        for (result.items) |it| {
+            testing.expect(it.kind == .keyword or it.kind == .snippet) catch |err| {
+                std.debug.print("keyword-only case {d}: `{s}` (unexpected item `{s}` of kind `{s}`)\n", .{ i, case, it.label, @tagName(it.kind) });
+                return err;
+            };
+        }
+    }
+
+    // Positions that still admit names in scope: expressions, types, destructuring targets,
+    // decltests, enum tag values, function type parameters, and tuple struct fields
+    const scope_cases = [_]struct { []const u8, []const u8 }{
+        .{ "const x: MyT<|> = 0;", "MyType" },
+        .{ "const x = pani<|>;", "panic" },
+        .{ "const E = enum(u8) {\n    a = pani<|>,\n};", "panic" },
+        .{ "const F = fn (MyT<|>) void;", "MyType" },
+        .{ "extern fn f(MyT<|>) void;", "MyType" },
+        .{ "const T = struct {\n    MyT<|>\n};", "MyType" },
+        .{ "test pani<|> {}", "panic" },
+        .{ "fn f() void {\n    var target: u8 = 0;\n    targ<|>, const b = .{ 1, 2 };\n    _ = .{ target, b };\n}", "target" },
+    };
+    for (scope_cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", try std.mem.concat(w.arena.allocator(), u8, &.{ header, c[0], "\n" }));
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r = resolver(&w, &ctx);
+        const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
+        const found = for (items) |it| {
+            if (std.mem.eql(u8, it.label, c[1])) break true;
+        } else false;
+        testing.expect(found) catch |err| {
+            std.debug.print("scope case {d}: `{s}` missing `{s}`\n", .{ i, c[0], c[1] });
+            return err;
+        };
+    }
+}
+
 test "auto import preserves rendered qualified paths and metadata" {
     var w: World = undefined;
     try w.init();

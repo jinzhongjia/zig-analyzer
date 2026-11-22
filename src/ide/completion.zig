@@ -3,8 +3,9 @@
 //! field is assigned, since a union initializer takes exactly one); after `.@`, the same names
 //! quoted (`.@"name"`); after `error.`, lists error names; after `@`, lists builtins (not in `.zon`
 //! files); inside `@import("`, lists modules and files; after `break :` /
-//! `continue :`, lists labels; otherwise lists the names visible at the cursor (local names and
-//! the declarations of enclosing containers). When `build.zig.zon` has no result type, its fields
+//! `continue :`, lists labels; otherwise, where the syntax admits a name reference (see
+//! `syntaxAt`), lists the names visible at the cursor (local names and the declarations of
+//! enclosing containers). When `build.zig.zon` has no result type, its fields
 //! and paths are listed by the built-in schema (see `manifest.zig`).
 //! Keywords are offered where the syntax admits them (see `addKeywords`).
 //! No completion in comments and strings (other than `@import("` and the paths of `build.zig.zon`).
@@ -135,7 +136,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     const text = (try r.ctx.get(database.syntax.SourceText, file)).text;
     if (offset > text.len) return .{ .items = base };
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
-    const name = if (offset == 0) null else try importPrefix(r.arena, root, text, offset);
+    const name = if (offset == 0 or visible.context != .scope) null else try importPrefix(r.arena, root, text, offset);
     // With nothing typed, the expected type is found from the syntax at the cursor (see
     // `expectedAtEmpty`)
     const expected = if (name == null and visible.context == .scope) try expectedAtEmpty(r, file, offset, visible.at) else null;
@@ -145,13 +146,13 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     const incomplete = name == null and visible.context == .scope and
         (options.auto_import or visible.roots.len != 0) and namePosition(root, text, offset);
     // Keywords and snippets start a statement, a member, or an expression in scope
-    const pos: ?Position = switch (visible.context) {
-        .none, .scope => try positionOf(r.arena, root, text, offset),
+    const pos: ?Position = visible.pos orelse switch (visible.context) {
+        .none => try positionOf(r.arena, root, text, offset),
         else => null,
     };
     var items: std.ArrayList(Item) = .empty;
     try items.appendSlice(r.arena, base);
-    if (pos) |p| try addKeywords(r, file, text, visible, p, &items);
+    if (pos) |p| try addKeywords(r.arena, text, visible, p, &items);
     if (name == null and !options.snippets) {
         try rankExpected(items.items, expected);
         return .{ .items = items.items, .is_incomplete = incomplete };
@@ -325,12 +326,20 @@ const Visible = struct {
     at: ?context.At = null,
     /// `.scope`: the local values that are roots of member paths, from the innermost outward
     roots: []const Root = &.{},
+    /// Syntactic position and classification of the word at the cursor (set for `.scope` and
+    /// `.keyword_only`, reused by keyword and snippet completion without reparsing the member)
+    pos: ?Position = null,
+    syntax: SyntaxAt = .{},
 
     const Context = enum {
         /// Not in any member
         none,
-        /// In a comment or string, or past the end of the text
+        /// In a comment or string, inside a number or operator, in a declaration / capture / label
+        /// name, or past the end of the text
         ignored,
+        /// Inside a member at a position that admits keywords or snippets, but not names in scope
+        /// (such as a parameter start in a function declaration, or a container member position)
+        keyword_only,
         builtin,
         /// In the string of an `@import` or a string of `build.zig.zon` (paths)
         path,
@@ -470,6 +479,20 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         }
     };
 
+    // Names in scope are offered only where the syntax admits a name reference (expression, type,
+    // decltest name, or inline-assembly output variable), not in declaration, capture, label, or
+    // error-set names, numbers, operators, or non-tuple container member positions
+    const pos = try positionOf(r.arena, root, text, offset);
+    const syntax = try syntaxAt(r, file, text, root, item, node, pos);
+    if (!syntax.scope) {
+        return .{
+            .context = if (syntax.keywords != .none) .keyword_only else .ignored,
+            .item = item,
+            .pos = pos,
+            .syntax = syntax,
+        };
+    }
+
     // Names in scope: when the cursor immediately follows a name, use the scope of that name; at a
     // parameter or return type not written yet, the scope of the parameters before it
     var scope = if (rel > 0) if (b.exprAt(rel - 1)) |e| switch (b.expr(e)) {
@@ -507,7 +530,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         try locals(r, &out, pb, pb.scopeAt(c_node.offset - owner.offset), weight, .{ .res = parent_res }, access, &roots);
         container = tree.items[parent].container;
     }
-    return .{ .items = out.items.items, .context = .scope, .item = item, .scope = scope, .at = at, .roots = roots.items };
+    return .{ .items = out.items.items, .context = .scope, .item = item, .scope = scope, .at = at, .roots = roots.items, .pos = pos, .syntax = syntax };
 }
 
 /// Completion at `.@` (the `@` at `at`): the names that complete right after the `.` (members,
@@ -2278,6 +2301,9 @@ fn quotedName(r: *Resolver, file: FileId, offset: u32, cursor_owner: *imports.Ow
             try std.fmt.allocPrint(r.arena, "@\"{s}\"", .{it.label});
     }
     visible.items = items;
+    // No keywords or snippets inside a quoted identifier
+    visible.pos = null;
+    visible.syntax = .{};
     // The expression at the cursor is the quoted name itself
     if (visible.at) |*a| a.rel = offset - a.node.offset;
     return visible;
@@ -2601,108 +2627,254 @@ const Jumps = struct {
     @"continue": bool = false,
 };
 
-/// Stands for the word at the cursor when the member is parsed again (see `addKeywords`)
+/// Stands for the word at the cursor when the member is parsed again (see `syntaxAt`)
 const keyword_placeholder = "__zig_analyzer_keyword";
+
+/// Syntactic classification of the word at the cursor inside a member (see `syntaxAt`):
+/// determines whether names in scope are valid and which keywords apply, parsing the member at
+/// most once
+const SyntaxAt = struct {
+    /// Names in scope (locals, container declarations, member paths, and auto-imports) are valid
+    /// at this position
+    scope: bool = false,
+    keywords: Keywords = .none,
+
+    const Keywords = union(enum) {
+        none,
+        member,
+        statement: Jumps,
+        expression: Jumps,
+        type,
+        ptr_type: PtrAttrs,
+        param: struct { fn_type: bool, has_colon: bool, has_any: bool },
+        switch_else,
+    };
+
+    const PtrAttrs = struct {
+        @"const": bool,
+        @"volatile": bool,
+        @"allowzero": bool,
+        @"align": bool,
+        @"addrspace": bool,
+    };
+};
+
+/// Classifies the word at `pos` inside the member `item` (`node`), deciding whether names in scope
+/// are valid and which keywords the syntax admits.
+///
+/// Error recovery leaves an empty or keyword word out of the syntax tree, so the member at the
+/// cursor is parsed again with a name in place of the word, and the position is that of the name
+fn syntaxAt(r: *Resolver, file: FileId, text: []const u8, root: SyntaxNode, item: u32, node: SyntaxNode, pos: Position) resolve.Error!SyntaxAt {
+    if (!imports.isZigSource(r.ctx.db.env.vfs.path(file))) return .{};
+    // The word starts inside a token (the digits after the `.` of `1.5`, between the characters
+    // of `=>`), or is a number
+    if (pos.prev) |p| if (p.range().end > pos.start) return .{};
+    if (pos.start < pos.end and std.ascii.isDigit(text[pos.start])) return .{};
+    if (pos.kind == .member) {
+        const next = nextTokenKind(root, pos.end);
+        // `name: T`: already the name of a named container field
+        if (next == .colon) return .{};
+        const container = pos.node.?;
+        const keywords: SyntaxAt.Keywords = if (next == .equal or betweenFields(container, pos.start, pos.end)) .none else .member;
+        // A bare identifier at member position is a type expression only for a tuple field of a
+        // `struct` (not a file, enum, union, opaque, or a struct with named fields)
+        const tuple_field = !pos.after_pub and !pos.doc and isTupleStruct(container);
+        return .{ .scope = tuple_field, .keywords = keywords };
+    }
+    if (pos.after_pub or pos.doc) return .{};
+    // Right after the closing quote of an escaped identifier (`@"name"|`), classify the escaped
+    // identifier itself (never a keyword)
+    const closed_escaped = pos.start == pos.end and if (pos.prev) |p|
+        p.kind == .identifier and p.range().end == pos.start and std.mem.startsWith(u8, p.text, "@\"")
+    else
+        false;
+    const word_start = if (closed_escaped) pos.prev.?.offset else pos.start;
+    const word_end = pos.end;
+    const member = node.range();
+    if (word_start < member.start) return .{};
+    const fragment = try std.mem.concat(r.arena, u8, &.{
+        text[member.start..word_start],
+        keyword_placeholder,
+        if (word_end < member.end) text[word_end..member.end] else "",
+    });
+    const parse = try Parse.createIn(r.arena, fragment, .zig, try r.ctx.get(database.syntax.SyntaxDialect, {}));
+    defer parse.destroy();
+    const reparsed = parse.rootNode();
+    const at = word_start - member.start;
+    const token = reparsed.tokenAtOffset(at) orelse return .{};
+    if (token.kind != .identifier or token.offset != at or !std.mem.eql(u8, token.text, keyword_placeholder)) return .{};
+    // Inside the name, so that a node ending right before it is not taken
+    const path = try reparsed.coveringPath(r.arena, at + 1);
+    if (path.len < 2) return .{};
+    const last = path[path.len - 1];
+    if (last.kind() != .name_ref) {
+        return switch (last.kind()) {
+            // Decltest (`test Foo {}`): references a declaration in the enclosing container
+            .test_decl => .{ .scope = true },
+            // Inline assembly output variable (`[out] "=r" (val)`): after `(` (not `[out]`)
+            .asm_output => .{ .scope = if (last.childToken(.l_paren)) |lp| lp.offset < at else false },
+            else => .{},
+        };
+    }
+    const name = last;
+    const parent = path[path.len - 2];
+    const tree = try r.itemTree(file);
+    const jumps = jumpsAt(path, switch (tree.items[item].kind) {
+        .@"fn", .@"test" => true,
+        else => false,
+    });
+    var result: SyntaxAt = if (pos.kind == .statement)
+        .{ .scope = true, .keywords = .{ .statement = jumps } }
+    else switch (parent.kind()) {
+        .optional_type, .error_union_type => .{ .scope = true, .keywords = .type },
+        // The child type is the last node; an array length or a sentinel is an expression
+        .array_type, .ptr_type, .slice_type => if (lastChildNode(parent).?.offset != name.offset)
+            .{ .scope = true, .keywords = .{ .expression = jumps } }
+        else if (parent.kind() == .array_type)
+            .{ .scope = true, .keywords = .type }
+        else
+            .{ .scope = true, .keywords = .{ .ptr_type = .{
+                .@"const" = parent.childToken(.keyword_const) == null,
+                .@"volatile" = parent.childToken(.keyword_volatile) == null,
+                .@"allowzero" = parent.childToken(.keyword_allowzero) == null,
+                .@"align" = parent.childNode(.align_clause) == null,
+                .@"addrspace" = parent.childNode(.addrspace_clause) == null,
+            } } },
+        .var_decl => blk: {
+            const before = tokensBefore(parent, name);
+            if (before.equal) break :blk .{ .scope = true, .keywords = .{ .expression = jumps } };
+            if (before.colon) break :blk .{ .scope = true, .keywords = .type };
+            break :blk .{};
+        },
+        // `name: T = value`; a container field without `:` or `=` is a bare enum/union member or a
+        // tuple field (only in a `struct` without named fields)
+        .container_field => blk: {
+            const before = tokensBefore(parent, name);
+            if (before.equal) break :blk .{ .scope = true, .keywords = .{ .expression = jumps } };
+            if (before.colon) break :blk .{ .scope = true, .keywords = .type };
+            // A bare container field outside the reparsed member (such as `pub const x |` whose
+            // placeholder spilled past the `var_decl`) is not a field at all
+            if (path.len == 3 and node.kind() != .container_field) break :blk .{};
+            // After a declaration modifier, only a declaration or type keyword follows, not a tuple
+            // field
+            if (pos.prev) |p| switch (p.kind) {
+                .keyword_pub, .keyword_extern, .keyword_export, .keyword_inline, .keyword_noinline, .keyword_threadlocal => break :blk .{},
+                else => {},
+            };
+            const container_node: ?SyntaxNode = if (path.len >= 3 and path[path.len - 3].kind() == .container_decl)
+                path[path.len - 3]
+            else
+                try r.containerNode(.{ .file = file, .container = tree.items[item].container });
+            break :blk .{ .scope = if (container_node) |cn| isTupleStruct(cn) else false };
+        },
+        .param => blk: {
+            const before = tokensBefore(parent, name);
+            // A parameter of a function type (or an `extern fn` declaration) may have no name
+            const fn_decl: ?SyntaxNode = if (path.len >= 5 and path[path.len - 5].kind() == .fn_decl) path[path.len - 5] else null;
+            const fn_type = fn_decl == null;
+            const is_extern = if (fn_decl) |fd| fd.childToken(.keyword_extern) != null else false;
+            const scope = before.colon or fn_type or is_extern;
+            const has_keywords = before.colon or !before.any;
+            break :blk .{
+                .scope = scope,
+                .keywords = if (has_keywords) .{ .param = .{ .fn_type = fn_type, .has_colon = before.colon, .has_any = before.any } } else .none,
+            };
+        },
+        // The return type
+        .fn_proto => .{ .scope = true, .keywords = .type },
+        // The tag type of an enum or union
+        .container_decl => .{ .scope = true, .keywords = .type },
+        // `else` is the only item of its case
+        .switch_case => .{
+            .scope = true,
+            .keywords = if (!tokensBefore(parent, name).any and lastChildNode(parent).?.offset == name.offset and parent.childToken(.comma) == null)
+                .switch_else
+            else
+                .none,
+        },
+        .test_decl, .error_node => .{},
+        else => .{ .scope = true, .keywords = .{ .expression = jumps } },
+    };
+    if (closed_escaped) result.keywords = .none;
+    return result;
+}
+
+/// Whether `container` is a `struct` (not a file, enum, union, or opaque) with no named fields
+fn isTupleStruct(container: SyntaxNode) bool {
+    if (container.kind() != .container_decl) return false;
+    if ((ast.ContainerDecl{ .syntax = container }).keyword() != .@"struct") return false;
+    var it = container.children();
+    while (it.nextNode()) |c| {
+        if (c.kind() == .container_field and c.childToken(.colon) != null) return false;
+    }
+    return true;
+}
+
+/// Kind of the first non-trivia token at or after `offset`
+fn nextTokenKind(root: SyntaxNode, offset: u32) ?SyntaxKind {
+    const end = root.range().end;
+    var at = offset;
+    while (at < end) {
+        const t = root.tokenAtOffset(at) orelse return null;
+        switch (t.kind) {
+            .whitespace, .line_comment, .doc_comment, .container_doc_comment, .unknown => {},
+            else => return t.kind,
+        }
+        at = t.range().end;
+    }
+    return null;
+}
 
 /// Keywords that the syntax admits at the word at the cursor: at the start of a container member,
 /// of a statement, of an expression, of a type (with the attributes a pointer type does not have
 /// yet), and of a parameter, and `else` as a switch case. `return` is offered only in the body of a
 /// function or test, `break` only in a loop or a labeled block or switch, `continue` only in a loop
 /// or a labeled switch, none of them inside `defer` and `errdefer`, which they cannot leave.
-///
-/// Error recovery leaves an empty or keyword word out of the syntax tree, so the member at the
-/// cursor is parsed again with a name in place of the word, and the position is that of the name
-fn addKeywords(r: *Resolver, file: FileId, text: []const u8, visible: Visible, pos: Position, items: *std.ArrayList(Item)) resolve.Error!void {
-    // The word starts inside a token (the digits after the `.` of `1.5`, between the characters
-    // of `=>`), or is a number
-    if (pos.prev) |p| if (p.range().end > pos.start) return;
-    if (pos.start < pos.end and std.ascii.isDigit(text[pos.start])) return;
+fn addKeywords(arena: Allocator, text: []const u8, visible: Visible, pos: Position, items: *std.ArrayList(Item)) Allocator.Error!void {
     const range: Item.Range = .{ .start = pos.start, .end = pos.end };
-    if (pos.kind == .member) {
-        if (betweenFields(pos.node.?, pos.start, pos.end)) return;
+    if (visible.context == .none) {
+        // The word starts inside a token or is a number
+        if (pos.prev) |p| if (p.range().end > pos.start) return;
+        if (pos.start < pos.end and std.ascii.isDigit(text[pos.start])) return;
+        if (pos.kind != .member or betweenFields(pos.node.?, pos.start, pos.end)) return;
         for (member_keywords) |k| {
             if ((pos.after_pub and k.no_pub) or (pos.doc and k.no_doc)) continue;
-            try addKeyword(r.arena, items, k.name, range);
+            try addKeyword(arena, items, k.name, range);
         }
         return;
     }
-    if (visible.context != .scope or pos.after_pub or pos.doc) return;
-    const node = try r.itemNode(file, visible.item) orelse return;
-    const member = node.range();
-    if (pos.start < member.start) return;
-    const fragment = try std.mem.concat(r.arena, u8, &.{
-        text[member.start..pos.start],
-        keyword_placeholder,
-        if (pos.end < member.end) text[pos.end..member.end] else "",
-    });
-    const parse = try Parse.createIn(r.arena, fragment, .zig, try r.ctx.get(database.syntax.SyntaxDialect, {}));
-    defer parse.destroy();
-    const root = parse.rootNode();
-    const at = pos.start - member.start;
-    const token = root.tokenAtOffset(at) orelse return;
-    if (token.kind != .identifier or token.offset != at or !std.mem.eql(u8, token.text, keyword_placeholder)) return;
-    // Inside the name, so that a node ending right before it is not taken
-    const path = try root.coveringPath(r.arena, at + 1);
-    if (path.len < 2 or path[path.len - 1].kind() != .name_ref) return;
-    const name = path[path.len - 1];
-    const parent = path[path.len - 2];
-    const tree = try r.itemTree(file);
-    const jumps = jumpsAt(path, switch (tree.items[visible.item].kind) {
-        .@"fn", .@"test" => true,
-        else => false,
-    });
-    if (pos.kind == .statement) {
-        try addKeywordList(r.arena, items, &statement_keywords, range);
-        return addJumps(r.arena, items, jumps, range);
-    }
-    switch (parent.kind()) {
-        .optional_type, .error_union_type => try addKeywordList(r.arena, items, &type_keywords, range),
-        // The child type is the last node; an array length or a sentinel is an expression
-        .array_type, .ptr_type, .slice_type => if (lastChildNode(parent).?.offset != name.offset) {
-            try addExpressionKeywords(r.arena, items, jumps, range);
-        } else {
-            try addKeywordList(r.arena, items, &type_keywords, range);
-            if (parent.kind() == .array_type) return;
+    switch (visible.syntax.keywords) {
+        .none => {},
+        .member => for (member_keywords) |k| {
+            if ((pos.after_pub and k.no_pub) or (pos.doc and k.no_doc)) continue;
+            try addKeyword(arena, items, k.name, range);
+        },
+        .statement => |jumps| {
+            try addKeywordList(arena, items, &statement_keywords, range);
+            try addJumps(arena, items, jumps, range);
+        },
+        .expression => |jumps| try addExpressionKeywords(arena, items, jumps, range),
+        .type => try addKeywordList(arena, items, &type_keywords, range),
+        .ptr_type => |attrs| {
+            try addKeywordList(arena, items, &type_keywords, range);
             // Pointer attributes come before the child type, each at most once
-            if (parent.childToken(.keyword_const) == null) try addKeyword(r.arena, items, "const", range);
-            if (parent.childToken(.keyword_volatile) == null) try addKeyword(r.arena, items, "volatile", range);
-            if (parent.childToken(.keyword_allowzero) == null) try addKeyword(r.arena, items, "allowzero", range);
-            if (parent.childNode(.align_clause) == null) try addKeyword(r.arena, items, "align", range);
-            if (parent.childNode(.addrspace_clause) == null) try addKeyword(r.arena, items, "addrspace", range);
+            if (attrs.@"const") try addKeyword(arena, items, "const", range);
+            if (attrs.@"volatile") try addKeyword(arena, items, "volatile", range);
+            if (attrs.@"allowzero") try addKeyword(arena, items, "allowzero", range);
+            if (attrs.@"align") try addKeyword(arena, items, "align", range);
+            if (attrs.@"addrspace") try addKeyword(arena, items, "addrspace", range);
         },
-        // `name: T = value`; a container field without `:` is an enum or union member name, or a
-        // tuple field
-        .var_decl, .container_field => {
-            const before = tokensBefore(parent, name);
-            if (before.equal) {
-                try addExpressionKeywords(r.arena, items, jumps, range);
-            } else if (before.colon) {
-                try addKeywordList(r.arena, items, &type_keywords, range);
+        .param => |p| {
+            if (p.has_colon or (p.fn_type and !p.has_any)) {
+                try addKeywordList(arena, items, &type_keywords, range);
+                try addKeyword(arena, items, "anytype", range);
+            }
+            if (!p.has_any) {
+                try addKeyword(arena, items, "comptime", range);
+                try addKeyword(arena, items, "noalias", range);
             }
         },
-        .param => {
-            const before = tokensBefore(parent, name);
-            // A parameter of a function type may have no name
-            const fn_type = path.len < 5 or path[path.len - 5].kind() != .fn_decl;
-            if (before.colon or (fn_type and !before.any)) {
-                try addKeywordList(r.arena, items, &type_keywords, range);
-                try addKeyword(r.arena, items, "anytype", range);
-            }
-            if (!before.any) {
-                try addKeyword(r.arena, items, "comptime", range);
-                try addKeyword(r.arena, items, "noalias", range);
-            }
-        },
-        // The return type
-        .fn_proto => try addKeywordList(r.arena, items, &type_keywords, range),
-        // The tag type of an enum or union
-        .container_decl => try addKeywordList(r.arena, items, &type_keywords, range),
-        // `else` is the only item of its case
-        .switch_case => if (!tokensBefore(parent, name).any and lastChildNode(parent).?.offset == name.offset and parent.childToken(.comma) == null) {
-            try addKeyword(r.arena, items, "else", range);
-        },
-        .test_decl, .error_node => {},
-        else => try addExpressionKeywords(r.arena, items, jumps, range),
+        .switch_else => try addKeyword(arena, items, "else", range),
     }
 }
 
@@ -3507,7 +3679,7 @@ const member_snippets = [_]Snippet{
 /// the `std` and `builtin` imports, `main` and `format` only when not declared yet
 fn addKeywordSnippets(r: *Resolver, file: FileId, text: []const u8, offset: u32, visible: Visible, pos: Position, items: *std.ArrayList(Item)) resolve.Error!void {
     switch (visible.context) {
-        .none, .scope => {},
+        .none, .keyword_only, .scope => {},
         else => return,
     }
     // Inside a number literal

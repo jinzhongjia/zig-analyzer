@@ -43,7 +43,7 @@ Keywords are offered in `.zig` files, with or without snippets, only where the s
 
 In statements and expressions, `return` is offered only in the body of a function or test, `break` only in a loop or a labeled block or switch, and `continue` only in a loop or a labeled switch; none of them inside `defer` or `errdefer`, which control cannot leave, except for the loops and labels inside it.
 
-An empty word, or one that is already a keyword, has no node of its own in the syntax tree after error recovery, so the member at the cursor is parsed again with a name in place of the word, and the position is that of the name. No keywords are offered in declaration, capture, and label names, after `.` or `@`, or inside numbers, operators, comments, and strings.
+An empty word, or one that is already a keyword, has no node of its own in the syntax tree after error recovery, so the member at the cursor is parsed again with a name in place of the word, and the position is that of the name. The same classification decides whether names in scope are offered: only where the syntax admits a name reference (expressions, types, decltest names, inline-assembly output variables, and tuple struct fields), never in declaration, capture, label, error-set, parameter, or field names, non-tuple container member positions, numbers, operators, comments, or strings. No keywords are offered in declaration, capture, and label names, after `.` or `@`, or inside numbers, operators, comments, and strings.
 
 ## Member completion
 
