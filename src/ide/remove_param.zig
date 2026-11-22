@@ -223,9 +223,10 @@ fn fail(file: FileId, offset: ?u32, message: []const u8) Outcome {
 /// errors before the edits by position and message). The only exception is another parameter in
 /// the parameter list becoming unused as a result (removing `x` from `comptime T: type, x: T`
 /// leaves `T` unused): this is equivalent to the error before the removal, and that parameter
-/// can be removed next.
+/// can be removed next. Edits whose errors are unknown are refused.
 fn verify(r: *Resolver, t: Target, param_list: TextRange, fe: rename.FileEdits) resolve.Error!?Problem {
-    const errors = try rename.astGenErrors(r, fe.file, fe.edits);
+    const errors = try rename.astGenErrors(r, fe.file, fe.edits) orelse
+        return .{ .file = fe.file, .offset = null, .message = rename.unchecked_message };
     for (try rename.newAstGenErrors(r.arena, errors.before, errors.after)) |a| {
         if (fe.file == t.file and std.mem.eql(u8, a.message, unused_message) and param_list.contains(a.start)) continue;
         return .{ .file = fe.file, .offset = a.start, .message = try std.fmt.allocPrint(r.arena, "the edit would cause an error here: {s}", .{a.message}) };
