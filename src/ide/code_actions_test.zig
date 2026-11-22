@@ -968,6 +968,31 @@ test "remove unused captures or rename them to _" {
     }
 }
 
+test "for inputs are not removed with the capture when AstGen cannot check the edit" {
+    const unused_capture = @import("unused_capture.zig");
+    const text =
+        \\fn f(xs: []const u32, base: usize) usize {
+        \\    var n: usize = base;
+        \\    for (xs, base..) |x, <|>i| {
+        \\        n += x;
+        \\    }
+        \\    return n;
+        \\}
+    ;
+    for ([_]bool{ false, true }) |zig_unavailable| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        if (zig_unavailable) try w.zigUnavailable();
+        const added = try w.add("/p/main.zig", text);
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        const f = try unused_capture.fix(&r, added.file, added.cursor);
+        try testing.expectEqual(zig_unavailable, f == null);
+    }
+}
+
 /// The titles of all fixes at `<|>`, one per line, with `(preferred)` after the preferred ones
 fn titles(text: []const u8) ![]const u8 {
     var w: World = undefined;

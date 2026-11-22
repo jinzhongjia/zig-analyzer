@@ -166,8 +166,7 @@ pub fn packagesRequest(server: *Server, ctx: *Db.Ctx, arena: Allocator, _: void)
     const workspaces = try server.workspaceList(arena);
     defer server.releaseList(arena, workspaces);
     var projects: std.ArrayList(PackagesResult.Project) = .empty;
-    var config = try server.configSnapshot();
-    defer config.deinit(server.gpa);
+    const config = server.config.load(.acquire);
     const env_pkg_dir: ?[]const u8 = if (server.zig_environ.load(.acquire)) |m| m.get("ZIG_LOCAL_PKG_DIR") else server.environ.getAlloc(arena, "ZIG_LOCAL_PKG_DIR") catch null;
     for (roots) |root| {
         // A project's `zig-analyzer.zon` can set `build.args` (such as `--pkg-dir`) and its

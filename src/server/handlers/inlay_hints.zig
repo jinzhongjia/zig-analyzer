@@ -15,9 +15,7 @@ pub fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.
     const lines = try Server.sourceLines(r.ctx, file);
     const start, const end = server.rangeOffsets(lines, params.range);
     const opts: ide.inlay_hints.Options = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        const c = &server.config;
+        const c = server.config.load(.acquire);
         break :blk .{
             .types = c.inlay_types,
             .capture_types = c.inlay_capture_types,

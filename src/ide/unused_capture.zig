@@ -209,7 +209,7 @@ fn forCapture(r: *Resolver, file: FileId, text: []const u8, node: SyntaxNode, ca
     if (start.kind() != .literal) {
         const checked = try arena.alloc(rename.Edit, edits.len);
         for (edits, checked) |e, *c| c.* = .{ .start = e.start, .end = e.end, .text = e.text };
-        const errors = try rename.astGenErrors(r, file, checked);
+        const errors = try rename.astGenErrors(r, file, checked) orelse return null;
         if ((try rename.newAstGenErrors(arena, errors.before, errors.after)).len > 0) return null;
     }
     return .{ .removed = true, .edits = edits };

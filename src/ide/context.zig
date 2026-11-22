@@ -153,11 +153,19 @@ pub fn defOfKey(r: *Resolver, key: hir.OwnerKey) resolve.Error!?Def {
     return null;
 }
 
+/// The doc comment of a definition; for an alias without one (`pub const Foo = @import("foo.zig").Foo;`,
+/// `pub const f = g;`), the first doc comment along its alias chain (see `Resolver.aliasStep`)
 pub fn doc(r: *Resolver, def: Def) resolve.Error!?[]const u8 {
-    return switch (def) {
-        .item => |it| (try r.itemTree(it.file)).items[it.item].doc,
-        else => null,
-    };
+    var cur = def;
+    for (0..resolve.max_depth) |_| {
+        const it = switch (cur) {
+            .item => |it| it,
+            else => return null,
+        };
+        if ((try r.itemTree(it.file)).items[it.item].doc) |text| return text;
+        cur = try r.aliasStep(cur) orelse return null;
+    }
+    return null;
 }
 
 /// Documentation of a definition whose value is `tv`: its doc comment, followed by the `//!` doc of

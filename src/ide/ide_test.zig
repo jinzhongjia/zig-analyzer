@@ -913,7 +913,7 @@ test "name completion ranks scope names before namespace members, each by how we
         }
     }.less);
     var labels: std.ArrayList([]const u8) = .empty;
-    for (items) |it| try labels.append(w.arena.allocator(), it.label);
+    for (items) |it| if (it.kind != .keyword) try labels.append(w.arena.allocator(), it.label);
     // Local names, parameters, container members and members through `std` come in that order;
     // names in scope that do not match sort last and are filtered by the client
     try testing.expectEqualStrings("memory mem_param memo std.mem std.mem.eql std run", try std.mem.join(w.arena.allocator(), " ", labels.items));
@@ -1370,6 +1370,117 @@ test "name completion ranks candidates fitting the expected type first" {
         .{ "fn run() void { const x: Want = blk: { break :blk cd<|>; }; _ = x; }", want_first },
         .{ "fn run() void { const x: Want = comptime cd<|>; _ = x; }", want_first },
         .{ "fn run(c: bool) void { const x: Other = if (c) .{} else cd<|>; _ = x; }", other_first },
+    });
+}
+
+/// The two-tier ranking of name completion when nothing is typed at the cursor: "none" when no
+/// candidate has a sort text (no expected type), otherwise "all" followed by the labels that sort
+/// first, sorted
+fn tierSummary(source: []const u8) ![]u8 {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(source);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    const items = (try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items;
+    var first: std.ArrayList([]const u8) = .empty;
+    var sorted: usize = 0;
+    for (items) |it| if (it.sort) |s| {
+        sorted += 1;
+        if (std.mem.eql(u8, s, "0")) try first.append(w.arena.allocator(), it.label) else try testing.expectEqualStrings("1", s);
+    };
+    try testing.expect(sorted == 0 or sorted == items.len);
+    std.mem.sort([]const u8, first.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.less);
+    const kind = if (sorted == 0) "none" else "all";
+    return testing.allocator.dupe(u8, try std.fmt.allocPrint(w.arena.allocator(), "{s}{s}{s}", .{
+        kind, if (first.items.len == 0) "" else " ", try std.mem.join(w.arena.allocator(), " ", first.items),
+    }));
+}
+
+/// Checks `cases` in order: the two-tier ranking at the cursor with nothing typed in the source of
+/// each case, placed after `decls`
+fn expectTiers(decls: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator, "//- /p/main.zig module:app\n{s}{s}\n", .{ decls, c[0] });
+        defer testing.allocator.free(source);
+        const got = try tierSummary(source);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "name completion with nothing typed ranks candidates fitting the expected type first" {
+    try expectTiers(expected_decls, &.{
+        // Call arguments: calling a method through a value skips self; calling through the type
+        // or calling a field of function type does not
+        .{ "fn run() void { take(<|>); }", "all cd_w" },
+        .{ "fn run() void { cd_o.put(<|>); }", "all cd_w" },
+        .{ "fn run() void { Other.put(<|>, .a); }", "all cd_o" },
+        .{ "fn run() void { Other.put(cd_o, <|>); }", "all cd_w" },
+        .{ "fn run(h: Hook) void { h.call(<|>); }", "all cd_w" },
+        // Declarations with a type annotation, including declarations in containers and default
+        // values of fields; the same while typing, before the `;` exists
+        .{ "fn run() void { const x: Want = <|>; _ = x; }", "all cd_w" },
+        .{ "fn run() void { var x: Want = <|>; _ = &x; }", "all cd_w" },
+        .{ "fn run() void {\n    const x: Want = <|>\n}", "all cd_w x" },
+        .{ "const top: Want = <|>;", "all cd_w top" },
+        .{ "const Holder = struct { w: Want = <|> };", "all cd_w" },
+        // Return values
+        .{ "fn run() Want { return <|>; }", "all cd_w run" },
+        .{ "fn run() !Want { return <|>; }", "all cd_w run" },
+        .{ "fn run() Other { return <|>; }", "all cd_o run" },
+        // Fields in initializers: the field of the initializer's type; no expected type when
+        // there is no such field
+        .{ "fn run() void { const o: Other = .{ .w = <|> }; _ = o; }", "all cd_w" },
+        .{ "fn run() void { _ = Other{ .w = <|> }; }", "all cd_w" },
+        .{ "fn run() void { takeOther(.{ .w = <|> }); }", "all cd_w" },
+        .{ "fn run() void { takeOther(.{ .missing = <|> }); }", "none" },
+        // Assignments and comparisons; a tagged union compared with its tag
+        .{ "fn run() void { var x: Want = .a; x = <|>; }", "all cd_w x" },
+        .{ "fn run(w: Want) void { if (w == <|>) {} }", "all cd_w w" },
+        .{ "fn run(o: Other) void { if (o.w != <|>) {} }", "all cd_w" },
+        .{ "fn run(t: Tagged) void { if (t == <|>) {} }", "all cd_w" },
+        // `@as(T, e)`; the branches of `if`, `switch`, `orelse`, and `catch`, `break :label`, and
+        // `comptime e` take the expected type of the expression they produce
+        .{ "fn run() void { _ = @as(Want, <|>); }", "all cd_w" },
+        .{ "fn run(c: bool) void { const x: Want = if (c) .a else <|>; _ = x; }", "all cd_w" },
+        .{ "fn run(n: u8) void { const x: Want = switch (n) { 0 => .a, else => <|> }; _ = x; }", "all cd_w" },
+        .{ "fn run(o: ?Want) void { const x: Want = o orelse <|>; _ = x; }", "all cd_w" },
+        .{ "fn run(e: anyerror!Want) void { const x: Want = e catch <|>; _ = x; }", "all cd_w" },
+        .{ "fn run() void { const x: Want = blk: { break :blk <|>; }; _ = x; }", "all cd_w" },
+        .{ "fn run() void { const x: Want = comptime <|>; _ = x; }", "all cd_w" },
+        .{ "fn run(c: bool) void { const x: Other = if (c) .{} else <|>; _ = x; }", "all cd_o" },
+        // No expected type: no sort text at all
+        .{ "fn run() void { const x = <|>; _ = x; }", "none" },
+        .{ "const top = <|>;", "none" },
+        .{ "fn run() void { _ = <|>; }", "none" },
+        // The syntax tree is not trusted when the call at the cursor is not closed; a syntax
+        // error in another statement does not matter
+        .{ "fn run() void {\n    take(<|>\n}", "none" },
+        .{ "fn run() void {\n    const y: u8 = ;\n    const x: Want = <|>;\n    _ = .{ x, y };\n}", "all cd_w" },
+    });
+}
+
+test "completion with nothing typed ranks the issue example by the expected type" {
+    const decls =
+        \\const u32_value: u32 = 1;
+        \\fn u32_fn() u32 { return 2; }
+        \\const other_value: []const u8 = "";
+        \\fn other_fn() void {}
+        \\
+    ;
+    try expectTiers(decls, &.{
+        .{ "fn run() void { const x: u32 = <|>; _ = x; }", "all u32_fn u32_value" },
     });
 }
 
@@ -2822,7 +2933,9 @@ fn completionAt(w: *World, at: World.Added) ![]const u8 {
     defer ctx.end();
     var r = resolver(w, &ctx);
     var labels: std.ArrayList([]const u8) = .empty;
-    for ((try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items) |it| try labels.append(w.arena.allocator(), it.label);
+    for ((try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items) |it| {
+        if (it.kind != .keyword) try labels.append(w.arena.allocator(), it.label);
+    }
     return std.mem.join(w.arena.allocator(), " ", labels.items);
 }
 
@@ -6243,6 +6356,92 @@ test "hover shows the file and size of @embedFile values, and the content of sho
     }
 }
 
+test "hover and completion on a re-exported declaration show the original's doc" {
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        // A re-export through `@import(...).Name`
+        .{
+            \\//- /p/main.zig
+            \\const lib = @import("lib.zig");
+            \\fn run() void {
+            \\    _ = lib.Foo<|>;
+            \\}
+            \\//- /p/lib.zig
+            \\pub const Foo = @import("foo.zig").Foo;
+            \\//- /p/foo.zig
+            \\/// A thing that does X.
+            \\pub const Foo = struct { value: u32 };
+            ,
+            "Foo",
+            "A thing that does X.",
+        },
+        // A re-export of a name in scope
+        .{
+            \\//- /p/main.zig
+            \\const lib = @import("lib.zig");
+            \\fn run() void {
+            \\    _ = lib.add<|>;
+            \\}
+            \\//- /p/lib.zig
+            \\pub const add = addImpl;
+            \\/// Adds two numbers.
+            \\fn addImpl(a: u32, b: u32) u32 {
+            \\    return a + b;
+            \\}
+            ,
+            "add",
+            "Adds two numbers.",
+        },
+        // The first doc along the alias chain: the re-export's own doc comes first
+        .{
+            \\//- /p/main.zig
+            \\const lib = @import("lib.zig");
+            \\fn run() void {
+            \\    _ = lib.Foo<|>;
+            \\}
+            \\//- /p/lib.zig
+            \\pub const Foo = @import("mid.zig").Foo;
+            \\//- /p/mid.zig
+            \\/// Re-exported here.
+            \\pub const Foo = @import("foo.zig").Foo;
+            \\//- /p/foo.zig
+            \\/// The original.
+            \\pub const Foo = struct {};
+            ,
+            "Foo",
+            "Re-exported here.",
+        },
+        // A value that is not an alias has no doc to take over
+        .{
+            \\//- /p/main.zig
+            \\const lib = @import("lib.zig");
+            \\fn run() void {
+            \\    _ = lib.Foo<|>;
+            \\}
+            \\//- /p/lib.zig
+            \\pub const Foo = if (@sizeOf(usize) == 8) @import("foo.zig").Foo else u8;
+            \\//- /p/foo.zig
+            \\/// The original.
+            \\pub const Foo = struct {};
+            ,
+            "Foo",
+            "",
+        },
+    };
+    for (cases) |c| {
+        const docs = try importedDocs(c[0], c[1]);
+        defer for (docs) |d| testing.allocator.free(d);
+        testing.expectEqualStrings(c[2], docs[1]) catch |err| {
+            std.debug.print("completion in\n{s}\n", .{c[0]});
+            return err;
+        };
+        const ok = if (c[2].len == 0) std.mem.indexOf(u8, docs[0], "The original.") == null else std.mem.endsWith(u8, docs[0], c[2]);
+        testing.expect(ok) catch |err| {
+            std.debug.print("hover in\n{s}\ngave\n{s}\n", .{ c[0], docs[0] });
+            return err;
+        };
+    }
+}
+
 test "hover on a constant aliasing a container shows the aliased type" {
     // Prevents an alias from reading like the definition (`const P2 = struct`)
     const text =
@@ -6275,7 +6474,7 @@ test "hover on a constant aliasing a container shows the aliased type" {
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, []const u8 }{
         .{ "Point = struct", "const Point = struct\n```\n\nsize: 4 · align: 4\n\nA point" },
-        .{ "P2 =", "const P2: type = Point\n```\n\nsize: 4 · align: 4" },
+        .{ "P2 =", "const P2: type = Point\n```\n\nsize: 4 · align: 4\n\nA point" },
         .{ "L =", "const L: type = List(u8)\n```\n\nsize: 16 · align: 8" },
         .{ "Foo =", "const Foo: type = Foo\n```\n\nsize: 1 · align: 1" },
         .{ "Choice =", "const Choice = struct\n```\n\nsize: 1 · align: 1" },
@@ -6627,7 +6826,7 @@ fn completionLabels(text: []const u8) ![]const u8 {
     var r = resolver(&w, &ctx);
     const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
-    for (items) |it| try labels.append(testing.allocator, it.label);
+    for (items) |it| if (it.kind != .keyword) try labels.append(testing.allocator, it.label);
     defer labels.deinit(testing.allocator);
     return testing.allocator.dupe(u8, try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
@@ -8301,14 +8500,14 @@ test "auto import is not offered outside zig source files" {
     try testing.expect(!detected.import_position);
 }
 
-/// The snippet inserted by the item named `label` at the cursor: `-` when it has no snippet,
-/// `missing` when there is no such item
+/// The snippet inserted by the item named `label` at the cursor (not a keyword): `-` when it has
+/// no snippet, `missing` when there is no such item
 fn snippetOf(w: *World, file: FileId, offset: u32, label: []const u8, options: completion.Options) ![]const u8 {
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
     var r = resolver(w, &ctx);
     for ((try completion.complete(&r, file, offset, options)).items) |it| {
-        if (std.mem.eql(u8, it.label, label)) return w.arena.allocator().dupe(u8, it.snippet orelse "-");
+        if (it.kind != .keyword and std.mem.eql(u8, it.label, label)) return w.arena.allocator().dupe(u8, it.snippet orelse "-");
     }
     return "missing";
 }
@@ -8856,6 +9055,160 @@ test "completion: snippets insert declarations that fit the position and the sta
     try testing.expectEqual(added.cursor - 2, item.replace.?.start);
     try testing.expectEqual(added.cursor + 3, item.replace.?.end);
     try testing.expectEqualStrings("for (…) |value| {}", item.detail.?);
+}
+
+/// Labels of the keyword items (`.keyword`) at the cursor, joined with `, `
+fn keywordLabels(w: *World, file: FileId, offset: u32, options: completion.Options) ![]const u8 {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    var labels: std.ArrayList([]const u8) = .empty;
+    for ((try completion.complete(&r, file, offset, options)).items) |it| {
+        if (it.kind == .keyword) try labels.append(w.arena.allocator(), it.label);
+    }
+    return std.mem.join(w.arena.allocator(), ", ", labels.items);
+}
+
+/// The labels of a `, `-joined list, sorted
+fn sortedLabels(arena: std.mem.Allocator, list: []const u8) ![]const u8 {
+    var labels: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitSequence(u8, list, ", ");
+    while (it.next()) |l| if (l.len != 0) try labels.append(arena, l);
+    std.mem.sort([]const u8, labels.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return std.mem.join(arena, ", ", labels.items);
+}
+
+test "completion: keywords follow the syntax position" {
+    const statement = "const, var, if, for, while, switch, defer, errdefer, try, comptime, inline, unreachable";
+    const expression = "if, switch, for, while, inline, try, comptime, unreachable, struct, enum, union, opaque, error, fn, packed, extern";
+    const types = "struct, enum, union, opaque, error, fn, packed, extern, comptime, if, switch";
+    const member = "pub, const, var, fn, test, comptime, extern, export, inline, noinline, threadlocal";
+    const cases = [_]struct { []const u8, []const u8 }{
+        // Start of a statement: `return` only in a function or test body, `break` and `continue`
+        // only in a loop, `break` in a labeled block
+        .{ "fn t() void {\n    <|>\n}", statement ++ ", return" },
+        .{ "fn t() void {\n    co<|>\n}", statement ++ ", return" },
+        .{ "fn t() void {\n    const<|>\n}", statement ++ ", return" },
+        .{ "test \"a\" {\n    <|>\n}", statement ++ ", return" },
+        .{ "fn t() void {\n    const a = 1;\n    _ = a;\n    <|>\n}", statement ++ ", return" },
+        .{ "fn t() void {\n    while (true) {\n        <|>\n    }\n}", statement ++ ", return, break, continue" },
+        .{ "fn t() void {\n    for (0..1) |_| {\n        <|>\n    }\n}", statement ++ ", return, break, continue" },
+        .{ "fn t() void {\n    blk: {\n        <|>\n    }\n}", statement ++ ", return, break" },
+        .{ "fn t() void {\n    {\n        <|>\n    }\n}", statement ++ ", return" },
+        .{ "comptime {\n    <|>\n}", statement },
+        // Control cannot leave a deferred block, but can leave a loop inside it
+        .{ "fn t() void {\n    while (true) {\n        defer {\n            <|>\n        }\n    }\n}", statement },
+        .{ "fn t() void {\n    defer {\n        while (true) {\n            <|>\n        }\n    }\n}", statement ++ ", break, continue" },
+        // A container in a function body starts a new scope
+        .{ "fn t() void {\n    while (true) {\n        const S = struct {\n            fn f() void {\n                <|>\n            }\n        };\n        _ = S;\n    }\n}", statement ++ ", return" },
+        // Expressions
+        .{ "fn t() void {\n    const a = i<|>\n}", expression ++ ", return" },
+        .{ "fn t() void {\n    const a = <|>\n}", expression ++ ", return" },
+        .{ "fn t() void {\n    const a = <|>;\n    _ = a;\n}", expression ++ ", return" },
+        .{ "fn t() u8 {\n    return <|>;\n}", expression ++ ", return" },
+        .{ "fn t() void {\n    t(<|>);\n}", expression ++ ", return" },
+        .{ "fn t(a: u8) void {\n    _ = a + <|>;\n}", expression ++ ", return" },
+        .{ "fn t() void {\n    while (true) {\n        _ = sw<|>;\n    }\n}", expression ++ ", return, break, continue" },
+        .{ "fn t(x: u8) void {\n    switch (x) {\n        else => <|>,\n    }\n}", expression ++ ", return" },
+        .{ "const a = <|>;", expression },
+        .{ "const S = struct {\n    a: u8 = <|>,\n};", expression },
+        .{ "fn t() void {\n    defer <|>;\n}", expression },
+        // An array length is an expression
+        .{ "fn t() void {\n    const a: [<|>]u8 = undefined;\n    _ = a;\n}", expression ++ ", return" },
+        // Types
+        .{ "fn t() void {\n    const a: <|> = undefined;\n    _ = a;\n}", types },
+        .{ "fn t() void {\n    const a: st<|> = undefined;\n    _ = a;\n}", types },
+        .{ "fn t() void {\n    const a: ?<|> = undefined;\n    _ = a;\n}", types },
+        .{ "fn t() void {\n    const a: anyerror!<|> = undefined;\n    _ = a;\n}", types },
+        .{ "fn t() void {\n    const a: [2]<|> = undefined;\n    _ = a;\n}", types },
+        .{ "fn t() <|> {}", types },
+        .{ "const S = struct {\n    a: <|>,\n};", types },
+        .{ "const U = union(<|>) {};", types },
+        // Pointer attributes that are not written yet
+        .{ "fn t() void {\n    const a: *<|> = undefined;\n    _ = a;\n}", types ++ ", const, volatile, allowzero, align, addrspace" },
+        .{ "fn t() void {\n    const a: []const <|> = undefined;\n    _ = a;\n}", types ++ ", volatile, allowzero, align, addrspace" },
+        .{ "fn t() void {\n    const a: [*]align(4) <|> = undefined;\n    _ = a;\n}", types ++ ", const, volatile, allowzero, addrspace" },
+        // Parameters: `comptime` and `noalias` before the name, `anytype` as the type, and a
+        // parameter of a function type may be only a type
+        .{ "fn t(<|>) void {}", "comptime, noalias" },
+        .{ "fn t(a: u8, <|>) void {}", "comptime, noalias" },
+        .{ "fn t(a: <|>) void {}", types ++ ", anytype" },
+        .{ "const F = fn (<|>) void;", types ++ ", anytype, comptime, noalias" },
+        // `else` as the only item of a switch case
+        .{ "fn t(x: u8) void {\n    switch (x) {\n        el<|>\n    }\n}", "else" },
+        .{ "fn t(x: u8) void {\n    switch (x) {\n        1, <|> => {},\n    }\n}", "" },
+        // Start of a container member
+        .{ "<|>", member },
+        .{ "const a = 1;\nco<|>", member },
+        .{ "pub <|>", "const, var, fn, extern, export, inline, noinline, threadlocal" },
+        .{ "/// doc\n<|>", "pub, const, var, fn, extern, export, inline, noinline, threadlocal" },
+        .{ "const S = struct {\n    a: u8,\n    <|>\n};", member },
+        // None in names, after `.`, after `@`, in numbers and operators, and between fields
+        .{ "fn t() void {\n    const <|>\n}", "" },
+        .{ "fn <|>() void {}", "" },
+        .{ "fn t(a: []const u8) void {\n    for (a) |<|>| {}\n}", "" },
+        .{ "fn t() void {\n    blk: {\n        break :<|>;\n    }\n}", "" },
+        .{ "const S = struct {\n    a: u8,\n};\nconst b = S.<|>;", "" },
+        .{ "const E = enum { a, b };\nconst b: E = .<|>;", "" },
+        .{ "fn t() void {\n    @<|>\n}", "" },
+        .{ "fn t() void {\n    const x = 1.5<|>;\n    _ = x;\n}", "" },
+        .{ "fn t() void {\n    const x = 15<|>;\n    _ = x;\n}", "" },
+        .{ "fn t(x: u8) void {\n    switch (x) {\n        else =<|>> {},\n    }\n}", "" },
+        .{ "fn t() void {\n    // co<|>\n}", "" },
+        .{ "fn t() void {\n    _ = \"co<|>\";\n}", "" },
+        .{ "const E = enum {\n    a,\n    <|>\n    b,\n};", "" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", c[0]);
+        // The same with and without snippets; a typed prefix reorders them (see `rank`)
+        for ([_]bool{ false, true }) |snippets| {
+            const got = try keywordLabels(&w, added.file, added.cursor, .{ .auto_import = false, .snippets = snippets });
+            testing.expectEqualStrings(try sortedLabels(w.arena.allocator(), c[1]), try sortedLabels(w.arena.allocator(), got)) catch |err| {
+                std.debug.print("case {d} (snippets: {}): `{s}`\n", .{ i, snippets, c[0] });
+                return err;
+            };
+        }
+    }
+}
+
+test "completion: keywords replace the word at the cursor and rank by the input" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", "fn t() void {\n    const count = 1;\n    _ = count;\n    co<|>ns\n}\n");
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
+    const keyword = for (items) |it| {
+        if (it.kind == .keyword and std.mem.eql(u8, it.label, "const")) break it;
+    } else return error.MissingKeyword;
+    try testing.expectEqual(added.cursor - 2, keyword.replace.?.start);
+    try testing.expectEqual(added.cursor + 2, keyword.replace.?.end);
+    try testing.expect(keyword.snippet == null);
+    // Keywords that do not match the input sort after those that do
+    const other = for (items) |it| {
+        if (it.kind == .keyword and std.mem.eql(u8, it.label, "while")) break it;
+    } else return error.MissingKeyword;
+    try testing.expect(std.mem.order(u8, keyword.sort.?, other.sort.?) == .lt);
+}
+
+test "completion: no keywords outside zig source files" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/build.zig.zon", ".{\n    .value = <|>\n}");
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    for ((try completion.complete(&r, added.file, added.cursor, .{})).items) |it| try testing.expect(it.kind != .keyword);
 }
 
 test "completion: no snippets outside zig source files" {

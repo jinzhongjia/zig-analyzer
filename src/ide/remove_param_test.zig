@@ -10,19 +10,26 @@ const remove_param = @import("remove_param.zig");
 /// the fixture has several files, the changed files, each starting with `//- <path>`),
 /// `<path>:<line>:<column> <reason>` when the parameter cannot be removed, or "no target" when no
 /// removal is offered. Text that does not start with `//- ` is the single file `/p/main.zig`.
-fn remove(text: []const u8) ![]const u8 {
+/// With `zig_unavailable`, the live checks cannot run once the target is found.
+fn remove(text: []const u8, zig_unavailable: bool) ![]const u8 {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
     const a = w.arena.allocator();
     const multi = std.mem.startsWith(u8, text, "//- ");
     const fx = try w.fixture(if (multi) text else try std.mem.concat(a, u8, &.{ "//- /p/main.zig\n", text }));
+    const cursor = fx.cursor orelse return error.NoCursor;
+    const found = blk: {
+        var ctx = w.db.beginRead(a);
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = a };
+        break :blk try remove_param.targets(&r, cursor.file, cursor.offset, cursor.offset);
+    };
+    if (found.len == 0) return testing.allocator.dupe(u8, "no target");
+    if (zig_unavailable) try w.zigUnavailable();
     var ctx = w.db.beginRead(a);
     defer ctx.end();
     var r: resolve.Resolver = .{ .ctx = &ctx, .arena = a };
-    const cursor = fx.cursor orelse return error.NoCursor;
-    const found = try remove_param.targets(&r, cursor.file, cursor.offset, cursor.offset);
-    if (found.len == 0) return testing.allocator.dupe(u8, "no target");
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(testing.allocator);
@@ -63,9 +70,22 @@ fn pathOf(fx: World.Fixture, file: FileId) []const u8 {
 }
 
 fn expectRemove(text: []const u8, expected: []const u8) !void {
-    const got = try remove(text);
+    const got = try remove(text, false);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(expected, got);
+}
+
+test "remove parameter: edits are refused when AstGen cannot check them" {
+    const got = try remove(
+        \\fn f(a: u32, <|>b: u32) u32 {
+        \\    return a;
+        \\}
+        \\fn g() u32 {
+        \\    return f(1, 2);
+        \\}
+    , true);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("/p/main.zig AstGen could not check the edited text", got);
 }
 
 test "remove parameter: plain function" {
