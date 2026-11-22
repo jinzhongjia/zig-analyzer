@@ -29,8 +29,6 @@ const WorkspaceFiles = database.inputs.WorkspaceFiles;
 const syntax_q = database.syntax;
 const live = database.live;
 const ide = za.ide;
-const package_manifest = za.project.manifest;
-const dependency_packages = za.project.packages;
 const compiler = za.diagnostics.compiler;
 const ZigEnv = za.project.ZigEnv;
 const Workspace = @import("Workspace.zig");
@@ -52,6 +50,20 @@ const Server = @This();
 const ClientCaps = @import("ClientCaps.zig");
 const SingleFiles = @import("SingleFiles.zig");
 const Rerun = @import("Rerun.zig");
+
+/// Request handlers by feature (see `request_handlers`)
+const requests = struct {
+    const code_actions = @import("handlers/code_actions.zig");
+    const completion = @import("handlers/completion.zig");
+    const document = @import("handlers/document.zig");
+    const hover = @import("handlers/hover.zig");
+    const inlay_hints = @import("handlers/inlay_hints.zig");
+    const inspection = @import("handlers/inspection.zig");
+    const navigation = @import("handlers/navigation.zig");
+    const references = @import("handlers/references.zig");
+    const rename = @import("handlers/rename.zig");
+    const semantic_tokens = @import("handlers/semantic_tokens.zig");
+};
 
 io: Io,
 gpa: Allocator,
@@ -642,7 +654,7 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
                 .string => |s| if (std.mem.startsWith(u8, s, config_request_prefix)) {
                     try server.handleConfigResponse(s, resp.result, resp.failed);
                 } else if (std.mem.startsWith(u8, s, apply_edit_prefix)) {
-                    server.applyEditResponse(resp.result, resp.failed);
+                    requests.code_actions.applyEditResponse(server, resp.result, resp.failed);
                 } else if (std.mem.eql(u8, s, server.semantic_refresh.id)) {
                     if (server.semantic_refresh.finished(server.io)) server.requestSemanticRefresh();
                 } else if (std.mem.eql(u8, s, server.inlay_refresh.id)) {
@@ -703,43 +715,43 @@ const Mode = enum {
 
 /// The command of a code action on a `build.zig.zon` dependency: runs `zig fetch` and applies the
 /// hash to the manifest
-const fetch_hash_command = "zig-analyzer/fetchDependencyHash";
+pub const fetch_hash_command = "zig-analyzer/fetchDependencyHash";
 /// IDs of the `workspace/applyEdit` requests (a string, so that no progress request ID is reused)
-const apply_edit_prefix = "zig-analyzer/apply-edit/";
+pub const apply_edit_prefix = "zig-analyzer/apply-edit/";
 
 const request_handlers = .{
     .{ "initialize", Mode.sync, initialize },
     .{ "shutdown", Mode.sync, shutdown },
     .{ "zig-analyzer/waitIdle", Mode.background, waitIdleRequest },
-    .{ "zig-analyzer/status", Mode.read, status },
-    .{ "zig-analyzer/fileStatus", Mode.read, fileStatus },
-    .{ "zig-analyzer/packages", Mode.read, packagesRequest },
-    .{ "zig-analyzer/syntaxTree", Mode.syntax, syntaxTree },
-    .{ "zig-analyzer/moduleGraph", Mode.read, moduleGraph },
+    .{ "zig-analyzer/status", Mode.read, requests.inspection.status },
+    .{ "zig-analyzer/fileStatus", Mode.read, requests.inspection.fileStatus },
+    .{ "zig-analyzer/packages", Mode.read, requests.inspection.packagesRequest },
+    .{ "zig-analyzer/syntaxTree", Mode.syntax, requests.inspection.syntaxTree },
+    .{ "zig-analyzer/moduleGraph", Mode.read, requests.inspection.moduleGraph },
     .{ "zig-analyzer/reloadWorkspace", Mode.sync, reloadWorkspace },
-    .{ "workspace/executeCommand", Mode.background, executeCommand },
-    .{ "textDocument/formatting", Mode.syntax, formatting },
-    .{ "textDocument/documentSymbol", Mode.semantic, documentSymbol },
-    .{ "textDocument/foldingRange", Mode.syntax, foldingRange },
-    .{ "textDocument/selectionRange", Mode.syntax, selectionRange },
-    .{ "textDocument/semanticTokens/full", Mode.semantic, semanticTokensFull },
-    .{ "textDocument/semanticTokens/full/delta", Mode.semantic, semanticTokensDelta },
-    .{ "textDocument/semanticTokens/range", Mode.semantic, semanticTokensRange },
-    .{ "textDocument/definition", Mode.semantic, definition },
-    .{ "textDocument/declaration", Mode.semantic, declaration },
-    .{ "textDocument/typeDefinition", Mode.semantic, typeDefinition },
-    .{ "textDocument/completion", Mode.semantic, completion },
-    .{ "completionItem/resolve", Mode.semantic, completionResolve },
-    .{ "textDocument/hover", Mode.semantic, hover },
-    .{ "textDocument/signatureHelp", Mode.semantic, signatureHelp },
-    .{ "textDocument/inlayHint", Mode.semantic, inlayHint },
-    .{ "textDocument/references", Mode.semantic, references },
-    .{ "textDocument/documentHighlight", Mode.semantic, documentHighlight },
-    .{ "textDocument/prepareRename", Mode.semantic, prepareRename },
-    .{ "textDocument/rename", Mode.semantic, rename },
-    .{ "workspace/symbol", Mode.semantic, workspaceSymbol },
-    .{ "textDocument/codeAction", Mode.semantic, codeAction },
-    .{ "codeAction/resolve", Mode.semantic, codeActionResolve },
+    .{ "workspace/executeCommand", Mode.background, requests.code_actions.executeCommand },
+    .{ "textDocument/formatting", Mode.syntax, requests.document.formatting },
+    .{ "textDocument/documentSymbol", Mode.semantic, requests.document.documentSymbol },
+    .{ "textDocument/foldingRange", Mode.syntax, requests.document.foldingRange },
+    .{ "textDocument/selectionRange", Mode.syntax, requests.document.selectionRange },
+    .{ "textDocument/semanticTokens/full", Mode.semantic, requests.semantic_tokens.semanticTokensFull },
+    .{ "textDocument/semanticTokens/full/delta", Mode.semantic, requests.semantic_tokens.semanticTokensDelta },
+    .{ "textDocument/semanticTokens/range", Mode.semantic, requests.semantic_tokens.semanticTokensRange },
+    .{ "textDocument/definition", Mode.semantic, requests.navigation.definition },
+    .{ "textDocument/declaration", Mode.semantic, requests.navigation.declaration },
+    .{ "textDocument/typeDefinition", Mode.semantic, requests.navigation.typeDefinition },
+    .{ "textDocument/completion", Mode.semantic, requests.completion.completion },
+    .{ "completionItem/resolve", Mode.semantic, requests.completion.completionResolve },
+    .{ "textDocument/hover", Mode.semantic, requests.hover.hover },
+    .{ "textDocument/signatureHelp", Mode.semantic, requests.hover.signatureHelp },
+    .{ "textDocument/inlayHint", Mode.semantic, requests.inlay_hints.inlayHint },
+    .{ "textDocument/references", Mode.semantic, requests.references.references },
+    .{ "textDocument/documentHighlight", Mode.semantic, requests.references.documentHighlight },
+    .{ "textDocument/prepareRename", Mode.semantic, requests.rename.prepareRename },
+    .{ "textDocument/rename", Mode.semantic, requests.rename.rename },
+    .{ "workspace/symbol", Mode.semantic, requests.references.workspaceSymbol },
+    .{ "textDocument/codeAction", Mode.semantic, requests.code_actions.codeAction },
+    .{ "codeAction/resolve", Mode.semantic, requests.code_actions.codeActionResolve },
 };
 
 /// Maximum nesting depth of request params (see `processRequest`)
@@ -1022,7 +1034,7 @@ fn testGate(server: *Server, comptime method: []const u8, point: @FieldType(Test
 
 /// Result of a handler: success, or the reason for the failure (answered with `request_failed`;
 /// the client shows the reason to the user)
-fn Outcome(comptime T: type) type {
+pub fn Outcome(comptime T: type) type {
     return union(enum) {
         ok: T,
         failed: []const u8,
@@ -1317,7 +1329,7 @@ const index_progress_delay_ms = 200;
 
 /// Whether auto-import is still enabled: the indexing task checks again before each batch and
 /// stops indexing once it is disabled
-fn autoImportEnabled(server: *Server) bool {
+pub fn autoImportEnabled(server: *Server) bool {
     return server.config.load(.acquire).completion_auto_import;
 }
 
@@ -1370,7 +1382,7 @@ fn scheduleIndexing(server: *Server) void {
 /// inline, and when its read transaction runs into a waiting write transaction, it and the caller
 /// still holding the read lock wait for each other. Scheduling is done by another task; if that
 /// task cannot start, no index is built and it is left to later requests.
-fn scheduleIndexingFromRead(server: *Server) void {
+pub fn scheduleIndexingFromRead(server: *Server) void {
     server.busyBegin();
     server.bg_group.concurrent(server.io, scheduleIndexingTask, .{server}) catch server.busyEnd();
 }
@@ -1657,7 +1669,7 @@ const imports_pending = std.math.maxInt(u64);
 
 /// The composition of the module graph that determines the auto-import index: the standard
 /// library, the default builtin, and each module's root, builtin, and imports, but not files
-fn importsBasis(graph: ?*const ModuleGraph) u64 {
+pub fn importsBasis(graph: ?*const ModuleGraph) u64 {
     const g = graph orelse return 0;
     var h: std.hash.Wyhash = .init(0);
     hashFile(&h, g.std_root);
@@ -2048,7 +2060,7 @@ fn forgetRealPath(server: *Server, file: ?Vfs.FileId) void {
 /// files and does not exist on disk, so it is not passed to the compiler; other features treat it
 /// as a single file). The virtual path ends in `.zon` for a document opened with languageId
 /// `zon`, in `.zig` for languageId `zig`, and otherwise follows the end of the URI.
-fn documentPath(server: *Server, arena: Allocator, document_uri: []const u8) Allocator.Error!?[]const u8 {
+pub fn documentPath(server: *Server, arena: Allocator, document_uri: []const u8) Allocator.Error!?[]const u8 {
     const path = uri.toPath(arena, document_uri) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.UnsupportedScheme => {
@@ -2263,7 +2275,7 @@ fn setDocVersion(server: *Server, id: Vfs.FileId, version: i32) Allocator.Error!
 }
 
 /// The version of `file` when it is open in the client; null otherwise
-fn docVersion(server: *Server, file: Vfs.FileId) ?i32 {
+pub fn docVersion(server: *Server, file: Vfs.FileId) ?i32 {
     server.docs.mutex.lockUncancelable(server.io);
     defer server.docs.mutex.unlock(server.io);
     return server.docs.versions.get(file);
@@ -2961,7 +2973,7 @@ pub fn originRules(server: *Server, arena: Allocator) Allocator.Error!origin.Rul
 
 /// The file belongs to some project's module graph (its compile set, or reachable from the
 /// other compile steps)
-fn inProject(server: *Server, file: Vfs.FileId) bool {
+pub fn inProject(server: *Server, file: Vfs.FileId) bool {
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
     for (server.workspaces.items) |ws| if (ws.contains(file)) return true;
@@ -3588,7 +3600,7 @@ fn reloadZigPathsTask(server: *Server) Io.Cancelable!void {
 /// library, a project's module graph, a root directory with build.zig, an unloaded project in an
 /// ancestor directory, the Zig lib directory in use; only a .zig file that is none of these is a
 /// detached file.
-const FileContext = enum {
+pub const FileContext = enum {
     /// Not compiled: virtual documents, and non-.zig files that belong to no project
     none,
     /// A file in a dependency library (see `origin.Origin.isLibrary`), or in the Zig lib directory
@@ -4300,7 +4312,7 @@ fn visibleFor(server: *Server, root: []const u8) ?*Workspace {
 }
 
 /// Snapshot of the instances in the list (each with a reference held; release with `releaseList`)
-fn workspaceList(server: *Server, a: Allocator) Allocator.Error![]*Workspace {
+pub fn workspaceList(server: *Server, a: Allocator) Allocator.Error![]*Workspace {
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
     const list = try a.dupe(*Workspace, server.workspaces.items);
@@ -4308,7 +4320,7 @@ fn workspaceList(server: *Server, a: Allocator) Allocator.Error![]*Workspace {
     return list;
 }
 
-fn releaseList(server: *Server, a: Allocator, list: []*Workspace) void {
+pub fn releaseList(server: *Server, a: Allocator, list: []*Workspace) void {
     _ = server;
     for (list) |ws| ws.release();
     a.free(list);
@@ -5299,7 +5311,7 @@ fn liveEligible(server: *Server, file: Vfs.FileId) bool {
     return !owned;
 }
 
-fn uriFor(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error![]const u8 {
+pub fn uriFor(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Error![]const u8 {
     server.docs.mutex.lockUncancelable(server.io);
     defer server.docs.mutex.unlock(server.io);
     if (server.docs.open.getPtr(file)) |open| return arena.dupe(u8, open.current().uri);
@@ -5633,7 +5645,7 @@ const NamingSettings = struct {
     ignore: []const []const u8,
     rules: Config.NamingRules,
 
-    fn allows(s: NamingSettings, f: ide.naming.Located) bool {
+    pub fn allows(s: NamingSettings, f: ide.naming.Located) bool {
         const enabled = switch (f.rule) {
             inline else => |rule| @field(s.rules, @tagName(rule)),
         };
@@ -5646,7 +5658,7 @@ const NamingSettings = struct {
 /// Whether the file gets naming checks, and their settings: open user code (see
 /// `origin.Origin.user` and `origin.Origin.outside`) with the check enabled, not in
 /// `naming.exclude`, and not generated code (see `naming.isGenerated`)
-fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const u8) Allocator.Error!?NamingSettings {
+pub fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const u8) Allocator.Error!?NamingSettings {
     if (!hintsEligible(server, file, text)) return null;
     const path = server.vfs.path(file);
     const config = server.config.load(.acquire);
@@ -5727,7 +5739,7 @@ fn unusedFor(server: *Server, file: Vfs.FileId, text: []const u8) bool {
 
 /// The lint rules the file gets, null when lint hints are off for it: the setting from the client
 /// or the project of the file, for open user code that is not generated
-fn lintFor(server: *Server, file: Vfs.FileId, text: []const u8) ?Config.LintRules {
+pub fn lintFor(server: *Server, file: Vfs.FileId, text: []const u8) ?Config.LintRules {
     if (!hintsEligible(server, file, text)) return null;
     const path = server.vfs.path(file);
     const config = server.config.load(.acquire);
@@ -5749,7 +5761,7 @@ fn lintFor(server: *Server, file: Vfs.FileId, text: []const u8) ?Config.LintRule
     return if (enable) rules else null;
 }
 
-fn lintAllows(rules: Config.LintRules, rule: ide.lint.Rule) bool {
+pub fn lintAllows(rules: Config.LintRules, rule: ide.lint.Rule) bool {
     return switch (rule) {
         inline else => |r| @field(rules, @tagName(r)),
     };
@@ -5763,7 +5775,7 @@ fn dupeStrings(arena: Allocator, list: []const []const u8) Allocator.Error![]con
 
 /// Layout rules of the import block for `file`: the client's settings, overridden by the
 /// `zig-analyzer.zon` of the project containing the file (the innermost one when nested)
-fn importOptionsFor(server: *Server, file: Vfs.FileId) ImportOptions {
+pub fn importOptionsFor(server: *Server, file: Vfs.FileId) ImportOptions {
     var options = server.config.load(.acquire).importOptions();
     const path = server.vfs.path(file);
     server.workspaces_mutex.lockUncancelable(server.io);
@@ -5788,7 +5800,7 @@ fn rootOf(server: *Server, arena: Allocator, path: []const u8) Allocator.Error!?
 }
 
 /// The workspace root directories, copied into `arena`
-fn rootsAlloc(server: *Server, arena: Allocator) Allocator.Error![]const []const u8 {
+pub fn rootsAlloc(server: *Server, arena: Allocator) Allocator.Error![]const []const u8 {
     server.roots_mutex.lockUncancelable(server.io);
     defer server.roots_mutex.unlock(server.io);
     return dupeStrings(arena, server.roots.items);
@@ -5898,14 +5910,14 @@ fn suppressibleCode(d: types.Diagnostic) ?[]const u8 {
 
 /// Maps a URI in a read request to a known file; returns
 /// null for files that are not open or do not exist
-fn lookupFile(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs.FileId {
+pub fn lookupFile(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs.FileId {
     const path = try server.documentPath(arena, document_uri) orelse return null;
     return try server.vfs.lookup(path);
 }
 
 /// Converts a range in a request to byte offsets; a range
 /// whose start and end are reversed is treated as swapped
-fn rangeOffsets(server: *const Server, lines: offsets.LineIndex, range: types.Range) struct { u32, u32 } {
+pub fn rangeOffsets(server: *const Server, lines: offsets.LineIndex, range: types.Range) struct { u32, u32 } {
     const a: u32 = @intCast(lines.offsetOf(range.start, server.encoding));
     const b: u32 = @intCast(lines.offsetOf(range.end, server.encoding));
     return .{ @min(a, b), @max(a, b) };
@@ -5913,115 +5925,15 @@ fn rangeOffsets(server: *const Server, lines: offsets.LineIndex, range: types.Ra
 
 /// Text and line index of the `SourceText` of `file`; the line table is cached for each revision
 /// of the text (`LineStarts`)
-fn sourceLines(ctx: *Db.Ctx, file: Vfs.FileId) !offsets.LineIndex {
+pub fn sourceLines(ctx: *Db.Ctx, file: Vfs.FileId) !offsets.LineIndex {
     return .{ .text = (try ctx.get(syntax_q.SourceText, file)).text, .line_starts = try ctx.get(syntax_q.LineStarts, file) };
 }
 
 /// File text and line index; empty for a file without `FileText`
-fn fileLines(ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) !offsets.LineIndex {
+pub fn fileLines(ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) !offsets.LineIndex {
     if (try ctx.get(FileText, file) == null) return offsets.LineIndex.init(arena, "");
     // With `FileText`, the `SourceText` is that text
     return sourceLines(ctx, file);
-}
-
-fn formatting(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentFormattingParams) HandlerError!types.ResultType("textDocument/formatting") {
-    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const lines = try fileLines(ctx, arena, file);
-    const mode = za.syntax.Parse.modeOf(server.vfs.path(file));
-    return ide.format.format(arena, lines, mode, server.encoding, try ctx.get(ide.format.ZigFmtRenderer, {}));
-}
-
-fn documentSymbol(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentSymbolParams) HandlerError!types.ResultType("textDocument/documentSymbol") {
-    const ctx = r.ctx;
-    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const parse = try ctx.get(syntax_q.ParseFile, file);
-    const lines = try fileLines(ctx, arena, file);
-    const symbols = if (parse.mode == .zon)
-        try ide.document_symbol.zonSymbols(arena, parse.rootNode(), lines, server.encoding)
-    else
-        try ide.document_symbol.documentSymbolsWithResolver(arena, r, file, try ctx.get(syntax_q.FileItemTree, file), try ctx.get(syntax_q.FileAstIdMap, file), lines, server.encoding);
-    if (server.caps.hierarchical_symbols) return .{ .array_of_DocumentSymbol = try server.clientSymbolTree(arena, symbols) };
-    var flat: std.ArrayList(types.SymbolInformation) = .empty;
-    try server.flattenSymbols(arena, params.textDocument.uri, symbols, null, &flat);
-    return .{ .array_of_SymbolInformation = flat.items };
-}
-
-/// The outline with the symbol kinds the client supports
-fn clientSymbolTree(server: *Server, arena: Allocator, symbols: []const types.DocumentSymbol) Allocator.Error![]const types.DocumentSymbol {
-    const out = try arena.dupe(types.DocumentSymbol, symbols);
-    for (out) |*s| {
-        s.kind = clientSymbolKind(server.caps.document_symbol_kinds, s.kind);
-        if (s.children) |children| s.children = try server.clientSymbolTree(arena, children);
-    }
-    return out;
-}
-
-/// The outline as a flat list for clients without `hierarchicalDocumentSymbolSupport`: each symbol
-/// names its parent symbol as `containerName`
-fn flattenSymbols(server: *Server, arena: Allocator, doc_uri: []const u8, symbols: []const types.DocumentSymbol, container: ?[]const u8, out: *std.ArrayList(types.SymbolInformation)) Allocator.Error!void {
-    for (symbols) |s| {
-        try out.append(arena, .{
-            .name = s.name,
-            .kind = clientSymbolKind(server.caps.document_symbol_kinds, s.kind),
-            .containerName = container,
-            .location = .{ .uri = doc_uri, .range = s.range },
-        });
-        try server.flattenSymbols(arena, doc_uri, s.children orelse &.{}, s.name, out);
-    }
-}
-
-fn foldingRange(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.FoldingRangeParams) HandlerError!types.ResultType("textDocument/foldingRange") {
-    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const parse = try ctx.get(syntax_q.ParseFile, file);
-    const lines = try fileLines(ctx, arena, file);
-    return try ide.folding.foldingRanges(arena, parse.rootNode(), lines);
-}
-
-fn selectionRange(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.SelectionRangeParams) HandlerError!types.ResultType("textDocument/selectionRange") {
-    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const parse = try ctx.get(syntax_q.ParseFile, file);
-    const lines = try fileLines(ctx, arena, file);
-    return try ide.selection_range.selectionRanges(arena, parse.rootNode(), lines, server.encoding, params.positions);
-}
-
-fn semanticTokensFull(server: *Server, r: *Resolver, arena: Allocator, params: types.SemanticTokensParams) HandlerError!types.ResultType("textDocument/semanticTokens/full") {
-    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const lines = try fileLines(r.ctx, arena, file);
-    const data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, null, server.semanticTokensOptions());
-    const result = try server.semanticTokensResult(r.ctx, arena, file, data, null);
-    return result.SemanticTokens;
-}
-
-fn semanticTokensDelta(server: *Server, r: *Resolver, arena: Allocator, params: types.SemanticTokensDeltaParams) HandlerError!types.ResultType("textDocument/semanticTokens/full/delta") {
-    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const lines = try fileLines(r.ctx, arena, file);
-    const data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, null, server.semanticTokensOptions());
-    return try server.semanticTokensResult(r.ctx, arena, file, data, params.previousResultId);
-}
-
-fn semanticTokensOptions(server: *Server) ide.semantic_tokens.Options {
-    const config = server.config.load(.acquire);
-    return .{ .partial = config.semantic_tokens_mode == .partial, .global_var = config.semantic_tokens_global_var };
-}
-
-fn semanticTokensResult(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, data: []const u32, previous_id: ?[]const u8) HandlerError!SemanticCache.Result {
-    const is_open = blk: {
-        server.docs.mutex.lockUncancelable(server.io);
-        defer server.docs.mutex.unlock(server.io);
-        break :blk server.docs.open.contains(file);
-    };
-    try ctx.checkCanceled();
-    // The read transaction guarantees that closing the document first waits for this request to
-    // exit; for a document that is not open, only the data is returned, and no snapshot reusable
-    // across sessions of the document is saved.
-    if (!is_open) return .{ .SemanticTokens = .{ .data = data } };
-    return try server.semantic_cache.update(server.io, server.gpa, arena, file, data, previous_id);
-}
-
-fn semanticTokensRange(server: *Server, r: *Resolver, arena: Allocator, params: types.SemanticTokensRangeParams) HandlerError!types.ResultType("textDocument/semanticTokens/range") {
-    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const lines = try fileLines(r.ctx, arena, file);
-    return .{ .data = try ide.semantic_tokens.semanticTokens(r, file, lines, server.encoding, params.range, server.semanticTokensOptions()) };
 }
 
 fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams) HandlerError!types.InitializeResult {
@@ -6114,7 +6026,7 @@ fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams)
 /// A symbol kind the client supports: a client that lists its kinds handles any kind; for other
 /// clients, kinds added after the initial protocol version (`File` to `Array`) are sent as the
 /// closest initial kind
-fn clientSymbolKind(listed: bool, kind: types.SymbolKind) types.SymbolKind {
+pub fn clientSymbolKind(listed: bool, kind: types.SymbolKind) types.SymbolKind {
     if (listed or @backingInt(kind) <= @backingInt(types.SymbolKind.Array)) return kind;
     return switch (kind) {
         .Struct, .Object => .Class,
@@ -6124,22 +6036,9 @@ fn clientSymbolKind(listed: bool, kind: types.SymbolKind) types.SymbolKind {
     };
 }
 
-/// A completion item kind the client supports (see `clientSymbolKind`)
-/// (the initial kinds are `Text` to `Reference`)
-fn clientCompletionKind(listed: bool, kind: types.CompletionItemKind) types.CompletionItemKind {
-    if (listed or @backingInt(kind) <= @backingInt(types.CompletionItemKind.Reference)) return kind;
-    return switch (kind) {
-        .Struct, .TypeParameter => .Class,
-        .EnumMember => .Enum,
-        .Constant => .Variable,
-        .Folder => .File,
-        else => .Text,
-    };
-}
-
 /// Markup content in the formats the client accepts: without markdown, code fences are removed
 /// and the text is sent as plain text
-fn markup(arena: Allocator, markdown: bool, text: []const u8) Allocator.Error!types.MarkupContent {
+pub fn markup(arena: Allocator, markdown: bool, text: []const u8) Allocator.Error!types.MarkupContent {
     if (markdown) return .{ .kind = .markdown, .value = text };
     var out: std.ArrayList(u8) = .empty;
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -6169,381 +6068,11 @@ fn shutdown(server: *Server, _: Allocator, _: void) HandlerError!void {
     server.state = .shutdown;
 }
 
-const StatusResult = struct {
-    /// Version of the server executable (as in `serverInfo.version` and `--version`)
-    version: []const u8,
-    revision: u64,
-    files: usize,
-    deep_verifications: u64,
-    /// Number of write transactions (see `db.Stats.writes`)
-    writes: u64,
-    /// Peak resident memory of the process (KB; 0 on unsupported platforms)
-    max_rss_kb: u64,
-    /// Number of types and values in the InternPool
-    intern_pool_items: usize,
-    /// Bytes used by the InternPool
-    intern_pool_bytes: usize,
-    /// Bytes allocated through the server's allocator and not yet freed (when the executable wraps
-    /// the allocator with `mem.Counting`; 0 otherwise)
-    heap_bytes: usize,
-    /// Memory held by the release allocator (null in builds that do not use it)
-    allocator: ?za.util.PagedAllocator.Stats,
-    queries: []const struct {
-        name: []const u8,
-        executions: u64,
-        hits: u64,
-        cutoffs: u64,
-        total_ms: f64,
-        self_ms: f64,
-        max_ms: f64,
-        memos: usize,
-        keys: usize,
-        /// Bytes used by retained values (for queries that declare `bytes`; 0 otherwise)
-        bytes: usize,
-        deps: usize,
-        incomplete: u64,
-    },
-    /// Cumulative counts of incomplete results by cause (cycles, stack depth, unavailable tools)
-    incomplete_causes: struct { cycle: u64, stack: u64, unavailable: u64 },
-};
-
-fn definition(server: *Server, r: *Resolver, arena: Allocator, params: types.DefinitionParams) HandlerError!types.ResultType("textDocument/definition") {
-    const locs = try server.gotoTargets(r, arena, params.textDocument.uri, params.position, ide.definition.definitionTargets);
-    return switch (locs.len) {
-        0 => null,
-        1 => .{ .Definition = .{ .Location = locs[0] } },
-        else => .{ .Definition = .{ .array_of_Location = locs } },
-    };
-}
-
-fn declaration(server: *Server, r: *Resolver, arena: Allocator, params: types.DeclarationParams) HandlerError!types.ResultType("textDocument/declaration") {
-    const locs = try server.gotoTargets(r, arena, params.textDocument.uri, params.position, ide.definition.declarationTargets);
-    return switch (locs.len) {
-        0 => null,
-        1 => .{ .Declaration = .{ .Location = locs[0] } },
-        else => .{ .Declaration = .{ .array_of_Location = locs } },
-    };
-}
-
-fn typeDefinition(server: *Server, r: *Resolver, arena: Allocator, params: types.TypeDefinitionParams) HandlerError!types.ResultType("textDocument/typeDefinition") {
-    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
-    const targets = try ide.definition.typeDefinitionTargets(r, at.file, at.offset);
-    const locs = try arena.alloc(types.Location, targets.len);
-    for (targets, locs) |t, *loc| loc.* = try server.targetLocation(r, arena, t);
-    return switch (locs.len) {
-        0 => null,
-        1 => .{ .Definition = .{ .Location = locs[0] } },
-        else => .{ .Definition = .{ .array_of_Location = locs } },
-    };
-}
-
-/// All goto targets at the cursor, computed with `find`. A path in `build.zig.zon` goes to the start
-/// of the file it points to, without interning that file
-fn gotoTargets(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position, comptime find: anytype) ![]const types.Location {
-    const at = try server.textPosition(r, arena, document_uri, pos) orelse return &.{};
-    if (try ide.definition.manifestPath(r, at.file, at.offset)) |path| {
-        const target_uri = if (try server.vfs.lookup(path)) |f| try server.uriFor(arena, f) else try uri.fromPath(arena, path);
-        return arena.dupe(types.Location, &.{.{ .uri = target_uri, .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } } }});
-    }
-    const targets = try find(r, at.file, at.offset);
-    const locs = try arena.alloc(types.Location, targets.len);
-    for (targets, locs) |t, *loc| loc.* = try server.targetLocation(r, arena, t);
-    return locs;
-}
-
-fn targetLocation(server: *Server, r: *Resolver, arena: Allocator, t: ide.definition.Target) !types.Location {
-    const target_uri = try server.uriFor(arena, t.file);
-    // The start of a file (the target of an import or of a path in `build.zig.zon`) needs no read
-    // of the file: a path can point to a file of any size and content
-    if (t.start == 0 and t.end == 0) return .{ .uri = target_uri, .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } } };
-    const lines = try sourceLines(r.ctx, t.file);
-    return .{ .uri = target_uri, .range = lines.range(t.start, t.end, server.encoding) };
-}
-
-fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.CompletionParams) HandlerError!types.ResultType("textDocument/completion") {
-    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    if (try r.ctx.get(FileText, file) == null) return null;
-    // With `FileText`, the `SourceText` is that text
-    const lines = try sourceLines(r.ctx, file);
-    const text = lines.text;
-    const line = lines.lineAt(params.position.line);
-    const offset: u32 = @intCast(if (line) |l| l.offset(params.position.character, server.encoding) else text.len);
-    const auto_import = server.autoImportEnabled();
-    // Auto-imports are not offered until the index has been built for the current module graph, and
-    // the result is marked incomplete: the client requests again as the user types, and they are
-    // offered then. Indexing starts when a Zig document opens (with auto-import on; see
-    // `requestAutoImportIndex`) or, for a document opened before that, at the first completion
-    // where a name could be imported. If the index is still not built and no indexing is in
-    // progress (the previous round failed, or the task could not start), it starts again.
-    const imports_ready = auto_import and
-        server.index.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
-    const config = server.config.load(.acquire);
-    const max_auto_imports, const snippets, const placeholders = .{ config.completion_max_auto_imports, config.completion_snippets, config.completion_argument_placeholders };
-    const import_options = server.importOptionsFor(file);
-    // `/` and `"` are trigger characters for paths; typed elsewhere they start no name
-    const path_trigger = blk: {
-        const c = params.context orelse break :blk false;
-        const t = c.triggerCharacter orelse break :blk false;
-        break :blk c.triggerKind == .TriggerCharacter and (std.mem.eql(u8, t, "/") or std.mem.eql(u8, t, "\""));
-    };
-    const result = try ide.completion.complete(r, file, offset, .{
-        .auto_import = auto_import and imports_ready,
-        .detect_import_position = auto_import and !imports_ready,
-        .max_auto_imports = if (max_auto_imports == 0) std.math.maxInt(usize) else max_auto_imports,
-        .imports = import_options,
-        .snippets = server.caps.snippet_support and snippets,
-        .argument_placeholders = placeholders,
-        .paths_only = path_trigger,
-    });
-    const imports_waiting = auto_import and !imports_ready and result.import_position;
-    if (imports_waiting) {
-        const first = !server.index.imports_wanted.swap(true, .acq_rel);
-        if (first or !server.index.rerun.running.load(.acquire)) server.scheduleIndexingFromRead();
-    }
-    const out = try arena.alloc(types.CompletionItem, result.items.len);
-    var ranges: CompletionRanges = .{ .text = text, .line = line, .encoding = server.encoding, .lines = lines };
-    for (result.items, out) |it, *o| {
-        o.* = .{
-            .label = it.label,
-            .kind = clientCompletionKind(server.caps.completion_kinds, switch (it.kind) {
-                .param, .variable => .Variable,
-                .type_param => .TypeParameter,
-                .function, .builtin => .Function,
-                .method => .Method,
-                .constant, .error_name => .Constant,
-                .namespace, .module => .Module,
-                .@"struct" => .Struct,
-                .@"enum" => .Enum,
-                .type => .Class,
-                .field => .Field,
-                .enum_member => .EnumMember,
-                .file => .File,
-                .folder => .Folder,
-                .label => .Reference,
-                .keyword => .Keyword,
-                .snippet => .Snippet,
-            }),
-            .documentation = if (it.doc) |d| .{ .MarkupContent = try markup(arena, server.caps.completion_markdown, d) } else null,
-            .detail = it.detail,
-            .filterText = it.filter,
-            .sortText = it.sort,
-            .data = if (it.target) |t| try completionData(r, arena, file, t) else null,
-            .labelDetails = if (it.qualifier) |q| .{ .description = q } else null,
-        };
-        // A replaced range ends at the end of the word (or path) at the cursor; inserting replaces
-        // only up to the cursor. Clients that support both ranges apply the one the user chose;
-        // others get the replaced range for every item
-        if (it.replace) |range| {
-            const new_text = it.snippet orelse it.label;
-            const replace = try ranges.get(arena, range.start, range.end);
-            o.textEdit = if (server.caps.insert_replace_support) .{ .InsertReplaceEdit = .{
-                .newText = new_text,
-                .insert = try ranges.get(arena, range.start, std.math.clamp(offset, range.start, range.end)),
-                .replace = replace,
-            } } else .{ .TextEdit = .{ .range = replace, .newText = new_text } };
-            if (it.snippet != null) o.insertTextFormat = .Snippet;
-        }
-        if (it.import_edit) |edit| {
-            const edits = try arena.alloc(types.TextEdit, 1);
-            edits[0] = .{ .range = try ranges.get(arena, edit.start, edit.end), .newText = edit.text };
-            o.additionalTextEdits = edits;
-        }
-    }
-    if (result.is_incomplete or imports_waiting) return .{ .CompletionList = .{ .isIncomplete = true, .items = out } };
-    return .{ .array_of_CompletionItem = out };
-}
-
-/// Converts the ranges of completion items to LSP ranges. Replaced ranges are almost always in the
-/// line of the cursor and are converted within that line, without building a line table for the
-/// whole file (on large files, building the line table is slower than the completion itself); only
-/// other ranges (added imports, ranges spanning lines) build the line table
-const CompletionRanges = struct {
-    text: []const u8,
-    /// The line of the cursor
-    line: ?offsets.Line,
-    encoding: offsets.Encoding,
-    lines: ?offsets.LineIndex = null,
-    /// The range converted last: items mostly replace the same range
-    last: ?struct { start: u32, end: u32, range: types.Range } = null,
-
-    fn get(c: *CompletionRanges, arena: Allocator, start: u32, end: u32) Allocator.Error!types.Range {
-        if (c.last) |l| if (l.start == start and l.end == end) return l.range;
-        const range = c.inLine(start, end) orelse blk: {
-            if (c.lines == null) c.lines = try offsets.LineIndex.init(arena, c.text);
-            break :blk c.lines.?.range(start, end, c.encoding);
-        };
-        c.last = .{ .start = start, .end = end, .range = range };
-        return range;
-    }
-
-    /// The range when both ends are in the line of the cursor
-    fn inLine(c: *const CompletionRanges, start: u32, end: u32) ?types.Range {
-        const line = c.line orelse return null;
-        return .{
-            .start = line.position(start, c.encoding) orelse return null,
-            .end = line.position(end, c.encoding) orelse return null,
-        };
-    }
-};
-
-test "CompletionRanges: ranges in the line of the cursor and elsewhere convert as with the line table" {
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    // CRLF line breaks and characters of 2, 3 and 4 UTF-8 bytes before the word at the cursor
-    const text = "const a = @import(\"a.zig\");\r\nfn f() void {\r\n    _ = \"é€😀\" ++ ad;\r\n}\r\n";
-    const word = std.mem.indexOf(u8, text, "ad;").?;
-    const line_start = std.mem.indexOf(u8, text, "    _").?;
-    const line_end = std.mem.indexOfPos(u8, text, line_start, "\r").?;
-    for ([_]offsets.Encoding{ .utf8, .utf16, .utf32 }) |enc| {
-        const lines = try offsets.LineIndex.init(arena, text);
-        var ranges: CompletionRanges = .{ .text = text, .line = offsets.Line.init(text, 2), .encoding = enc };
-        // In the line of the cursor (the word, an empty range at its end, the whole line): no line
-        // table is built
-        for ([_][2]usize{ .{ word, word + 2 }, .{ word + 2, word + 2 }, .{ line_start, line_end } }) |r| {
-            try std.testing.expectEqualDeep(lines.range(r[0], r[1], enc), try ranges.get(arena, @intCast(r[0]), @intCast(r[1])));
-        }
-        try std.testing.expect(ranges.lines == null);
-        // An import added in the first line, and a range spanning lines
-        for ([_][2]usize{ .{ 0, 0 }, .{ line_start - 2, word } }) |r| {
-            try std.testing.expectEqualDeep(lines.range(r[0], r[1], enc), try ranges.get(arena, @intCast(r[0]), @intCast(r[1])));
-        }
-        try std.testing.expect(ranges.lines != null);
-    }
-}
-
-/// `data` of a completion item: the file where completion happens (`from`), the target file, and
-/// the `AstId` of the declaration in it (which still finds the same declaration after edits). When
-/// the item is selected, the client sends it with a `completionItem/resolve` request.
-fn completionData(r: *Resolver, arena: Allocator, from: Vfs.FileId, target: za.ide_db.imports.Target) !std.json.Value {
-    var obj: std.json.ObjectMap = .empty;
-    try obj.put(arena, "from", .{ .integer = from.index() });
-    switch (target) {
-        .decl => |d| {
-            try obj.put(arena, "file", .{ .integer = d.file.index() });
-            try obj.put(arena, "item", .{ .integer = @backingInt((try r.itemTree(d.file)).items[d.item].ast_id) });
-        },
-        .file => |f| try obj.put(arena, "file", .{ .integer = f.index() }),
-    }
-    return .{ .object = obj };
-}
-
-/// A completion item was selected: fills in the signature (`detail`), the doc comment and the
-/// definition's location (`documentation`). Returns the item unchanged if `data` did not come from
-/// this server or the declaration it refers to no longer exists.
-fn completionResolve(server: *Server, r: *Resolver, arena: Allocator, params: types.CompletionItem) HandlerError!types.ResultType("completionItem/resolve") {
-    var item = params;
-    const data = switch (params.data orelse return item) {
-        .object => |o| o,
-        else => return item,
-    };
-    const from = server.dataFile(data, "from") orelse return item;
-    const file = server.dataFile(data, "file") orelse return item;
-    const target: za.ide_db.imports.Target = if (data.get("item")) |v| blk: {
-        if (v != .integer or v.integer < 0 or v.integer > std.math.maxInt(u32)) return item;
-        const def = try ide.context.defOfKey(r, .{ .file = file, .item = @fromBackingInt(@as(u32, @intCast(v.integer))) }) orelse return item;
-        break :blk .{ .decl = .{ .file = file, .item = def.item.item } };
-    } else .{ .file = file };
-    const description = try ide.completion.describe(r, from, target);
-    item.detail = description.detail;
-    item.documentation = .{ .MarkupContent = try markup(arena, server.caps.completion_markdown, description.doc) };
-    return item;
-}
-
-/// The file named by `key` in `data`; null if it is not a file of the current session
-fn dataFile(server: *Server, data: std.json.ObjectMap, key: []const u8) ?Vfs.FileId {
-    const v = data.get(key) orelse return null;
-    if (v != .integer or v.integer < 0 or v.integer >= server.vfs.count()) return null;
-    return @fromBackingInt(@as(u32, @intCast(v.integer)));
-}
-
 /// The file, text, line index and position of a request
-fn textPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position) !?struct { file: Vfs.FileId, text: []const u8, lines: offsets.LineIndex, offset: u32 } {
+pub fn textPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position) !?struct { file: Vfs.FileId, text: []const u8, lines: offsets.LineIndex, offset: u32 } {
     const file = try server.lookupFile(arena, document_uri) orelse return null;
     const lines = try sourceLines(r.ctx, file);
     return .{ .file = file, .text = lines.text, .lines = lines, .offset = @intCast(lines.offsetOf(pos, server.encoding)) };
-}
-
-/// Shown under a hover answered while a project is pending, so that a less precise type or an
-/// `unknown` is not taken for the final result
-const hover_loading_note = "The project is still loading, so this result may be incomplete.";
-
-fn hover(server: *Server, r: *Resolver, arena: Allocator, params: types.HoverParams) HandlerError!types.ResultType("textDocument/hover") {
-    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
-    // Checked before computing: a load that ends during the computation cancels this read
-    const incomplete = server.projectsPending();
-    const config = server.config.load(.acquire);
-    const info = try ide.hover.hoverWith(r, at.file, at.offset, .{
-        .roots = try server.rootsAlloc(arena),
-        .instances = config.hover_instances,
-        .layout = config.hover_layout,
-        .fqn = config.hover_fqn,
-        // Links to source locations open the file at the line in the client; plain text has none
-        .links = if (server.caps.hover_markdown) .{ .ctx = server, .uri = hoverUri } else null,
-    }) orelse return null;
-    const lines = at.lines;
-    const text = if (!incomplete) info.text else try std.mem.concat(arena, u8, &.{ info.text, if (server.caps.hover_markdown) "\n\n---\n\n_" ++ hover_loading_note ++ "_" else "\n\n" ++ hover_loading_note });
-    return .{
-        .contents = .{ .MarkupContent = try markup(arena, server.caps.hover_markdown, text) },
-        .range = lines.range(info.start, info.end, server.encoding),
-    };
-}
-
-/// The URI of `file` for a link in hover (see `ide.hover.Links`)
-fn hoverUri(ctx: *anyopaque, arena: Allocator, file: Vfs.FileId) Allocator.Error![]const u8 {
-    const server: *Server = @ptrCast(@alignCast(ctx));
-    return server.uriFor(arena, file);
-}
-
-fn signatureHelp(server: *Server, r: *Resolver, arena: Allocator, params: types.SignatureHelpParams) HandlerError!types.ResultType("textDocument/signatureHelp") {
-    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
-    const sig = try ide.signature_help.signatureHelp(r, at.file, at.offset) orelse return null;
-    const ps = try arena.alloc(types.ParameterInformation, sig.params.len);
-    for (sig.params, sig.ranges, ps) |p, range, *o| o.* = .{ .label = if (server.caps.signature_label_offsets) .{ .tuple = .{
-        offsets.unitCount(sig.label[0..range[0]], server.encoding),
-        offsets.unitCount(sig.label[0..range[1]], server.encoding),
-    } } else .{ .string = p } };
-    const info = try arena.alloc(types.SignatureInformation, 1);
-    info[0] = .{
-        .label = sig.label,
-        .parameters = ps,
-        .activeParameter = if (ps.len == 0) null else sig.active,
-        .documentation = if (sig.doc) |d| .{ .MarkupContent = try markup(arena, server.caps.signature_markdown, d) } else null,
-    };
-    return .{ .signatures = info, .activeSignature = 0, .activeParameter = if (ps.len == 0) null else sig.active };
-}
-
-fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.InlayHintParams) HandlerError!types.ResultType("textDocument/inlayHint") {
-    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const lines = try sourceLines(r.ctx, file);
-    const start, const end = server.rangeOffsets(lines, params.range);
-    const opts: ide.inlay_hints.Options = blk: {
-        const c = server.config.load(.acquire);
-        break :blk .{
-            .types = c.inlay_types,
-            .capture_types = c.inlay_capture_types,
-            .field_types = c.inlay_field_types,
-            .anonymous_containers = c.inlay_anonymous_containers,
-            .parameters = c.inlay_parameters,
-            .builtin_parameters = c.inlay_builtin_parameters,
-            .exclude_single_argument = c.inlay_exclude_single_argument,
-            .hide_redundant_param_names = c.hide_redundant_param_names,
-            .max_length = c.inlay_max_length,
-        };
-    };
-    const hints = try ide.inlay_hints.inlayHints(r, file, start, end, opts);
-    const out = try arena.alloc(types.InlayHint, hints.len);
-    for (hints, out) |h, *o| o.* = .{
-        .position = lines.position(h.offset, server.encoding),
-        .label = .{ .string = h.label },
-        .kind = switch (h.kind) {
-            .type => .Type,
-            .parameter => .Parameter,
-        },
-        .paddingRight = if (h.kind == .parameter) true else null,
-        .tooltip = if (h.tooltip) |t| .{ .string = t } else null,
-    };
-    return out;
 }
 
 /// `Pending.scans_awaited` of the semantic request whose handler runs on this thread (see
@@ -6559,7 +6088,7 @@ threadlocal var handler_scans_awaited: u64 = 0;
 /// files may have changed since the last one, see `scheduleScan`), returns `error.ScanPending`
 /// instead: the request waits for the scans scheduled so far, which takes a moment, and runs again
 /// (see `waitScans`). Once it has waited, the scans it waited for are enough.
-fn scopeIncomplete(server: *Server) error{ScanPending}!?[]const u8 {
+pub fn scopeIncomplete(server: *Server) error{ScanPending}!?[]const u8 {
     const scheduled = server.scan.rerun.generation.load(.acquire);
     if (scheduled == 0)
         return "the workspace folders are still being searched for source files, so not all files that may refer to it are known yet";
@@ -6592,7 +6121,7 @@ const SubProjectWait = struct {
 threadlocal var handler_sub_projects: ?*SubProjectWait = null;
 
 /// What a request does with the references it finds (see `scopeIncompleteFor`)
-const ScopeUse = enum {
+pub const ScopeUse = enum {
     /// Lists them: uses in sub-projects that cannot be loaded are left out, as are those in a
     /// project that failed to load
     find,
@@ -6626,7 +6155,7 @@ fn subProjectState(server: *Server, dir: []const u8) SubProjectState {
 /// still not loaded then (its project failed to load or could not be started, or the wait was cut
 /// short), or not loaded with the setting off, leaves its uses out: `find` goes on without them,
 /// and `edit` fails with the reason.
-fn subProjectGap(server: *Server, r: *Resolver, name: []const u8, use: ScopeUse) !?[]const u8 {
+pub fn subProjectGap(server: *Server, r: *Resolver, name: []const u8, use: ScopeUse) !?[]const u8 {
     if (!server.buildFlags().build) return null;
     const dirs = blk: {
         server.roots_mutex.lockUncancelable(server.io);
@@ -6678,7 +6207,7 @@ fn mentionedUnder(server: *Server, r: *Resolver, scope: []const Vfs.FileId, dir:
 
 /// Scope of find references and workspace symbol: project files in the module graph (excluding the
 /// standard library), the user's source files under the root directories, and open documents
-fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
+pub fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     var set: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
     for (try za.ide_db.search.searchFiles(r)) |f| try set.put(r.arena, f, {});
     server.docs.mutex.lockUncancelable(server.io);
@@ -6691,1173 +6220,13 @@ fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
 /// `workspace_symbol.dependencies` includes them. Every file of the scope is searched: the request
 /// first waits for background indexing (see `waitSymbolIndex`), and files not indexed yet (added
 /// since, or when indexing stopped early) are indexed in the request.
-fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
+pub fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     const scope = try server.searchScope(r);
     if (server.config.load(.acquire).workspace_symbol_dependencies) return scope;
     const rules = try server.originRules(r.arena);
     var user: std.ArrayList(Vfs.FileId) = .empty;
     for (scope) |f| if (!origin.classify(&server.vfs, rules, server.vfs.path(f), false).isLibrary()) try user.append(r.arena, f);
     return user.items;
-}
-
-/// The symbols at the cursor (see `definition.symbolsAt`); null when there is none
-fn symbolsAtPosition(server: *Server, r: *Resolver, arena: Allocator, document_uri: []const u8, pos: types.Position) !?struct { symbols: []const za.ide_db.search.Symbol, file: Vfs.FileId } {
-    const at = try server.textPosition(r, arena, document_uri, pos) orelse return null;
-    const symbols = try ide.definition.symbolsAt(r, at.file, at.offset);
-    if (symbols.len == 0) return null;
-    return .{ .symbols = symbols, .file = at.file };
-}
-
-/// Why the references of `symbol` cannot all be found now (see `scopeIncomplete` and
-/// `subProjectGap`); null also when only its own file can refer to it
-fn scopeIncompleteFor(server: *Server, r: *Resolver, symbol: za.ide_db.search.Symbol, use: ScopeUse) !?[]const u8 {
-    if (try ownFileOnly(r, symbol)) return null;
-    if (try server.scopeIncomplete()) |reason| return reason;
-    const name = try za.ide_db.search.symbolName(r, symbol) orelse return null;
-    return server.subProjectGap(r, name, use);
-}
-
-/// Whether only the file of `symbol` can refer to it: local names, labels, and declarations without
-/// `pub` other than fields. Error names are global.
-fn ownFileOnly(r: *Resolver, symbol: za.ide_db.search.Symbol) !bool {
-    return switch (symbol) {
-        .def => |def| !try za.ide_db.search.visibleOutsideFile(r, def),
-        .label => true,
-        .error_name, .zon_field => false,
-    };
-}
-
-/// Converts reference positions to LSP ranges (caching the line index per file)
-const RangeMapper = struct {
-    server: *Server,
-    r: *Resolver,
-    file: ?Vfs.FileId = null,
-    lines: offsets.LineIndex = undefined,
-
-    fn range(m: *RangeMapper, file: Vfs.FileId, start: u32, end: u32) !types.Range {
-        if (m.file != file) {
-            m.lines = try sourceLines(m.r.ctx, file);
-            m.file = file;
-        }
-        return m.lines.range(start, end, m.server.encoding);
-    }
-};
-
-fn references(server: *Server, r: *Resolver, arena: Allocator, params: types.ReferenceParams) HandlerError!Outcome(types.ResultType("textDocument/references")) {
-    const found = try server.symbolsAtPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
-    for (found.symbols) |symbol| if (try server.scopeIncompleteFor(r, symbol, .find)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot find all references: {s}", .{reason}) };
-    const refs = try za.ide_db.search.symbolsReferences(r, found.symbols, .{ .scope = try server.searchScope(r) });
-    var out: std.ArrayList(types.Location) = .empty;
-    var m: RangeMapper = .{ .server = server, .r = r };
-    for (refs) |ref| {
-        if (ref.is_decl and !params.context.includeDeclaration) continue;
-        try out.append(arena, .{ .uri = try server.uriFor(arena, ref.file), .range = try m.range(ref.file, ref.start, ref.end) });
-    }
-    return .{ .ok = out.items };
-}
-
-/// Occurrences of the symbol at the cursor in the same file: declarations and the targets of
-/// assignments are written to (`Write`), other uses read it (`Read`)
-fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentHighlightParams) HandlerError!types.ResultType("textDocument/documentHighlight") {
-    const found = try server.symbolsAtPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
-    const refs = try za.ide_db.search.symbolsReferences(r, found.symbols, .{ .scope = &.{}, .only_file = found.file });
-    const out = try arena.alloc(types.DocumentHighlight, refs.len);
-    var m: RangeMapper = .{ .server = server, .r = r };
-    for (refs, out) |ref, *o| o.* = .{ .range = try m.range(ref.file, ref.start, ref.end), .kind = if (ref.is_decl or ref.is_write) .Write else .Read };
-    return out;
-}
-
-/// Why `symbol` cannot be renamed, or null when it can: the user's own code (see
-/// `origin.Origin.user`) and unsaved documents can be renamed. In a file outside the workspace
-/// folders (`origin.Origin.outside`), only what its own file alone can refer to can be renamed
-/// (see `ownFileOnly`): which other files use the rest is not known. That includes files outside
-/// the workspace folders that a project's module graph includes (modules added by path, such as a
-/// library a workspace folder depends on by `.path`): the library's other users (its tests, its
-/// other dependents) are not in the workspace either.
-fn renameRefusal(server: *Server, r: *Resolver, symbol: za.ide_db.search.Symbol) !?[]const u8 {
-    const file = switch (symbol) {
-        .def => |def| switch (def) {
-            .item => |it| it.file,
-            .local => |l| l.file,
-            // `@import` and its path string lead to a file, which is not a name in the code
-            .file => return "cannot rename: the cursor is on the import of a file, and files cannot be renamed",
-        },
-        .label => |l| l.file,
-        .error_name => |e| e.file,
-        .zon_field => |z| blk: {
-            if (try ide.manifest.active(r, z.literal.file)) return "cannot rename a field of build.zig.zon: its names are defined by the package format";
-            break :blk z.literal.file;
-        },
-    };
-    if (try za.ide_db.search.symbolName(r, symbol) == null) return "cannot rename: there is no name here";
-    const rules = try server.originRules(r.arena);
-    return switch (origin.classify(&server.vfs, rules, server.vfs.path(file), false)) {
-        // Unsaved documents (`untitled:` etc.) exist only in the editor
-        .virtual, .user => null,
-        .outside => if (try ownFileOnly(r, symbol))
-            null
-        else if (symbol == .error_name)
-            "cannot rename an error name in a file outside the workspace folders: error names are global, and the files that use it are not known"
-        else
-            "cannot rename a public declaration or field of a file outside the workspace folders: the files that use it are not known",
-        .zig_lib, .generated, .package, .other => "cannot rename a symbol defined outside the workspace",
-    };
-}
-
-fn prepareRename(server: *Server, r: *Resolver, arena: Allocator, params: types.PrepareRenameParams) HandlerError!Outcome(types.ResultType("textDocument/prepareRename")) {
-    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
-    const tok = try ide.definition.tokenAt(r, at.file, at.offset) orelse return .{ .ok = null };
-    if (tok.kind != .identifier) return .{ .ok = null };
-    const symbol = try ide.definition.symbolAt(r, at.file, at.offset) orelse return .{ .ok = null };
-    if (try server.renameRefusal(r, symbol)) |reason| return .{ .failed = reason };
-    if (symbol == .def) if (try ide.rename.stdRootLookup(r, symbol.def)) |p| {
-        const prefix = try std.fmt.allocPrint(arena, "cannot rename `{s}`", .{za.syntax.ast.identName(tok.text)});
-        return .{ .failed = try server.fixProblem(r, arena, prefix, p.file, p.offset, p.message) };
-    };
-    const lines = at.lines;
-    return .{ .ok = .{ .PrepareRenamePlaceholder = .{
-        .range = lines.range(tok.offset, tok.offset + @as(u32, @intCast(tok.text.len)), server.encoding),
-        .placeholder = za.syntax.ast.identName(tok.text),
-    } } };
-}
-
-fn rename(server: *Server, r: *Resolver, arena: Allocator, params: types.RenameParams) HandlerError!Outcome(types.ResultType("textDocument/rename")) {
-    _ = try identifierText(arena, params.newName, false);
-    const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return .{ .ok = null };
-    const symbol = try ide.definition.symbolAt(r, at.file, at.offset) orelse return .{ .ok = null };
-    if (try server.renameRefusal(r, symbol)) |reason| return .{ .failed = reason };
-    const old = (try za.ide_db.search.symbolName(r, symbol)).?;
-    const outcome = switch (symbol) {
-        .def => |def| try server.checkedRename(r, arena, def, old, params.newName),
-        .label => |l| try server.checkedLabelRename(r, arena, l, old, params.newName),
-        .error_name => |e| try server.checkedErrorRename(r, arena, e.file, old, params.newName),
-        .zon_field => |z| try server.checkedZonFieldRename(r, arena, z, old, params.newName),
-    };
-    const checked = switch (outcome) {
-        .ok => |checked| checked,
-        .failed => |reason| return .{ .failed = reason },
-    };
-    return .{ .ok = try server.renameEdit(r, arena, checked.refs, checked.text, null) };
-}
-
-const CheckedRename = struct {
-    refs: []const za.ide_db.search.Reference,
-    /// The new name as written in the source (see `identifierText`)
-    text: []const u8,
-};
-
-/// The references of `def` and the source text of the new name for renaming it from `old` to
-/// `new` (as given, possibly `@"..."`), or why the result would be partial or break the build:
-/// the references cannot all be confirmed (see `renameReferences`), the new name conflicts with an
-/// existing one (a member of the same container, shadowing, or a reference that would become
-/// ambiguous; see `rename.declarationConflict` and `rename.resolutionConflict`), or AstGen
-/// reports a new error in the declaration's file once it is renamed (`rename.verifyAstGen`).
-fn checkedRename(server: *Server, r: *Resolver, arena: Allocator, def: za.names.resolve.Def, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
-    const refs = switch (try server.renameReferences(r, arena, .{ .def = def }, old, new)) {
-        .ok => |refs| refs,
-        .failed => |reason| return .{ .failed = reason },
-    };
-    const name = try decodedName(arena, new);
-    if (try ide.rename.declarationConflict(r, def, name)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    if (try ide.rename.resolutionConflict(r, def, name)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    const def_file = switch (def) {
-        .item => |it| it.file,
-        .local => |l| l.file,
-        .file => unreachable,
-    };
-    const is_field = switch (def) {
-        .item => |it| (try r.itemTree(it.file)).items[it.item].kind == .field,
-        .local, .file => false,
-    };
-    const text = try identifierText(arena, new, is_field);
-    // Shadowing and name clashes can only occur in the file of the declaration, and missed
-    // references in that file are reported too: confirm by running AstGen on the renamed text
-    var edits: std.ArrayList(ide.rename.Edit) = .empty;
-    for (refs) |ref| if (ref.file == def_file) try edits.append(arena, .{ .start = ref.start, .end = ref.end, .text = text });
-    if (try ide.rename.verifyAstGen(r, def_file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    // Strings (`@field`, `@hasDecl`, `@fieldParentPtr`, serialization keys) can name only
-    // container members, and one without `pub` only in its own file
-    if (def == .item) {
-        const files = if (try za.ide_db.search.visibleOutsideFile(r, def)) try za.ide_db.search.candidateFilesFor(r, def_file, try server.searchScope(r)) else try arena.dupe(Vfs.FileId, &.{def_file});
-        if (try ide.rename.stringReference(r, files, old)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    }
-    return .{ .ok = .{ .refs = refs, .text = text } };
-}
-
-/// The name that `new` (as given, possibly `@"..."`) spells
-fn decodedName(arena: Allocator, new: []const u8) HandlerError![]const u8 {
-    if (!std.mem.startsWith(u8, new, "@\"")) return new;
-    return std.zig.string_literal.parseAlloc(arena, new[1..]) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidLiteral => return error.InvalidIdentifier,
-    };
-}
-
-/// The references of a label and the source text of its new name (see `checkedRename`): the label
-/// and the `break` / `continue` that target it are all in one member, and AstGen confirms the
-/// renamed file (a label must not redefine a label of an enclosing expression)
-fn checkedLabelRename(server: *Server, r: *Resolver, arena: Allocator, label: za.ide_db.search.Label, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
-    const refs = switch (try server.renameReferences(r, arena, .{ .label = label }, old, new)) {
-        .ok => |refs| refs,
-        .failed => |reason| return .{ .failed = reason },
-    };
-    const text = try identifierText(arena, new, false);
-    const edits = try arena.alloc(ide.rename.Edit, refs.len);
-    for (refs, edits) |ref, *e| e.* = .{ .start = ref.start, .end = ref.end, .text = text };
-    if (try ide.rename.verifyAstGen(r, label.file, edits)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    return .{ .ok = .{ .refs = refs, .text = text } };
-}
-
-/// The references of a field of a `.zon` file and the source text of its new name (see
-/// `checkedRename`). AstGen confirms the `.zon` file (a field name must be unique in its literal), and
-/// strings may name the field (`@field`, `@hasField`).
-fn checkedZonFieldRename(server: *Server, r: *Resolver, arena: Allocator, field: za.ide_db.search.ZonField, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
-    const refs = switch (try server.renameReferences(r, arena, .{ .zon_field = field }, old, new)) {
-        .ok => |refs| refs,
-        .failed => |reason| return .{ .failed = reason },
-    };
-    const text = try identifierText(arena, new, true);
-    const file = field.literal.file;
-    var edits: std.ArrayList(ide.rename.Edit) = .empty;
-    for (refs) |ref| if (ref.file == file) try edits.append(arena, .{ .start = ref.start, .end = ref.end, .text = text });
-    if (try ide.rename.verifyAstGen(r, file, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    const files = try za.ide_db.search.candidateFilesFor(r, file, try server.searchScope(r));
-    if (try ide.rename.stringReference(r, files, old)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    return .{ .ok = .{ .refs = refs, .text = text } };
-}
-
-/// The uses of the error `old`, found in `file`, and the source text of its new name (see
-/// `checkedRename`). Error names are global, so the uses in all files compiled together with
-/// `file` are renamed: each must be confirmed and editable (see `renameReferences`), no file that
-/// is not renamed may use `old`, and `new` must not already be an error name (see
-/// `rename.errorNameConflict`); `@errorName` results may be compared with a string of the name,
-/// and AstGen confirms each renamed file.
-fn checkedErrorRename(server: *Server, r: *Resolver, arena: Allocator, file: Vfs.FileId, old: []const u8, new: []const u8) !Outcome(CheckedRename) {
-    const refs = switch (try server.renameReferences(r, arena, .{ .error_name = .{ .file = file, .name = old } }, old, new)) {
-        .ok => |refs| refs,
-        .failed => |reason| return .{ .failed = reason },
-    };
-    const scope = try server.searchScope(r);
-    if (try ide.rename.errorNameConflict(r, file, scope, old, try decodedName(arena, new))) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    const files = try za.ide_db.search.candidateFilesFor(r, file, scope);
-    if (try ide.rename.stringReference(r, files, old)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    // Error names may be names of primitive types (`error.u8`)
-    const text = try identifierText(arena, new, true);
-    var i: usize = 0;
-    while (i < refs.len) {
-        const f = refs[i].file;
-        var edits: std.ArrayList(ide.rename.Edit) = .empty;
-        while (i < refs.len and refs[i].file == f) : (i += 1) try edits.append(arena, .{ .start = refs[i].start, .end = refs[i].end, .text = text });
-        if (try ide.rename.verifyAstGen(r, f, edits.items)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    }
-    return .{ .ok = .{ .refs = refs, .text = text } };
-}
-
-/// All references of `symbol` for renaming it from `old` to `new`, or why they cannot all be
-/// confirmed, in which case renaming would leave a partially renamed result: the standard library
-/// looks the declaration up by name in the root source file (see `rename.stdRootLookup`), the
-/// search scope is still incomplete (see `scopeIncomplete`), a reference is ambiguous in a generic
-/// function, goes through a member access of unknown type, or depends on instances that grow
-/// without bound, is in a `.zon` file whose import sites give result types that cannot be named
-/// (`search.Options.zon_import`), or
-/// a file that mentions the name has syntax errors.
-fn renameReferences(server: *Server, r: *Resolver, arena: Allocator, symbol: za.ide_db.search.Symbol, old: []const u8, new: []const u8) !Outcome([]const za.ide_db.search.Reference) {
-    if (symbol == .def) if (try ide.rename.stdRootLookup(r, symbol.def)) |p| return .{ .failed = try server.renameProblem(r, arena, old, new, p.file, p.offset, p.message) };
-    if (try server.scopeIncompleteFor(r, symbol, .edit)) |reason| return .{ .failed = try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`: {s}", .{ old, new, reason }) };
-    const scope = try server.searchScope(r);
-    var ambiguous: ?za.ide_db.search.Reference = null;
-    var uncertain: ?za.ide_db.search.Reference = null;
-    var incomplete: ?za.ide_db.search.Reference = null;
-    var zon_import: ?za.ide_db.search.Reference = null;
-    var syntax_error: ?Vfs.FileId = null;
-    const refs = try za.ide_db.search.symbolReferences(r, symbol, .{
-        .scope = scope,
-        .ambiguous = &ambiguous,
-        .uncertain = &uncertain,
-        .incomplete = &incomplete,
-        .zon_import = &zon_import,
-        .syntax_error = &syntax_error,
-    });
-    if (zon_import) |z| return .{ .failed = try server.renameProblem(r, arena, old, new, z.file, z.start, za.ide_db.search.zon_import_message) };
-    if (syntax_error) |file| return .{ .failed = try server.renameProblem(r, arena, old, new, file, null, "the file has syntax errors, so references in it may be missed") };
-    if (ambiguous) |a| return .{ .failed = try server.renameProblem(r, arena, old, new, a.file, a.start, za.ide_db.search.ambiguous_message) };
-    if (uncertain) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, if (symbol == .error_name)
-        "the type here is unknown, so whether this is the same error cannot be confirmed"
-    else
-        "the type here is unknown, so whether this refers to the same declaration cannot be confirmed") };
-    if (incomplete) |u| return .{ .failed = try server.renameProblem(r, arena, old, new, u.file, u.start, "this reference depends on instantiations of a generic function that grow without bound, so not all of them can be checked") };
-    const rules = try server.originRules(arena);
-    for (refs, 0..) |ref, i| {
-        // Sorted by file: check each file once
-        if (i > 0 and refs[i - 1].file == ref.file) continue;
-        if (!server.editable(rules, ref.file)) return .{ .failed = try server.renameProblem(r, arena, old, new, ref.file, ref.start, not_editable) };
-    }
-    return .{ .ok = refs };
-}
-
-/// Why an edit that a rename or fix needs in a file that is not `editable` is refused
-const not_editable = "this use is in a dependency library (the Zig installation, a fetched package, a generated file) or a stale copy of one, which must not be edited";
-
-/// Whether renames and fixes may edit `file`: the user's own code (see `origin.Origin`). A
-/// fetched package is restored from its hash on other machines, the Zig installation is shared by
-/// every project, and generated files are overwritten by builds.
-fn editable(server: *Server, rules: origin.Rules, file: Vfs.FileId) bool {
-    return switch (origin.classify(&server.vfs, rules, server.vfs.path(file), server.inProject(file))) {
-        .virtual, .user, .outside => true,
-        .zig_lib, .generated, .package, .other => false,
-    };
-}
-
-/// Edits that change the references (sorted by file and position, including the declaration) to
-/// `new_text`. When `confirm` is not null, the edits carry an annotation with it as the label
-/// that requires user confirmation (see `workspaceEdit`).
-fn renameEdit(server: *Server, r: *Resolver, arena: Allocator, refs: []const za.ide_db.search.Reference, new_text: []const u8, confirm: ?[]const u8) !types.WorkspaceEdit {
-    var files: std.ArrayList(ide.rename.FileEdits) = .empty;
-    var i: usize = 0;
-    while (i < refs.len) {
-        const file = refs[i].file;
-        var edits: std.ArrayList(ide.rename.Edit) = .empty;
-        while (i < refs.len and refs[i].file == file) : (i += 1) {
-            try edits.append(arena, .{ .start = refs[i].start, .end = refs[i].end, .text = new_text });
-        }
-        try files.append(arena, .{ .file = file, .edits = edits.items });
-    }
-    return server.workspaceEdit(r, arena, files.items, if (confirm) |label| .{
-        .id = "zig-analyzer.rename-public",
-        .label = label,
-        .description = "code outside this workspace that uses the name is not updated",
-    } else null);
-}
-
-/// A change annotation that requires user confirmation
-const Confirmation = struct {
-    id: []const u8,
-    label: []const u8,
-    description: []const u8,
-};
-
-/// Edits of each file (sorted by file, and by position within a file). When `confirm` is not
-/// null and the client supports change annotations, the edits carry an annotation requiring user
-/// confirmation, and the client asks the user to confirm before applying them.
-fn workspaceEdit(server: *Server, r: *Resolver, arena: Allocator, files: []const ide.rename.FileEdits, confirm: ?Confirmation) !types.WorkspaceEdit {
-    const annotated = confirm != null and server.caps.change_annotations;
-    const DocumentChange = @typeInfo(@typeInfo(@FieldType(types.WorkspaceEdit, "documentChanges")).optional.child).pointer.child;
-    const DocumentEdit = @typeInfo(@FieldType(types.TextDocumentEdit, "edits")).pointer.child;
-    var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
-    var documents: std.ArrayList(DocumentChange) = .empty;
-    var m: RangeMapper = .{ .server = server, .r = r };
-    for (files) |fe| {
-        const file_uri = try server.uriFor(arena, fe.file);
-        if (annotated) {
-            const edits = try arena.alloc(DocumentEdit, fe.edits.len);
-            for (fe.edits, edits) |e, *o| o.* = .{ .AnnotatedTextEdit = .{ .range = try m.range(fe.file, e.start, e.end), .newText = e.text, .annotationId = confirm.?.id } };
-            try documents.append(arena, .{ .TextDocumentEdit = .{ .textDocument = .{ .uri = file_uri, .version = server.docVersion(fe.file) }, .edits = edits } });
-        } else {
-            const edits = try arena.alloc(types.TextEdit, fe.edits.len);
-            for (fe.edits, edits) |e, *o| o.* = .{ .range = try m.range(fe.file, e.start, e.end), .newText = e.text };
-            try changes.map.put(arena, file_uri, edits);
-        }
-    }
-    if (!annotated) return .{ .changes = changes };
-    var annotations: std.json.ArrayHashMap(types.ChangeAnnotation) = .{};
-    try annotations.map.put(arena, confirm.?.id, .{
-        .label = confirm.?.label,
-        .needsConfirmation = true,
-        .description = confirm.?.description,
-    });
-    return .{ .documentChanges = documents.items, .changeAnnotations = annotations };
-}
-
-/// Source text of a new name: `@"..."` is validated and used as is; anything else is wrapped in
-/// `@"..."` when needed: keywords, names with special characters, `_`, and names of primitive types
-/// and values (`u8`, `true`; declarations and locals cannot share these names). With `is_field`,
-/// primitive names are used as is: field declarations and accesses after `.` can both use them
-/// (e.g. `null` and `bool` of `std.json.Value`).
-fn identifierText(arena: Allocator, name: []const u8, is_field: bool) HandlerError![]const u8 {
-    if (std.mem.startsWith(u8, name, "@\"")) {
-        // The whole name must be a single identifier token, and the quoted part must have valid
-        // escapes, be non-empty, and contain no NUL
-        var tokenizer: std.zig.Tokenizer = .init(try arena.dupeSentinel(u8, name, 0));
-        const token = tokenizer.next();
-        if (token.tag != .identifier or token.loc.end != name.len) return error.InvalidIdentifier;
-        const decoded = std.zig.string_literal.parseAlloc(arena, name[1..]) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.InvalidLiteral => return error.InvalidIdentifier,
-        };
-        if (decoded.len == 0 or std.mem.indexOfScalar(u8, decoded, 0) != null) return error.InvalidIdentifier;
-        return name;
-    }
-    if (name.len == 0 or std.mem.indexOfAny(u8, name, "\"\n\r\\\x00") != null) return error.InvalidIdentifier;
-    return std.fmt.allocPrint(arena, "{f}", .{std.zig.fmtIdFlags(name, .{ .allow_primitive = is_field })});
-}
-
-test "rename: source text of the new name" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try std.testing.expectEqualStrings("greet", try identifierText(a, "greet", false));
-    try std.testing.expectEqualStrings("@\"fn\"", try identifierText(a, "fn", false));
-    try std.testing.expectEqualStrings("@\"a b\"", try identifierText(a, "a b", false));
-    // Names of primitive types and values, and `_`: written as is, the declaration would have the
-    // same name as a primitive, which is a compile error
-    try std.testing.expectEqualStrings("@\"u8\"", try identifierText(a, "u8", false));
-    try std.testing.expectEqualStrings("@\"true\"", try identifierText(a, "true", false));
-    try std.testing.expectEqualStrings("@\"_\"", try identifierText(a, "_", false));
-    // Fields may share a name with a primitive; `_` marks
-    // an enum as non-exhaustive, so it is still quoted
-    try std.testing.expectEqualStrings("bool", try identifierText(a, "bool", true));
-    try std.testing.expectEqualStrings("@\"_\"", try identifierText(a, "_", true));
-    try std.testing.expectEqualStrings("@\"x\\\"y\"", try identifierText(a, "@\"x\\\"y\"", false));
-    try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"a\"b\"", false));
-    try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"\"", false));
-    try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "", false));
-    // The compiler rejects identifiers containing NUL
-    try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "a\x00b", false));
-    try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"a\\x00b\"", false));
-    try std.testing.expectError(error.InvalidIdentifier, identifierText(a, "@\"\\u{0}\"", false));
-}
-
-fn workspaceSymbol(server: *Server, r: *Resolver, arena: Allocator, params: types.WorkspaceSymbolParams) HandlerError!types.ResultType("workspace/symbol") {
-    const scope = try server.symbolScope(r);
-    const limit = server.config.load(.acquire).workspace_symbol_limit;
-    const syms = try ide.workspace_symbol.search(r, scope, params.query, if (limit == 0) std.math.maxInt(usize) else limit);
-    const out = try arena.alloc(types.WorkspaceSymbol, syms.len);
-    var m: RangeMapper = .{ .server = server, .r = r };
-    for (syms, out) |s, *o| o.* = .{
-        .name = s.name,
-        .kind = clientSymbolKind(server.caps.workspace_symbol_kinds, s.kind),
-        .containerName = s.container,
-        .location = .{ .Location = .{ .uri = try server.uriFor(arena, s.file), .range = try m.range(s.file, s.start, s.end) } },
-    };
-    return .{ .array_of_WorkspaceSymbol = out };
-}
-
-/// The code action kinds requested by the client (`context.only`)
-/// include `kind`: kinds are hierarchical by `.`, so `source` includes
-/// `source.organizeImports`. Any kind qualifies when none is requested.
-fn wantsKind(only: ?[]const []const u8, kind: []const u8) bool {
-    const list = only orelse return true;
-    for (list) |k| {
-        if (std.mem.eql(u8, kind, k)) return true;
-        if (kind.len > k.len and std.mem.startsWith(u8, kind, k) and kind[k.len] == '.') return true;
-    }
-    return false;
-}
-
-fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types.CodeActionParams) HandlerError!types.ResultType("textDocument/codeAction") {
-    // Every action is a `CodeAction` literal: most carry an edit, and the dependency hash action
-    // carries a command
-    if (!server.caps.code_action_literals) return null;
-    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const lines = try sourceLines(r.ctx, file);
-    const text = lines.text;
-    const start, const end = server.rangeOffsets(lines, params.range);
-    const only = params.context.only;
-    const import_options = server.importOptionsFor(file);
-    var actions: std.ArrayList(ide.code_actions.Action) = .empty;
-    if (wantsKind(only, types.CodeActionKind.QuickFix) or wantsKind(only, types.CodeActionKind.RefactorExtract) or wantsKind(only, types.CodeActionKind.RefactorRewrite))
-        try actions.appendSlice(arena, try ide.code_actions.codeActions(r, file, start, end));
-    // When organize imports is requested explicitly (a keybinding,
-    // organizing on save), the cursor position is ignored
-    if (wantsKind(only, types.CodeActionKind.SourceOrganizeImports)) {
-        if (try ide.code_actions.organizeImports(r, file, start, end, import_options, only != null)) |a| try actions.append(arena, a);
-    }
-    // Applies to the whole file regardless of the range, so it is left out of the unfiltered menu
-    if (only != null and wantsKind(only, types.CodeActionKind.SourceFixAll)) {
-        if (try ide.code_actions.fixAll(r, file)) |a| try actions.append(arena, a);
-    }
-    const doc_uri = try server.uriFor(arena, file);
-    const Item = CodeActionItem;
-    var out: std.ArrayList(Item) = .empty;
-    for (actions.items) |a| {
-        const kind = switch (a.kind) {
-            .quickfix => types.CodeActionKind.QuickFix,
-            .refactor_extract => types.CodeActionKind.RefactorExtract,
-            .refactor_rewrite => types.CodeActionKind.RefactorRewrite,
-            .source_organize_imports => types.CodeActionKind.SourceOrganizeImports,
-            .source_fix_all => types.CodeActionKind.SourceFixAll,
-        };
-        if (!wantsKind(only, kind)) continue;
-        const edits = try arena.alloc(types.TextEdit, a.edits.len);
-        for (a.edits, edits) |e, *te| te.* = .{ .range = lines.range(e.start, e.end, server.encoding), .newText = e.text };
-        var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
-        try changes.map.put(arena, doc_uri, edits);
-        // Link the same diagnostic sent by the client (same range and message, so another
-        // diagnostic on the same name, such as a naming hint, is not taken for it), so that the
-        // fix shows up on the diagnostic
-        const diagnostics: ?[]const types.Diagnostic = if (a.diagnostic) |d| blk: {
-            const range = lines.range(d.start, d.end, server.encoding);
-            for (params.context.diagnostics) |cd| {
-                if (std.meta.eql(cd.range, range) and cd.message == .string and std.mem.eql(u8, cd.message.string, d.message))
-                    break :blk try arena.dupe(types.Diagnostic, &.{cd});
-            }
-            break :blk null;
-        } else null;
-        try out.append(arena, .{ .CodeAction = .{
-            .title = a.title,
-            .kind = kind,
-            .diagnostics = diagnostics,
-            .isPreferred = if (a.diagnostic != null and a.preferred) true else null,
-            .edit = .{ .changes = changes },
-        } });
-    }
-    if (wantsKind(only, types.CodeActionKind.QuickFix)) {
-        for (try ide.remove_param.targets(r, file, start, end)) |t| {
-            const range = lines.range(t.start, t.end, server.encoding);
-            if (try server.removeParamAction(r, arena, doc_uri, range, t, params.context.diagnostics)) |action| try out.append(arena, .{ .CodeAction = action });
-        }
-    }
-    if (wantsKind(only, types.CodeActionKind.QuickFix)) if (try server.namingFor(arena, file, text)) |settings| {
-        for (try ide.naming.findings(r, file, .{ .start = start, .end = end })) |f| {
-            if (!settings.allows(f)) continue;
-            const range = lines.range(f.start, f.end, server.encoding);
-            if (try server.namingAction(r, arena, doc_uri, range, f, params.context.diagnostics)) |action| try out.append(arena, .{ .CodeAction = action });
-        }
-    };
-    if (wantsKind(only, types.CodeActionKind.QuickFix)) if (server.lintFor(file, text)) |rules| {
-        for (try ide.lint.findings(r, file, .{ .start = start, .end = end })) |f| {
-            if (!lintAllows(rules, f.rule)) continue;
-            const fix = f.fix orelse continue;
-            const range = lines.range(f.start, f.end, server.encoding);
-            var action: types.CodeAction = .{
-                .title = try std.fmt.allocPrint(arena, "remove `{s}`", .{text[f.start .. std.mem.indexOfScalarPos(u8, text, f.start, '(') orelse f.start]}),
-                .kind = types.CodeActionKind.QuickFix,
-                .isPreferred = true,
-            };
-            // Link the same hint sent by the client
-            for (params.context.diagnostics) |d| {
-                const c = d.code orelse continue;
-                if (c == .string and std.mem.eql(u8, c.string, f.rule.code()) and std.meta.eql(d.range, range)) {
-                    action.diagnostics = try arena.dupe(types.Diagnostic, &.{d});
-                    break;
-                }
-            }
-            var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
-            try changes.map.put(arena, doc_uri, try arena.dupe(types.TextEdit, &.{.{
-                .range = lines.range(fix.start, fix.end, server.encoding),
-                .newText = fix.text,
-            }}));
-            action.edit = .{ .changes = changes };
-            try out.append(arena, .{ .CodeAction = action });
-        }
-    };
-    if (server.caps.apply_edit and wantsKind(only, types.CodeActionKind.QuickFix)) try server.dependencyHashActions(arena, file, doc_uri, text, start, end, &out);
-    return out.items;
-}
-
-/// A code action result item (`CodeAction` or `Command`)
-const CodeActionItem = @typeInfo(@typeInfo(types.ResultType("textDocument/codeAction")).optional.child).pointer.child;
-
-/// Code actions that fetch the hash of a `build.zig.zon` dependency with `zig fetch`. Each action
-/// carries the command that runs the fetch, so the network request starts only when the user picks
-/// it; the edit is computed from the manifest as it is then (see `executeCommand`).
-fn dependencyHashActions(
-    server: *Server,
-    arena: Allocator,
-    file: Vfs.FileId,
-    doc_uri: []const u8,
-    text: []const u8,
-    start: u32,
-    end: u32,
-    out: *std.ArrayList(CodeActionItem),
-) !void {
-    if (!std.mem.eql(u8, std.fs.path.basename(server.vfs.path(file)), "build.zig.zon")) return;
-    const manifest = (try package_manifest.parse(arena, text)) orelse return;
-    const dep = package_manifest.dependencyAt(&manifest, start, end) orelse return;
-    const url = dep.url orelse return;
-    const title = if (dep.hash != null)
-        try std.fmt.allocPrint(arena, "update hash for `{s}`", .{dep.name})
-    else
-        try std.fmt.allocPrint(arena, "fetch hash for `{s}`", .{dep.name});
-    const arguments: std.json.ObjectMap = try .init(arena, &.{ "uri", "dependency", "url" }, &.{
-        .{ .string = doc_uri },
-        .{ .string = dep.name },
-        .{ .string = url },
-    });
-    try out.append(arena, .{ .CodeAction = .{
-        .title = title,
-        .kind = types.CodeActionKind.QuickFix,
-        .command = .{
-            .title = title,
-            .command = fetch_hash_command,
-            .arguments = try arena.dupe(types.LSPAny, &.{.{ .object = arguments }}),
-        },
-    } });
-}
-
-/// Data kept between `textDocument/codeAction` and `codeAction/resolve` (`CodeAction.data`) for
-/// fixes whose edits are computed only after they are selected
-const ResolveData = struct {
-    /// Naming fix
-    naming: ?struct {
-        uri: []const u8,
-        /// Start of the name
-        line: u32,
-        character: u32,
-        name: []const u8,
-        new_name: []const u8,
-    } = null,
-    /// Removing an unused parameter
-    remove_param: ?struct {
-        uri: []const u8,
-        /// Start of the parameter name
-        line: u32,
-        character: u32,
-        name: []const u8,
-    } = null,
-};
-
-/// Rename fix for a name that violates the naming conventions, applied only when the user picks it
-/// (not marked preferred). If the client supports `codeAction/resolve`, only the title and `data`
-/// are given, and references are searched and conflicts checked only after it is picked; otherwise
-/// the edit is computed right away. If the name cannot be renamed safely, the action carries the
-/// reason when the client supports `disabled`, and is not offered otherwise.
-fn namingAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []const u8, range: types.Range, f: ide.naming.Located, client_diagnostics: []const types.Diagnostic) !?types.CodeAction {
-    const what = if (f.def == .item and f.public) (if (f.rule == .field) "field " else "public ") else "";
-    var action: types.CodeAction = .{
-        .title = try std.fmt.allocPrint(arena, "rename {s}`{s}` to `{s}`", .{ what, f.name, f.suggestion }),
-        .kind = types.CodeActionKind.QuickFix,
-    };
-    // Link the same hint sent by the client
-    for (client_diagnostics) |d| {
-        const c = d.code orelse continue;
-        if (c == .string and std.mem.eql(u8, c.string, f.rule.code()) and std.meta.eql(d.range, range)) {
-            action.diagnostics = try arena.dupe(types.Diagnostic, &.{d});
-            break;
-        }
-    }
-    // A conflict at the declaration needs no reference search
-    if (try ide.rename.declarationConflict(r, f.def, f.suggestion)) |p| {
-        if (!server.caps.code_action_disabled) return null;
-        action.disabled = .{ .reason = try server.renameProblem(r, arena, f.name, f.suggestion, p.file, p.offset, p.message) };
-        return action;
-    }
-    if (server.caps.code_action_resolve) {
-        const inner: std.json.ObjectMap = try .init(arena, &.{ "uri", "line", "character", "name", "new_name" }, &.{
-            .{ .string = doc_uri },
-            .{ .integer = range.start.line },
-            .{ .integer = range.start.character },
-            .{ .string = f.name },
-            .{ .string = f.suggestion },
-        });
-        action.data = .{ .object = try .init(arena, &.{"naming"}, &.{.{ .object = inner }}) };
-        return action;
-    }
-    switch (try server.namingEdit(r, arena, f)) {
-        .ok => |edit| action.edit = edit,
-        .failed => |reason| {
-            if (!server.caps.code_action_disabled) return null;
-            action.disabled = .{ .reason = reason };
-        },
-    }
-    return action;
-}
-
-/// Fills in the edits of naming fixes and parameter removals; other code actions are already
-/// complete from `textDocument/codeAction` and are returned unchanged
-fn codeActionResolve(server: *Server, r: *Resolver, arena: Allocator, params: types.CodeAction) HandlerError!Outcome(types.CodeAction) {
-    const value = params.data orelse return .{ .ok = params };
-    const data = std.json.parseFromValueLeaky(ResolveData, arena, value, .{ .ignore_unknown_fields = true }) catch return .{ .ok = params };
-    var action = params;
-    if (data.naming) |d| {
-        const at = try server.textPosition(r, arena, d.uri, .{ .line = d.line, .character = d.character }) orelse
-            return .{ .failed = "cannot rename: the document is no longer available" };
-        // The document may have changed between the two requests: find the name again by its position
-        const found = for (try ide.naming.findings(r, at.file, .{ .start = at.offset, .end = at.offset })) |f| {
-            if (f.start == at.offset and std.mem.eql(u8, f.name, d.name) and std.mem.eql(u8, f.suggestion, d.new_name)) break f;
-        } else return .{ .failed = "cannot rename: the name has changed since the fix was offered" };
-        switch (try server.namingEdit(r, arena, found)) {
-            .ok => |edit| action.edit = edit,
-            .failed => |reason| return .{ .failed = reason },
-        }
-    } else if (data.remove_param) |d| {
-        const at = try server.textPosition(r, arena, d.uri, .{ .line = d.line, .character = d.character }) orelse
-            return .{ .failed = "cannot remove parameter: the document is no longer available" };
-        const found = for (try ide.remove_param.targets(r, at.file, at.offset, at.offset)) |t| {
-            if (t.start == at.offset and std.mem.eql(u8, t.name, d.name)) break t;
-        } else return .{ .failed = "cannot remove parameter: the parameter has changed since the fix was offered" };
-        switch (try server.removeParamEdit(r, arena, found)) {
-            .ok => |edit| action.edit = edit,
-            .failed => |reason| return .{ .failed = reason },
-        }
-    }
-    return .{ .ok = action };
-}
-
-/// The argument of `fetch_hash_command`: the manifest and the dependency the action was offered on
-const FetchHashArgs = struct {
-    uri: []const u8,
-    dependency: []const u8,
-    url: []const u8,
-};
-
-/// Runs `zig fetch <url>` for a dependency and applies the hash to the manifest with
-/// `workspace/applyEdit`. Runs on a background task, outside any read transaction, because the
-/// download can take a long time; the edit is computed after it, against the manifest as it is then.
-fn executeCommand(server: *Server, arena: Allocator, params: types.ExecuteCommandParams) HandlerError!types.ResultType("workspace/executeCommand") {
-    if (!std.mem.eql(u8, params.command, fetch_hash_command)) return error.InvalidParams;
-    const arguments = params.arguments orelse return error.InvalidParams;
-    if (arguments.len == 0) return error.InvalidParams;
-    const args = std.json.parseFromValueLeaky(FetchHashArgs, arena, arguments[0], .{ .ignore_unknown_fields = true }) catch return error.InvalidParams;
-    if (!server.caps.apply_edit) return error.InvalidParams;
-    const path = (try server.documentPath(arena, args.uri)) orelse return error.InvalidParams;
-    const dir = std.fs.path.dirname(path) orelse return error.InvalidParams;
-
-    const title = try std.fmt.allocPrint(arena, "fetching hash for `{s}`", .{args.dependency});
-    var progress = server.progress.begin(server, title, false);
-    defer if (progress) |p| server.progress.end(server, p, "failed");
-
-    const config = server.config.load(.acquire);
-    const argv = [_][]const u8{ config.zig_path orelse "zig", "fetch", args.url };
-    const result = std.process.run(server.gpa, server.io, .{
-        .argv = &argv,
-        .cwd = .{ .path = dir },
-        .environ_map = server.zig_environ.load(.acquire),
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(64 * 1024),
-        // A wrapper script (asdf, mise) or a large download may take a while; a hung one must end
-        .timeout = .{ .duration = .{ .raw = Io.Duration.fromSeconds(120), .clock = .awake } },
-    }) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        try server.warnFetch(arena, args.dependency, switch (err) {
-            error.FileNotFound, error.AccessDenied, error.InvalidExe => "the zig executable cannot be run",
-            error.Timeout => "zig fetch timed out",
-            else => @errorName(err),
-        });
-        return null;
-    };
-    defer server.gpa.free(result.stdout);
-    defer server.gpa.free(result.stderr);
-    const code: u8 = switch (result.term) {
-        .exited => |c| c,
-        else => {
-            try server.warnFetch(arena, args.dependency, "zig fetch ended without an exit code");
-            return null;
-        },
-    };
-    if (code != 0) {
-        try server.warnFetch(arena, args.dependency, errorLine(result.stderr) orelse "zig fetch failed");
-        return null;
-    }
-    const hash = fetchedHash(result.stdout) orelse {
-        try server.warnFetch(arena, args.dependency, "zig fetch printed no hash");
-        return null;
-    };
-
-    const edit = blk: {
-        var ctx = server.db.beginRead(arena);
-        defer ctx.end();
-        const file = (try server.lookupFile(arena, args.uri)) orelse try server.vfs.intern(path);
-        const lines = try sourceLines(&ctx, file);
-        const manifest = (try package_manifest.parse(arena, lines.text)) orelse break :blk null;
-        const hash_edit = (try package_manifest.hashEdit(arena, &manifest, args.dependency, args.url, hash)) orelse break :blk null;
-        break :blk .{ .range = lines.range(hash_edit.start, hash_edit.end, server.encoding), .newText = hash_edit.text };
-    } orelse {
-        try server.warnFetch(arena, args.dependency, "the dependency changed since the action was offered");
-        return null;
-    };
-
-    var changes: std.json.ArrayHashMap([]const types.TextEdit) = .{};
-    try changes.map.put(arena, args.uri, try arena.dupe(types.TextEdit, &.{.{ .range = edit.range, .newText = edit.newText }}));
-    const label = try std.fmt.allocPrint(arena, "zig-analyzer: hash of `{s}`", .{args.dependency});
-    const id = try std.fmt.allocPrint(arena, "{s}{d}", .{ apply_edit_prefix, server.next_apply_edit.fetchAdd(1, .monotonic) });
-    server.sendRequest(.{ .string = id }, "workspace/applyEdit", types.ApplyWorkspaceEditParams{
-        .label = label,
-        .edit = .{ .changes = changes },
-    });
-    server.progress.end(server, progress, "fetched");
-    progress = null;
-    return null;
-}
-
-/// Reports why a dependency hash could not be computed or applied
-fn warnFetch(server: *Server, arena: Allocator, dependency: []const u8, reason: []const u8) Allocator.Error!void {
-    server.showWarning(try std.fmt.allocPrint(arena, "cannot fetch the hash of `{s}`: {s}", .{ dependency, reason }));
-}
-
-/// The hash `zig fetch` prints: its last non-empty line, when it has no whitespace or quote
-fn fetchedHash(stdout: []const u8) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, stdout, '\n');
-    var last: ?[]const u8 = null;
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len != 0) last = trimmed;
-    }
-    const hash = last orelse return null;
-    for (hash) |c| if (std.ascii.isWhitespace(c) or c == '"' or c == '\\') return null;
-    return hash;
-}
-
-/// The last non-empty line of `stderr`, as the reason shown to the user
-fn errorLine(stderr: []const u8) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, stderr, '\n');
-    var last: ?[]const u8 = null;
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len != 0) last = trimmed;
-    }
-    return last;
-}
-
-/// The client's answer to `workspace/applyEdit`: says so when it did not apply the edit
-fn applyEditResponse(server: *Server, result: json.Value, failed: bool) void {
-    if (failed) {
-        log.warn("the client rejected workspace/applyEdit", .{});
-        server.showWarning("cannot apply the dependency hash: the client rejected the edit");
-        return;
-    }
-    if (result != .object) return;
-    const applied = result.object.get("applied") orelse return;
-    if (applied == .bool and applied.bool) return;
-    const reason = if (result.object.get("failureReason")) |r| switch (r) {
-        .string => |s| s,
-        else => "the client did not apply the edit",
-    } else "the client did not apply the edit";
-    var buf: [1024]u8 = undefined;
-    server.showWarning(std.fmt.bufPrint(&buf, "cannot apply the dependency hash: {s}", .{reason}) catch "cannot apply the dependency hash");
-}
-
-/// Renames a name that violates the naming conventions to the suggested spelling. Returns only
-/// complete and safe edits, as rename does (see `checkedRename`): nothing is renamed when some
-/// reference cannot be confirmed, the new name conflicts with an existing one, or the name appears
-/// in a string (reflection).
-fn namingEdit(server: *Server, r: *Resolver, arena: Allocator, f: ide.naming.Located) !Outcome(types.WorkspaceEdit) {
-    const def = f.def;
-    if (try server.renameRefusal(r, .{ .def = def })) |reason| return .{ .failed = reason };
-    const checked = switch (try server.checkedRename(r, arena, def, f.name, f.suggestion)) {
-        .ok => |checked| checked,
-        .failed => |reason| return .{ .failed = reason },
-    };
-    const confirm = if (f.public) try std.fmt.allocPrint(arena, "Rename public `{s}` to `{s}`", .{ f.name, f.suggestion }) else null;
-    return .{ .ok = try server.renameEdit(r, arena, checked.refs, checked.text, confirm) };
-}
-
-/// Explanation of why a name cannot be renamed:
-/// "cannot rename `a` to `b`: reason (file:line:column)"; only the file when the position is null
-fn renameProblem(server: *Server, r: *Resolver, arena: Allocator, old: []const u8, new: []const u8, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
-    return server.fixProblem(r, arena, try std.fmt.allocPrint(arena, "cannot rename `{s}` to `{s}`", .{ old, new }), file, offset, reason);
-}
-
-/// Why a fix cannot be applied: "<prefix>: reason (file:line:column)"; only the file when the
-/// position is null
-fn fixProblem(server: *Server, r: *Resolver, arena: Allocator, prefix: []const u8, file: Vfs.FileId, offset: ?u32, reason: []const u8) ![]const u8 {
-    const shown = server.vfs.shownPath(try server.rootsAlloc(arena), server.vfs.path(file));
-    const at = offset orelse return std.fmt.allocPrint(arena, "{s}: {s} ({s})", .{ prefix, reason, shown });
-    const pos = (try sourceLines(r.ctx, file)).position(at, server.encoding);
-    return std.fmt.allocPrint(arena, "{s}: {s} ({s}:{d}:{d})", .{ prefix, reason, shown, pos.line + 1, pos.character + 1 });
-}
-
-/// Removes an unused parameter together with the matching argument at each call site, applied
-/// only when the user selects it (not marked preferred). Calls in the whole workspace have to be
-/// found: when the client supports `codeAction/resolve`, only the title and `data` are given, and
-/// the edits are computed after selection; otherwise they are computed right away. When the
-/// parameter cannot be removed, the reason is attached if the client supports `disabled`;
-/// otherwise the action is not offered.
-fn removeParamAction(server: *Server, r: *Resolver, arena: Allocator, doc_uri: []const u8, range: types.Range, t: ide.remove_param.Target, client_diagnostics: []const types.Diagnostic) !?types.CodeAction {
-    if (try server.renameRefusal(r, .{ .def = .{ .item = .{ .file = t.file, .item = t.item } } }) != null) return null;
-    var action: types.CodeAction = .{
-        .title = try std.fmt.allocPrint(arena, "remove parameter `{s}`", .{t.name}),
-        .kind = types.CodeActionKind.QuickFix,
-    };
-    // Attach the same diagnostic sent by the client (a naming hint may share the position)
-    for (client_diagnostics) |d| {
-        if (std.meta.eql(d.range, range) and d.message == .string and std.mem.eql(u8, d.message.string, ide.remove_param.unused_message)) {
-            action.diagnostics = try arena.dupe(types.Diagnostic, &.{d});
-            break;
-        }
-    }
-    if (server.caps.code_action_resolve) {
-        const inner: std.json.ObjectMap = try .init(arena, &.{ "uri", "line", "character", "name" }, &.{
-            .{ .string = doc_uri },
-            .{ .integer = range.start.line },
-            .{ .integer = range.start.character },
-            .{ .string = t.name },
-        });
-        action.data = .{ .object = try .init(arena, &.{"remove_param"}, &.{.{ .object = inner }}) };
-        return action;
-    }
-    switch (try server.removeParamEdit(r, arena, t)) {
-        .ok => |edit| action.edit = edit,
-        .failed => |reason| {
-            if (!server.caps.code_action_disabled) return null;
-            action.disabled = .{ .reason = reason };
-        },
-    }
-    return action;
-}
-
-/// Removes the parameter `t` and the arguments at each call site (see `ide.remove_param.edits`).
-/// When the function is pub, the edits require user confirmation: calls outside the workspace
-/// are not updated.
-fn removeParamEdit(server: *Server, r: *Resolver, arena: Allocator, t: ide.remove_param.Target) !Outcome(types.WorkspaceEdit) {
-    const fn_name = (try r.itemTree(t.file)).items[t.item].name orelse "";
-    if (try server.scopeIncompleteFor(r, .{ .def = .{ .item = .{ .file = t.file, .item = t.item } } }, .edit)) |reason|
-        return .{ .failed = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`: {s}", .{ t.name, reason }) };
-    const prefix = try std.fmt.allocPrint(arena, "cannot remove parameter `{s}`", .{t.name});
-    switch (try ide.remove_param.edits(r, t, try server.searchScope(r))) {
-        .ok => |files| {
-            const rules = try server.originRules(arena);
-            for (files) |fe| if (!server.editable(rules, fe.file)) {
-                return .{ .failed = try server.fixProblem(r, arena, prefix, fe.file, if (fe.edits.len != 0) fe.edits[0].start else null, not_editable) };
-            };
-            return .{ .ok = try server.workspaceEdit(r, arena, files, if (t.public) .{
-                .id = "zig-analyzer.remove-param-public",
-                .label = try std.fmt.allocPrint(arena, "Remove parameter `{s}` of public `{s}`", .{ t.name, fn_name }),
-                .description = "code outside this workspace that calls the function is not updated",
-            } else null) };
-        },
-        .failed => |p| return .{ .failed = try server.fixProblem(r, arena, prefix, p.file, p.offset, p.message) },
-    }
-}
-
-/// Parameters of inspection requests that take a document
-const DocumentParams = struct { textDocument: types.TextDocumentIdentifier };
-
-const FileStatusResult = struct {
-    path: []const u8,
-    /// Origin of the file (see `origin.Origin`)
-    origin: origin.Origin,
-    /// Compile context (see `FileContext`)
-    context: FileContext,
-    open: bool,
-    /// Modules the file belongs to in the module graph (given as root files; `std` for the standard
-    /// library, an empty string for a generated file whose path is not known yet), in priority
-    /// order; empty when the file is not in the module graph
-    modules: []const []const u8,
-    /// Root directories of the projects containing it, and their latest builds
-    projects: []const struct { root: []const u8, last_build: ?Workspace.LastBuild },
-    /// Root files of the single-file compiles that read it (or reported errors in it)
-    single_file_roots: []const []const u8,
-};
-
-/// The packages of each workspace root: the `build.zig.zon` fields, and for each dependency
-/// whether its directory is on disk and where its manifest and build script are
-const PackagesResult = struct {
-    projects: []const Project,
-
-    const Project = struct {
-        root: []const u8,
-        manifest: []const u8,
-        name: ?[]const u8,
-        version: ?[]const u8,
-        fingerprint: ?[]const u8,
-        minimum_zig_version: ?[]const u8,
-        /// `[""]` means every file is included
-        paths: []const []const u8,
-        dependencies: []const Dependency,
-        /// Why the manifest could not be read; the other fields are then empty
-        parse_error: ?[]const u8,
-    };
-
-    const Dependency = struct {
-        name: []const u8,
-        kind: enum { url, path, none },
-        url: ?[]const u8,
-        path: ?[]const u8,
-        hash: ?[]const u8,
-        lazy: ?bool,
-        /// Where the dependency is expected: the `.path` resolved against the project, or the
-        /// package directory entry of a `.hash`
-        root: ?[]const u8,
-        exists: bool,
-        manifest: ?[]const u8,
-        build_zig: ?[]const u8,
-    };
-};
-
-/// How the file is treated: origin, compile context, the modules and
-/// projects it belongs to, the related single-file compiles. Used to
-/// diagnose problems that users report with diagnostics or name resolution.
-fn fileStatus(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: DocumentParams) HandlerError!?FileStatusResult {
-    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const open = blk: {
-        server.docs.mutex.lockUncancelable(server.io);
-        defer server.docs.mutex.unlock(server.io);
-        break :blk server.docs.open.contains(file);
-    };
-    var modules: std.ArrayList([]const u8) = .empty;
-    if (try ctx.get(ModuleGraph.Input, {})) |g| if (g.entry(file)) |e| {
-        try modules.append(arena, server.moduleName(g, e.module));
-        for (e.others) |m| try modules.append(arena, server.moduleName(g, m));
-    };
-    const Project = @typeInfo(@FieldType(FileStatusResult, "projects")).pointer.child;
-    var projects: std.ArrayList(Project) = .empty;
-    {
-        const list = try server.workspaceList(arena);
-        defer server.releaseList(arena, list);
-        for (list) |ws| if (ws.contains(file)) try projects.append(arena, .{ .root = try arena.dupe(u8, ws.root), .last_build = ws.lastBuild() });
-    }
-    var roots: std.ArrayList([]const u8) = .empty;
-    {
-        server.single.mutex.lockUncancelable(server.io);
-        defer server.single.mutex.unlock(server.io);
-        for (server.single.entries.keys(), server.single.entries.values()) |root, *sf| {
-            if (root == file or sf.inputs.contains(file) or sf.files.contains(file)) try roots.append(arena, server.vfs.path(root));
-        }
-    }
-    return .{
-        .path = server.vfs.path(file),
-        .origin = server.fileOrigin(file),
-        .context = server.fileContext(file),
-        .open = open,
-        .modules = modules.items,
-        .projects = projects.items,
-        .single_file_roots = roots.items,
-    };
-}
-
-fn moduleName(server: *Server, g: *const ModuleGraph, module: u32) []const u8 {
-    if (module == ModuleGraph.std_module) return "std";
-    const root = g.modules[module].root orelse return "";
-    return server.vfs.path(root);
-}
-
-/// The `build.zig.zon` of each workspace root, with its dependencies and the directories they
-/// resolve to. The manifest text is the open buffer when there is one, the file on disk otherwise.
-fn packagesRequest(server: *Server, ctx: *Db.Ctx, arena: Allocator, _: void) HandlerError!PackagesResult {
-    const roots = try server.rootsAlloc(arena);
-    const workspaces = try server.workspaceList(arena);
-    defer server.releaseList(arena, workspaces);
-    var projects: std.ArrayList(PackagesResult.Project) = .empty;
-    const config = server.config.load(.acquire);
-    const env_pkg_dir: ?[]const u8 = if (server.zig_environ.load(.acquire)) |m| m.get("ZIG_LOCAL_PKG_DIR") else server.environ.getAlloc(arena, "ZIG_LOCAL_PKG_DIR") catch null;
-    for (roots) |root| {
-        // A project's `zig-analyzer.zon` can set `build.args` (such as `--pkg-dir`) and its
-        // environment can name the package directory
-        var build_args: []const []const u8 = config.build_args;
-        var pkg_env = env_pkg_dir;
-        for (workspaces) |ws| if (server.vfs.samePath(ws.root, root)) {
-            build_args = ws.config.build_args;
-            if (ws.env.childEnviron()) |m| pkg_env = m.get("ZIG_LOCAL_PKG_DIR");
-            break;
-        };
-        const manifest_path = try std.fs.path.join(arena, &.{ root, "build.zig.zon" });
-        const known = try server.vfs.lookup(manifest_path);
-        if (known == null and accessible(server.io, manifest_path) == null) continue;
-        const file = known orelse try server.vfs.intern(manifest_path);
-        const lines = try sourceLines(ctx, file);
-        var project: PackagesResult.Project = .{
-            .root = root,
-            .manifest = manifest_path,
-            .name = null,
-            .version = null,
-            .fingerprint = null,
-            .minimum_zig_version = null,
-            .paths = &.{},
-            .dependencies = &.{},
-            .parse_error = null,
-        };
-        const manifest = try package_manifest.parse(arena, lines.text) orelse {
-            project.parse_error = "cannot parse build.zig.zon";
-            try projects.append(arena, project);
-            continue;
-        };
-        project.name = manifest.name;
-        project.version = manifest.version;
-        project.fingerprint = manifest.fingerprint;
-        project.minimum_zig_version = manifest.minimum_zig_version;
-        project.paths = manifest.paths;
-        const pkg_dir = try dependency_packages.packageDir(arena, root, build_args, pkg_env);
-        const dependencies = try arena.alloc(PackagesResult.Dependency, manifest.dependencies.len);
-        for (manifest.dependencies, dependencies) |dep, *out| {
-            const kind: @FieldType(PackagesResult.Dependency, "kind") = if (dep.url != null) .url else if (dep.path != null) .path else .none;
-            const resolved: ?[]const u8 = if (dep.path) |p|
-                try std.fs.path.resolveAlloc(arena, &.{ root, p })
-            else if (dep.url != null and dep.hash != null)
-                try std.fs.path.join(arena, &.{ pkg_dir, dep.hash.? })
-            else
-                null;
-            out.* = .{
-                .name = dep.name,
-                .kind = kind,
-                .url = dep.url,
-                .path = dep.path,
-                .hash = dep.hash,
-                .lazy = dep.lazy,
-                .root = resolved,
-                .exists = false,
-                .manifest = null,
-                .build_zig = null,
-            };
-            if (resolved) |dir| {
-                out.exists = accessible(server.io, dir) != null;
-                if (out.exists) {
-                    out.manifest = try existingPath(server.io, arena, dir, "build.zig.zon");
-                    out.build_zig = try existingPath(server.io, arena, dir, "build.zig");
-                }
-            }
-        }
-        project.dependencies = dependencies;
-        try projects.append(arena, project);
-    }
-    return .{ .projects = projects.items };
-}
-
-fn accessible(io: Io, path: []const u8) ?void {
-    Io.Dir.cwd().access(io, path, .{}) catch return null;
-    return {};
-}
-
-/// `<dir>/<name>` when it exists, null otherwise
-fn existingPath(io: Io, arena: Allocator, dir: []const u8, name: []const u8) Allocator.Error!?[]const u8 {
-    const path = try std.fs.path.join(arena, &.{ dir, name });
-    if (accessible(io, path) == null) return null;
-    return path;
-}
-
-/// Syntax tree of the document: indented nodes and tokens (without trivia) with their byte ranges,
-/// followed by the syntax errors. Used to diagnose problems with parsing and error recovery.
-fn syntaxTree(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: DocumentParams) HandlerError!?[]const u8 {
-    const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
-    const parse = try ctx.get(syntax_q.ParseFile, file);
-    var out: std.Io.Writer.Allocating = .init(arena);
-    parse.rootNode().dump(&out.writer, .{ .token_ranges = true }) catch return error.OutOfMemory;
-    for (parse.errors) |e| out.writer.print("error@{d}: {s}\n", .{ e.offset, e.message }) catch return error.OutOfMemory;
-    return out.written();
-}
-
-const ModuleGraphResult = struct {
-    /// Root file of the standard library
-    std_root: ?[]const u8,
-    modules: []const struct {
-        /// Root file; null for a generated file whose path is not known yet
-        root: ?[]const u8,
-        /// builtin.zig generated from the module's parameters
-        builtin: ?[]const u8,
-        imports: []const struct { name: []const u8, module: u32 },
-        /// Number of files belonging to it (including those that also belong to other modules)
-        files: usize,
-    },
-};
-
-/// The module graph (aggregated from the build graphs of all projects, see `updateModuleGraph`):
-/// each module's root file, builtin, imports and file count. Used to diagnose problems with imports
-/// and name resolution.
-fn moduleGraph(server: *Server, ctx: *Db.Ctx, arena: Allocator, _: void) HandlerError!ModuleGraphResult {
-    const g = try ctx.get(ModuleGraph.Input, {}) orelse return .{ .std_root = null, .modules = &.{} };
-    const Item = @typeInfo(@FieldType(ModuleGraphResult, "modules")).pointer.child;
-    const Import = @typeInfo(@FieldType(Item, "imports")).pointer.child;
-    const out = try arena.alloc(Item, g.modules.len);
-    for (g.modules, out) |m, *o| {
-        const imports = try arena.alloc(Import, m.imports.len);
-        // The response is serialized only after the read transaction ends, when the module graph
-        // may have been replaced: copy the names out
-        for (m.imports, imports) |imp, *x| x.* = .{ .name = try arena.dupe(u8, imp.name), .module = imp.module };
-        o.* = .{
-            .root = if (m.root) |r| server.vfs.path(r) else null,
-            .builtin = if (m.builtin) |b| server.vfs.path(b) else null,
-            .imports = imports,
-            .files = 0,
-        };
-    }
-    // Standard library files (`std_module`) are not counted
-    for (g.files) |e| {
-        if (e.module < out.len) out[e.module].files += 1;
-        for (e.others) |m| if (m < out.len) {
-            out[m].files += 1;
-        };
-    }
-    return .{ .std_root = if (g.std_root) |r| server.vfs.path(r) else null, .modules = out };
 }
 
 /// Restarts all projects (same as saving build.zig): used when the build graph or compile results
@@ -7867,63 +6236,6 @@ fn reloadWorkspace(server: *Server, arena: Allocator, _: void) HandlerError!void
     defer server.releaseList(arena, list);
     if (list.len != 0) log.info("restarting projects on request", .{});
     for (list) |ws| server.restartWorkspace(ws, 0);
-}
-
-fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!StatusResult {
-    var stats: [Db.query_types.len]za.db.QueryStats = undefined;
-    const summary = server.db.stats(&stats);
-    const queries = try arena.alloc(@typeInfo(@FieldType(StatusResult, "queries")).pointer.child, stats.len);
-    inline for (Db.query_types, 0..) |Q, i| {
-        const q = stats[i];
-        queries[i] = .{
-            .name = @typeName(Q),
-            .executions = q.executions,
-            .hits = q.hits,
-            .cutoffs = q.cutoffs,
-            .total_ms = za.db_report.ms(q.total_ns),
-            .self_ms = za.db_report.ms(q.self_ns),
-            .max_ms = za.db_report.ms(q.max_ns),
-            .memos = q.memos,
-            .keys = q.keys,
-            .bytes = q.bytes,
-            .deps = q.deps,
-            .incomplete = q.incomplete,
-        };
-    }
-    return .{
-        .version = za.version,
-        .revision = summary.revision,
-        .files = server.vfs.count(),
-        .deep_verifications = summary.deep_verifications,
-        .writes = summary.writes,
-        .max_rss_kb = maxRssKb(),
-        .intern_pool_items = server.ip.count(),
-        .intern_pool_bytes = server.ip.bytes(),
-        .heap_bytes = if (server.heap) |h| h.liveBytes() else 0,
-        .allocator = if (server.allocator_stats) |f| try f(arena) else null,
-        .queries = queries,
-        .incomplete_causes = .{
-            .cycle = summary.incomplete_causes.get(.cycle),
-            .stack = summary.incomplete_causes.get(.stack),
-            .unavailable = summary.incomplete_causes.get(.unavailable),
-        },
-    };
-}
-
-/// Peak resident memory of the process (KB)
-fn maxRssKb() u64 {
-    const builtin_os = @import("builtin").os.tag;
-    if (builtin_os == .windows) {
-        const w = std.os.windows;
-        var c: w.PROCESS.VM_COUNTERS = undefined;
-        if (w.ntdll.NtQueryInformationProcess(w.GetCurrentProcess(), .VmCounters, &c, @sizeOf(w.PROCESS.VM_COUNTERS), null) != .SUCCESS) return 0;
-        return c.PeakWorkingSetSize / 1024;
-    }
-    if (builtin_os == .wasi) return 0;
-    const usage = std.posix.getrusage(std.posix.rusage.SELF);
-    const rss: u64 = @intCast(@max(0, usage.maxrss));
-    // macOS reports bytes, Linux reports KB
-    return if (builtin_os == .macos) rss / 1024 else rss;
 }
 
 // ── Sending ──────────────────────────────────────────────────────────
@@ -7988,6 +6300,16 @@ test {
     _ = origin;
     _ = workspace_files;
     _ = Workspace;
+    _ = requests.code_actions;
+    _ = requests.completion;
+    _ = requests.document;
+    _ = requests.hover;
+    _ = requests.inlay_hints;
+    _ = requests.inspection;
+    _ = requests.navigation;
+    _ = requests.references;
+    _ = requests.rename;
+    _ = requests.semantic_tokens;
     _ = @import("Server_test.zig");
     _ = @import("semantic_tokens_test.zig");
     _ = @import("build_e2e_test.zig");
