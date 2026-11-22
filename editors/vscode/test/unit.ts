@@ -410,6 +410,17 @@ function inspectionViews(): void {
   const rows = status.lines.filter((l) => /^ {2}[ab] /.test(l));
   check(status.lines[0] === "Version             0.2.1" && status.lines[1] === "Revision            1" && status.lines.includes("Max RSS             1.0 MiB") && rows[0].startsWith("  b ") && rows[0].includes("2.0 KiB"),
     "status: fields, sizes, and queries by total time");
+  check(status.lines.includes("Incomplete          0 by cycles, 0 by stack depth, 0 by unavailable tools"), "status: missing incomplete causes read as 0");
+  const causes = views.render("status", {
+    version: "0.2.1", revision: 1, files: 2, deep_verifications: 0, writes: 0, max_rss_kb: 1024, intern_pool_items: 0, intern_pool_bytes: 0, heap_bytes: 0,
+    allocator: null, queries: [], incomplete_causes: { cycle: 1, stack: 2, unavailable: 3 },
+  }, format);
+  check(causes.lines.includes("Incomplete          1 by cycles, 2 by stack depth, 3 by unavailable tools"), "status: incomplete causes by kind");
+  const older = views.render("status", {
+    version: "0.2.1", revision: 1, files: 2, deep_verifications: 0, writes: 0, max_rss_kb: 1024, intern_pool_items: 0, intern_pool_bytes: 0, heap_bytes: 0,
+    allocator: null, queries: [], incomplete_causes: { cycle: 1, stack: 2 },
+  }, format);
+  check(older.lines.includes("Incomplete          1 by cycles, 2 by stack depth, 0 by unavailable tools"), "status: a server without the unavailable count reads it as 0");
 
   const packages = views.render("packages", {
     projects: [{
