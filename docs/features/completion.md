@@ -70,7 +70,7 @@ Controlled by `completion.snippets` (on by default), used only with `completionI
 
 ## completionItem/resolve
 
-The completion list carries no signatures, because they need inference: a signature is computed only on selection. `detail` is the signature, the same as hover and shown as written in the source; `documentation` holds the doc comment and the definition's location, given as a path under `std/`, an importable path, or the module name plus a path under its root. A constant whose value is a file also gets that file's `//!` doc.
+The completion list carries no signatures, because they need inference: a signature is computed only on selection. `detail` is the signature, the same as hover and shown as written in the source; `documentation` holds the doc comment and the definition's location, given as a path under `std/`, an importable path, or the module name plus a path under its root. A constant whose value is a file also gets that file's `//!` doc. An alias without its own doc comment (`pub const Foo = @import("foo.zig").Foo;`, `pub const f = g;`) takes the first doc comment along its alias chain; hover and signature help use the same doc.
 
 ## Fields and paths of `build.zig.zon`
 

@@ -6245,6 +6245,92 @@ test "hover shows the file and size of @embedFile values, and the content of sho
     }
 }
 
+test "hover and completion on a re-exported declaration show the original's doc" {
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        // A re-export through `@import(...).Name`
+        .{
+            \\//- /p/main.zig
+            \\const lib = @import("lib.zig");
+            \\fn run() void {
+            \\    _ = lib.Foo<|>;
+            \\}
+            \\//- /p/lib.zig
+            \\pub const Foo = @import("foo.zig").Foo;
+            \\//- /p/foo.zig
+            \\/// A thing that does X.
+            \\pub const Foo = struct { value: u32 };
+            ,
+            "Foo",
+            "A thing that does X.",
+        },
+        // A re-export of a name in scope
+        .{
+            \\//- /p/main.zig
+            \\const lib = @import("lib.zig");
+            \\fn run() void {
+            \\    _ = lib.add<|>;
+            \\}
+            \\//- /p/lib.zig
+            \\pub const add = addImpl;
+            \\/// Adds two numbers.
+            \\fn addImpl(a: u32, b: u32) u32 {
+            \\    return a + b;
+            \\}
+            ,
+            "add",
+            "Adds two numbers.",
+        },
+        // The first doc along the alias chain: the re-export's own doc comes first
+        .{
+            \\//- /p/main.zig
+            \\const lib = @import("lib.zig");
+            \\fn run() void {
+            \\    _ = lib.Foo<|>;
+            \\}
+            \\//- /p/lib.zig
+            \\pub const Foo = @import("mid.zig").Foo;
+            \\//- /p/mid.zig
+            \\/// Re-exported here.
+            \\pub const Foo = @import("foo.zig").Foo;
+            \\//- /p/foo.zig
+            \\/// The original.
+            \\pub const Foo = struct {};
+            ,
+            "Foo",
+            "Re-exported here.",
+        },
+        // A value that is not an alias has no doc to take over
+        .{
+            \\//- /p/main.zig
+            \\const lib = @import("lib.zig");
+            \\fn run() void {
+            \\    _ = lib.Foo<|>;
+            \\}
+            \\//- /p/lib.zig
+            \\pub const Foo = if (@sizeOf(usize) == 8) @import("foo.zig").Foo else u8;
+            \\//- /p/foo.zig
+            \\/// The original.
+            \\pub const Foo = struct {};
+            ,
+            "Foo",
+            "",
+        },
+    };
+    for (cases) |c| {
+        const docs = try importedDocs(c[0], c[1]);
+        defer for (docs) |d| testing.allocator.free(d);
+        testing.expectEqualStrings(c[2], docs[1]) catch |err| {
+            std.debug.print("completion in\n{s}\n", .{c[0]});
+            return err;
+        };
+        const ok = if (c[2].len == 0) std.mem.indexOf(u8, docs[0], "The original.") == null else std.mem.endsWith(u8, docs[0], c[2]);
+        testing.expect(ok) catch |err| {
+            std.debug.print("hover in\n{s}\ngave\n{s}\n", .{ c[0], docs[0] });
+            return err;
+        };
+    }
+}
+
 test "hover on a constant aliasing a container shows the aliased type" {
     // Prevents an alias from reading like the definition (`const P2 = struct`)
     const text =
@@ -6277,7 +6363,7 @@ test "hover on a constant aliasing a container shows the aliased type" {
     var r = resolver(&w, &ctx);
     const cases = [_]struct { []const u8, []const u8 }{
         .{ "Point = struct", "const Point = struct\n```\n\nsize: 4 · align: 4\n\nA point" },
-        .{ "P2 =", "const P2: type = Point\n```\n\nsize: 4 · align: 4" },
+        .{ "P2 =", "const P2: type = Point\n```\n\nsize: 4 · align: 4\n\nA point" },
         .{ "L =", "const L: type = List(u8)\n```\n\nsize: 16 · align: 8" },
         .{ "Foo =", "const Foo: type = Foo\n```\n\nsize: 1 · align: 1" },
         .{ "Choice =", "const Choice = struct\n```\n\nsize: 1 · align: 1" },

@@ -39,7 +39,7 @@ pub const Error = error{ Canceled, OutOfMemory };
 
 /// Maximum length of an alias chain, guarding against cycles such as `const a = b; const b = a;`.
 /// Same as the recursion limit for glob imports in rust-analyzer's name resolution.
-const max_depth = 100;
+pub const max_depth = 100;
 
 pub const Resolver = struct {
     ctx: *Db.Ctx,
@@ -206,21 +206,26 @@ pub const Resolver = struct {
     /// is not an alias
     pub fn aliasTarget(r: *Resolver, def: Def) Error!Def {
         var cur = def;
-        for (0..max_depth) |_| {
-            const it = switch (cur) {
-                .item => |it| it,
-                else => return cur,
-            };
-            if ((try r.itemTree(it.file)).items[it.item].kind != .@"const") return cur;
-            const b = try r.body(it.file, it.item);
-            const value = b.value orelse return cur;
-            cur = switch (b.expr(value)) {
-                .name_ref => |n| if (b.nameRefIsBuiltin(value)) null else try r.resolveName(it.file, it.item, b, b.expr_scopes[@backingInt(value)], n),
-                .field_access => |fa| if (try r.evalNamespace(it.file, it.item, b, fa.lhs)) |ns| try r.memberDef(ns, it.file, fa.field orelse return cur) else null,
-                else => null,
-            } orelse return cur;
-        }
+        for (0..max_depth) |_| cur = try r.aliasStep(cur) orelse return cur;
         return cur;
+    }
+
+    /// The definition a container-level alias `const f = name;` / `const f = a.b.c;` directly
+    /// points to (one step of `aliasTarget`); null when `def` is not such an alias or its value
+    /// cannot be resolved statically
+    pub fn aliasStep(r: *Resolver, def: Def) Error!?Def {
+        const it = switch (def) {
+            .item => |it| it,
+            else => return null,
+        };
+        if ((try r.itemTree(it.file)).items[it.item].kind != .@"const") return null;
+        const b = try r.body(it.file, it.item);
+        const value = b.value orelse return null;
+        return switch (b.expr(value)) {
+            .name_ref => |n| if (b.nameRefIsBuiltin(value)) null else try r.resolveName(it.file, it.item, b, b.expr_scopes[@backingInt(value)], n),
+            .field_access => |fa| if (try r.evalNamespace(it.file, it.item, b, fa.lhs)) |ns| try r.memberDef(ns, it.file, fa.field orelse return null) else null,
+            else => null,
+        };
     }
 
     // ── Namespace evaluation ─────────────────────────────────────────

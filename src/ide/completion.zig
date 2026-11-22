@@ -859,11 +859,12 @@ fn decls(r: *Resolver, out: *Collector, file: FileId, tree: *const ItemTree, con
             else => null,
         };
         // A namespace or struct constant may be a file: its doc comment and the file's (the type of
-        // the declaration has already been computed for the kind)
+        // the declaration has already been computed for the kind); an alias without a doc comment
+        // takes the one along its alias chain
         const doc = if (it.kind == .@"const" and (kind == .namespace or kind == .@"struct"))
             try context.docOf(r, .{ .item = .{ .file = file, .item = m } }, try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = file, .item = it.ast_id } }))
         else
-            it.doc;
+            try context.doc(r, .{ .item = .{ .file = file, .item = m } });
         try out.add(.{ .label = name, .kind = kind, .doc = doc, .target = target, .weight = weight, .origin = .{ .target = .{ .decl = .{ .file = file, .item = m } } } });
     }
 }
@@ -1018,7 +1019,7 @@ fn expectedMembers(r: *Resolver, out: *Collector, ty: Index, decl_literals: Decl
                 const decl_ty = (try r.ctx.get(queries.DeclType, .{ .owner = .{ .file = ns.file, .item = it.ast_id }, .inst = inst })).ty;
                 if (!producesType(ip, decl_ty, ty, it.kind == .@"fn", decl_literals == .@"try")) continue;
                 const is_fn = it.kind == .@"fn";
-                try out.add(.{ .label = name, .kind = kindOf(try symbol_kind.ofDecl(r, ns.file, m)), .doc = it.doc, .target = if (is_fn) .{ .decl = .{ .file = ns.file, .item = m } } else null });
+                try out.add(.{ .label = name, .kind = kindOf(try symbol_kind.ofDecl(r, ns.file, m)), .doc = try context.doc(r, .{ .item = .{ .file = ns.file, .item = m } }), .target = if (is_fn) .{ .decl = .{ .file = ns.file, .item = m } } else null });
             },
             else => {},
         }
@@ -1257,7 +1258,7 @@ fn valueMembers(r: *Resolver, from: FileId, t: Index) resolve.Error![]const Memb
                 const decl: Member.Decl = .{ .file = ns.file, .item = m, .ast_id = it.ast_id, .inst = c.inst, .alias = it.kind == .@"const" };
                 switch (it.kind) {
                     .field => if (fields) try out.append(r.arena, .{ .name = name, .doc = it.doc, .what = .{ .field = decl } }),
-                    .@"fn", .@"const" => if (ns.file == from or it.flags.is_pub) try out.append(r.arena, .{ .name = name, .doc = it.doc, .what = .{ .method = decl } }),
+                    .@"fn", .@"const" => if (ns.file == from or it.flags.is_pub) try out.append(r.arena, .{ .name = name, .doc = try context.doc(r, .{ .item = .{ .file = ns.file, .item = m } }), .what = .{ .method = decl } }),
                     else => {},
                 }
             }
