@@ -169,21 +169,14 @@ graph_mutex: Io.Mutex = .init,
 /// builtin.zig files are named by the hash of their contents, so a path always has the same
 /// contents.
 builtin_targets: std.AutoHashMapUnmanaged(Vfs.FileId, za.sema.InternPool.Target) = .empty,
-/// Config option `sema.callsite_seeding` (read by the IDE layer through `Env`)
+/// Config option `sema.callsite_seeding`, set together with `config`: read by the IDE layer
+/// through `Env`, which cannot depend on `Config`
 callsite_seeding: std.atomic.Value(bool) = .init(true),
-/// Config option `build.sub_projects`, readable where `config_mutex` cannot be taken (with
-/// `workspaces_mutex` held, see `startWorkspace`)
-sub_projects_enabled: std.atomic.Value(bool) = .init(true),
 /// Counting allocator (set by the executable; used for `heap_bytes` in `zig-analyzer/status`)
 heap: ?*const za.util.mem.Counting = null,
 /// Statistics of the release allocator (set by the executable; `allocator` in
 /// `zig-analyzer/status`)
 allocator_stats: ?*const fn (Allocator) Allocator.Error!za.util.PagedAllocator.Stats = null,
-/// Slow request log threshold (ms, 0 disables it), from the config option `log.slow_request_ms`
-slow_request_ms: std.atomic.Value(u32) = .init(100),
-/// Once the InternPool exceeds this many MB, type information is reclaimed as a whole
-/// generation (0 disables reclaiming); from the config option `sema.max_intern_pool_mb`
-max_intern_pool_mb: std.atomic.Value(u32) = .init(64),
 /// The most type information that one request or diagnostics publish has added (InternPool bytes
 /// and keys of the type-information queries, see `maybeResetSema`). A reclaim waits until the
 /// type information is at least twice that: one that discards what a single request needs makes
@@ -192,9 +185,6 @@ sema_peak_growth: struct {
     bytes: std.atomic.Value(usize) = .init(0),
     keys: std.atomic.Value(usize) = .init(0),
 } = .{},
-/// Debounce (ms) of diagnostic publishing triggered by edits, from the config option
-/// `diagnostics.debounce_ms`
-debounce_ms: std.atomic.Value(u32) = .init(50),
 /// Files pending publication due to edits (see `publishDebounced`)
 edits_mutex: Io.Mutex = .init,
 edits: std.AutoHashMapUnmanaged(Vfs.FileId, Edit) = .empty,
@@ -205,8 +195,12 @@ live_prepared: live.Prepared = undefined,
 index: Indexing = .{},
 /// Scans of the workspace for source files (see `scheduleScan`)
 scan: Scans = .{},
-config_mutex: Io.Mutex = .init,
-config: Config = .{},
+/// The current configuration (see `setConfig`): replaced as a whole and never modified, so a
+/// reader sees one consistent configuration without a lock
+config: std.atomic.Value(*const Config) = .init(&default_config),
+/// Every configuration set so far: a replaced one may still be read, so all are freed only in
+/// deinit (accessed only by `setConfig`, which the main loop serializes)
+configs: std.ArrayList(*Config) = .empty,
 /// What the client supports, read from `initialize` (accessed only on the main loop)
 caps: ClientCaps = .{},
 /// The client answered a registration of file watchers with an error: it does not watch files
@@ -285,6 +279,7 @@ pub const Toolchain = struct {
 };
 
 const no_toolchain: Toolchain = .{};
+const default_config: Config = .{};
 
 pub const TestHooks = if (@import("builtin").is_test) struct {
     /// Holds the read and semantic requests of one method at a point of their execution (see
@@ -538,7 +533,11 @@ pub fn deinit(server: *Server) void {
     server.semantic_cache.deinit(server.gpa);
     server.watched_built.deinit(server.gpa);
     server.progress.deinit(server.gpa);
-    server.config.deinit(server.gpa);
+    for (server.configs.items) |c| {
+        c.deinit(server.gpa);
+        server.gpa.destroy(c);
+    }
+    server.configs.deinit(server.gpa);
     server.pending.deinit(server.gpa);
     server.db.deinit();
     server.ip.deinit();
@@ -1044,7 +1043,7 @@ fn reportIfSlow(server: *Server, ctx: *Db.Ctx, method: []const u8, t0: Io.Timest
     // build output show a misleading `failed command`; the report contents are covered by tests
     // that call writeSlowReport directly
     if (@import("builtin").is_test) return;
-    const threshold = server.slow_request_ms.load(.monotonic);
+    const threshold = server.config.load(.acquire).slow_request_ms;
     if (threshold == 0) return;
     const ns: u64 = @intCast(@max(0, t0.durationTo(Io.Clock.awake.now(server.io)).nanoseconds));
     if (ns < @as(u64, threshold) * std.time.ns_per_ms) return;
@@ -1319,9 +1318,7 @@ const index_progress_delay_ms = 200;
 /// Whether auto-import is still enabled: the indexing task checks again before each batch and
 /// stops indexing once it is disabled
 fn autoImportEnabled(server: *Server) bool {
-    server.config_mutex.lockUncancelable(server.io);
-    defer server.config_mutex.unlock(server.io);
-    return server.config.completion_auto_import;
+    return server.config.load(.acquire).completion_auto_import;
 }
 
 /// Whether a Zig document is open. Virtual documents opened with languageId `zig` have a `.zig`
@@ -2911,9 +2908,7 @@ pub const WatchScope = enum {
 };
 
 pub fn watchScope(server: *Server) WatchScope {
-    server.config_mutex.lockUncancelable(server.io);
-    defer server.config_mutex.unlock(server.io);
-    return switch (server.config.files_watcher) {
+    return switch (server.config.load(.acquire).files_watcher) {
         .auto => if (server.clientWatches()) .outside_roots else .all,
         .client => .none,
         .server => .all,
@@ -3004,34 +2999,36 @@ fn didChangeConfiguration(server: *Server, _: Allocator, params: types.DidChange
 fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     var new = fresh;
     server.reportConfigWarnings("zig-analyzer settings", &new);
-    server.config_mutex.lockUncancelable(server.io);
-    const zig_changed = !server.config.sameZig(&new);
-    const zig_paths_changed = !server.config.sameZigPaths(&new);
-    const build_changed = !server.config.sameBuild(&new);
-    const semantic_changed = server.config.callsite_seeding != new.callsite_seeding or server.config.semantic_tokens_mode != new.semantic_tokens_mode or
-        server.config.semantic_tokens_global_var != new.semantic_tokens_global_var;
-    const imports_enabled = !server.config.completion_auto_import and new.completion_auto_import;
-    const inactive_changed = server.config.inactive_code != new.inactive_code;
-    const naming_changed = !server.config.sameNaming(&new);
-    const unused_changed = server.config.unused_enable != new.unused_enable;
-    const lint_changed = !server.config.sameLint(&new);
-    const build_was_enabled = server.config.build_enable;
-    const sub_projects_changed = server.config.build_sub_projects != new.build_sub_projects;
-    const watcher_changed = server.config.files_watcher != new.files_watcher;
-    const inlay_changed = server.config.inlay_types != new.inlay_types or server.config.inlay_capture_types != new.inlay_capture_types or
-        server.config.inlay_field_types != new.inlay_field_types or
-        server.config.inlay_anonymous_containers != new.inlay_anonymous_containers or
-        server.config.inlay_parameters != new.inlay_parameters or server.config.inlay_builtin_parameters != new.inlay_builtin_parameters or
-        server.config.inlay_exclude_single_argument != new.inlay_exclude_single_argument or
-        server.config.hide_redundant_param_names != new.hide_redundant_param_names or server.config.inlay_max_length != new.inlay_max_length or
-        server.config.callsite_seeding != new.callsite_seeding;
-    const compiler_disabled = server.config.compiler_diagnostics and !new.compiler_diagnostics;
-    const log_file_changed = !eqlOptionalStr(server.config.log_file, new.log_file);
+    const old = server.config.load(.acquire);
+    if (old.same(&new)) {
+        new.deinit(server.gpa);
+        return;
+    }
+    const zig_changed = !old.sameZig(&new);
+    const zig_paths_changed = !old.sameZigPaths(&new);
+    const build_changed = !old.sameBuild(&new);
+    const semantic_changed = old.callsite_seeding != new.callsite_seeding or old.semantic_tokens_mode != new.semantic_tokens_mode or
+        old.semantic_tokens_global_var != new.semantic_tokens_global_var;
+    const imports_enabled = !old.completion_auto_import and new.completion_auto_import;
+    const inactive_changed = old.inactive_code != new.inactive_code;
+    const naming_changed = !old.sameNaming(&new);
+    const unused_changed = old.unused_enable != new.unused_enable;
+    const lint_changed = !old.sameLint(&new);
+    const build_was_enabled = old.build_enable;
+    const sub_projects_changed = old.build_sub_projects != new.build_sub_projects;
+    const watcher_changed = old.files_watcher != new.files_watcher;
+    const inlay_changed = old.inlay_types != new.inlay_types or old.inlay_capture_types != new.inlay_capture_types or
+        old.inlay_field_types != new.inlay_field_types or
+        old.inlay_anonymous_containers != new.inlay_anonymous_containers or
+        old.inlay_parameters != new.inlay_parameters or old.inlay_builtin_parameters != new.inlay_builtin_parameters or
+        old.inlay_exclude_single_argument != new.inlay_exclude_single_argument or
+        old.hide_redundant_param_names != new.hide_redundant_param_names or old.inlay_max_length != new.inlay_max_length or
+        old.callsite_seeding != new.callsite_seeding;
+    const compiler_disabled = old.compiler_diagnostics and !new.compiler_diagnostics;
+    const log_file_changed = !eqlOptionalStr(old.log_file, new.log_file);
     server.applyLogging(&new, log_file_changed);
     server.applyCacheLimits(&new);
-    server.config.deinit(server.gpa);
-    server.config = new;
-    server.config_mutex.unlock(server.io);
+    try server.setConfig(new);
     server.wakeProjectWaiters();
     if (inactive_changed or naming_changed or unused_changed or lint_changed) server.publishOpenFiles();
     if (watcher_changed) server.resyncWatcher();
@@ -3077,9 +3074,8 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
 
 /// Whether build system integration and compiler diagnostics are enabled
 pub fn buildFlags(server: *Server) struct { build: bool, compiler: bool } {
-    server.config_mutex.lockUncancelable(server.io);
-    defer server.config_mutex.unlock(server.io);
-    return .{ .build = server.config.build_enable, .compiler = server.config.compiler_diagnostics };
+    const config = server.config.load(.acquire);
+    return .{ .build = config.build_enable, .compiler = config.compiler_diagnostics };
 }
 
 /// Stops all projects and clears the compiler diagnostics they published; the module graph is
@@ -3204,14 +3200,9 @@ fn refreshRoot(server: *Server, dir: []const u8) Allocator.Error!bool {
     return true;
 }
 
-/// Log level and slow request threshold; with `reopen_file`, reopens the log file as configured
+/// Log level; with `reopen_file`, reopens the log file as configured
 fn applyLogging(server: *Server, config: *const Config, reopen_file: bool) void {
     za.util.log.setLevel(config.log_level);
-    server.slow_request_ms.store(config.slow_request_ms, .monotonic);
-    server.debounce_ms.store(config.debounce_ms, .monotonic);
-    server.max_intern_pool_mb.store(config.max_intern_pool_mb, .monotonic);
-    server.callsite_seeding.store(config.callsite_seeding, .monotonic);
-    server.sub_projects_enabled.store(config.build_sub_projects, .release);
     if (!reopen_file) return;
     za.util.log.setFile(config.log_file) catch |err| {
         log.warn("cannot open log file {s}: {t}", .{ config.log_file.?, err });
@@ -3289,11 +3280,17 @@ fn handleConfigResponse(server: *Server, id: []const u8, result: json.Value, fai
     try server.applyConfig(fresh);
 }
 
-/// A copy of the current configuration (freed by the caller)
-pub fn configSnapshot(server: *Server) Allocator.Error!Config {
-    server.config_mutex.lockUncancelable(server.io);
-    defer server.config_mutex.unlock(server.io);
-    return server.config.clone(server.gpa);
+/// Publishes `config` as the current configuration (taking ownership of it, freed also on
+/// error); `callsite_seeding` is set together with it. Only the main loop sets configurations.
+fn setConfig(server: *Server, config: Config) Allocator.Error!void {
+    var owned = config;
+    errdefer owned.deinit(server.gpa);
+    const ptr = try server.gpa.create(Config);
+    errdefer server.gpa.destroy(ptr);
+    try server.configs.append(server.gpa, ptr);
+    ptr.* = owned;
+    server.config.store(ptr, .release);
+    server.callsite_seeding.store(ptr.callsite_seeding, .release);
 }
 
 fn initialized(server: *Server, arena: Allocator, _: types.InitializedParams) !void {
@@ -3365,8 +3362,7 @@ fn startup(server: *Server) Io.Cancelable!void {
     // The origin rules (the Zig installation and the global cache) are known from here on, also
     // when the zig environment cannot be queried
     defer server.scheduleScan();
-    var config = server.configSnapshot() catch return;
-    defer config.deinit(server.gpa);
+    const config = server.config.load(.acquire);
     const queried = ZigEnv.query(server.gpa, server.io, config.zig_path) catch |err| {
         if (err == error.Canceled) return error.Canceled;
         // `zig build test` deliberately cannot find zig (see `ZigEnv.query`)
@@ -3467,8 +3463,7 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
     // the new one is set
     const old = server.toolchain.load(.acquire);
     const current = old.env;
-    var config = server.configSnapshot() catch Config{};
-    defer config.deinit(gpa);
+    const config = server.config.load(.acquire);
     var buf: [2048]u8 = undefined;
     var notes: std.Io.Writer = .fixed(&buf);
 
@@ -3637,7 +3632,7 @@ pub fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
     const path = server.vfs.path(file);
     const build = server.buildFlags().build;
     if (build) {
-        const sub_projects = server.sub_projects_enabled.load(.acquire);
+        const sub_projects = server.config.load(.acquire).build_sub_projects;
         server.roots_mutex.lockUncancelable(server.io);
         defer server.roots_mutex.unlock(server.io);
         for (server.roots.items, server.root_has_build.items) |root, has_build| {
@@ -3706,12 +3701,7 @@ pub fn projectsPending(server: *Server) bool {
 /// way from the client
 fn holdForProjects(server: *Server) bool {
     if (server.config_pulling.load(.acquire)) return true;
-    const enabled = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        break :blk server.config.wait_for_project;
-    };
-    return enabled and server.projectsPending();
+    return server.config.load(.acquire).wait_for_project and server.projectsPending();
 }
 
 /// Holds a semantic request back (see `holdForProjects`) until it can be answered, or until it is
@@ -3728,7 +3718,7 @@ fn waitForProjects(server: *Server, pending: *const Pending) bool {
 }
 
 /// Called after changing anything `waitForProjects` checks. The caller must not hold the locks it
-/// takes while checking (`config_mutex`, `workspaces_mutex`, a workspace's mutex).
+/// takes while checking (`workspaces_mutex`, a workspace's mutex).
 pub fn wakeProjectWaiters(server: *Server) void {
     server.project_wait_mutex.lockUncancelable(server.io);
     defer server.project_wait_mutex.unlock(server.io);
@@ -3814,7 +3804,7 @@ fn isProjectRoot(server: *Server, root: []const u8) bool {
 /// build.zig, or, while `build.sub_projects` is on, a sub-project (see `sub_projects`) under a root
 /// directory that still has one
 fn startsProject(server: *Server, root: []const u8) bool {
-    const enabled = server.sub_projects_enabled.load(.acquire);
+    const enabled = server.config.load(.acquire).build_sub_projects;
     server.roots_mutex.lockUncancelable(server.io);
     defer server.roots_mutex.unlock(server.io);
     for (server.roots.items, server.root_has_build.items) |r, has_build| {
@@ -3853,7 +3843,7 @@ fn subProjectOf(server: *Server, a: Allocator, path: []const u8) Allocator.Error
 /// its project, while `build.sub_projects` is on (and once the zig environment is known; startup
 /// starts it otherwise, see `refreshSubProjects`)
 fn startSubProjectFor(server: *Server, path: []const u8) void {
-    if (!server.sub_projects_enabled.load(.acquire) or server.zigEnv() == null) return;
+    if (!server.config.load(.acquire).build_sub_projects or server.zigEnv() == null) return;
     const dir = (server.subProjectOf(server.gpa, path) catch return) orelse return;
     defer server.gpa.free(dir);
     server.startWorkspace(dir);
@@ -3861,7 +3851,7 @@ fn startSubProjectFor(server: *Server, path: []const u8) void {
 
 /// Starts the projects of the sub-projects that contain open documents (see `startSubProjectFor`)
 fn startOpenSubProjects(server: *Server) void {
-    if (!server.sub_projects_enabled.load(.acquire) or server.zigEnv() == null) return;
+    if (!server.config.load(.acquire).build_sub_projects or server.zigEnv() == null) return;
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -4594,7 +4584,7 @@ fn debounceTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             }
             seen = edit.generation;
         }
-        const ms = server.debounce_ms.load(.monotonic);
+        const ms = server.config.load(.acquire).debounce_ms;
         if (ms > 0) try (Io.Clock.Duration{ .raw = .fromMilliseconds(ms), .clock = .awake }).sleep(server.io);
     }
     const start = server.semaUsage();
@@ -4646,7 +4636,7 @@ fn semaUsage(server: *Server) SemaUsage {
 /// `sema_peak_growth`). Called when a request or a diagnostics publish that started at `start`
 /// finishes, outside read transactions.
 fn maybeResetSema(server: *Server, start: SemaUsage) void {
-    const limit = server.max_intern_pool_mb.load(.monotonic);
+    const limit = server.config.load(.acquire).max_intern_pool_mb;
     if (limit == 0) return;
     const now = server.semaUsage();
     // A reclaim in the meantime counts as no growth
@@ -5592,11 +5582,7 @@ fn appendUnloadedProjectHint(server: *Server, arena: Allocator, file: Vfs.FileId
 
 /// Inactive code is shown only for open files: it requires inferring all members of the file
 fn wantsInactiveCode(server: *Server, file: Vfs.FileId) bool {
-    {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        if (!server.config.inactive_code) return false;
-    }
+    if (!server.config.load(.acquire).inactive_code) return false;
     server.docs.mutex.lockUncancelable(server.io);
     defer server.docs.mutex.unlock(server.io);
     return server.docs.open.contains(file);
@@ -5663,18 +5649,11 @@ const NamingSettings = struct {
 fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const u8) Allocator.Error!?NamingSettings {
     if (!hintsEligible(server, file, text)) return null;
     const path = server.vfs.path(file);
-    var enable: bool = undefined;
-    var ignore: []const []const u8 = undefined;
-    var exclude: []const []const u8 = undefined;
-    var rules: Config.NamingRules = undefined;
-    {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        enable = server.config.naming_enable;
-        ignore = try dupeStrings(arena, server.config.naming_ignore);
-        exclude = try dupeStrings(arena, server.config.naming_exclude);
-        rules = server.config.naming_rules;
-    }
+    const config = server.config.load(.acquire);
+    var enable = config.naming_enable;
+    var ignore = config.naming_ignore;
+    var exclude = config.naming_exclude;
+    var rules = config.naming_rules;
     // `naming.exclude` paths are relative to the workspace root directory, or to the project root
     // directory when they come from `zig-analyzer.zon`
     var base = try server.rootOf(arena, path);
@@ -5730,12 +5709,7 @@ fn hintsEligible(server: *Server, file: Vfs.FileId, text: []const u8) bool {
 fn unusedFor(server: *Server, file: Vfs.FileId, text: []const u8) bool {
     if (!hintsEligible(server, file, text)) return false;
     const path = server.vfs.path(file);
-    var enable = false;
-    {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        enable = server.config.unused_enable;
-    }
+    var enable = server.config.load(.acquire).unused_enable;
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
@@ -5756,14 +5730,9 @@ fn unusedFor(server: *Server, file: Vfs.FileId, text: []const u8) bool {
 fn lintFor(server: *Server, file: Vfs.FileId, text: []const u8) ?Config.LintRules {
     if (!hintsEligible(server, file, text)) return null;
     const path = server.vfs.path(file);
-    var enable = false;
-    var rules: Config.LintRules = .{};
-    {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        enable = server.config.lint_enable;
-        rules = server.config.lint_rules;
-    }
+    const config = server.config.load(.acquire);
+    var enable = config.lint_enable;
+    var rules = config.lint_rules;
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
@@ -5795,11 +5764,7 @@ fn dupeStrings(arena: Allocator, list: []const []const u8) Allocator.Error![]con
 /// Layout rules of the import block for `file`: the client's settings, overridden by the
 /// `zig-analyzer.zon` of the project containing the file (the innermost one when nested)
 fn importOptionsFor(server: *Server, file: Vfs.FileId) ImportOptions {
-    var options = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        break :blk server.config.importOptions();
-    };
+    var options = server.config.load(.acquire).importOptions();
     const path = server.vfs.path(file);
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
@@ -6035,9 +6000,8 @@ fn semanticTokensDelta(server: *Server, r: *Resolver, arena: Allocator, params: 
 }
 
 fn semanticTokensOptions(server: *Server) ide.semantic_tokens.Options {
-    server.config_mutex.lockUncancelable(server.io);
-    defer server.config_mutex.unlock(server.io);
-    return .{ .partial = server.config.semantic_tokens_mode == .partial, .global_var = server.config.semantic_tokens_global_var };
+    const config = server.config.load(.acquire);
+    return .{ .partial = config.semantic_tokens_mode == .partial, .global_var = config.semantic_tokens_global_var };
 }
 
 fn semanticTokensResult(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, data: []const u32, previous_id: ?[]const u8) HandlerError!SemanticCache.Result {
@@ -6078,16 +6042,17 @@ fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams)
     }
     server.caps.read(params.capabilities);
     if (params.initializationOptions) |options| if (options != .null) {
-        server.config = Config.parse(server.gpa, options) catch |err| switch (err) {
+        var config: Config = Config.parse(server.gpa, options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidConfig => blk: {
                 server.showWarning("invalid zig-analyzer initializationOptions, using defaults");
                 break :blk .{};
             },
         };
-        server.reportConfigWarnings("zig-analyzer settings", &server.config);
-        server.applyLogging(&server.config, server.config.log_file != null);
-        server.applyCacheLimits(&server.config);
+        server.reportConfigWarnings("zig-analyzer settings", &config);
+        server.applyLogging(&config, config.log_file != null);
+        server.applyCacheLimits(&config);
+        try server.setConfig(config);
     };
     log.info("initialized, position encoding {t}", .{server.encoding});
     if (params.processId) |pid| server.watchParent(pid);
@@ -6312,12 +6277,8 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
     // progress (the previous round failed, or the task could not start), it starts again.
     const imports_ready = auto_import and
         server.index.imports_basis.load(.acquire) == importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
-    const max_auto_imports, const snippets, const placeholders = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        const c = &server.config;
-        break :blk .{ c.completion_max_auto_imports, c.completion_snippets, c.completion_argument_placeholders };
-    };
+    const config = server.config.load(.acquire);
+    const max_auto_imports, const snippets, const placeholders = .{ config.completion_max_auto_imports, config.completion_snippets, config.completion_argument_placeholders };
     const import_options = server.importOptionsFor(file);
     // `/` and `"` are trigger characters for paths; typed elsewhere they start no name
     const path_trigger = blk: {
@@ -6511,11 +6472,12 @@ fn hover(server: *Server, r: *Resolver, arena: Allocator, params: types.HoverPar
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
     // Checked before computing: a load that ends during the computation cancels this read
     const incomplete = server.projectsPending();
+    const config = server.config.load(.acquire);
     const info = try ide.hover.hoverWith(r, at.file, at.offset, .{
         .roots = try server.rootsAlloc(arena),
-        .instances = server.config.hover_instances,
-        .layout = server.config.hover_layout,
-        .fqn = server.config.hover_fqn,
+        .instances = config.hover_instances,
+        .layout = config.hover_layout,
+        .fqn = config.hover_fqn,
         // Links to source locations open the file at the line in the client; plain text has none
         .links = if (server.caps.hover_markdown) .{ .ctx = server, .uri = hoverUri } else null,
     }) orelse return null;
@@ -6556,9 +6518,7 @@ fn inlayHint(server: *Server, r: *Resolver, arena: Allocator, params: types.Inla
     const lines = try sourceLines(r.ctx, file);
     const start, const end = server.rangeOffsets(lines, params.range);
     const opts: ide.inlay_hints.Options = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        const c = &server.config;
+        const c = server.config.load(.acquire);
         break :blk .{
             .types = c.inlay_types,
             .capture_types = c.inlay_capture_types,
@@ -6686,7 +6646,7 @@ fn subProjectGap(server: *Server, r: *Resolver, name: []const u8, use: ScopeUse)
         try missing.append(r.arena, .{ .dir = dir, .state = state });
     }
     if (missing.items.len == 0) return null;
-    const enabled = server.sub_projects_enabled.load(.acquire);
+    const enabled = server.config.load(.acquire).build_sub_projects;
     // A project that failed to load stays so until build.zig changes: waiting would not help
     if (enabled) if (handler_sub_projects) |wait| if (!wait.awaited) {
         for (missing.items) |m| if (m.state != .failed) try wait.dirs.append(wait.arena, try wait.arena.dupe(u8, m.dir));
@@ -6733,12 +6693,7 @@ fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
 /// since, or when indexing stopped early) are indexed in the request.
 fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     const scope = try server.searchScope(r);
-    const dependencies = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        break :blk server.config.workspace_symbol_dependencies;
-    };
-    if (dependencies) return scope;
+    if (server.config.load(.acquire).workspace_symbol_dependencies) return scope;
     const rules = try server.originRules(r.arena);
     var user: std.ArrayList(Vfs.FileId) = .empty;
     for (scope) |f| if (!origin.classify(&server.vfs, rules, server.vfs.path(f), false).isLibrary()) try user.append(r.arena, f);
@@ -7164,11 +7119,7 @@ test "rename: source text of the new name" {
 
 fn workspaceSymbol(server: *Server, r: *Resolver, arena: Allocator, params: types.WorkspaceSymbolParams) HandlerError!types.ResultType("workspace/symbol") {
     const scope = try server.symbolScope(r);
-    const limit = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        break :blk server.config.workspace_symbol_limit;
-    };
+    const limit = server.config.load(.acquire).workspace_symbol_limit;
     const syms = try ide.workspace_symbol.search(r, scope, params.query, if (limit == 0) std.math.maxInt(usize) else limit);
     const out = try arena.alloc(types.WorkspaceSymbol, syms.len);
     var m: RangeMapper = .{ .server = server, .r = r };
@@ -7456,8 +7407,7 @@ fn executeCommand(server: *Server, arena: Allocator, params: types.ExecuteComman
     var progress = server.progress.begin(server, title, false);
     defer if (progress) |p| server.progress.end(server, p, "failed");
 
-    var config = server.configSnapshot() catch |err| return err;
-    defer config.deinit(server.gpa);
+    const config = server.config.load(.acquire);
     const argv = [_][]const u8{ config.zig_path orelse "zig", "fetch", args.url };
     const result = std.process.run(server.gpa, server.io, .{
         .argv = &argv,
@@ -7769,8 +7719,7 @@ fn packagesRequest(server: *Server, ctx: *Db.Ctx, arena: Allocator, _: void) Han
     const workspaces = try server.workspaceList(arena);
     defer server.releaseList(arena, workspaces);
     var projects: std.ArrayList(PackagesResult.Project) = .empty;
-    var config = try server.configSnapshot();
-    defer config.deinit(server.gpa);
+    const config = server.config.load(.acquire);
     const env_pkg_dir: ?[]const u8 = if (server.zig_environ.load(.acquire)) |m| m.get("ZIG_LOCAL_PKG_DIR") else server.environ.getAlloc(arena, "ZIG_LOCAL_PKG_DIR") catch null;
     for (roots) |root| {
         // A project's `zig-analyzer.zon` can set `build.args` (such as `--pkg-dir`) and its
