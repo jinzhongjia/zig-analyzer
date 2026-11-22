@@ -350,6 +350,8 @@ The `Configuration` format and in-process AstGen come from the standard library 
 
 `Server` groups its state with the lock that protects it: client capabilities (`ClientCaps`, written once at `initialize`), open documents (`Documents`), the diagnostic publish queue and what was last sent (`PublishQueue`, `Sent`), single-file mode (`SingleFiles`), and background indexing and workspace scans (`Indexing`, `Scans`). Indexing and scans run one pass at a time (`Rerun`): scheduling during a pass makes the running task do another one. Test hooks (`Server.hooks`) exist only in test builds.
 
+`Server.zig` holds the message loop, request scheduling and cancellation, document sync, configuration, and diagnostic publishing. The request handlers live by feature in `server/handlers/` (navigation, completion, hover, inlay hints, references, rename, code actions, document structure, semantic tokens, inspection): they convert between LSP types and the results of `ide/`, and `request_handlers` maps each method to its handler and scheduling mode.
+
 Settings read on hot paths, inside queries, or under locks that come before `config_mutex` (`slow_request_ms`, `debounce_ms`, `max_intern_pool_mb`, `callsite_seeding`, `sub_projects_enabled`, `poll_interval_ms`) are also kept in atomics, written together when the configuration is applied.
 
 ### Write transactions
@@ -408,7 +410,7 @@ Results follow the capabilities: `rename.prepareSupport`, `codeActionLiteralSupp
 
 ### Observability
 
-Slow requests are logged (`log.slow_request_ms`), and `-Dtracy=<dir>` enables tracy. Custom requests are prefixed with `zig-analyzer/`, with result fields in `server/Server.zig`: `status` (query execution counts, hit rates, time, and memory; InternPool and heap usage), `fileStatus`, `packages` (the `build.zig.zon` of each workspace root and the directories its dependencies resolve to), `syntaxTree`, `moduleGraph`, `reloadWorkspace`, and `waitIdle` (returns once background tasks have finished; used by tests and benchmarks). `workspace/executeCommand` runs `zig-analyzer/fetchDependencyHash` (a code action's command that runs `zig fetch` and applies the hash with `workspace/applyEdit`).
+Slow requests are logged (`log.slow_request_ms`), and `-Dtracy=<dir>` enables tracy. Custom requests are prefixed with `zig-analyzer/`, with result fields in `server/handlers/inspection.zig`: `status` (query execution counts, hit rates, time, and memory; InternPool and heap usage), `fileStatus`, `packages` (the `build.zig.zon` of each workspace root and the directories its dependencies resolve to), `syntaxTree`, `moduleGraph`, `reloadWorkspace`, and `waitIdle` (returns once background tasks have finished; used by tests and benchmarks). `workspace/executeCommand` runs `zig-analyzer/fetchDependencyHash` (a code action's command that runs `zig fetch` and applies the hash with `workspace/applyEdit`).
 
 ### Crashes
 
