@@ -29,6 +29,8 @@ Other files under the root directory, outside every module directory, get none, 
 
 The official parser and AstGen recurse per level, so deep files run on a dedicated thread with a stack sized by the estimated depth. Past 409600 levels (102400 on 32-bit), 4 times what `zig ast-check` handles on 64-bit, a file gets no live diagnostics.
 
+A check that could not run (`zig ast-check` cannot be started, crashes, or is ended after 30 seconds; no thread can be spawned for a deep file) gives no live diagnostics and is not cached: the next read of the file runs it again. Results that list the same diagnostics compare equal, so a recomputation that finds the same errors changes nothing downstream.
+
 ## Notes, reference traces, and compile log output
 
 Notes and reference traces map to `relatedInformation`, with messages as in `zig build`. The `@compileLog` output is appended to the `found compile log statement` error, or, when the compiler ties it to no error, to the first error under the build root. When unsaved changes hide that error, the output is published on its own with severity Information.

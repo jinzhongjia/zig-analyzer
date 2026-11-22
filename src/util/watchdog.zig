@@ -16,6 +16,8 @@ pub const Watchdog = struct {
         mutex: Io.Mutex = .init,
         cond: Io.Condition = .init,
         done: bool = false,
+        /// The time ran out and the child process was ended
+        expired: bool = false,
     };
 
     /// `id` identifies a direct child process (its pid on POSIX, its process handle on Windows):
@@ -39,22 +41,28 @@ pub const Watchdog = struct {
         w.thread = null;
     }
 
+    /// Whether the watchdog ended the child process; valid after `stop`
+    pub fn expired(w: *const Watchdog) bool {
+        return w.state.expired;
+    }
+
     fn run(w: *Watchdog, id: std.process.Child.Id, timeout: Io.Timeout) void {
         const io = w.io;
         const deadline = timeout.toDeadline(io);
-        var expired = false;
+        var timed_out = false;
         w.state.mutex.lockUncancelable(io);
         while (!w.state.done) {
             w.state.cond.waitTimeout(io, &w.state.mutex, deadline) catch |err| switch (err) {
                 error.Timeout => {
-                    expired = true;
+                    timed_out = true;
                     break;
                 },
                 error.Canceled => {},
             };
         }
+        w.state.expired = timed_out;
         w.state.mutex.unlock(io);
-        if (expired) terminate(id);
+        if (timed_out) terminate(id);
     }
 
     fn terminate(id: std.process.Child.Id) void {

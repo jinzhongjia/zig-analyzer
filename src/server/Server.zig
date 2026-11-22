@@ -5133,6 +5133,10 @@ fn prepareLive(server: *Server, file: Vfs.FileId) bool {
     const mode = live.modeOf(server.vfs.path(file));
     if (!server.live_prepared.claim(server.io, file, live.Prepared.hash(r.text, mode, r.backend))) return true;
     const result = live.checkWith(server.gpa, server.io, r.backend, server.zig_environ.load(.acquire), r.text, mode) catch return false;
+    if (!result.complete) {
+        result.destroy(server.gpa);
+        return false;
+    }
     server.live_prepared.put(server.io, file, r.text, mode, r.backend, result) catch return false;
     return true;
 }
@@ -6595,8 +6599,8 @@ const StatusResult = struct {
         deps: usize,
         incomplete: u64,
     },
-    /// Cumulative counts of incomplete results by cause (cycles, stack depth)
-    incomplete_causes: struct { cycle: u64, stack: u64 },
+    /// Cumulative counts of incomplete results by cause (cycles, stack depth, unavailable tools)
+    incomplete_causes: struct { cycle: u64, stack: u64, unavailable: u64 },
 };
 
 fn definition(server: *Server, r: *Resolver, arena: Allocator, params: types.DefinitionParams) HandlerError!types.ResultType("textDocument/definition") {
@@ -8312,6 +8316,7 @@ fn status(server: *Server, _: *Db.Ctx, arena: Allocator, _: void) HandlerError!S
         .incomplete_causes = .{
             .cycle = summary.incomplete_causes.get(.cycle),
             .stack = summary.incomplete_causes.get(.stack),
+            .unavailable = summary.incomplete_causes.get(.unavailable),
         },
     };
 }
