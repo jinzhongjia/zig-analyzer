@@ -6,6 +6,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
 const Ast = std.zig.Ast;
 const ErrorBundle = std.zig.ErrorBundle;
 const Environ = std.process.Environ;
@@ -38,6 +39,23 @@ pub const Note = struct {
 pub const Result = struct {
     arena: std.heap.ArenaAllocator.State,
     items: []const Diagnostic,
+    /// False when the check could not run (zig could not be started, crashed or timed out, or no
+    /// thread could be spawned for a deeply nested file): `items` is empty and says nothing about
+    /// the text, so the result is not memoized
+    complete: bool = true,
+
+    /// Same diagnostics, in the same order
+    pub fn eql(a: *const Result, b: *const Result) bool {
+        if (a.complete != b.complete or a.items.len != b.items.len) return false;
+        for (a.items, b.items) |x, y| {
+            if (x.start != y.start or x.end != y.end or !std.mem.eql(u8, x.message, y.message)) return false;
+            if (x.notes.len != y.notes.len) return false;
+            for (x.notes, y.notes) |m, n| {
+                if (m.start != n.start or m.end != n.end or !std.mem.eql(u8, m.message, n.message)) return false;
+            }
+        }
+        return true;
+    }
 
     pub fn destroy(r: *Result, gpa: Allocator) void {
         var arena = r.arena.promote(gpa);
@@ -55,14 +73,15 @@ pub fn check(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Resu
     defer gpa.free(source);
     const depth = try nesting.estimate(gpa, source, nesting.thread_depth);
     if (depth <= nesting.inline_depth) return checkSource(gpa, source, mode);
-    if (depth <= nesting.thread_depth) {
-        var result: Allocator.Error!*Result = undefined;
-        if (std.Thread.spawn(.{ .stack_size = nesting.threadStackSize(depth, nesting.thread_depth) }, checkInto, .{ gpa, source, mode, &result })) |thread| {
-            thread.join();
-            return result;
-        } else |err| log.warn("cannot spawn a thread for AstGen of a deeply nested file: {t}", .{err});
-    }
-    return empty(gpa);
+    // Nested beyond the limit: no diagnostics, a result as final as any other
+    if (depth > nesting.thread_depth) return noDiagnostics(gpa, true);
+    var result: Allocator.Error!*Result = undefined;
+    const thread = std.Thread.spawn(.{ .stack_size = nesting.threadStackSize(depth, nesting.thread_depth) }, checkInto, .{ gpa, source, mode, &result }) catch |err| {
+        log.warn("cannot spawn a thread for AstGen of a deeply nested file: {t}", .{err});
+        return failed(gpa);
+    };
+    thread.join();
+    return result;
 }
 
 fn checkInto(gpa: Allocator, source: [:0]const u8, mode: Mode, result: *Allocator.Error!*Result) void {
@@ -170,11 +189,14 @@ pub const AstCheck = struct {
         const mode = modeOf(vfs.path(file));
         const backend = try ctx.get(LiveBackend, {});
         if (ctx.db.env.live_prepared) |p| if (p.take(ctx.db.io, text, mode, backend)) |r| return r;
-        return checkWith(ctx.db.gpa, ctx.db.io, backend, ctx.db.env.zig_environ.load(.acquire), text, mode);
+        const result = try checkWith(ctx.db.gpa, ctx.db.io, backend, ctx.db.env.zig_environ.load(.acquire), text, mode);
+        // A check that could not run is computed again by the next read
+        if (!result.complete) ctx.markIncomplete(.unavailable);
+        return result;
     }
 
     pub fn eql(a: Value, b: Value) bool {
-        return a == b;
+        return a.eql(b);
     }
 
     pub fn bytes(v: Value) usize {
@@ -195,7 +217,7 @@ pub fn checkWith(gpa: Allocator, io: Io, backend: Backend, environ_map: ?*const 
             error.OutOfMemory => error.OutOfMemory,
             error.Canceled => error.Canceled,
             // zig cannot be run: no live diagnostics (compiler diagnostics are still available)
-            else => empty(gpa),
+            else => failed(gpa),
         },
     };
 }
@@ -247,8 +269,10 @@ pub const Prepared = struct {
     }
 
     /// Puts the result of `checkWith(backend, text, mode)` for file `file`, taking ownership of
-    /// `result`, and records this text as prepared
+    /// `result`, and records this text as prepared. `result` is complete: `AstCheck` runs a check
+    /// that could not run again.
     pub fn put(p: *Prepared, io: Io, file: Vfs.FileId, text: []const u8, mode: Mode, backend: Backend, result: *Result) Allocator.Error!void {
+        assert(result.complete);
         errdefer result.destroy(p.gpa);
         const owned = try p.gpa.dupe(u8, text);
         errdefer p.gpa.free(owned);
@@ -287,12 +311,17 @@ pub const Prepared = struct {
     }
 };
 
-fn empty(gpa: Allocator) Allocator.Error!*Result {
+/// A result without diagnostics; `complete` is false for a check that could not run
+fn noDiagnostics(gpa: Allocator, complete: bool) Allocator.Error!*Result {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     const result = try arena.allocator().create(Result);
-    result.* = .{ .arena = undefined, .items = &.{} };
+    result.* = .{ .arena = undefined, .items = &.{}, .complete = complete };
     result.arena = arena.state;
     return result;
+}
+
+fn failed(gpa: Allocator) Allocator.Error!*Result {
+    return noDiagnostics(gpa, false);
 }
 
 // ── Subprocess backend: zig ast-check ────────────────────────────────
@@ -324,6 +353,15 @@ pub fn checkSubprocess(gpa: Allocator, io: std.Io, zig_exe: []const u8, environ_
     var r = child.stderr.?.readerStreaming(io, &buf);
     const output = try r.interface.allocRemaining(gpa, .limited(16 * 1024 * 1024));
     defer gpa.free(output);
+    // The output of a check that did not finish (timed out, crashed) is partial: exit code 0 means
+    // no errors and 1 errors
+    watchdog.stop();
+    const term = try child.wait(io);
+    if (watchdog.expired()) return error.AstCheckTimedOut;
+    switch (term) {
+        .exited => |code| if (code > 1) return error.AstCheckFailed,
+        else => return error.AstCheckFailed,
+    }
     return parseAstCheckOutput(gpa, text, output);
 }
 
@@ -556,6 +594,7 @@ test "deeply nested text: AstGen on a large stack, nothing beyond the limit" {
         const r = try check(gpa, src.items, .zig);
         defer r.destroy(gpa);
         try testing.expectEqual(0, r.items.len);
+        try testing.expect(r.complete);
     }
 }
 
@@ -598,4 +637,54 @@ test "prepared results: matched by text, mode and backend, taken once, oldest ev
     try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("y", .zig, .in_process)));
     try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = 8;", .zig, .{ .subprocess = "zig" })));
     try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 2)), Prepared.hash("const a = 8;", .zig, .in_process)));
+}
+
+test "results compare by their diagnostics" {
+    const gpa = testing.allocator;
+    const a = try check(gpa, "const a = ;", .zig);
+    defer a.destroy(gpa);
+    const b = try check(gpa, "const a = ;", .zig);
+    defer b.destroy(gpa);
+    const c = try check(gpa, "const a = 1;\nconst a = 2;", .zig);
+    defer c.destroy(gpa);
+    const none = try check(gpa, "const a = 1;", .zig);
+    defer none.destroy(gpa);
+    const not_run = try failed(gpa);
+    defer not_run.destroy(gpa);
+    try testing.expect(a.eql(b));
+    try testing.expect(!a.eql(c));
+    try testing.expect(!none.eql(not_run));
+}
+
+test "a check that could not run is not memoized" {
+    // A zig that failed once must not leave the file without live diagnostics until it is edited
+    const World = @import("../names/resolve_test.zig").World;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/a.zig", "const a = ;");
+    {
+        w.db.beginWrite();
+        defer w.db.endWrite();
+        try w.db.set(LiveBackend, {}, .{ .subprocess = try testing.allocator.dupe(u8, "/nonexistent/zig") }, .low);
+    }
+    var buf: [@import("../database.zig").Db.query_types.len]engine.QueryStats = undefined;
+    const before = w.db.stats(&buf).incomplete_causes.get(.unavailable);
+    for (0..2) |_| {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        const r = try ctx.get(AstCheck, added.file);
+        try testing.expect(!r.complete);
+    }
+    try testing.expectEqual(before + 2, w.db.stats(&buf).incomplete_causes.get(.unavailable));
+    {
+        w.db.beginWrite();
+        defer w.db.endWrite();
+        try w.db.set(LiveBackend, {}, .in_process, .low);
+    }
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    const r = try ctx.get(AstCheck, added.file);
+    try testing.expect(r.complete);
+    try testing.expectEqual(1, r.items.len);
 }

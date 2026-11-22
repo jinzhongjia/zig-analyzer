@@ -188,6 +188,8 @@ pub const IncompleteCause = enum {
     cycle,
     /// Nested computation exceeded the stack depth limit
     stack,
+    /// An external tool the computation runs could not produce a result (`live.AstCheck`)
+    unavailable,
 };
 
 /// Queries executed in one read transaction (in preorder; the call tree can be reconstructed from
