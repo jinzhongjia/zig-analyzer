@@ -1594,7 +1594,7 @@ test "a save sent to a maker that has exited, before the end of its stream is re
     const builds = compiles(&h);
 
     var pause: Workspace.ExitPause = .{};
-    h.server.maker_exit_pause.store(&pause, .release);
+    h.server.hooks.maker_exit.store(&pause, .release);
     // A failing test does not leave the reading task held
     defer pause.release.set(testing.io);
     const first = visibleInstance(&h);

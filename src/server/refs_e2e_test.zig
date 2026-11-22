@@ -470,8 +470,8 @@ test "rename waits for a scan of the workspace folders in progress instead of fa
     // The rename stops in its read transaction. A file created meanwhile schedules a scan, which
     // cannot finish before that read transaction ends: the scan writes the files it found.
     var gate: Server.TestGate = .{ .method = "textDocument/rename", .point = .in_read };
-    h.server.test_gate = &gate;
-    defer h.server.test_gate = null;
+    h.server.hooks.request = &gate;
+    defer h.server.hooks.request = null;
     const id = try h.send("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = position(scale_text, "scale"), .newName = "double" });
     try gate.entered.wait(testing.io);
     const scans = h.server.scan_generation.load(.acquire);
@@ -506,9 +506,9 @@ test "rename answers while scans of the workspace folders keep being scheduled" 
     _ = try h.request("zig-analyzer/waitIdle", {});
     // Each scan schedules another before it finishes, as while source files keep being created: a
     // scan is always pending, and a rename that waited until none was pending did not end
-    h.server.test_rescan.store(true, .release);
+    h.server.hooks.rescan.store(true, .release);
     const renamed = blk: {
-        defer h.server.test_rescan.store(false, .release);
+        defer h.server.hooks.rescan.store(false, .release);
         h.server.scheduleScan();
         break :blk try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = position(scale_text, "scale"), .newName = "double" });
     };
