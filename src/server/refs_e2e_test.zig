@@ -7,6 +7,8 @@ const za = @import("../zig_analyzer.zig");
 const fixture = za.project.fixture;
 const Harness = @import("test_harness.zig").Harness;
 const Server = @import("Server.zig");
+const indexing = @import("indexing.zig");
+const slow_log = @import("slow_log.zig");
 
 const Empty = struct {};
 /// Code action literal support, without which no code actions are returned (each carries an edit)
@@ -222,7 +224,7 @@ test "references, highlight, rename and workspace symbol" {
         _ = try za.ide.hover.hover(&r, lib, @intCast(std.mem.indexOf(u8, lib_text, "hello();").?), &.{}, .count);
         try testing.expect(trace.events.items.len > 0);
         var out: std.Io.Writer.Allocating = .init(a);
-        try h.server.writeSlowReport(&out.writer, &ctx, &trace, 0);
+        try slow_log.writeSlowReport(&h.server, &out.writer, &ctx, &trace, 0);
         const report = out.written();
         try testing.expect(std.mem.indexOf(u8, report, "by query (self time):") != null);
         // Keys in the call tree are shown as "file:member" (a test has no name)
@@ -509,7 +511,7 @@ test "rename answers while scans of the workspace folders keep being scheduled" 
     h.server.hooks.rescan.store(true, .release);
     const renamed = blk: {
         defer h.server.hooks.rescan.store(false, .release);
-        h.server.scheduleScan();
+        indexing.scheduleScan(&h.server);
         break :blk try h.request("textDocument/rename", .{ .textDocument = .{ .uri = lib_uri }, .position = position(scale_text, "scale"), .newName = "double" });
     };
     try testing.expectEqualStrings("lib.zig:0:7 main.zig:2:12", try renameEdits(&h, renamed));

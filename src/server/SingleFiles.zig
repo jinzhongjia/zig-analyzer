@@ -10,6 +10,10 @@ const panic_context = za.util.panic_context;
 const Vfs = za.base.Vfs;
 const compiler = za.diagnostics.compiler;
 const Server = @import("Server.zig");
+const config_sync = @import("config_sync.zig");
+const doc_sync = @import("doc_sync.zig");
+const project_set = @import("project_set.zig");
+const publishing = @import("publishing.zig");
 
 const log = std.log.scoped(.server);
 
@@ -62,8 +66,8 @@ fn owner(s: *SingleFiles) *Server {
 pub fn compile(s: *SingleFiles, file: Vfs.FileId) void {
     const server = s.owner();
     if (!server.startup_done.load(.acquire)) return; // compiled when startup finishes
-    if (server.fileContext(file) != .detached) return;
-    if (!server.buildFlags().compiler) return;
+    if (project_set.fileContext(server, file) != .detached) return;
+    if (!config_sync.buildFlags(server).compiler) return;
     // The compiler reads from disk: a file that is not on disk (a new file not saved yet, a deleted
     // file) is not compiled, and its previous compile result is dropped
     Io.Dir.cwd().access(server.io, server.vfs.path(file), .{}) catch {
@@ -72,7 +76,7 @@ pub fn compile(s: *SingleFiles, file: Vfs.FileId) void {
     };
     // While projects are loading for the first time, the file may turn out to belong to a project:
     // compile it when loading finishes rather than in the wrong context (see `reconcile`)
-    const deferred = server.projectsLoading();
+    const deferred = project_set.projectsLoading(server);
     {
         s.mutex.lockUncancelable(server.io);
         defer s.mutex.unlock(server.io);
@@ -122,7 +126,7 @@ pub fn reconcile(s: *SingleFiles) void {
     // The context is determined outside the lock: that
     // needs the locks of projects and root directories
     for (roots.items) |root| {
-        const detached = server.fileContext(root) == .detached;
+        const detached = project_set.fileContext(server, root) == .detached;
         s.mutex.lockUncancelable(server.io);
         defer s.mutex.unlock(server.io);
         const sf = s.entries.getPtr(root) orelse continue;
@@ -140,7 +144,7 @@ pub fn reconcile(s: *SingleFiles) void {
             _ = s.entries.swapRemove(root);
         }
     }
-    server.publishFiles(affected.keys(), true);
+    publishing.publishFiles(server, affected.keys(), true);
 
     server.docs.mutex.lockUncancelable(server.io);
     const open = gpa.dupe(Vfs.FileId, server.docs.open.keys()) catch {
@@ -160,8 +164,8 @@ pub fn reconcile(s: *SingleFiles) void {
     // context may also have just changed to this one
     var unloaded: std.ArrayList(Vfs.FileId) = .empty;
     defer unloaded.deinit(gpa);
-    for (open) |file| if (server.fileContext(file) == .unloaded_project) unloaded.append(gpa, file) catch {};
-    server.publishFiles(unloaded.items, false);
+    for (open) |file| if (project_set.fileContext(server, file) == .unloaded_project) unloaded.append(gpa, file) catch {};
+    publishing.publishFiles(server, unloaded.items, false);
 }
 
 /// Recompiles single-file mode roots: `roots`, plus the roots whose last
@@ -204,7 +208,7 @@ pub fn drop(s: *SingleFiles, file: Vfs.FileId) bool {
         affected.appendSlice(server.gpa, sf.files.keys()) catch {};
         sf.clearResult(server.gpa);
     }
-    server.publishFiles(affected.items, true);
+    publishing.publishFiles(server, affected.items, true);
     return true;
 }
 
@@ -248,7 +252,7 @@ pub fn clear(s: *SingleFiles) void {
             if (!sf.running) s.entries.swapRemoveAt(i);
         }
     }
-    server.publishFiles(files.items, true);
+    publishing.publishFiles(server, files.items, true);
 }
 
 fn task(s: *SingleFiles, file: Vfs.FileId) Io.Cancelable!void {
@@ -266,7 +270,7 @@ fn task(s: *SingleFiles, file: Vfs.FileId) Io.Cancelable!void {
     while (true) {
         // Taken for every compile: after the zig path configuration changes, recompiles use the new
         // environment
-        const env = server.zigEnv().?;
+        const env = project_set.zigEnv(server).?;
         var inputs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
         const result: ?*compiler.BuildResult = blk: {
             // The file has been deleted from disk (if deleted during a compile, `drop`
@@ -288,20 +292,20 @@ fn task(s: *SingleFiles, file: Vfs.FileId) Io.Cancelable!void {
             defer compiled.deinit(server.gpa);
             errors = compiled.errors.errorMessageCount();
             for (compiled.inputs) |p| {
-                const id = server.toolFile(p) catch continue;
+                const id = doc_sync.toolFile(server, p) catch continue;
                 inputs.put(server.gpa, id, {}) catch continue;
             }
             break :blk compiler.collect(server.gpa, &.{compiled.errors}, std.fs.path.dirname(path) orelse ".", path, server, readDisk) catch null;
         };
         var files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty;
         if (result) |r| for (r.files.keys(), r.files.values()) |p, *fr| {
-            const id = server.toolFile(p) catch continue;
+            const id = doc_sync.toolFile(server, p) catch continue;
             files.put(server.gpa, id, fr) catch continue;
         };
         // During the compile, the file may have stopped being a detached file (its project finished
         // loading, a build.zig was created in its root directory, etc.), or compiler diagnostics
         // may have been turned off: in either case this result is not used
-        const detached = server.fileContext(file) == .detached and server.buildFlags().compiler;
+        const detached = project_set.fileContext(server, file) == .detached and config_sync.buildFlags(server).compiler;
         s.mutex.lockUncancelable(server.io);
         const sf = s.entries.getPtr(file).?;
         if (detached and sf.rerun) {
@@ -334,7 +338,7 @@ fn task(s: *SingleFiles, file: Vfs.FileId) Io.Cancelable!void {
             _ = s.entries.swapRemove(file);
         }
         s.mutex.unlock(server.io);
-        server.publishFiles(affected.items, true);
+        publishing.publishFiles(server, affected.items, true);
         return;
     }
 }

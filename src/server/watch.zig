@@ -2,13 +2,13 @@
 //! when the client cannot register file watchers dynamically (the default for Neovim on Linux), or
 //! when `files.watcher` is configured as `server`. With `auto` and a client that registers file
 //! watchers, the server still watches the files outside the root directories: clients apply the
-//! registered watchers inside the workspace folders only (see `Server.WatchScope`).
+//! registered watchers inside the workspace folders only (see `file_changes.WatchScope`).
 //!
 //! Files of interest: interned `.zig` / `.zon` files (analysis reads any imported file from disk
 //! on demand), plus `build.zig`, `build.zig.zon`, and `zig-analyzer.zon` in each workspace root,
-//! and the configure input directories of projects (see `Server.configureInputDirs`), whose
+//! and the configure input directories of projects (see `file_changes.configureInputDirs`), whose
 //! created and deleted entries are reported too; libraries, which never change, are excluded (see
-//! `Server.watchable`). Changes are handled as `workspace/didChangeWatchedFiles` notifications,
+//! `file_changes.watchable`). Changes are handled as `workspace/didChangeWatchedFiles` notifications,
 //! along the same path as the client's notifications, open documents included: their buffers
 //! take precedence, but builds read the disk. A notification may name a file of interest under
 //! another spelling (see `Spellings`): it counts for that file.
@@ -20,7 +20,7 @@
 //! directories to watch are recomputed when new files are interned, roots are added or removed,
 //! directories are created or deleted, or notifications are lost. Source files created in watched
 //! directories that are not files of interest yet, and directories created or deleted, make the
-//! server scan the root directories for source files again (see `Server.scheduleScan`).
+//! server scan the root directories for source files again (see `indexing.scheduleScan`).
 //! A file becomes of interest when it is interned, and the server may read it before this task
 //! watches it: once it is watched, its known text is compared with the disk, so a change in
 //! between is not lost. A file still being read then, or when a change to it is notified, is
@@ -49,6 +49,8 @@ const types = za.lsp.types;
 const uri = za.base.uri;
 const Vfs = za.base.Vfs;
 const Server = @import("Server.zig");
+const file_changes = @import("file_changes.zig");
+const indexing = @import("indexing.zig");
 const Config = @import("../Config.zig");
 const origin = @import("origin.zig");
 const workspace_files = @import("workspace_files.zig");
@@ -127,10 +129,10 @@ pub const Watcher = struct {
     scan_closed: bool = false,
 
     // ── The following fields are accessed only by the background task ──
-    /// What is being watched (see `Server.WatchScope`); `.none` while not watching
-    scope: Server.WatchScope = .none,
+    /// What is being watched (see `file_changes.WatchScope`); `.none` while not watching
+    scope: file_changes.WatchScope = .none,
     /// The scope seen in the previous round of `run`; null before the first round
-    last_scope: ?Server.WatchScope = null,
+    last_scope: ?file_changes.WatchScope = null,
     /// The scope has widened: the files of interest are compared with the disk once recomputed
     verify: bool = false,
     /// Arena holding `files` and `missing`; replaced as a whole on recomputation
@@ -143,7 +145,7 @@ pub const Watcher = struct {
     /// existing ancestors are watched instead)
     missing: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     /// Configure input directories whose entries are of interest (see
-    /// `Server.configureInputDirs`): identity keys in `state_arena`. Each is also a file of
+    /// `file_changes.configureInputDirs`): identity keys in `state_arena`. Each is also a file of
     /// interest itself, so its appearance and disappearance, and its modification time when
     /// polled, are noticed.
     entry_dirs: std.StringHashMapUnmanaged(void) = .empty,
@@ -166,7 +168,7 @@ pub const Watcher = struct {
     poll_ns: i96 = 0,
     next_poll: ?Io.Timestamp = null,
     /// Files to compare with the disk again: they were being read from disk when compared (see
-    /// `Server.ChangeSource`); allocated by `gpa`
+    /// `file_changes.ChangeSource`); allocated by `gpa`
     reverify: std.ArrayList([]u8) = .empty,
 
     /// Ids of the requests sent by `registerClientGlobs` start with this
@@ -344,7 +346,7 @@ pub const Watcher = struct {
         defer w.deactivate();
         while (!w.stopping.load(.acquire)) {
             w.testPause(&w.test_pause);
-            const scope = w.server.watchScope();
+            const scope = file_changes.watchScope(w.server);
             // Files the server starts watching may have changed while nobody watched them: they
             // are compared with the disk. At startup, they were all just read.
             if (w.last_scope) |last| if (@backingInt(scope) > @backingInt(last)) {
@@ -357,7 +359,7 @@ pub const Watcher = struct {
                 // Clear first, then check: new files interned during the check wake the task
                 // again (see `onNewPath`)
                 w.resync_requested.store(false, .release);
-                if (w.server.clientWatches()) w.registerClientGlobs() catch |err| switch (err) {
+                if (file_changes.clientWatches(w.server)) w.registerClientGlobs() catch |err| switch (err) {
                     error.OutOfMemory => log.err("out of memory while registering file watchers", .{}),
                 };
                 w.backend.wait(null);
@@ -390,7 +392,7 @@ pub const Watcher = struct {
         try c.list.ensureTotalCapacity(w.gpa, count);
         for (c.list.items.len..count) |i| {
             const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
-            const watchable = server.watchable(rules, path);
+            const watchable = file_changes.watchable(server, rules, path);
             c.list.appendAssumeCapacity(.{ .watchable = watchable, .in_root = watchable and server.vfs.rootOf(rules.roots, path) != null });
         }
         return c.list.items;
@@ -432,8 +434,8 @@ pub const Watcher = struct {
             if (std.mem.endsWith(u8, path, ".zig") or std.mem.endsWith(u8, path, ".zon")) continue;
             try globs.append(a, try std.fmt.allocPrint(a, "**/{s}", .{std.fs.path.basename(path)}));
         }
-        for (try server.configureInputDirs(a)) |dir| {
-            if (!server.watchable(rules, dir)) continue;
+        for (try file_changes.configureInputDirs(server, a)) |dir| {
+            if (!file_changes.watchable(server, rules, dir)) continue;
             const base = std.fs.path.basename(dir);
             try globs.append(a, try std.fmt.allocPrint(a, "**/{s}", .{base}));
             try globs.append(a, try std.fmt.allocPrint(a, "**/{s}/*", .{base}));
@@ -460,7 +462,7 @@ pub const Watcher = struct {
 
     /// One round: recompute the watched directories (if needed), wait for notifications or the
     /// time to poll, and handle this batch of changes
-    fn step(w: *Watcher, scope: Server.WatchScope) Allocator.Error!void {
+    fn step(w: *Watcher, scope: file_changes.WatchScope) Allocator.Error!void {
         const io = w.server.io;
         var batch_arena: std.heap.ArenaAllocator = .init(w.gpa);
         defer batch_arena.deinit();
@@ -512,7 +514,7 @@ pub const Watcher = struct {
             // Entries created, removed or renamed in a directory the scan entered
             var dir_changes: Pending = .{};
             try w.dir_poller.poll(io, a, w.fallback_dirs.items, &dir_changes);
-            if (dir_changes.paths.count() != 0) w.server.scheduleScan();
+            if (dir_changes.paths.count() != 0) indexing.scheduleScan(w.server);
             w.poll_ns = start.durationTo(Io.Clock.awake.now(io)).nanoseconds;
             w.schedulePoll();
         };
@@ -566,7 +568,7 @@ pub const Watcher = struct {
     /// that already exist in directories that did not exist before but have appeared now are
     /// recorded in `pending`, and so are the files that were not of interest before, to be
     /// compared with the disk.
-    fn resync(w: *Watcher, a: Allocator, scope: Server.WatchScope, pending: *Pending) Allocator.Error!void {
+    fn resync(w: *Watcher, a: Allocator, scope: file_changes.WatchScope, pending: *Pending) Allocator.Error!void {
         const server = w.server;
         const gpa = w.gpa;
         if (scope == .outside_roots) try w.registerClientGlobs();
@@ -597,8 +599,8 @@ pub const Watcher = struct {
         }
         var entry_dirs: std.StringHashMapUnmanaged(void) = .empty;
         errdefer entry_dirs.deinit(gpa);
-        for (try server.configureInputDirs(na)) |dir| {
-            if (!server.watchable(rules, dir)) continue;
+        for (try file_changes.configureInputDirs(server, na)) |dir| {
+            if (!file_changes.watchable(server, rules, dir)) continue;
             if (outside_only and server.vfs.rootOf(rules.roots, dir) != null) continue;
             const k = try w.key(na, dir);
             try files.put(gpa, k, dir);
@@ -751,7 +753,7 @@ pub const Watcher = struct {
         // root directories after nobody watched them (see `verify`), may miss source files
         if (scope == .all) {
             const missed = if (scan.epoch) |e| e != w.epoch.load(.monotonic) else false;
-            if (missed or w.verify) server.scheduleScan();
+            if (missed or w.verify) indexing.scheduleScan(server);
         }
         log.debug("watching {d} directories ({d} with their subdirectories) for {d} files ({d} files and {d} directories checked periodically)", .{
             own.items.len,
@@ -776,7 +778,7 @@ pub const Watcher = struct {
         var dirs: std.StringHashMapUnmanaged(void) = .empty;
         var all = false;
         // Source files the server does not know yet may belong to the workspace (see
-        // `Server.scheduleScan`), and directories that appear or disappear may hold some
+        // `indexing.scheduleScan`), and directories that appear or disappear may hold some
         var rescan = false;
         var created: std.ArrayList([]const u8) = .empty;
         var dirs_changed: std.ArrayList([]const u8) = .empty;
@@ -853,7 +855,7 @@ pub const Watcher = struct {
                 if (workspace_files.affectsScan(&w.server.vfs, rules, path) and isDir(w.server.io, path)) rescan = true;
             }
         }
-        if (rescan) w.server.scheduleScan();
+        if (rescan) indexing.scheduleScan(w.server);
         if (!all and dirs.count() == 0) return moved;
         for (w.files.keys(), w.files.values()) |k, path| {
             if (!all and !underAny(k, &dirs)) continue;
@@ -885,10 +887,10 @@ pub const Watcher = struct {
             const kind: types.FileChangeType = if (!exists) .Deleted else if (hint == .created) .Created else .Changed;
             try (if (hint == .verify) &verified else &events).append(a, .{ .uri = try uri.fromPath(a, path), .type = kind });
         }
-        if (verified.items.len != 0) try w.reverifyLater(server.applyWatchedChanges(a, verified.items, .verified));
+        if (verified.items.len != 0) try w.reverifyLater(file_changes.applyWatchedChanges(server, a, verified.items, .verified));
         if (events.items.len == 0) return;
         log.debug("{d} file(s) changed on disk", .{events.items.len});
-        try w.reverifyLater(server.applyWatchedChanges(a, events.items, .notified));
+        try w.reverifyLater(file_changes.applyWatchedChanges(server, a, events.items, .notified));
     }
 
     /// Files that were being read from disk when their changes were handled: compared with the
@@ -910,7 +912,7 @@ pub const Watcher = struct {
 const Pending = struct {
     paths: std.StringArrayHashMapUnmanaged(Hint) = .empty,
 
-    /// From the weakest: `verify` (compare with the known text, see `Server.ChangeSource`)
+    /// From the weakest: `verify` (compare with the known text, see `file_changes.ChangeSource`)
     const Hint = enum { verify, changed, created };
 
     fn add(p: *Pending, a: Allocator, path: []const u8, hint: Hint) Allocator.Error!void {
@@ -1032,7 +1034,7 @@ fn isDir(io: Io, path: []const u8) bool {
 }
 
 /// What `Watcher.classify` remembers. Under the same rules, whether an interned path is watched
-/// (`Server.watchable`) and whether it is under a root directory never change (the case rule of a
+/// (`file_changes.watchable`) and whether it is under a root directory never change (the case rule of a
 /// directory is fixed once it has been seen), so each file is classified once instead of on every
 /// recomputation; loading a project recomputes many times while it interns thousands of files.
 const Classes = struct {

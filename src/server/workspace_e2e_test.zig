@@ -7,6 +7,8 @@ const za = @import("../zig_analyzer.zig");
 const fixture = za.project.fixture;
 const Harness = @import("test_harness.zig").Harness;
 const Server = @import("Server.zig");
+const indexing = @import("indexing.zig");
+const project_set = @import("project_set.zig");
 const Workspace = @import("Workspace.zig");
 const watch = @import("watch.zig");
 
@@ -756,7 +758,7 @@ test "shutdown returns while a workspace scan waits for the watch task, which wa
     pause.entered.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } }) catch return error.ChangeNotNoticed;
     // A workspace scan ends meanwhile: it holds the busy count until the watch task handles it
     const generation = h.server.scan.rerun.generation.load(.acquire) + 1;
-    h.server.scheduleScan();
+    indexing.scheduleScan(&h.server);
     const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(60));
     while (h.server.scan.done.load(.acquire) < generation) {
         if (std.Io.Clock.awake.now(testing.io).durationTo(deadline).nanoseconds <= 0) return error.ScanNotDone;
@@ -835,7 +837,7 @@ test "a project is not started for a folder removed before its start" {
     try testing.expect(try (Projects{ .n = 0 }).done(&h));
 
     // The start that startup began for the folder before the removal comes in after it
-    h.server.startWorkspace(second.root);
+    project_set.startWorkspace(&h.server, second.root);
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expect(try (Projects{ .n = 0 }).done(&h));
 
@@ -1244,7 +1246,7 @@ test "a project whose background task cannot be started does not leave the serve
     var server: Server = undefined;
     try server.init(threaded.io(), testing.allocator, &writer);
     defer server.deinit();
-    try server.setToolchain(.{ .env = try server.ownEnv(try za.project.ZigEnv.query(testing.allocator, testing.io, project.env.zig_exe)) });
+    try project_set.setToolchain(&server, .{ .env = try project_set.ownEnv(&server, try za.project.ZigEnv.query(testing.allocator, testing.io, project.env.zig_exe)) });
 
     try testing.expectError(error.ConcurrencyUnavailable, Workspace.start(&server, project.root, 0));
     const busy = server.busy;
@@ -1841,7 +1843,7 @@ test "abandoning a restart clears the previous compiler diagnostics and keeps th
         try testing.io.sleep(.fromMilliseconds(50), .awake);
     } else return error.TestUnexpectedResult;
     pending.stop();
-    h.server.abandon(pending);
+    project_set.abandon(&h.server, pending);
     pending.release();
     _ = try h.request("zig-analyzer/waitIdle", {});
     // The old compiler diagnostics are no longer updated: they are no longer shown; the old
@@ -1886,12 +1888,12 @@ test "a restart or build requested through a replaced instance applies to the pr
     // The build request is forwarded to the current instance: files with compiler diagnostics are
     // republished
     const before = (try h.notifications("textDocument/publishDiagnostics")).len;
-    h.server.requestBuild(stale);
+    project_set.requestBuild(&h.server, stale);
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expect((try h.notifications("textDocument/publishDiagnostics")).len > before);
 
     // Restart the current instance
-    h.server.restartWorkspace(stale, 0);
+    project_set.restartWorkspace(&h.server, stale, 0);
     _ = try h.request("zig-analyzer/waitIdle", {});
     try testing.expect(visibleInstance(&h) != current);
     try testing.expect(try lastHas(&h, main_uri, "expected type 'u32'"));

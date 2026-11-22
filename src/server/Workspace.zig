@@ -10,8 +10,8 @@
 //! invisible until its first build completes (or configuration fails); meanwhile the old
 //! instance's model, compile set, and compiler diagnostics remain in effect. If the old instance
 //! has no model, the new instance replaces it as soon as it is configured; if it has one and
-//! configuration fails, the old instance stays (see `Server.restartWorkspace`, `Server.promote`,
-//! `Server.keepOnConfigurationFailure`).
+//! configuration fails, the old instance stays (see `project_set.restartWorkspace`, `project_set.promote`,
+//! `project_set.keepOnConfigurationFailure`).
 //! Instances are reclaimed by reference counting: the server's project list, the background task,
 //! and callers that use an instance temporarily each hold one reference.
 //!
@@ -28,6 +28,12 @@ const ErrorBundle = std.zig.ErrorBundle;
 
 const za = @import("../zig_analyzer.zig");
 const Server = @import("Server.zig");
+const config_sync = @import("config_sync.zig");
+const doc_sync = @import("doc_sync.zig");
+const file_changes = @import("file_changes.zig");
+const indexing = @import("indexing.zig");
+const project_set = @import("project_set.zig");
+const publishing = @import("publishing.zig");
 const origin = @import("origin.zig");
 const bsp = za.project.bsp;
 const builtin = za.project.builtin;
@@ -78,9 +84,9 @@ refs: std.atomic.Value(u32) = .init(0),
 /// protected by `Server.workspaces_mutex`
 successor: ?*Workspace = null,
 /// The caller has decided where this instance goes: added to the project list, attached to an old
-/// instance, or discarded (see `Server.startWorkspace`, `Server.restartWorkspace`).
-/// Only after this does the background task handle events, and only then can `Server.isVisible`
-/// and `Server.promote` decide based on the placement.
+/// instance, or discarded (see `project_set.startWorkspace`, `project_set.restartWorkspace`).
+/// Only after this does the background task handle events, and only then can `project_set.isVisible`
+/// and `project_set.promote` decide based on the placement.
 placed: Io.Event = .unset,
 
 mutex: Io.Mutex = .init,
@@ -132,7 +138,7 @@ built: bool = false,
 /// The first load has finished: the build graph was read and the compile set computed, or loading
 /// failed or the instance has ended. Before that, it is not yet known which files outside the root
 /// directory belong to the project, so single-file mode defers compiling (see
-/// `Server.projectsLoading`).
+/// `project_set.projectsLoading`).
 load_done: bool = false,
 /// Another build request arrived during the build: the result of this round is discarded, and the
 /// project is rebuilt as soon as the round finishes
@@ -199,7 +205,7 @@ const generated_recompute_cost_factor = 4;
 /// goes.
 pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace {
     const gpa = server.gpa;
-    const env = server.zigEnv() orelse return error.ZigNotFound;
+    const env = project_set.zigEnv(server) orelse return error.ZigNotFound;
     const ws = try gpa.create(Workspace);
     errdefer gpa.destroy(ws);
     // One reference belongs to the background task, one to the caller
@@ -318,7 +324,7 @@ fn destroy(ws: *Workspace) void {
 
 /// A change on disk of `files` (owned by the project) was notified. During a build, returns true:
 /// whether to rebuild for them is decided when the build completes, by comparing the disk with
-/// what the latest rebuild was based on (`Server.changedSinceBuilt`). The build may be writing
+/// what the latest rebuild was based on (`project_set.changedSinceBuilt`). The build may be writing
 /// them itself (a step that generates code into the source tree): what was read in the middle of
 /// such a write is not what any build reads, and taking it as the basis would rebuild once more
 /// when the write's own notification comes. Returns false when no build is in progress.
@@ -369,7 +375,7 @@ pub fn requestBuild(ws: *Workspace) void {
     };
     if (replaced) {
         log.info("{s}: the local cache directory of zig build was deleted or replaced, restarting", .{ws.root});
-        ws.server.restartWorkspace(ws, 0);
+        project_set.restartWorkspace(ws.server, ws, 0);
         return;
     }
     // The compiler is not run and there are no generated files to produce: do not build, but
@@ -491,8 +497,8 @@ fn finishLoading(ws: *Workspace) void {
         if (ws.load_done) return;
         ws.load_done = true;
     }
-    ws.server.wakeProjectWaiters();
-    ws.server.requestAutoImportIndex();
+    project_set.wakeProjectWaiters(ws.server);
+    indexing.requestAutoImportIndex(ws.server);
     ws.server.single.reconcile();
 }
 
@@ -522,7 +528,7 @@ pub fn liveEligible(ws: *Workspace, file: FileId) bool {
 }
 
 /// Whether this project takes part in the module graph: it has a model and a compile set (see
-/// `Server.updateModuleGraph`)
+/// `indexing.updateModuleGraph`)
 pub fn inModuleGraph(ws: *Workspace) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
@@ -617,7 +623,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
                     // A failure of the maker, shown to the user: not an error of the server
                     log.warn("{s}: build system exited unexpectedly: {t} ({?t})", .{ ws.root, err, client.readError() });
                     ws.server.showWarning("zig build keeps exiting unexpectedly, compiler diagnostics are unavailable until build.zig is saved");
-                    ws.server.abandon(ws);
+                    project_set.abandon(ws.server, ws);
                 } else {
                     log.info("{s}: build system exited unexpectedly ({t}, {?t}), restarting", .{ ws.root, err, client.readError() });
                     // Count as busy during the restart: this instance may not be busy when it
@@ -625,7 +631,7 @@ fn run(ws: *Workspace) Io.Cancelable!void {
                     // instance counts as busy, otherwise the new instance's progress may end only
                     // after shutdown
                     ws.server.busyBegin();
-                    ws.server.restartWorkspace(ws, next);
+                    project_set.restartWorkspace(ws.server, ws, next);
                     ws.server.busyEnd();
                 }
             }
@@ -684,7 +690,7 @@ fn reportConfigureExit(ws: *Workspace, client: *bsp.Client) void {
     }) catch null;
     defer if (message) |m| gpa.free(m);
     ws.server.showWarning(message orelse "zig build cannot configure the project; compiler diagnostics are unavailable until build.zig or the build settings change");
-    ws.server.abandon(ws);
+    project_set.abandon(ws.server, ws);
 }
 
 fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
@@ -704,11 +710,11 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
         .handshake => |h| if (h.version != bsp.protocol_version) {
             log.err("{s}: build system protocol version {d} does not match supported version {d}", .{ ws.root, h.version, bsp.protocol_version });
             ws.stop();
-            ws.server.abandon(ws);
+            project_set.abandon(ws.server, ws);
         },
         .configuration => |path| {
             // The project is not started when the user's zig differs from the version used at
-            // compile time (see `Server.startWorkspace`), so the build graph format matches
+            // compile time (see `project_set.startWorkspace`), so the build graph format matches
             ws.reportLoading("Reading build graph");
             var model = configuration.load(ws.gpa, io, ws.root, path, ws.env) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -755,7 +761,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             for (ws.model.?.configure_inputs) |input| if (!input.directory) {
                 _ = try ws.server.vfs.intern(input.path);
             };
-            if (ws.model.?.configure_inputs.len != 0) ws.server.resyncWatcher();
+            if (ws.model.?.configure_inputs.len != 0) file_changes.resyncWatcher(ws.server);
             try ws.recomputeCompileSet();
             // If the old instance has no model worth keeping, there is no need to wait for the
             // whole build to finish
@@ -795,7 +801,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             // graph, named imports would stop resolving and references and rename would miss
             // their importers until the configuration is fixed. The configuration errors replace
             // its compiler diagnostics, as in `zig build`.
-            if (ws.server.keepOnConfigurationFailure(ws)) |old| {
+            if (project_set.keepOnConfigurationFailure(ws.server, ws)) |old| {
                 defer old.release();
                 try ws.storeResult(old);
             } else try ws.finishBuild();
@@ -854,7 +860,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             ws.mutex.unlock(io);
             defer changed.deinit(ws.gpa);
             // The steps that may write the files are done (see `deferChanges`)
-            const differs = ws.server.changedSinceBuilt(changed.keys()) catch return;
+            const differs = project_set.changedSinceBuilt(ws.server, changed.keys()) catch return;
             // A change to build for, counted like a requested build (see `Server.build_requests`)
             if (differs) _ = ws.server.build_requests.fetchAdd(1, .acq_rel);
             ws.mutex.lockUncancelable(io);
@@ -893,7 +899,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 if (replaced) {
                     ws.clearBundles();
                     log.info("{s}: the local cache directory of zig build was deleted or replaced during the build, restarting", .{ws.root});
-                    ws.server.restartWorkspace(ws, 0);
+                    project_set.restartWorkspace(ws.server, ws, 0);
                     ws.server.busyEnd();
                     return;
                 }
@@ -956,7 +962,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 }
                 ws.mutex.unlock(io);
                 defer late.deinit(ws.gpa);
-                if (ws.server.changedSinceBuilt(late.keys()) catch true) {
+                if (project_set.changedSinceBuilt(ws.server, late.keys()) catch true) {
                     _ = ws.server.build_requests.fetchAdd(1, .acq_rel);
                     again = true;
                 }
@@ -1063,7 +1069,7 @@ fn finishBuild(ws: *Workspace) Allocator.Error!void {
 }
 
 /// Converts the errors collected in this round into diagnostics, replaces the result of `target`
-/// (this instance, or the old instance that stays in effect, see `Server.keepOnConfigurationFailure`)
+/// (this instance, or the old instance that stays in effect, see `project_set.keepOnConfigurationFailure`)
 /// with them, and republishes the files that had or now have diagnostics
 fn storeResult(ws: *Workspace, target: *Workspace) Allocator.Error!void {
     defer ws.clearBundles();
@@ -1075,7 +1081,7 @@ fn storeResult(ws: *Workspace, target: *Workspace) Allocator.Error!void {
     var files: std.AutoArrayHashMapUnmanaged(FileId, *const compiler.FileResult) = .empty;
     errdefer files.deinit(ws.gpa);
     for (result.files.keys(), result.files.values()) |path, *fr| {
-        try files.put(ws.gpa, try ws.server.toolFile(path), fr);
+        try files.put(ws.gpa, try doc_sync.toolFile(ws.server, path), fr);
     }
 
     // Affected files: files with compiler diagnostics in the previous round or this one
@@ -1105,23 +1111,23 @@ fn storeResult(ws: *Workspace, target: *Workspace) Allocator.Error!void {
     // For a new instance created by a restart, the first result replaces the old instance along
     // with the model and the compile set
     if (target == ws) ws.promote(.built);
-    ws.server.publishFiles(affected.items, true);
+    publishing.publishFiles(ws.server, affected.items, true);
 }
 
 /// A new instance created by a restart has reached `stage`: replaces the old instance (see
-/// `Server.promote`), updates the module graph, republishes open files and the files the old
+/// `project_set.promote`), updates the module graph, republishes open files and the files the old
 /// instance published compiler diagnostics for, and lets single-file mode converge to the new
 /// module graph
-fn promote(ws: *Workspace, stage: Server.PromoteStage) void {
-    const old = ws.server.promote(ws, stage) orelse return;
+fn promote(ws: *Workspace, stage: project_set.PromoteStage) void {
+    const old = project_set.promote(ws.server, ws, stage) orelse return;
     defer old.release();
-    ws.server.updateModuleGraph();
-    ws.server.publishOpenFiles();
+    indexing.updateModuleGraph(ws.server);
+    publishing.publishOpenFiles(ws.server);
     old.mutex.lockUncancelable(ws.server.io);
     const stale = ws.gpa.dupe(FileId, old.result_files.keys()) catch &.{};
     old.mutex.unlock(ws.server.io);
     defer ws.gpa.free(stale);
-    ws.server.publishFiles(stale, true);
+    publishing.publishFiles(ws.server, stale, true);
     ws.server.single.reconcile();
 }
 
@@ -1148,7 +1154,7 @@ pub fn clearResult(ws: *Workspace) void {
     ws.result_files.clearRetainingCapacity();
     ws.mutex.unlock(ws.server.io);
     defer ws.gpa.free(stale);
-    ws.server.publishFiles(stale, true);
+    publishing.publishFiles(ws.server, stale, true);
 }
 
 fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
@@ -1303,9 +1309,9 @@ fn recomputeLocked(ws: *Workspace) Allocator.Error!void {
     // A change of the compile set affects which modules files belong to, live diagnostics of open
     // files, and whether files are compiled in single-file mode. A new instance that has not
     // replaced the old one yet has no effect (everything is updated when it replaces it).
-    if (!ws.server.isVisible(ws)) return;
-    ws.server.updateModuleGraph();
-    ws.server.publishOpenFiles();
+    if (!project_set.isVisible(ws.server, ws)) return;
+    indexing.updateModuleGraph(ws.server);
+    publishing.publishOpenFiles(ws.server);
     ws.server.single.reconcile();
 }
 

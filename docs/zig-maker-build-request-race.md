@@ -29,7 +29,7 @@ Line numbers refer to Zig 0.17.0, with Zig 0.17.1 in parentheses. The parts of `
 
 ## Workaround
 
-`Workspace.run` (`src/server/Workspace.zig`): when the stream of the maker ends after the build graph was read, and the instance is not being stopped, the project is restarted at once as a new instance (`Server.restartWorkspace`; see "Restarts" in [design.md](design.md)).
+`Workspace.run` (`src/server/Workspace.zig`): when the stream of the maker ends after the build graph was read, and the instance is not being stopped, the project is restarted at once as a new instance (`project_set.restartWorkspace`; see "Restarts" in [design.md](design.md)).
 
 - The new maker configures the project and builds the files as they are on disk. Until its first build completes, the previous model and compiler diagnostics stay in effect, so a crash publishes no wrong or missing diagnostics.
 - A build that was in progress when the maker exited (its request had been written) ends its progress with "Build interrupted", and the first build of the new instance covers it; saves made during the restart are built by the new instance once it has configured. No saved change is lost.

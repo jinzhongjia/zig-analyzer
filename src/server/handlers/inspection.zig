@@ -16,7 +16,9 @@ const origin = @import("../origin.zig");
 const ModuleGraph = za.names.ModuleGraph;
 
 const Server = @import("../Server.zig");
-const FileContext = Server.FileContext;
+const config_sync = @import("../config_sync.zig");
+const project_set = @import("../project_set.zig");
+const FileContext = project_set.FileContext;
 const HandlerError = Server.HandlerError;
 
 const StatusResult = struct {
@@ -130,8 +132,8 @@ pub fn fileStatus(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: Docum
     const Project = @typeInfo(@FieldType(FileStatusResult, "projects")).pointer.child;
     var projects: std.ArrayList(Project) = .empty;
     {
-        const list = try server.workspaceList(arena);
-        defer server.releaseList(arena, list);
+        const list = try project_set.workspaceList(server, arena);
+        defer project_set.releaseList(server, arena, list);
         for (list) |ws| if (ws.contains(file)) try projects.append(arena, .{ .root = try arena.dupe(u8, ws.root), .last_build = ws.lastBuild() });
     }
     var roots: std.ArrayList([]const u8) = .empty;
@@ -145,7 +147,7 @@ pub fn fileStatus(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: Docum
     return .{
         .path = server.vfs.path(file),
         .origin = server.fileOrigin(file),
-        .context = server.fileContext(file),
+        .context = project_set.fileContext(server, file),
         .open = open,
         .modules = modules.items,
         .projects = projects.items,
@@ -163,8 +165,8 @@ fn moduleName(server: *Server, g: *const ModuleGraph, module: u32) []const u8 {
 /// resolve to. The manifest text is the open buffer when there is one, the file on disk otherwise.
 pub fn packagesRequest(server: *Server, ctx: *Db.Ctx, arena: Allocator, _: void) HandlerError!PackagesResult {
     const roots = try server.rootsAlloc(arena);
-    const workspaces = try server.workspaceList(arena);
-    defer server.releaseList(arena, workspaces);
+    const workspaces = try project_set.workspaceList(server, arena);
+    defer project_set.releaseList(server, arena, workspaces);
     var projects: std.ArrayList(PackagesResult.Project) = .empty;
     const config = server.config.load(.acquire);
     const env_pkg_dir: ?[]const u8 = if (server.zig_environ.load(.acquire)) |m| m.get("ZIG_LOCAL_PKG_DIR") else server.environ.getAlloc(arena, "ZIG_LOCAL_PKG_DIR") catch null;

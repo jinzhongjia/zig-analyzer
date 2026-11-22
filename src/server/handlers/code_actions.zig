@@ -14,6 +14,9 @@ const package_manifest = za.project.manifest;
 const Resolver = za.names.resolve.Resolver;
 
 const Server = @import("../Server.zig");
+const config_sync = @import("../config_sync.zig");
+const doc_sync = @import("../doc_sync.zig");
+const file_diagnostics = @import("../file_diagnostics.zig");
 const references = @import("references.zig");
 const rename = @import("rename.zig");
 const HandlerError = Server.HandlerError;
@@ -99,16 +102,16 @@ pub fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types
             if (try removeParamAction(server, r, arena, doc_uri, range, t, params.context.diagnostics)) |action| try out.append(arena, .{ .CodeAction = action });
         }
     }
-    if (wantsKind(only, types.CodeActionKind.QuickFix)) if (try server.namingFor(arena, file, text)) |settings| {
+    if (wantsKind(only, types.CodeActionKind.QuickFix)) if (try file_diagnostics.namingFor(server, arena, file, text)) |settings| {
         for (try ide.naming.findings(r, file, .{ .start = start, .end = end })) |f| {
             if (!settings.allows(f)) continue;
             const range = lines.range(f.start, f.end, server.encoding);
             if (try namingAction(server, r, arena, doc_uri, range, f, params.context.diagnostics)) |action| try out.append(arena, .{ .CodeAction = action });
         }
     };
-    if (wantsKind(only, types.CodeActionKind.QuickFix)) if (server.lintFor(file, text)) |rules| {
+    if (wantsKind(only, types.CodeActionKind.QuickFix)) if (file_diagnostics.lintFor(server, file, text)) |rules| {
         for (try ide.lint.findings(r, file, .{ .start = start, .end = end })) |f| {
-            if (!Server.lintAllows(rules, f.rule)) continue;
+            if (!file_diagnostics.lintAllows(rules, f.rule)) continue;
             const fix = f.fix orelse continue;
             const range = lines.range(f.start, f.end, server.encoding);
             var action: types.CodeAction = .{
@@ -292,7 +295,7 @@ pub fn executeCommand(server: *Server, arena: Allocator, params: types.ExecuteCo
     if (arguments.len == 0) return error.InvalidParams;
     const args = std.json.parseFromValueLeaky(FetchHashArgs, arena, arguments[0], .{ .ignore_unknown_fields = true }) catch return error.InvalidParams;
     if (!server.caps.apply_edit) return error.InvalidParams;
-    const path = (try server.documentPath(arena, args.uri)) orelse return error.InvalidParams;
+    const path = (try doc_sync.documentPath(server, arena, args.uri)) orelse return error.InvalidParams;
     const dir = std.fs.path.dirname(path) orelse return error.InvalidParams;
 
     const title = try std.fmt.allocPrint(arena, "fetching hash for `{s}`", .{args.dependency});

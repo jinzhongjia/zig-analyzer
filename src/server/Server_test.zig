@@ -1,6 +1,9 @@
 const std = @import("std");
 const testing = std.testing;
 const Server = @import("Server.zig");
+const indexing = @import("indexing.zig");
+const project_set = @import("project_set.zig");
+const publishing = @import("publishing.zig");
 const za = @import("../zig_analyzer.zig");
 const transport = za.lsp.transport;
 const FileText = @import("../database.zig").inputs.FileText;
@@ -955,7 +958,7 @@ test "resetting type information gives the same hover results" {
 
     const items = h.server.ip.count();
     // The reclaim waits until the task of the hover request has ended its read transaction
-    while (!h.server.resetSema()) std.Thread.yield() catch {};
+    while (!publishing.resetSema(&h.server)) std.Thread.yield() catch {};
     try testing.expect(h.server.ip.count() < items);
     const after = try h.request("textDocument/hover", at);
     try testing.expectEqualStrings(contents, after.object.get("result").?.object.get("contents").?.object.get("value").?.string);
@@ -1210,7 +1213,7 @@ test "a module graph update does not cancel the folding and selection requests i
         try gate.entered.wait(testing.io);
         // Another default builtin.zig changes the module graph, as a zig environment query does
         try setDefaultBuiltin(&h.server, try std.fmt.allocPrint(testing.allocator, "/zig-analyzer-test/builtin-{d}.zig", .{i}));
-        const update = try std.Thread.spawn(.{}, Server.updateModuleGraph, .{&h.server});
+        const update = try std.Thread.spawn(.{}, indexing.updateModuleGraph, .{&h.server});
         defer update.join();
         // The update waits for the held request
         while (h.server.db.pending_write.load(.acquire) == 0) std.Thread.yield() catch {};
@@ -1253,7 +1256,7 @@ test "a request interrupted by an update the server made on its own is answered,
     try gate.entered.wait(testing.io);
     // Another default builtin.zig changes the module graph, as a zig environment query does
     try setDefaultBuiltin(&h.server, try testing.allocator.dupe(u8, "/zig-analyzer-test/builtin-retry.zig"));
-    const update = try std.Thread.spawn(.{}, Server.updateModuleGraph, .{&h.server});
+    const update = try std.Thread.spawn(.{}, indexing.updateModuleGraph, .{&h.server});
     defer update.join();
     // The update waits for the held request, whose reads are canceled from here on
     while (h.server.db.pending_write.load(.acquire) == 0) std.Thread.yield() catch {};
@@ -2335,7 +2338,7 @@ test "a module graph update compared while a write transaction waits for the loc
     try h.notify("initialized", struct {}{});
     _ = try h.request("zig-analyzer/waitIdle", {});
     // The module graph now equals what another update computes
-    h.server.updateModuleGraph();
+    indexing.updateModuleGraph(&h.server);
     _ = try h.request("zig-analyzer/waitIdle", {});
     const writes = h.server.db.writes.load(.monotonic);
 
@@ -2343,7 +2346,7 @@ test "a module graph update compared while a write transaction waits for the loc
     h.server.hooks.graph = &gate;
     defer h.server.hooks.graph = null;
     {
-        const updater = try std.Thread.spawn(.{}, Server.updateModuleGraph, .{&h.server});
+        const updater = try std.Thread.spawn(.{}, indexing.updateModuleGraph, .{&h.server});
         // Lets the held comparison finish when the test fails before releasing it
         errdefer {
             gate.release.set(testing.io);
@@ -2582,5 +2585,5 @@ test "case-variant URIs of one file: each keeps its text and gets the diagnostic
 /// Replaces the default builtin.zig of the current toolchain, taking ownership of `path`
 fn setDefaultBuiltin(server: *Server, path: []const u8) !void {
     const current = server.toolchain.load(.acquire);
-    try server.setToolchain(.{ .env = current.env, .source_tree = current.source_tree, .default_builtin = path });
+    try project_set.setToolchain(server, .{ .env = current.env, .source_tree = current.source_tree, .default_builtin = path });
 }
