@@ -6,6 +6,7 @@
 //! `continue :`, lists labels; otherwise lists the names visible at the cursor (local names and
 //! the declarations of enclosing containers). When `build.zig.zon` has no result type, its fields
 //! and paths are listed by the built-in schema (see `manifest.zig`).
+//! Keywords are offered where the syntax admits them (see `addKeywords`).
 //! No completion in comments and strings (other than `@import("` and the paths of `build.zig.zon`).
 //! With snippets, functions and builtins complete as calls (see `addCallSnippets`), and common
 //! snippets are also offered where a statement or a declaration starts (see `addKeywordSnippets`).
@@ -43,6 +44,7 @@ const fuzzy = @import("../ide_db/fuzzy.zig");
 const value = @import("../sema/value.zig");
 const engine = @import("../db/engine.zig");
 const mem = @import("../util/mem.zig");
+const Parse = @import("../syntax/Parse.zig");
 
 pub const Options = struct {
     auto_import: bool = true,
@@ -118,7 +120,7 @@ pub const Item = struct {
         target: imports.Target,
     };
 
-    pub const Kind = enum { param, type_param, constant, variable, function, method, namespace, @"struct", @"enum", type, field, enum_member, error_name, builtin, module, file, folder, label, snippet };
+    pub const Kind = enum { param, type_param, constant, variable, function, method, namespace, @"struct", @"enum", type, field, enum_member, error_name, builtin, module, file, folder, label, keyword, snippet };
     pub const Range = struct { start: u32, end: u32 };
 };
 
@@ -139,9 +141,15 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     // again
     const incomplete = name == null and visible.context == .scope and
         (options.auto_import or visible.roots.len != 0) and namePosition(root, text, offset);
-    if (name == null and !options.snippets) return .{ .items = base, .is_incomplete = incomplete };
+    // Keywords and snippets start a statement, a member, or an expression in scope
+    const pos: ?Position = switch (visible.context) {
+        .none, .scope => try positionOf(r.arena, root, text, offset),
+        else => null,
+    };
     var items: std.ArrayList(Item) = .empty;
     try items.appendSlice(r.arena, base);
+    if (pos) |p| try addKeywords(r, file, text, visible, p, &items);
+    if (name == null and !options.snippets) return .{ .items = items.items, .is_incomplete = incomplete };
     var result: Result = .{ .items = &.{}, .is_incomplete = incomplete, .import_position = name != null and (options.auto_import or options.detect_import_position) };
     if (name) |n| {
         const limit = options.max_auto_imports;
@@ -206,10 +214,6 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
         try items.appendSlice(r.arena, extra.items);
     }
     if (options.snippets) {
-        const pos: ?Position = switch (visible.context) {
-            .none, .scope => try positionOf(r.arena, root, text, offset),
-            else => null,
-        };
         try addCallSnippets(r, file, text, root, offset, visible, pos, items.items, options.argument_placeholders);
         if (pos) |p| try addKeywordSnippets(r, file, text, offset, visible, p, &items);
     }
@@ -2139,6 +2143,238 @@ fn members(r: *Resolver, out: *Collector, ns: Namespace, same_file: bool) resolv
         const it = tree.items[m];
         if (it.kind == .field) if (it.name) |name| try out.add(.{ .label = name, .kind = .enum_member, .doc = it.doc });
     }
+}
+
+// ── keyword ──
+
+/// Source weight of keywords (see `rank`): the same as snippets
+const keyword_weight = snippet_weight;
+
+const MemberKeyword = struct {
+    name: []const u8,
+    /// Cannot follow `pub`
+    no_pub: bool = false,
+    /// Cannot have a doc comment
+    no_doc: bool = false,
+};
+
+/// Keywords that start a container member
+const member_keywords = [_]MemberKeyword{
+    .{ .name = "pub", .no_pub = true },
+    .{ .name = "const" },
+    .{ .name = "var" },
+    .{ .name = "fn" },
+    .{ .name = "test", .no_pub = true, .no_doc = true },
+    .{ .name = "comptime", .no_pub = true, .no_doc = true },
+    .{ .name = "extern" },
+    .{ .name = "export" },
+    .{ .name = "inline" },
+    .{ .name = "noinline" },
+    .{ .name = "threadlocal" },
+};
+
+/// Keywords that start a statement, besides those that leave it (see `Jumps`)
+const statement_keywords = [_][]const u8{ "const", "var", "if", "for", "while", "switch", "defer", "errdefer", "try", "comptime", "inline", "unreachable" };
+
+/// Keywords that start an expression, besides those that leave it (see `Jumps`)
+const expression_keywords = [_][]const u8{ "if", "switch", "for", "while", "inline", "try", "comptime", "unreachable", "struct", "enum", "union", "opaque", "error", "fn", "packed", "extern" };
+
+/// Keywords that start a type expression (the `PrimaryTypeExpr` of the grammar, without the
+/// labeled loops)
+const type_keywords = [_][]const u8{ "struct", "enum", "union", "opaque", "error", "fn", "packed", "extern", "comptime", "if", "switch" };
+
+/// The `return`, `break` and `continue` that are allowed at a position
+const Jumps = struct {
+    /// In the body of a function or test
+    @"return": bool = false,
+    /// In a loop or a labeled block or switch
+    @"break": bool = false,
+    /// In a loop or a labeled switch
+    @"continue": bool = false,
+};
+
+/// Stands for the word at the cursor when the member is parsed again (see `addKeywords`)
+const keyword_placeholder = "__zig_analyzer_keyword";
+
+/// Keywords that the syntax admits at the word at the cursor: at the start of a container member,
+/// of a statement, of an expression, of a type (with the attributes a pointer type does not have
+/// yet), and of a parameter, and `else` as a switch case. `return` is offered only in the body of a
+/// function or test, `break` only in a loop or a labeled block or switch, `continue` only in a loop
+/// or a labeled switch, none of them inside `defer` and `errdefer`, which they cannot leave.
+///
+/// Error recovery leaves an empty or keyword word out of the syntax tree, so the member at the
+/// cursor is parsed again with a name in place of the word, and the position is that of the name
+fn addKeywords(r: *Resolver, file: FileId, text: []const u8, visible: Visible, pos: Position, items: *std.ArrayList(Item)) resolve.Error!void {
+    // The word starts inside a token (the digits after the `.` of `1.5`, between the characters
+    // of `=>`), or is a number
+    if (pos.prev) |p| if (p.range().end > pos.start) return;
+    if (pos.start < pos.end and std.ascii.isDigit(text[pos.start])) return;
+    const range: Item.Range = .{ .start = pos.start, .end = pos.end };
+    if (pos.kind == .member) {
+        if (betweenFields(pos.node.?, pos.start, pos.end)) return;
+        for (member_keywords) |k| {
+            if ((pos.after_pub and k.no_pub) or (pos.doc and k.no_doc)) continue;
+            try addKeyword(r.arena, items, k.name, range);
+        }
+        return;
+    }
+    if (visible.context != .scope or pos.after_pub or pos.doc) return;
+    const node = try r.itemNode(file, visible.item) orelse return;
+    const member = node.range();
+    if (pos.start < member.start) return;
+    const fragment = try std.mem.concat(r.arena, u8, &.{
+        text[member.start..pos.start],
+        keyword_placeholder,
+        if (pos.end < member.end) text[pos.end..member.end] else "",
+    });
+    const parse = try Parse.createIn(r.arena, fragment, .zig, try r.ctx.get(database.syntax.SyntaxDialect, {}));
+    defer parse.destroy();
+    const root = parse.rootNode();
+    const at = pos.start - member.start;
+    const token = root.tokenAtOffset(at) orelse return;
+    if (token.kind != .identifier or token.offset != at or !std.mem.eql(u8, token.text, keyword_placeholder)) return;
+    // Inside the name, so that a node ending right before it is not taken
+    const path = try root.coveringPath(r.arena, at + 1);
+    if (path.len < 2 or path[path.len - 1].kind() != .name_ref) return;
+    const name = path[path.len - 1];
+    const parent = path[path.len - 2];
+    const tree = try r.itemTree(file);
+    const jumps = jumpsAt(path, switch (tree.items[visible.item].kind) {
+        .@"fn", .@"test" => true,
+        else => false,
+    });
+    if (pos.kind == .statement) {
+        try addKeywordList(r.arena, items, &statement_keywords, range);
+        return addJumps(r.arena, items, jumps, range);
+    }
+    switch (parent.kind()) {
+        .optional_type, .error_union_type => try addKeywordList(r.arena, items, &type_keywords, range),
+        // The child type is the last node; an array length or a sentinel is an expression
+        .array_type, .ptr_type, .slice_type => if (lastChildNode(parent).?.offset != name.offset) {
+            try addExpressionKeywords(r.arena, items, jumps, range);
+        } else {
+            try addKeywordList(r.arena, items, &type_keywords, range);
+            if (parent.kind() == .array_type) return;
+            // Pointer attributes come before the child type, each at most once
+            if (parent.childToken(.keyword_const) == null) try addKeyword(r.arena, items, "const", range);
+            if (parent.childToken(.keyword_volatile) == null) try addKeyword(r.arena, items, "volatile", range);
+            if (parent.childToken(.keyword_allowzero) == null) try addKeyword(r.arena, items, "allowzero", range);
+            if (parent.childNode(.align_clause) == null) try addKeyword(r.arena, items, "align", range);
+            if (parent.childNode(.addrspace_clause) == null) try addKeyword(r.arena, items, "addrspace", range);
+        },
+        // `name: T = value`; a container field without `:` is an enum or union member name, or a
+        // tuple field
+        .var_decl, .container_field => {
+            const before = tokensBefore(parent, name);
+            if (before.equal) {
+                try addExpressionKeywords(r.arena, items, jumps, range);
+            } else if (before.colon) {
+                try addKeywordList(r.arena, items, &type_keywords, range);
+            }
+        },
+        .param => {
+            const before = tokensBefore(parent, name);
+            // A parameter of a function type may have no name
+            const fn_type = path.len < 5 or path[path.len - 5].kind() != .fn_decl;
+            if (before.colon or (fn_type and !before.any)) {
+                try addKeywordList(r.arena, items, &type_keywords, range);
+                try addKeyword(r.arena, items, "anytype", range);
+            }
+            if (!before.any) {
+                try addKeyword(r.arena, items, "comptime", range);
+                try addKeyword(r.arena, items, "noalias", range);
+            }
+        },
+        // The return type
+        .fn_proto => try addKeywordList(r.arena, items, &type_keywords, range),
+        // The tag type of an enum or union
+        .container_decl => try addKeywordList(r.arena, items, &type_keywords, range),
+        // `else` is the only item of its case
+        .switch_case => if (!tokensBefore(parent, name).any and lastChildNode(parent).?.offset == name.offset and parent.childToken(.comma) == null) {
+            try addKeyword(r.arena, items, "else", range);
+        },
+        .test_decl, .error_node => {},
+        else => try addExpressionKeywords(r.arena, items, jumps, range),
+    }
+}
+
+/// The jumps allowed at the deepest node of `path`, a path in a member alone (see `addKeywords`);
+/// `in_fn` when the member is a function or a test
+fn jumpsAt(path: []const SyntaxNode, in_fn: bool) Jumps {
+    var jumps: Jumps = .{};
+    var i = path.len - 1;
+    while (i > 0) {
+        i -= 1;
+        const n = path[i];
+        switch (n.kind()) {
+            .while_expr, .for_expr => {
+                jumps.@"break" = true;
+                jumps.@"continue" = true;
+            },
+            .switch_expr => if (n.childNode(.label) != null) {
+                jumps.@"break" = true;
+                jumps.@"continue" = true;
+            },
+            .block => {
+                if (n.childNode(.label) != null) jumps.@"break" = true;
+                if (i > 0) switch (path[i - 1].kind()) {
+                    .fn_decl, .test_decl => {
+                        jumps.@"return" = in_fn;
+                        return jumps;
+                    },
+                    else => {},
+                };
+            },
+            // Control cannot leave a deferred expression, and a container starts a new scope: only
+            // the loops and labels inside count
+            .defer_stmt, .errdefer_stmt, .container_decl, .fn_proto => return jumps,
+            else => {},
+        }
+    }
+    return jumps;
+}
+
+/// The tokens of `parent` that come before its child `child`
+fn tokensBefore(parent: SyntaxNode, child: SyntaxNode) struct { any: bool = false, colon: bool = false, equal: bool = false } {
+    var out: @TypeOf(tokensBefore(parent, child)) = .{};
+    var it = parent.children();
+    while (it.next()) |c| {
+        if (c.range().start >= child.offset) break;
+        if (isTrivia(c.kind())) continue;
+        out.any = true;
+        switch (c.kind()) {
+            .colon => out.colon = true,
+            .equal => out.equal = true,
+            else => {},
+        }
+    }
+    return out;
+}
+
+fn lastChildNode(node: SyntaxNode) ?SyntaxNode {
+    var last: ?SyntaxNode = null;
+    var it = node.children();
+    while (it.nextNode()) |c| last = c;
+    return last;
+}
+
+fn addExpressionKeywords(arena: Allocator, items: *std.ArrayList(Item), jumps: Jumps, range: Item.Range) Allocator.Error!void {
+    try addKeywordList(arena, items, &expression_keywords, range);
+    try addJumps(arena, items, jumps, range);
+}
+
+fn addJumps(arena: Allocator, items: *std.ArrayList(Item), jumps: Jumps, range: Item.Range) Allocator.Error!void {
+    if (jumps.@"return") try addKeyword(arena, items, "return", range);
+    if (jumps.@"break") try addKeyword(arena, items, "break", range);
+    if (jumps.@"continue") try addKeyword(arena, items, "continue", range);
+}
+
+fn addKeywordList(arena: Allocator, items: *std.ArrayList(Item), list: []const []const u8, range: Item.Range) Allocator.Error!void {
+    for (list) |k| try addKeyword(arena, items, k, range);
+}
+
+fn addKeyword(arena: Allocator, items: *std.ArrayList(Item), keyword: []const u8, range: Item.Range) Allocator.Error!void {
+    try items.append(arena, .{ .label = keyword, .kind = .keyword, .replace = range, .weight = keyword_weight });
 }
 
 // ── snippet ──────────────────────────────────────────────────────────
