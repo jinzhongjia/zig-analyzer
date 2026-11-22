@@ -92,7 +92,7 @@ pub const Item = struct {
     replace: ?Range = null,
     filter: ?[]const u8 = null,
     qualifier: ?[]const u8 = null,
-    /// The rank in name completion (see `rank`)
+    /// The rank in name completion (see `rank` and `rankExpected`)
     sort: ?[]const u8 = null,
     /// Source weight of a name in scope (see `rank`); 0 when it is not a name in scope
     weight: f32 = 0,
@@ -136,6 +136,9 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     if (offset > text.len) return .{ .items = base };
     const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
     const name = if (offset == 0) null else try importPrefix(r.arena, root, text, offset);
+    // With nothing typed, the expected type is found from the syntax at the cursor (see
+    // `expectedAtEmpty`)
+    const expected = if (name == null and visible.context == .scope) try expectedAtEmpty(r, file, offset, visible.at) else null;
     // Before a name is typed in an expression, the member paths of local values and the
     // auto-import candidates are not listed yet: typing a prefix adds them, so the client must ask
     // again
@@ -149,7 +152,10 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     var items: std.ArrayList(Item) = .empty;
     try items.appendSlice(r.arena, base);
     if (pos) |p| try addKeywords(r, file, text, visible, p, &items);
-    if (name == null and !options.snippets) return .{ .items = items.items, .is_incomplete = incomplete };
+    if (name == null and !options.snippets) {
+        try rankExpected(items.items, expected);
+        return .{ .items = items.items, .is_incomplete = incomplete };
+    }
     var result: Result = .{ .items = &.{}, .is_incomplete = incomplete, .import_position = name != null and (options.auto_import or options.detect_import_position) };
     if (name) |n| {
         const limit = options.max_auto_imports;
@@ -217,7 +223,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
         try addCallSnippets(r, file, text, root, offset, visible, pos, items.items, options.argument_placeholders);
         if (pos) |p| try addKeywordSnippets(r, file, text, offset, visible, p, &items);
     }
-    if (name) |n| try rank(r.arena, items.items, n.prefix, try expectedAt(r, file, offset, visible.at));
+    if (name) |n| try rank(r.arena, items.items, n.prefix, try expectedAt(r, file, offset, visible.at)) else try rankExpected(items.items, expected);
     result.items = items.items;
     return result;
 }
@@ -258,6 +264,14 @@ fn higherRank(ctx: Rank, a: Item, b: Item) bool {
 
 fn higherScore(_: void, a: Item, b: Item) bool {
     return a.score > b.score;
+}
+
+/// Order of name completion when nothing is typed (`Item.sort`): candidates whose type fits the
+/// expected type at the cursor sort first, all others after; a client keeps its own order within a
+/// tier. Nothing is filtered, and no sort is set when there is no expected type
+fn rankExpected(items: []Item, expected: ?Expected) resolve.Error!void {
+    const x = expected orelse return;
+    for (items) |*it| it.sort = if (try x.matches(it.origin, it.snippet != null)) "0" else "1";
 }
 
 pub const Description = struct {
@@ -1516,62 +1530,449 @@ fn expectedAt(r: *Resolver, file: FileId, offset: u32, at: ?context.At) resolve.
     const e = a.body.exprAt(a.rel - 1) orelse return null;
     if (a.body.expr(e) != .name_ref) return null;
     const want = try expectedOf(r, a, e) orelse return null;
-    if (!value.isConcrete(a.ip, want) or !try wellFormed(r, file, offset)) return null;
+    if (!value.isConcrete(a.ip, want) or !try wellFormed(r, file, offset, null)) return null;
     return .{ .r = r, .ty = want, .inst = if (a.seeded) |s| s.inst else null };
 }
 
-/// The expected type of the expression `e`, computed from the parent expression and the inference
-/// result: a call argument takes the type of the called function's parameter; `const x: T = e`
-/// (including declarations in containers and default values of fields) takes the annotated type;
-/// `return e` takes the return type of the function; `.f = e` in an initializer takes the type of
-/// the field; `lhs = e` takes the type of the left-hand side; a comparison takes the type of the
-/// other side; `@as(T, e)` takes `T`. The branches of `if`, `switch`, `orelse`, and `catch`, the
-/// value of `break :label`, and `comptime e` take the expected type of the expression they produce
-fn expectedOf(r: *Resolver, a: context.At, e: Body.ExprId) resolve.Error!?Index {
+/// The expected type at a cursor with nothing typed (see `expectedEmptySlot`), by the same rules
+/// as `expectedOf`
+fn expectedAtEmpty(r: *Resolver, file: FileId, offset: u32, at: ?context.At) resolve.Error!?Expected {
+    const found = try expectedEmptySlot(r, at orelse return null, file, offset) orelse return null;
+    const want = try expectedIn(r, found.a, found.parent, found.slot) orelse return null;
+    if (!value.isConcrete(found.a.ip, want) or !try wellFormed(r, file, offset, found.end)) return null;
+    return .{ .r = r, .ty = want, .inst = if (found.a.seeded) |s| s.inst else null };
+}
+
+/// The parent of a slot whose expected type applies: an expression, a local binding's initializer,
+/// or the value of a declaration or field default
+const ExpectedParent = union(enum) {
+    expr: Body.ExprId,
+    binding: Body.BindingId,
+    body,
+};
+
+/// Which part of the parent holds the value whose expected type is wanted
+const ExpectedSlot = union(enum) {
+    /// Argument `n` of a call, or the second argument of `@as` (which may be missing)
+    arg: usize,
+    /// The value of the initializer field named `name`
+    init_field: []const u8,
+    /// The value of `return`
+    return_value,
+    /// The right-hand side of a `=` assignment
+    assign_rhs,
+    /// The left-hand side of a comparison
+    comparison_lhs,
+    /// The right-hand side of a comparison
+    comparison_rhs,
+    /// The right-hand side of `orelse`
+    orelse_rhs,
+    /// The right-hand side of `catch`
+    catch_rhs,
+    /// The value of a `break`
+    break_value,
+    /// A branch whose expected type is the expected type of the parent: a branch of `if` or
+    /// `switch`, or the value of `comptime`
+    branch,
+    /// The initializer of a local binding
+    binding_init,
+    /// The value of a declaration or a field default
+    body_value,
+};
+
+/// The expected type of the value in `slot` of `parent`, computed from the parent expression and
+/// the inference result: a call argument takes the type of the called function's parameter;
+/// `const x: T = e` (including declarations in containers and default values of fields) takes the
+/// annotated type; `return e` takes the return type of the function; `.f = e` in an initializer
+/// takes the type of the field; `lhs = e` takes the type of the left-hand side; a comparison takes
+/// the type of the other side; `@as(T, e)` takes `T`. The branches of `if`, `switch`, `orelse`, and
+/// `catch`, the value of `break :label`, and `comptime e` take the expected type of the expression
+/// they produce
+fn expectedIn(r: *Resolver, a: context.At, parent: ExpectedParent, slot: ExpectedSlot) resolve.Error!?Index {
     const b = a.body;
-    for (b.exprs, 0..) |x, i| {
-        const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
-        switch (x) {
-            .call => |c| for (c.args, 0..) |arg, n| {
-                if (arg == e) return argType(r, a, c.callee, n);
-            },
-            .init => |init| for (init.fields) |f| {
-                if (f.value == e) return initFieldType(r, a, id, f.name orelse return null);
-            },
-            .@"return" => |v| if (v == e) {
-                const it = (try r.itemTree(a.file)).items[a.item];
-                if (it.kind != .@"fn") return null;
-                const ret = a.exprType(b.type_expr orelse return null).asType() orelse return null;
-                // `!T`: `T` with the error set inferred from the body (see `queries.returnType`)
-                if (!it.flags.inferred_error_set or ret == .unknown) return ret;
-                const set = try a.ip.get(.{ .inferred_error_set = .{ .file = a.file, .decl = it.ast_id, .inst = if (a.seeded) |s| s.inst else null } });
-                return try a.ip.get(.{ .error_union_type = .{ .err = set, .payload = ret } });
-            },
-            .assign => |s| if (s.rhs == e) return if (s.op == .equal) a.exprType(s.lhs).ty else null,
-            .binary => |s| {
-                if (isComparison(s.op) and (s.lhs == e or s.rhs == e)) {
-                    return comparedType(r, a.exprType(if (s.lhs == e) s.rhs else s.lhs).ty, s.op);
-                }
-                if (s.op == .keyword_orelse and s.rhs == e) return expectedOf(r, a, id);
-            },
-            .builtin_call => |c| if (std.mem.eql(u8, c.name, "@as") and c.args.len == 2 and c.args[1] == e) {
+    const id = switch (parent) {
+        .binding => |binding| {
+            if (slot != .binding_init) return null;
+            return a.exprType(b.binding(binding).ty orelse return null).asType();
+        },
+        .body => {
+            if (slot != .body_value) return null;
+            return a.exprType(b.type_expr orelse return null).asType();
+        },
+        .expr => |e| e,
+    };
+    switch (slot) {
+        .arg => |n| switch (b.expr(id)) {
+            .call => |c| return argType(r, a, c.callee, n),
+            .builtin_call => |c| {
+                // `@as(T, e)`; at an empty second argument only `T` is written
+                if (!std.mem.eql(u8, c.name, "@as") or n != 1 or c.args.len == 0 or c.args.len > 2) return null;
                 return a.exprType(c.args[0]).asType();
             },
-            .@"if" => |s| if (s.then == e or s.@"else" == e) return expectedOf(r, a, id),
-            .@"switch" => |s| for (s.prongs) |prong| {
-                if (prong.body == e) return expectedOf(r, a, id);
-            },
-            .@"catch" => |s| if (s.rhs == e) return expectedOf(r, a, id),
-            .@"comptime" => |inner| if (inner == e) return expectedOf(r, a, id),
-            .@"break" => |s| if (s.value == e) {
-                return expectedOf(r, a, labeledBlock(b, id, s.label orelse return null) orelse return null);
-            },
-            else => {},
-        }
+            else => return null,
+        },
+        .init_field => |name| {
+            if (b.expr(id) != .init) return null;
+            return initFieldType(r, a, id, name);
+        },
+        .return_value => {
+            if (b.expr(id) != .@"return") return null;
+            const it = (try r.itemTree(a.file)).items[a.item];
+            if (it.kind != .@"fn") return null;
+            const ret = a.exprType(b.type_expr orelse return null).asType() orelse return null;
+            // `!T`: `T` with the error set inferred from the body (see `queries.returnType`)
+            if (!it.flags.inferred_error_set or ret == .unknown) return ret;
+            const set = try a.ip.get(.{ .inferred_error_set = .{ .file = a.file, .decl = it.ast_id, .inst = if (a.seeded) |s| s.inst else null } });
+            return try a.ip.get(.{ .error_union_type = .{ .err = set, .payload = ret } });
+        },
+        .assign_rhs => {
+            const s = switch (b.expr(id)) {
+                .assign => |s| s,
+                else => return null,
+            };
+            return if (s.op == .equal) a.exprType(s.lhs).ty else null;
+        },
+        .comparison_lhs => {
+            const s = switch (b.expr(id)) {
+                .binary => |s| s,
+                else => return null,
+            };
+            if (!isComparison(s.op)) return null;
+            return comparedType(r, a.exprType(s.rhs).ty, s.op);
+        },
+        .comparison_rhs => {
+            const s = switch (b.expr(id)) {
+                .binary => |s| s,
+                else => return null,
+            };
+            if (!isComparison(s.op)) return null;
+            return comparedType(r, a.exprType(s.lhs).ty, s.op);
+        },
+        .orelse_rhs => {
+            const s = switch (b.expr(id)) {
+                .binary => |s| s,
+                else => return null,
+            };
+            if (s.op != .keyword_orelse) return null;
+            return expectedOf(r, a, id);
+        },
+        .catch_rhs => {
+            if (b.expr(id) != .@"catch") return null;
+            return expectedOf(r, a, id);
+        },
+        .break_value => {
+            const s = switch (b.expr(id)) {
+                .@"break" => |s| s,
+                else => return null,
+            };
+            return expectedOf(r, a, labeledBlock(b, id, s.label orelse return null) orelse return null);
+        },
+        .branch => return expectedOf(r, a, id),
+        .binding_init, .body_value => return null,
     }
-    for (b.bindings) |binding| if (binding.init == e) return a.exprType(binding.ty orelse return null).asType();
-    if (b.value == e) return a.exprType(b.type_expr orelse return null).asType();
+}
+
+/// The slot of the expression `e` in the parent expression `id` whose expected type applies, or
+/// null when `e` is not a child in such a slot
+fn expectedSlotOf(b: *const Body, id: Body.ExprId, e: Body.ExprId) ?ExpectedSlot {
+    switch (b.expr(id)) {
+        .call => |c| for (c.args, 0..) |arg, n| {
+            if (arg == e) return .{ .arg = n };
+        },
+        .builtin_call => |c| if (std.mem.eql(u8, c.name, "@as") and c.args.len == 2 and c.args[1] == e) return .{ .arg = 1 },
+        .init => |init| for (init.fields) |f| {
+            if (f.value == e) return .{ .init_field = f.name orelse return null };
+        },
+        .@"return" => |v| if (v == e) return .return_value,
+        .assign => |s| if (s.rhs == e) return .assign_rhs,
+        .binary => |s| {
+            if (isComparison(s.op)) {
+                if (s.lhs == e) return .comparison_lhs;
+                if (s.rhs == e) return .comparison_rhs;
+            }
+            if (s.op == .keyword_orelse and s.rhs == e) return .orelse_rhs;
+        },
+        .@"if" => |s| if (s.then == e or s.@"else" == e) return .branch,
+        .@"switch" => |s| for (s.prongs) |prong| {
+            if (prong.body == e) return .branch;
+        },
+        .@"catch" => |s| if (s.rhs == e) return .catch_rhs,
+        .@"comptime" => |inner| if (inner == e) return .branch,
+        .@"break" => |s| if (s.value == e) return .break_value,
+        else => {},
+    }
     return null;
+}
+
+/// The expected type of the expression `e` (see `expectedIn`)
+fn expectedOf(r: *Resolver, a: context.At, e: Body.ExprId) resolve.Error!?Index {
+    const b = a.body;
+    for (0..b.exprs.len) |i| {
+        const id: Body.ExprId = @fromBackingInt(@as(u32, @intCast(i)));
+        if (expectedSlotOf(b, id, e)) |slot| return expectedIn(r, a, .{ .expr = id }, slot);
+    }
+    for (b.bindings, 0..) |binding, i| if (binding.init == e) {
+        const id: Body.BindingId = @fromBackingInt(@as(u32, @intCast(i)));
+        return expectedIn(r, a, .{ .binding = id }, .binding_init);
+    };
+    if (b.value == e) return expectedIn(r, a, .body, .body_value);
+    return null;
+}
+
+/// A slot with no expression at the cursor: the parent whose expected type applies, the slot, and
+/// the `At` of the member that holds them. `a` differs from the cursor's member for a container
+/// field whose default value is not written yet, since the field node ends at the `=`.
+const ExpectedEmpty = struct {
+    a: context.At,
+    parent: ExpectedParent,
+    slot: ExpectedSlot,
+    /// Start of the token after the cursor (the end of the file when none): the parse error of the
+    /// missing expression is there
+    end: u32,
+};
+
+/// The empty expression slot at the cursor, found from the previous non-trivia token and its
+/// syntax parent, and mapped to the parent expression in the HIR body. Only a position that is
+/// empty and followed by the end of an expression (`;`, `,`, or a closing `)`, `}`, `]`) counts.
+fn expectedEmptySlot(r: *Resolver, a: context.At, file: FileId, offset: u32) resolve.Error!?ExpectedEmpty {
+    const root = (try r.ctx.get(database.syntax.ParseFile, file)).rootNode();
+    const prev = tokenBefore(root, offset) orelse return null;
+    const end = emptyEnd(root, offset) orelse return null;
+    const path = try root.coveringPath(r.arena, prev.offset);
+    const node = path[path.len - 1];
+    switch (prev.kind) {
+        .equal => return emptyAfterEqual(r, a, file, path, node, end),
+        .l_paren, .comma => {
+            if (node.kind() != .arg_list or path.len < 2) return null;
+            const call = path[path.len - 2];
+            const e = exprForNode(a.body, a.node.offset, call) orelse return null;
+            switch (a.body.expr(e)) {
+                .call, .builtin_call => {
+                    return .{ .a = a, .parent = .{ .expr = e }, .slot = .{ .arg = commasBefore(node, offset) }, .end = end };
+                },
+                else => return null,
+            }
+        },
+        .keyword_return => {
+            const e = exprForNode(a.body, a.node.offset, node) orelse return null;
+            if (a.body.expr(e) != .@"return" or a.body.expr(e).@"return" != null) return null;
+            return .{ .a = a, .parent = .{ .expr = e }, .slot = .return_value, .end = end };
+        },
+        .keyword_else => {
+            const if_node = ancestorOf(path, .if_expr) orelse return null;
+            const e = exprForNode(a.body, a.node.offset, if_node) orelse return null;
+            const s = switch (a.body.expr(e)) {
+                .@"if" => |s| s,
+                else => return null,
+            };
+            const els = s.@"else" orelse return null;
+            if (a.body.expr(els) != .missing) return null;
+            return .{ .a = a, .parent = .{ .expr = e }, .slot = .branch, .end = end };
+        },
+        .keyword_orelse => {
+            const e = exprForNode(a.body, a.node.offset, node) orelse return null;
+            const s = switch (a.body.expr(e)) {
+                .binary => |s| s,
+                else => return null,
+            };
+            if (s.op != .keyword_orelse or a.body.expr(s.rhs) != .missing) return null;
+            return .{ .a = a, .parent = .{ .expr = e }, .slot = .orelse_rhs, .end = end };
+        },
+        .keyword_catch => {
+            const e = exprForNode(a.body, a.node.offset, node) orelse return null;
+            const s = switch (a.body.expr(e)) {
+                .@"catch" => |s| s,
+                else => return null,
+            };
+            if (a.body.expr(s.rhs) != .missing) return null;
+            return .{ .a = a, .parent = .{ .expr = e }, .slot = .catch_rhs, .end = end };
+        },
+        .equal_equal, .bang_equal, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal => {
+            const e = exprForNode(a.body, a.node.offset, node) orelse return null;
+            const s = switch (a.body.expr(e)) {
+                .binary => |s| s,
+                else => return null,
+            };
+            if (!isComparison(s.op) or a.body.expr(s.rhs) != .missing) return null;
+            return .{ .a = a, .parent = .{ .expr = e }, .slot = .comparison_rhs, .end = end };
+        },
+        .equal_angle_bracket_right => {
+            if (node.kind() != .switch_prong) return null;
+            const switch_node = ancestorOf(path, .switch_expr) orelse return null;
+            const e = exprForNode(a.body, a.node.offset, switch_node) orelse return null;
+            const s = switch (a.body.expr(e)) {
+                .@"switch" => |s| s,
+                else => return null,
+            };
+            // The prongs of the syntax tree and of the HIR correspond by position
+            var index: usize = 0;
+            var it = switch_node.children();
+            while (it.nextNode()) |child| {
+                if (child.offset == node.offset and child.range().end == node.range().end) break;
+                if (child.kind() == .switch_prong) index += 1;
+            } else return null;
+            if (index >= s.prongs.len or a.body.expr(s.prongs[index].body) != .missing) return null;
+            return .{ .a = a, .parent = .{ .expr = e }, .slot = .branch, .end = end };
+        },
+        .keyword_comptime => {
+            if (node.kind() != .comptime_expr) return null;
+            const e = exprForNode(a.body, a.node.offset, node) orelse return null;
+            const inner = switch (a.body.expr(e)) {
+                .@"comptime" => |inner| inner,
+                else => return null,
+            };
+            if (a.body.expr(inner) != .missing) return null;
+            return .{ .a = a, .parent = .{ .expr = e }, .slot = .branch, .end = end };
+        },
+        .keyword_break => return emptyBreakValue(a, path, end),
+        .identifier => {
+            if (node.kind() != .break_label) return null;
+            return emptyBreakValue(a, path, end);
+        },
+        else => return null,
+    }
+}
+
+/// The empty value of the `break` whose syntax node contains the cursor
+fn emptyBreakValue(a: context.At, path: []const SyntaxNode, end: u32) resolve.Error!?ExpectedEmpty {
+    const break_node = ancestorOf(path, .break_expr) orelse return null;
+    const e = exprForNode(a.body, a.node.offset, break_node) orelse return null;
+    const s = switch (a.body.expr(e)) {
+        .@"break" => |s| s,
+        else => return null,
+    };
+    if (s.value != null) return null;
+    return .{ .a = a, .parent = .{ .expr = e }, .slot = .break_value, .end = end };
+}
+
+/// The empty expression slot after the `=` at the end of `node`
+fn emptyAfterEqual(r: *Resolver, a: context.At, file: FileId, path: []const SyntaxNode, node: SyntaxNode, end: u32) resolve.Error!?ExpectedEmpty {
+    const b = a.body;
+    const base = a.node.offset;
+    switch (node.kind()) {
+        .var_decl => {
+            // The declaration itself: its value is the slot
+            if (node.offset == a.node.offset and node.range().end == a.node.range().end) {
+                if (b.value != null or b.type_expr == null) return null;
+                return .{ .a = a, .parent = .body, .slot = .body_value, .end = end };
+            }
+            // A local variable (a target of a destructuring declaration has its own rule)
+            if (path.len < 2) return null;
+            switch (path[path.len - 2].kind()) {
+                .block, .comptime_stmt => {},
+                else => return null,
+            }
+            const name = (ast.cast(ast.VarDecl, node) orelse return null).name() orelse return null;
+            const start = name.offset - base;
+            for (b.bindings, 0..) |binding, i| {
+                if (binding.range.start != start or binding.init != null) continue;
+                const id: Body.BindingId = @fromBackingInt(@as(u32, @intCast(i)));
+                return .{ .a = a, .parent = .{ .binding = id }, .slot = .binding_init, .end = end };
+            }
+            return null;
+        },
+        // The cursor may be outside the field node, which ends at the `=`: take the field's Body
+        // instead of the one of the enclosing declaration
+        .container_field => {
+            const item = try itemOfNode(r, file, node) orelse return null;
+            const fa = try context.atItem(r, file, item) orelse return null;
+            const fb = try r.body(file, item);
+            if (fb.value != null or fb.type_expr == null) return null;
+            return .{ .a = fa, .parent = .body, .slot = .body_value, .end = end };
+        },
+        .field_init => {
+            const init = ancestorOf(path, .init_expr) orelse return null;
+            const e = exprForNode(b, base, init) orelse return null;
+            if (b.expr(e) != .init) return null;
+            const field = ast.cast(ast.FieldInit, node) orelse return null;
+            const name_token = field.name() orelse return null;
+            const name = try ast.identNameAlloc(r.arena, name_token.text);
+            for (b.expr(e).init.fields) |f| {
+                if (f.name == null or !std.mem.eql(u8, f.name.?, name)) continue;
+                if (b.expr(f.value) != .missing) return null;
+                return .{ .a = a, .parent = .{ .expr = e }, .slot = .{ .init_field = name }, .end = end };
+            }
+            return null;
+        },
+        .assign_expr => {
+            const e = exprForNode(b, base, node) orelse return null;
+            const s = switch (b.expr(e)) {
+                .assign => |s| s,
+                else => return null,
+            };
+            if (s.op != .equal or b.expr(s.rhs) != .missing) return null;
+            return .{ .a = a, .parent = .{ .expr = e }, .slot = .assign_rhs, .end = end };
+        },
+        else => return null,
+    }
+}
+
+/// The expression whose range is exactly the range of `node`
+fn exprForNode(b: *const Body, base: u32, node: SyntaxNode) ?Body.ExprId {
+    const range = node.range();
+    if (range.end <= base) return null;
+    const e = b.exprAt(range.end - 1 - base) orelse return null;
+    const r = b.range(e);
+    if (r.start != range.start - base or r.end != range.end - base) return null;
+    return e;
+}
+
+/// The innermost node of `path` of the given kind
+fn ancestorOf(path: []const SyntaxNode, kind: SyntaxKind) ?SyntaxNode {
+    var i = path.len;
+    while (i > 0) {
+        i -= 1;
+        if (path[i].kind() == kind) return path[i];
+    }
+    return null;
+}
+
+/// The number of commas directly inside the argument list `node` before `offset`
+fn commasBefore(node: SyntaxNode, offset: u32) usize {
+    var n: usize = 0;
+    var it = node.children();
+    while (it.next()) |child| switch (child) {
+        .token => |t| if (t.kind == .comma and t.offset < offset) {
+            n += 1;
+        },
+        .node => {},
+    };
+    return n;
+}
+
+/// The member whose node is `node`: a container field is not the member at the cursor when its
+/// default value is not written yet, because its node ends at the `=`
+fn itemOfNode(r: *Resolver, file: FileId, node: SyntaxNode) resolve.Error!?u32 {
+    const tree = try r.itemTree(file);
+    const map = try r.ctx.get(database.syntax.FileAstIdMap, file);
+    for (tree.items, 0..) |it, i| {
+        const n = map.get(it.ast_id) orelse continue;
+        if (n.offset == node.offset and n.range().end == node.range().end) return @intCast(i);
+    }
+    return null;
+}
+
+/// The end of the empty expression slot at the cursor: the start of the next non-trivia token,
+/// which must be able to end an expression (`;`, `,`, or a closing `)`, `}`, `]`), or the end of
+/// the file. Null when text follows the cursor before such a token.
+fn emptyEnd(root: SyntaxNode, offset: u32) ?u32 {
+    const end = root.range().end;
+    var at = offset;
+    while (at < end) {
+        const t = root.tokenAtOffset(at) orelse return null;
+        switch (t.kind) {
+            .whitespace, .line_comment, .doc_comment, .container_doc_comment, .unknown => {},
+            else => {
+                if (t.offset < at) return null;
+                return switch (t.kind) {
+                    .semicolon, .comma, .r_paren, .r_brace, .r_bracket => t.offset,
+                    else => null,
+                };
+            },
+        }
+        at = t.range().end;
+    }
+    return offset;
 }
 
 /// The innermost block labeled `label` that contains the expression `e`
@@ -1669,8 +2070,10 @@ fn comparable(ip: *InternPool, t: Index) bool {
 /// error node and `u32 = cd`. It cannot be trusted when there is a syntax error inside the
 /// statement, the previous item is an error node, or the call or initializer at the cursor is not
 /// closed; an error at the start of the statement belongs to the previous statement (a missing
-/// `;`), and errors at its end or after it are outside the statement
-fn wellFormed(r: *Resolver, file: FileId, offset: u32) resolve.Error!bool {
+/// `;`), and errors at its end or after it are outside the statement. `slot_end` is set at an empty
+/// expression slot: the parse error of the missing expression, between the cursor and the token
+/// that follows it, is expected
+fn wellFormed(r: *Resolver, file: FileId, offset: u32, slot_end: ?u32) resolve.Error!bool {
     const parse = try r.ctx.get(database.syntax.ParseFile, file);
     const path = try parse.rootNode().coveringPath(r.arena, offset - 1);
     var i = path.len;
@@ -1690,7 +2093,11 @@ fn wellFormed(r: *Resolver, file: FileId, offset: u32) resolve.Error!bool {
     }
     if (prev) |p| if (p.kind() == .error_node) return false;
     const range = stmt.range();
-    for (parse.errors) |err| if (err.offset > range.start and err.offset < range.end) return false;
+    for (parse.errors) |err| {
+        if (err.offset <= range.start or err.offset >= range.end) continue;
+        if (slot_end) |end| if (err.offset >= offset and err.offset <= end) continue;
+        return false;
+    }
     for (path[i..]) |n| switch (n.kind()) {
         .arg_list => if (n.childToken(.r_paren) == null) return false,
         .init_list => if (n.childToken(.r_brace) == null) return false,

@@ -1373,6 +1373,117 @@ test "name completion ranks candidates fitting the expected type first" {
     });
 }
 
+/// The two-tier ranking of name completion when nothing is typed at the cursor: "none" when no
+/// candidate has a sort text (no expected type), otherwise "all" followed by the labels that sort
+/// first, sorted
+fn tierSummary(source: []const u8) ![]u8 {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(source);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const at = f.cursor.?;
+    const items = (try completion.complete(&r, at.file, at.offset, .{ .auto_import = false })).items;
+    var first: std.ArrayList([]const u8) = .empty;
+    var sorted: usize = 0;
+    for (items) |it| if (it.sort) |s| {
+        sorted += 1;
+        if (std.mem.eql(u8, s, "0")) try first.append(w.arena.allocator(), it.label) else try testing.expectEqualStrings("1", s);
+    };
+    try testing.expect(sorted == 0 or sorted == items.len);
+    std.mem.sort([]const u8, first.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.less);
+    const kind = if (sorted == 0) "none" else "all";
+    return testing.allocator.dupe(u8, try std.fmt.allocPrint(w.arena.allocator(), "{s}{s}{s}", .{
+        kind, if (first.items.len == 0) "" else " ", try std.mem.join(w.arena.allocator(), " ", first.items),
+    }));
+}
+
+/// Checks `cases` in order: the two-tier ranking at the cursor with nothing typed in the source of
+/// each case, placed after `decls`
+fn expectTiers(decls: []const u8, cases: []const struct { []const u8, []const u8 }) !void {
+    for (cases) |c| {
+        const source = try std.fmt.allocPrint(testing.allocator, "//- /p/main.zig module:app\n{s}{s}\n", .{ decls, c[0] });
+        defer testing.allocator.free(source);
+        const got = try tierSummary(source);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
+test "name completion with nothing typed ranks candidates fitting the expected type first" {
+    try expectTiers(expected_decls, &.{
+        // Call arguments: calling a method through a value skips self; calling through the type
+        // or calling a field of function type does not
+        .{ "fn run() void { take(<|>); }", "all cd_w" },
+        .{ "fn run() void { cd_o.put(<|>); }", "all cd_w" },
+        .{ "fn run() void { Other.put(<|>, .a); }", "all cd_o" },
+        .{ "fn run() void { Other.put(cd_o, <|>); }", "all cd_w" },
+        .{ "fn run(h: Hook) void { h.call(<|>); }", "all cd_w" },
+        // Declarations with a type annotation, including declarations in containers and default
+        // values of fields; the same while typing, before the `;` exists
+        .{ "fn run() void { const x: Want = <|>; _ = x; }", "all cd_w" },
+        .{ "fn run() void { var x: Want = <|>; _ = &x; }", "all cd_w" },
+        .{ "fn run() void {\n    const x: Want = <|>\n}", "all cd_w x" },
+        .{ "const top: Want = <|>;", "all cd_w top" },
+        .{ "const Holder = struct { w: Want = <|> };", "all cd_w" },
+        // Return values
+        .{ "fn run() Want { return <|>; }", "all cd_w run" },
+        .{ "fn run() !Want { return <|>; }", "all cd_w run" },
+        .{ "fn run() Other { return <|>; }", "all cd_o run" },
+        // Fields in initializers: the field of the initializer's type; no expected type when
+        // there is no such field
+        .{ "fn run() void { const o: Other = .{ .w = <|> }; _ = o; }", "all cd_w" },
+        .{ "fn run() void { _ = Other{ .w = <|> }; }", "all cd_w" },
+        .{ "fn run() void { takeOther(.{ .w = <|> }); }", "all cd_w" },
+        .{ "fn run() void { takeOther(.{ .missing = <|> }); }", "none" },
+        // Assignments and comparisons; a tagged union compared with its tag
+        .{ "fn run() void { var x: Want = .a; x = <|>; }", "all cd_w x" },
+        .{ "fn run(w: Want) void { if (w == <|>) {} }", "all cd_w w" },
+        .{ "fn run(o: Other) void { if (o.w != <|>) {} }", "all cd_w" },
+        .{ "fn run(t: Tagged) void { if (t == <|>) {} }", "all cd_w" },
+        // `@as(T, e)`; the branches of `if`, `switch`, `orelse`, and `catch`, `break :label`, and
+        // `comptime e` take the expected type of the expression they produce
+        .{ "fn run() void { _ = @as(Want, <|>); }", "all cd_w" },
+        .{ "fn run(c: bool) void { const x: Want = if (c) .a else <|>; _ = x; }", "all cd_w" },
+        .{ "fn run(n: u8) void { const x: Want = switch (n) { 0 => .a, else => <|> }; _ = x; }", "all cd_w" },
+        .{ "fn run(o: ?Want) void { const x: Want = o orelse <|>; _ = x; }", "all cd_w" },
+        .{ "fn run(e: anyerror!Want) void { const x: Want = e catch <|>; _ = x; }", "all cd_w" },
+        .{ "fn run() void { const x: Want = blk: { break :blk <|>; }; _ = x; }", "all cd_w" },
+        .{ "fn run() void { const x: Want = comptime <|>; _ = x; }", "all cd_w" },
+        .{ "fn run(c: bool) void { const x: Other = if (c) .{} else <|>; _ = x; }", "all cd_o" },
+        // No expected type: no sort text at all
+        .{ "fn run() void { const x = <|>; _ = x; }", "none" },
+        .{ "const top = <|>;", "none" },
+        .{ "fn run() void { _ = <|>; }", "none" },
+        // The syntax tree is not trusted when the call at the cursor is not closed; a syntax
+        // error in another statement does not matter
+        .{ "fn run() void {\n    take(<|>\n}", "none" },
+        .{ "fn run() void {\n    const y: u8 = ;\n    const x: Want = <|>;\n    _ = .{ x, y };\n}", "all cd_w" },
+    });
+}
+
+test "completion with nothing typed ranks the issue example by the expected type" {
+    const decls =
+        \\const u32_value: u32 = 1;
+        \\fn u32_fn() u32 { return 2; }
+        \\const other_value: []const u8 = "";
+        \\fn other_fn() void {}
+        \\
+    ;
+    try expectTiers(decls, &.{
+        .{ "fn run() void { const x: u32 = <|>; _ = x; }", "all u32_fn u32_value" },
+    });
+}
+
 test "candidates fit the expected type only by exact rules" {
     const cases = [_]struct { []const u8, []const u8, bool }{
         .{ "Want", "const cd_b: Want = .a;", true },
