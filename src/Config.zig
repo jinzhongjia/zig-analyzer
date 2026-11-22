@@ -655,6 +655,20 @@ pub fn sameLint(a: *const Config, b: *const Config) bool {
     return a.lint_enable == b.lint_enable and std.meta.eql(a.lint_rules, b.lint_rules);
 }
 
+/// Whether every setting is the same, including which are present (`warnings` aside)
+pub fn same(a: *const Config, b: *const Config) bool {
+    inline for (settings) |s| if (!eqlValue(@field(a, s.field), @field(b, s.field))) return false;
+    return a.present.eql(b.present);
+}
+
+fn eqlValue(a: anytype, b: @TypeOf(a)) bool {
+    return switch (@TypeOf(a)) {
+        ?[]const u8 => eqlOptional(a, b),
+        []const []const u8 => eqlList(a, b),
+        else => std.meta.eql(a, b),
+    };
+}
+
 fn eqlOptional(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?, b.?);
@@ -761,6 +775,34 @@ test "parse: nested fields, optional wrapper" {
     defer unknown_query.deinit(testing.allocator);
     try testing.expect(unknown_query.cache_queries.Infer.count == null);
     try testing.expectEqual(1, unknown_query.warnings.len);
+}
+
+test "same: compares every setting and which are present" {
+    var c = try parseText(
+        \\{"build": {"args": ["-Da=1"]}, "cache": {"queries": {"Infer": {"count": 8}}}, "naming": {"rules": {"field": false}}}
+    );
+    defer c.deinit(testing.allocator);
+    var copy = try c.clone(testing.allocator);
+    defer copy.deinit(testing.allocator);
+    try testing.expect(c.same(&copy));
+    var other_args = try parseText(
+        \\{"build": {"args": ["-Da=2"]}, "cache": {"queries": {"Infer": {"count": 8}}}, "naming": {"rules": {"field": false}}}
+    );
+    defer other_args.deinit(testing.allocator);
+    try testing.expect(!c.same(&other_args));
+    var other_cache = try parseText(
+        \\{"build": {"args": ["-Da=1"]}, "cache": {"queries": {"Infer": {"count": 9}}}, "naming": {"rules": {"field": false}}}
+    );
+    defer other_cache.deinit(testing.allocator);
+    try testing.expect(!c.same(&other_cache));
+    // A setting given with its default value is present, unlike one left out
+    var empty = try parseText("{}");
+    defer empty.deinit(testing.allocator);
+    var default_set = try parseText(
+        \\{"build": {"enable": true}}
+    );
+    defer default_set.deinit(testing.allocator);
+    try testing.expect(!empty.same(&default_set));
 }
 
 test "parse: zig path overrides" {
