@@ -1756,6 +1756,10 @@ test "cache settings from initialization and later configuration limit the retai
         /// file in turn (which reads the parse results)
         fn retained(hh: *Harness) !i64 {
             for (uris) |uri| _ = try hh.request("textDocument/documentSymbol", .{ .textDocument = .{ .uri = uri } });
+            // A request sweeps after it has answered, and the sweep is skipped while another read
+            // transaction is active (the next request may have begun one): sweep here once none
+            // is, so that the count does not depend on that timing
+            while (!hh.server.db.trySweep()) try testing.io.sleep(.fromMilliseconds(1), .awake);
             const status = try hh.request("zig-analyzer/status", {});
             for (status.object.get("result").?.object.get("queries").?.array.items) |q| {
                 if (std.mem.endsWith(u8, q.object.get("name").?.string, ".ParseFile")) return q.object.get("memos").?.integer;

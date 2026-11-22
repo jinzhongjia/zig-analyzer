@@ -1,5 +1,8 @@
 //! The protocol edits of auto-import completions must apply directly and resolve to the target
 //! declaration under the negotiated position encoding.
+//!
+//! The servers of these tests build the auto-import index ahead of the first completion, as
+//! outside tests (see `Server.TestHooks.eager_imports`).
 
 const std = @import("std");
 const testing = std.testing;
@@ -112,6 +115,7 @@ test "auto-import edits replace the whole identifier and resolve after applicati
     for ([_]offsets.Encoding{ .utf8, .utf16 }) |encoding| {
         var h: Harness = undefined;
         try h.start();
+        h.server.hooks.eager_imports = true;
         defer h.finish();
         const a = h.arena.allocator();
         const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
@@ -175,6 +179,7 @@ test "auto-import indexing restarts when an earlier pass did not finish" {
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
+    h.server.hooks.eager_imports = true;
     defer h.finish();
     const a = h.arena.allocator();
     const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
@@ -210,6 +215,7 @@ test "auto-import works in an unsaved untitled document" {
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
+    h.server.hooks.eager_imports = true;
     defer h.finish();
     const a = h.arena.allocator();
     _ = try h.request("initialize", .{
@@ -265,6 +271,7 @@ test "zig-analyzer.zon import settings override the client's in organize imports
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
+    h.server.hooks.eager_imports = true;
     defer h.finish();
     const a = h.arena.allocator();
     const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
@@ -351,6 +358,7 @@ test "disabled auto-import does not build or query the import index" {
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
+    h.server.hooks.eager_imports = true;
     defer h.finish();
     const a = h.arena.allocator();
     const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
@@ -386,6 +394,7 @@ test "auto-import items resolve to the signature, docs and where the target is d
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
+    h.server.hooks.eager_imports = true;
     defer h.finish();
     const a = h.arena.allocator();
     const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
@@ -425,6 +434,7 @@ test "completion does not run auto-import indexing inside its read transaction" 
     defer threaded.deinit();
     var h: Harness = undefined;
     try h.startIo(threaded.io());
+    h.server.hooks.eager_imports = true;
     defer h.finish();
     _ = try h.request("initialize", .{ .capabilities = Empty{}, .initializationOptions = .{ .completion = .{ .auto_import = true } } });
     try h.notify("initialized", Empty{});
@@ -465,6 +475,7 @@ test "auto-import module and file candidates resolve through completionItem/reso
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
+    h.server.hooks.eager_imports = true;
     defer h.finish();
     const a = h.arena.allocator();
     const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
@@ -516,6 +527,7 @@ test "auto-import completion reports truncation and recomputes for a narrower pr
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
+    h.server.hooks.eager_imports = true;
     defer h.finish();
     const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
     _ = try h.request("initialize", .{
@@ -576,6 +588,7 @@ test "auto-import storage public paths and direct aliases resolve after applying
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
+    h.server.hooks.eager_imports = true;
     defer h.finish();
     const a = h.arena.allocator();
     const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
@@ -698,6 +711,7 @@ test "auto-import is on by default, can be turned off, and its limit is configur
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
+    h.server.hooks.eager_imports = true;
     defer h.finish();
     const a = h.arena.allocator();
     const uri = try za.base.uri.fromPath(a, try project.path(a, "src/main.zig"));
@@ -811,6 +825,7 @@ test "auto-import offers declarations of files reached from a single-file root" 
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
+    h.server.hooks.eager_imports = true;
     defer h.finish();
     const response = try completeOpened(&h, &project, "main.zig", main, "bFu");
     try testing.expectEqualStrings("const bFunc = @import(\"lib/b.zig\").bFunc;\n", importEdit(response, "bFunc") orelse return error.MissingSiblingImport);
@@ -836,6 +851,7 @@ test "auto-import offers declarations of files reached from build.zig" {
     defer project.deinit();
     var h: Harness = undefined;
     try h.start();
+    h.server.hooks.eager_imports = true;
     defer h.finish();
     const response = try completeOpened(&h, &project, "build.zig", build, "tool_na");
     try testing.expectEqualStrings("const tool_name = @import(\"build/tools.zig\").tool_name;\n", importEdit(response, "tool_name") orelse return error.MissingBuildScriptImport);
@@ -863,6 +879,7 @@ test "the first completion after opening includes auto-imports in single-file an
         defer project.deinit();
         var h: Harness = undefined;
         try h.start();
+        h.server.hooks.eager_imports = true;
         defer h.finish();
         const a = h.arena.allocator();
         const uri = try za.base.uri.fromPath(a, try project.path(a, case.path));
