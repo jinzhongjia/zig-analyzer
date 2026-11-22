@@ -838,16 +838,16 @@ test "single-file mode: closing a file without errors drops its result" {
     const uri = try open(&h, try project.path(h.arena.allocator(), "one.zig"), text);
     try waitIdle(&h);
     {
-        h.server.single_mutex.lockUncancelable(testing.io);
-        defer h.server.single_mutex.unlock(testing.io);
-        try testing.expectEqual(1, h.server.single.count());
+        h.server.single.mutex.lockUncancelable(testing.io);
+        defer h.server.single.mutex.unlock(testing.io);
+        try testing.expectEqual(1, h.server.single.entries.count());
     }
     try h.notify("textDocument/didClose", .{ .textDocument = .{ .uri = uri } });
     try waitIdle(&h);
     {
-        h.server.single_mutex.lockUncancelable(testing.io);
-        defer h.server.single_mutex.unlock(testing.io);
-        try testing.expectEqual(0, h.server.single.count());
+        h.server.single.mutex.lockUncancelable(testing.io);
+        defer h.server.single.mutex.unlock(testing.io);
+        try testing.expectEqual(0, h.server.single.entries.count());
     }
     try shutdown(&h);
 }

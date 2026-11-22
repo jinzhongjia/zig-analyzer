@@ -493,7 +493,7 @@ fn finishLoading(ws: *Workspace) void {
     }
     ws.server.wakeProjectWaiters();
     ws.server.requestAutoImportIndex();
-    ws.server.reconcileSingle();
+    ws.server.single.reconcile();
 }
 
 /// Whether to publish live diagnostics: yes before the compile set is computed; afterwards for
@@ -1122,7 +1122,7 @@ fn promote(ws: *Workspace, stage: Server.PromoteStage) void {
     old.mutex.unlock(ws.server.io);
     defer ws.gpa.free(stale);
     ws.server.publishFiles(stale, true);
-    ws.server.reconcileSingle();
+    ws.server.single.reconcile();
 }
 
 /// Result of the most recent build: when it was stored (Unix milliseconds), the number of files
@@ -1306,7 +1306,7 @@ fn recomputeLocked(ws: *Workspace) Allocator.Error!void {
     if (!ws.server.isVisible(ws)) return;
     ws.server.updateModuleGraph();
     ws.server.publishOpenFiles();
-    ws.server.reconcileSingle();
+    ws.server.single.reconcile();
 }
 
 /// Computes the build scripts of the project and of its dependency packages (see

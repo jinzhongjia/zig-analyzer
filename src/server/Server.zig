@@ -50,6 +50,7 @@ const log = std.log.scoped(.server);
 
 const Server = @This();
 const ClientCaps = @import("ClientCaps.zig");
+const SingleFiles = @import("SingleFiles.zig");
 
 io: Io,
 gpa: Allocator,
@@ -98,12 +99,8 @@ sub_projects: std.ArrayList([]u8) = .empty,
 /// Protects `roots`, `root_has_build` and `sub_projects`
 roots_mutex: Io.Mutex = .init,
 
-single_mutex: Io.Mutex = .init,
-/// Compile results of single-file mode (standalone .zig files, see `FileContext.detached`), keyed
-/// by the compiled root file. The results also include errors in files imported by the root file.
-single: std.AutoArrayHashMapUnmanaged(Vfs.FileId, SingleFile) = .empty,
-/// The `zig build-obj` processes of single-file compiles in progress: ended when the server stops
-single_compiles: za.project.bsp.SingleFileCompiles = .{},
+/// Single-file mode: compile results of standalone .zig files (see `FileContext.detached`)
+single: SingleFiles = .{},
 /// Sequence number of the last compile result taken (shared by project builds and single-file
 /// compiles; see `nextCompileGeneration`)
 compile_generation: std.atomic.Value(u64) = .init(0),
@@ -375,31 +372,6 @@ const Documents = struct {
     virtual_langs: std.StringHashMapUnmanaged(bool) = .empty,
 };
 
-const SingleFile = struct {
-    result: ?*compiler.BuildResult = null,
-    /// FileId → entry in `result` (the root file itself and the files it imports)
-    files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty,
-    /// Files under the root file's directory read by the compile that produced `result`
-    /// (including the files it imports): a change to any of them requires recompiling
-    inputs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty,
-    /// Compile result sequence number taken when `result` was stored: larger is newer
-    generation: u64 = 0,
-    running: bool = false,
-    rerun: bool = false,
-    /// The compile was deferred (a project is still loading for the first time): it runs after
-    /// loading finishes (see `reconcileSingle`)
-    pending: bool = false,
-
-    fn clearResult(sf: *SingleFile, gpa: Allocator) void {
-        if (sf.result) |r| r.release(gpa);
-        sf.result = null;
-        sf.files.deinit(gpa);
-        sf.files = .empty;
-        sf.inputs.deinit(gpa);
-        sf.inputs = .empty;
-    }
-};
-
 const HeldDocument = struct {
     file: Vfs.FileId,
     /// When its text last changed (see `Db.Ctx.inputChangedAt`)
@@ -513,7 +485,6 @@ pub fn deinit(server: *Server) void {
     server.root_has_build.deinit(server.gpa);
     for (server.sub_projects.items) |d| server.gpa.free(d);
     server.sub_projects.deinit(server.gpa);
-    for (server.single.values()) |*sf| sf.clearResult(server.gpa);
     server.single.deinit(server.gpa);
     for (server.envs.items) |env| {
         env.deinit(server.gpa);
@@ -841,7 +812,7 @@ fn addPending(server: *Server, a: Allocator, id: jsonrpc.Id, inputs: ?Db.Inputs)
 /// synchronously in the caller, and while it runs on the main loop, `$/cancelRequest` cannot be
 /// received and later requests queue up. `concurrent` has no count limit by default and
 /// fails only when a thread cannot be created, in which case this falls back to `async`.
-fn spawn(io: Io, group: *Io.Group, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
+pub fn spawn(io: Io, group: *Io.Group, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
     group.concurrent(io, function, args) catch group.async(io, function, args);
 }
 
@@ -2185,7 +2156,7 @@ fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocumentP
     server.publishFiles(&.{id}, false);
     server.publishDependents(&.{id});
     if (server.openDocumentCount() > 1) server.requestRefresh();
-    server.compileSingle(id);
+    server.single.compile(id);
     server.scheduleCompileSetRefresh(&.{id});
     // The auto-import index starts here so that the first completion at a name includes
     // auto-imports
@@ -2333,10 +2304,10 @@ fn didClose(server: *Server, arena: Allocator, params: types.DidCloseTextDocumen
     // When a single-file mode root file was deleted from disk while open (notifications of
     // external changes skip open files), drop its compile results on close and republish the files
     // it imports as well
-    if (disk == null and server.dropSingle(id)) return;
+    if (disk == null and server.single.drop(id)) return;
     // Results that are no longer needed after closing are freed immediately, so they do not grow
     // linearly with the files opened over a long session
-    server.releaseSingleIfUnused(id);
+    server.single.releaseIfUnused(id);
     // After closing, republish from the disk contents (files in the compile set may still have
     // compiler diagnostics)
     server.publishFiles(&.{id}, true);
@@ -2383,23 +2354,6 @@ fn clearDocument(server: *Server, document_uri: []const u8) void {
     server.send(bytes);
 }
 
-/// After a document is closed, frees its single-file results if they no longer need to be kept:
-/// no compile is running, and the results contain no diagnostics (diagnostics continue to be
-/// published after closing). When the file is reopened or saved later, it is recompiled on demand.
-fn releaseSingleIfUnused(server: *Server, file: Vfs.FileId) void {
-    {
-        server.single_mutex.lockUncancelable(server.io);
-        defer server.single_mutex.unlock(server.io);
-        const sf = server.single.getPtr(file) orelse return;
-        if (sf.running or sf.pending) return;
-        if (sf.result) |r| for (r.files.values()) |fr| {
-            if (fr.items.len != 0) return;
-        };
-        sf.clearResult(server.gpa);
-        _ = server.single.swapRemove(file);
-    }
-}
-
 fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentParams) !void {
     const id = try server.fileIdFromUri(arena, params.textDocument.uri) orelse return;
     const path = server.vfs.path(id);
@@ -2438,7 +2392,7 @@ fn didSave(server: *Server, arena: Allocator, params: types.DidSaveTextDocumentP
     }
     // Single-file mode: compile the file itself if it is a standalone file; root files whose last
     // compile read it or reported errors in it are recompiled as well
-    server.recompileSingle(&.{id}, &.{id});
+    server.single.recompile(&.{id}, &.{id});
 }
 
 /// Files in a project root directory whose changes require restarting the project
@@ -2725,7 +2679,7 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
     server.docs.mutex.lockUncancelable(server.io);
     const open = try arena.dupe(Vfs.FileId, server.docs.open.keys());
     server.docs.mutex.unlock(server.io);
-    server.recompileSingle(open, rebuilt.items);
+    server.single.recompile(open, rebuilt.items);
     // If it cannot be recorded, the next change rebuilds as usual. The projects that decide when
     // their build completes record what they then compare.
     server.watched_built_mutex.lockUncancelable(server.io);
@@ -3070,7 +3024,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
         server.busyBegin();
         spawn(server.io, &server.bg_group, reloadZigPathsTask, .{server});
     }
-    if (compiler_disabled) server.clearSingleFileResults();
+    if (compiler_disabled) server.single.clear();
     if (inlay_changed) server.requestInlayRefresh();
     if (semantic_changed) server.requestSemanticRefresh();
     if (imports_enabled) {
@@ -3091,7 +3045,7 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
             for (list) |ws| server.restartWorkspace(ws, 0);
         }
         // Files' compile contexts may have changed, and compiler diagnostics may be re-enabled
-        server.reconcileSingle();
+        server.single.reconcile();
     }
     if (sub_projects_changed and new.build_enable) {
         // Off: the projects of sub-projects stop, and their open files get the unloaded-project
@@ -3099,12 +3053,12 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
         if (server.stopStrayProjects()) server.updateModuleGraph();
         server.startOpenSubProjects();
         server.publishOpenFiles();
-        server.reconcileSingle();
+        server.single.reconcile();
     }
 }
 
 /// Whether build system integration and compiler diagnostics are enabled
-fn buildFlags(server: *Server) struct { build: bool, compiler: bool } {
+pub fn buildFlags(server: *Server) struct { build: bool, compiler: bool } {
     server.config_mutex.lockUncancelable(server.io);
     defer server.config_mutex.unlock(server.io);
     return .{ .build = server.config.build_enable, .compiler = server.config.compiler_diagnostics };
@@ -3134,7 +3088,7 @@ fn stopProjects(server: *Server) void {
     server.publishFiles(stale.items, true);
     server.publishOpenFiles();
     // Open files are compiled in single-file mode instead
-    server.reconcileSingle();
+    server.single.reconcile();
 }
 
 /// Starts projects for the root directories that have a build.zig (rechecked on disk: build.zig
@@ -3228,32 +3182,8 @@ fn refreshRoot(server: *Server, dir: []const u8) Allocator.Error!bool {
     }
     // Open files: single-file mode results no longer apply, or they switch to single-file mode
     server.publishOpenFiles();
-    server.reconcileSingle();
+    server.single.reconcile();
     return true;
-}
-
-/// Clears the compiler diagnostics of single-file mode (when compiler diagnostics are disabled).
-/// Root files not being compiled are no longer recorded; when re-enabled, the open files are
-/// recompiled.
-fn clearSingleFileResults(server: *Server) void {
-    var files: std.ArrayList(Vfs.FileId) = .empty;
-    defer files.deinit(server.gpa);
-    {
-        server.single_mutex.lockUncancelable(server.io);
-        defer server.single_mutex.unlock(server.io);
-        var i: usize = server.single.count();
-        while (i > 0) {
-            i -= 1;
-            const sf = &server.single.values()[i];
-            if (sf.result != null) {
-                files.append(server.gpa, server.single.keys()[i]) catch {};
-                files.appendSlice(server.gpa, sf.files.keys()) catch {};
-            }
-            sf.clearResult(server.gpa);
-            if (!sf.running) server.single.swapRemoveAt(i);
-        }
-    }
-    server.publishFiles(files.items, true);
 }
 
 /// Log level and slow request threshold; with `reopen_file`, reopens the log file as configured
@@ -3475,7 +3405,7 @@ fn startup(server: *Server) Io.Cancelable!void {
     // workspace folders) are known only now, and naming hints depend on them; their live
     // diagnostics may also have switched to the configured zig's `zig ast-check`
     server.publishOpenFiles();
-    server.reconcileSingle();
+    server.single.reconcile();
 }
 
 /// Takes ownership of `env` and returns the server's copy of it (freed only in deinit)
@@ -3556,7 +3486,7 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
             appendNote(&notes, "zig.builtin_path {s} is not an existing file, using the generated builtin.zig", .{path});
         }
         // Generated with the settings of the single-file compile (`zig build-obj`, see
-        // `compileSingle`), whose diagnostics these files get
+        // `SingleFiles.compile`), whose diagnostics these files get
         break :blk za.project.builtin.generate(gpa, io, env, &.{"build-obj"}) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.OutOfMemory => null,
@@ -3611,11 +3541,11 @@ fn reloadZigPathsTask(server: *Server) Io.Cancelable!void {
         var roots: std.ArrayList(Vfs.FileId) = .empty;
         defer roots.deinit(server.gpa);
         {
-            server.single_mutex.lockUncancelable(server.io);
-            defer server.single_mutex.unlock(server.io);
-            roots.appendSlice(server.gpa, server.single.keys()) catch {};
+            server.single.mutex.lockUncancelable(server.io);
+            defer server.single.mutex.unlock(server.io);
+            roots.appendSlice(server.gpa, server.single.entries.keys()) catch {};
         }
-        server.recompileSingle(roots.items, &.{});
+        server.single.recompile(roots.items, &.{});
         // Files in the standard library and the global cache are not watched (see `watchable`):
         // the set changes with the effective directories
         server.resyncWatcher();
@@ -3623,7 +3553,7 @@ fn reloadZigPathsTask(server: *Server) Io.Cancelable!void {
     // The origins of files (the standard library, dependency packages in the global cache) and
     // inference results may change
     server.publishOpenFiles();
-    server.reconcileSingle();
+    server.single.reconcile();
 }
 
 // ── Single-file mode ─────────────────────────────────────────────────
@@ -3666,7 +3596,7 @@ const FileContext = enum {
     }
 };
 
-fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
+pub fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
     const in_project = server.inProject(file);
     switch (server.originOf(file, in_project)) {
         .virtual => return .none,
@@ -3721,7 +3651,7 @@ fn projectDirOf(server: *Server, path: []const u8) ?[]const u8 {
 
 /// Some project is still loading for the first time (see `Workspace.load_done`): it is not yet
 /// known which files outside the root directories belong to projects
-fn projectsLoading(server: *Server) bool {
+pub fn projectsLoading(server: *Server) bool {
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
     for (server.workspaces.items) |ws| if (ws.isLoading()) return true;
@@ -3798,249 +3728,10 @@ fn rememberHeldDocument(server: *Server, arena: Allocator, pending: *Pending, do
     pending.document = .{ .file = file, .text_changed_at = ctx.inputChangedAt(FileText, file) };
 }
 
-/// Compiles a detached file in the background with `zig build-obj -fno-emit-bin`; when requested
-/// again during a compile, recompiles after that compile finishes
-fn compileSingle(server: *Server, file: Vfs.FileId) void {
-    if (!server.startup_done.load(.acquire)) return; // compiled when startup finishes
-    if (server.fileContext(file) != .detached) return;
-    if (!server.buildFlags().compiler) return;
-    // The compiler reads from disk: a file that is not on disk (a new file not saved yet, a deleted
-    // file) is not compiled, and its previous compile result is dropped
-    Io.Dir.cwd().access(server.io, server.vfs.path(file), .{}) catch {
-        _ = server.dropSingle(file);
-        return;
-    };
-    // While projects are loading for the first time, the file may turn out to belong to a project:
-    // compile it when loading finishes rather than in the wrong context (see `reconcileSingle`)
-    const deferred = server.projectsLoading();
-    {
-        server.single_mutex.lockUncancelable(server.io);
-        defer server.single_mutex.unlock(server.io);
-        const gop = server.single.getOrPut(server.gpa, file) catch return;
-        if (!gop.found_existing) gop.value_ptr.* = .{};
-        if (deferred) {
-            gop.value_ptr.pending = true;
-            return;
-        }
-        gop.value_ptr.pending = false;
-        if (gop.value_ptr.running) {
-            gop.value_ptr.rerun = true;
-            return;
-        }
-        gop.value_ptr.running = true;
-    }
-    server.busyBegin();
-    // A compile takes seconds; avoid running it synchronously on the main loop where possible
-    // (otherwise messages such as responses to progress tokens cannot be handled meanwhile)
-    spawn(server.io, &server.bg_group, singleFileTask, .{ server, file });
-}
-
-/// Reconciles single-file mode with the current compile context of each file; called after the
-/// contexts may have changed (the zig environment became ready, a project finished loading, a
-/// compile set changed, a new instance replaced an old one, projects or root directories were added
-/// or removed, build integration or compiler diagnostics were toggled): roots that are no longer
-/// detached files drop their compile results; deferred compiles are run, and open detached files
-/// that have never been compiled are compiled. Whether single-file results are used for a file
-/// depends on that file's context (see `FileContext.usesSingle`), so the files in the results are
-/// republished accordingly.
-pub fn reconcileSingle(server: *Server) void {
-    if (server.isShuttingDown()) return;
-    const gpa = server.gpa;
-    var roots: std.ArrayList(Vfs.FileId) = .empty;
-    defer roots.deinit(gpa);
-    var affected: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
-    defer affected.deinit(gpa);
-    var compile: std.ArrayList(Vfs.FileId) = .empty;
-    defer compile.deinit(gpa);
-    {
-        server.single_mutex.lockUncancelable(server.io);
-        defer server.single_mutex.unlock(server.io);
-        roots.appendSlice(gpa, server.single.keys()) catch return;
-        for (server.single.values()) |*sf| for (sf.files.keys()) |f| affected.put(gpa, f, {}) catch return;
-    }
-    // The context is determined outside the lock: that
-    // needs the locks of projects and root directories
-    for (roots.items) |root| {
-        const detached = server.fileContext(root) == .detached;
-        server.single_mutex.lockUncancelable(server.io);
-        defer server.single_mutex.unlock(server.io);
-        const sf = server.single.getPtr(root) orelse continue;
-        if (detached) {
-            if (sf.pending) compile.append(gpa, root) catch {};
-            continue;
-        }
-        affected.put(gpa, root, {}) catch {};
-        for (sf.files.keys()) |f| affected.put(gpa, f, {}) catch {};
-        if (sf.running) {
-            // Dropped according to the context when the compile finishes (see `singleFileTask`)
-            sf.rerun = true;
-        } else {
-            sf.clearResult(gpa);
-            _ = server.single.swapRemove(root);
-        }
-    }
-    server.publishFiles(affected.keys(), true);
-
-    server.docs.mutex.lockUncancelable(server.io);
-    const open = gpa.dupe(Vfs.FileId, server.docs.open.keys()) catch {
-        server.docs.mutex.unlock(server.io);
-        return;
-    };
-    server.docs.mutex.unlock(server.io);
-    defer gpa.free(open);
-    {
-        server.single_mutex.lockUncancelable(server.io);
-        defer server.single_mutex.unlock(server.io);
-        for (open) |file| if (!server.single.contains(file)) compile.append(gpa, file) catch {};
-    }
-    for (compile.items) |file| server.compileSingle(file);
-    // Files in unloaded projects: the hint was deferred until startup finished
-    // and projects finished loading (see `appendUnloadedProjectHint`), and the
-    // context may also have just changed to this one
-    var unloaded: std.ArrayList(Vfs.FileId) = .empty;
-    defer unloaded.deinit(gpa);
-    for (open) |file| if (server.fileContext(file) == .unloaded_project) unloaded.append(gpa, file) catch {};
-    server.publishFiles(unloaded.items, false);
-}
-
 /// Sequence number of a compile result: project builds and single-file compiles each take one when
 /// storing a result; larger is newer
 pub fn nextCompileGeneration(server: *Server) u64 {
     return server.compile_generation.fetchAdd(1, .monotonic) + 1;
-}
-
-/// Drops the compile result of the root file `file`, which is no longer on disk, and republishes
-/// the files that have errors in that result (errors in files it imports are cleared too). Returns
-/// whether a result was dropped (`file` has then been republished as well).
-fn dropSingle(server: *Server, file: Vfs.FileId) bool {
-    var affected: std.ArrayList(Vfs.FileId) = .empty;
-    defer affected.deinit(server.gpa);
-    {
-        server.single_mutex.lockUncancelable(server.io);
-        defer server.single_mutex.unlock(server.io);
-        const sf = server.single.getPtr(file) orelse return false;
-        // An ongoing compile may have read the file before it was deleted: recompile when it
-        // finishes (the file is no longer on disk, so the result is empty)
-        if (sf.running) sf.rerun = true;
-        if (sf.result == null) return false;
-        affected.append(server.gpa, file) catch {};
-        affected.appendSlice(server.gpa, sf.files.keys()) catch {};
-        sf.clearResult(server.gpa);
-    }
-    server.publishFiles(affected.items, true);
-    return true;
-}
-
-fn singleFileTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
-    defer server.busyEnd();
-    const path = server.vfs.path(file);
-    var pc: panic_context.Text = .{};
-    pc.enter("single-file compile {s}", .{path});
-    defer pc.leave();
-    var title_buf: [256]u8 = undefined;
-    const title = std.fmt.bufPrint(&title_buf, "Compiling {s}", .{std.fs.path.basename(path)}) catch "Compiling";
-    const progress = server.progress.begin(server, title, false);
-    var errors: usize = 0;
-    defer server.progress.end(server, progress, if (errors == 0) "Done" else "Has errors");
-    while (true) {
-        // Taken for every compile: after the zig path configuration changes, recompiles use the new
-        // environment
-        const env = server.zigEnv().?;
-        var inputs: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
-        const result: ?*compiler.BuildResult = blk: {
-            // The file has been deleted from disk (if deleted during a compile, `dropSingle`
-            // requests a recompile): no result
-            Io.Dir.cwd().access(server.io, path, .{}) catch break :blk null;
-            var compiled = za.project.bsp.compileSingleFile(server.gpa, server.io, env, path, &server.single_compiles) catch |err| switch (err) {
-                // The server is stopping: the compile was ended, and nothing is published anymore
-                error.Stopped => {
-                    server.single_mutex.lockUncancelable(server.io);
-                    defer server.single_mutex.unlock(server.io);
-                    server.single.getPtr(file).?.running = false;
-                    return;
-                },
-                else => {
-                    log.warn("{s}: single-file compile failed: {t}", .{ path, err });
-                    break :blk null;
-                },
-            };
-            defer compiled.deinit(server.gpa);
-            errors = compiled.errors.errorMessageCount();
-            for (compiled.inputs) |p| {
-                const id = server.toolFile(p) catch continue;
-                inputs.put(server.gpa, id, {}) catch continue;
-            }
-            break :blk compiler.collect(server.gpa, &.{compiled.errors}, std.fs.path.dirname(path) orelse ".", path, server, readDisk) catch null;
-        };
-        var files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty;
-        if (result) |r| for (r.files.keys(), r.files.values()) |p, *fr| {
-            const id = server.toolFile(p) catch continue;
-            files.put(server.gpa, id, fr) catch continue;
-        };
-        // During the compile, the file may have stopped being a detached file (its project finished
-        // loading, a build.zig was created in its root directory, etc.), or compiler diagnostics
-        // may have been turned off: in either case this result is not used
-        const detached = server.fileContext(file) == .detached and server.buildFlags().compiler;
-        server.single_mutex.lockUncancelable(server.io);
-        const sf = server.single.getPtr(file).?;
-        if (detached and sf.rerun) {
-            sf.rerun = false;
-            server.single_mutex.unlock(server.io);
-            files.deinit(server.gpa);
-            inputs.deinit(server.gpa);
-            if (result) |r| r.release(server.gpa);
-            continue;
-        }
-        // Affected files: the root file itself, and the files with errors in the previous and the
-        // current result (imported files included)
-        var affected: std.ArrayList(Vfs.FileId) = .empty;
-        defer affected.deinit(server.gpa);
-        affected.append(server.gpa, file) catch {};
-        affected.appendSlice(server.gpa, sf.files.keys()) catch {};
-        sf.clearResult(server.gpa);
-        if (detached) {
-            affected.appendSlice(server.gpa, files.keys()) catch {};
-            sf.result = result;
-            sf.files = files;
-            sf.inputs = inputs;
-            sf.generation = server.nextCompileGeneration();
-            sf.running = false;
-        } else {
-            // Discard this result and stop tracking this root file
-            files.deinit(server.gpa);
-            inputs.deinit(server.gpa);
-            if (result) |r| r.release(server.gpa);
-            _ = server.single.swapRemove(file);
-        }
-        server.single_mutex.unlock(server.io);
-        server.publishFiles(affected.items, true);
-        return;
-    }
-}
-
-/// Recompiles single-file mode roots: `roots`, plus the roots whose last
-/// compile read a file in `changed` or reported errors in one (e.g. a
-/// root that imports the saved file). Each root is compiled only once.
-fn recompileSingle(server: *Server, roots: []const Vfs.FileId, changed: []const Vfs.FileId) void {
-    var list: std.AutoArrayHashMapUnmanaged(Vfs.FileId, void) = .empty;
-    defer list.deinit(server.gpa);
-    for (roots) |root| list.put(server.gpa, root, {}) catch return;
-    {
-        server.single_mutex.lockUncancelable(server.io);
-        defer server.single_mutex.unlock(server.io);
-        for (server.single.keys(), server.single.values()) |root, *sf| {
-            for (changed) |f| if (sf.inputs.contains(f) or sf.files.contains(f)) {
-                list.put(server.gpa, root, {}) catch return;
-                break;
-            };
-        }
-    }
-    for (list.keys()) |root| server.compileSingle(root);
-}
-
-fn readDisk(ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8 {
-    const server: *Server = @ptrCast(@alignCast(ctx));
-    return Io.Dir.cwd().readFileAlloc(server.io, path, gpa, .limited(Vfs.max_file_size)) catch null;
 }
 
 /// Starts the project for a root directory; does nothing if the root directory already has a
@@ -4252,7 +3943,7 @@ fn refreshSubProjects(server: *Server, a: Allocator, files: []const []const u8) 
     if (server.stopStrayProjects()) server.updateModuleGraph();
     server.startOpenSubProjects();
     server.publishOpenFiles();
-    server.reconcileSingle();
+    server.single.reconcile();
 }
 
 /// Whether `list` has a path that is `path` (see `Vfs.samePath`)
@@ -4349,7 +4040,7 @@ fn didChangeWorkspaceFolders(server: *Server, arena: Allocator, params: types.Di
     // Open files may move into or out of project directories and unloaded projects (the hint
     // appears or disappears accordingly)
     server.publishOpenFiles();
-    server.reconcileSingle();
+    server.single.reconcile();
     server.resyncWatcher();
     // Before startup, the scan at the end of startup covers the new roots
     if (server.started) server.scheduleScan();
@@ -4616,7 +4307,7 @@ fn stopWorkspaces(server: *Server) void {
     server.wakeProjectWaiters();
     server.wakeScanWaiters();
     if (server.watcher) |w| w.stop();
-    server.single_compiles.stop(server.io);
+    server.single.compiles.stop(server.io);
 }
 
 pub fn isShuttingDown(server: *Server) bool {
@@ -5658,9 +5349,9 @@ fn compilerResult(server: *Server, arena: Allocator, file: Vfs.FileId, other: *O
         }
     }
     if (server.fileContext(file).usesSingle()) {
-        server.single_mutex.lockUncancelable(server.io);
-        defer server.single_mutex.unlock(server.io);
-        for (server.single.values()) |*sf| if (sf.files.get(file)) |fr| {
+        server.single.mutex.lockUncancelable(server.io);
+        defer server.single.mutex.unlock(server.io);
+        for (server.single.entries.values()) |*sf| if (sf.files.get(file)) |fr| {
             const build = sf.result orelse {
                 _ = never(true, @src(), "single-file root has result files without a result");
                 continue;
@@ -5794,7 +5485,7 @@ test "computeDiagnostics: notes of combined results keep the coordinates of thei
     // the saved text finishes: the older result is iterated first
     for ([_][]const u8{ "b.zig", "a.zig" }, [_][]const u8{ old_util, new_util }, 1..) |root, text, generation| {
         const result = try Build.result(util_path, text);
-        const gop = try server.single.getOrPut(gpa, try server.vfs.intern(try std.fs.path.join(arena, &.{ dir, root })));
+        const gop = try server.single.entries.getOrPut(gpa, try server.vfs.intern(try std.fs.path.join(arena, &.{ dir, root })));
         gop.value_ptr.* = .{ .result = result, .generation = generation };
         try gop.value_ptr.files.put(gpa, util, result.files.getPtr(util_path).?);
     }
@@ -8015,9 +7706,9 @@ fn fileStatus(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: DocumentP
     }
     var roots: std.ArrayList([]const u8) = .empty;
     {
-        server.single_mutex.lockUncancelable(server.io);
-        defer server.single_mutex.unlock(server.io);
-        for (server.single.keys(), server.single.values()) |root, *sf| {
+        server.single.mutex.lockUncancelable(server.io);
+        defer server.single.mutex.unlock(server.io);
+        for (server.single.entries.keys(), server.single.entries.values()) |root, *sf| {
             if (root == file or sf.inputs.contains(file) or sf.files.contains(file)) try roots.append(arena, server.vfs.path(root));
         }
     }

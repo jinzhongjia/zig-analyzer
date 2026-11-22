@@ -889,9 +889,9 @@ test "removed workspace folder: open files belong to a project that is not loade
     const after = (try lastDiagnostics(&h, main_uri)) orelse return error.NoDiagnostics;
     try testing.expectEqual(1, after.len);
     try testing.expect(std.mem.startsWith(u8, after[0], "this file belongs to the project at"));
-    h.server.single_mutex.lockUncancelable(testing.io);
-    const single_count = h.server.single.count();
-    h.server.single_mutex.unlock(testing.io);
+    h.server.single.mutex.lockUncancelable(testing.io);
+    const single_count = h.server.single.entries.count();
+    h.server.single.mutex.unlock(testing.io);
     try testing.expectEqual(0, single_count);
 
     _ = try h.request("shutdown", {});
