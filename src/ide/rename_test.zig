@@ -322,11 +322,13 @@ test "rename: declarations the standard library looks up in the root source file
 }
 
 /// Extra AstGen error after renaming all references of the definition at `<|>` to `new`; with
-/// `skip_uses`, only the declaration is renamed (simulating references missed by the rename)
-fn verify(text: []const u8, new: []const u8, skip_uses: bool) ![]const u8 {
+/// `skip_uses`, only the declaration is renamed (simulating references missed by the rename); with
+/// `zig_unavailable`, the live checks cannot run
+fn verify(text: []const u8, new: []const u8, skip_uses: bool, zig_unavailable: bool) ![]const u8 {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
+    if (zig_unavailable) try w.zigUnavailable();
     const added = try w.add("/p/main.zig", text);
     const a = w.arena.allocator();
     var ctx = w.db.beginRead(a);
@@ -343,9 +345,26 @@ fn verify(text: []const u8, new: []const u8, skip_uses: bool) ![]const u8 {
 }
 
 fn expectVerify(text: []const u8, new: []const u8, skip_uses: bool, expected: []const u8) !void {
-    const got = try verify(text, new, skip_uses);
+    const got = try verify(text, new, skip_uses, false);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(expected, got);
+}
+
+test "rename: edits are refused when AstGen cannot check them" {
+    // Empty results of checks that could not run must neither approve a rename that adds an error
+    // nor refuse one that does not
+    const text =
+        \\fn f() u32 {
+        \\    const a = 1;
+        \\    const <|>b = 2;
+        \\    return a + b;
+        \\}
+    ;
+    for ([_][]const u8{ "c", "a" }) |new| {
+        const got = try verify(text, new, false, true);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("3:11 AstGen could not check the edited text", got);
+    }
 }
 
 test "rename: AstGen confirms the renamed text" {

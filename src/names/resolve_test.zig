@@ -41,6 +41,14 @@ pub const World = struct {
         w.arena.deinit();
     }
 
+    /// Makes every live check fail to run (`live.Result.complete` is false): the subprocess
+    /// backend with a zig that does not exist
+    pub fn zigUnavailable(w: *World) !void {
+        w.db.beginWrite();
+        defer w.db.endWrite();
+        try w.db.set(database.live.LiveBackend, {}, .{ .subprocess = try testing.allocator.dupe(u8, "/nonexistent/zig") }, .low);
+    }
+
     /// The added file and the cursor position after removing `<|>` (0 without a marker)
     pub const Added = struct { file: FileId, cursor: u32 };
 
