@@ -42,10 +42,10 @@
 const std = @import("std");
 const json = std.json;
 const Allocator = std.mem.Allocator;
-const ImportOptions = @import("../ide_db/organize_imports.zig").Options;
-const HoverInstances = @import("../ide/hover.zig").Instances;
-const syntax_queries = @import("../syntax/queries.zig");
-const syntax_ast = @import("../syntax/ast.zig");
+const ImportOptions = @import("ide_db/organize_imports.zig").Options;
+const HoverInstances = @import("ide/hover.zig").Instances;
+const syntax_queries = @import("syntax/queries.zig");
+const syntax_ast = @import("syntax/ast.zig");
 
 const Config = @This();
 

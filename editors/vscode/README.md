@@ -96,7 +96,7 @@ Click the `zig-analyzer` status bar item, or run from the command palette:
 ```sh
 npm install
 npm run typecheck
-npm run check-settings   # package.json settings match src/server/Config.zig
+npm run check-settings   # package.json settings match src/Config.zig
 npm test                 # unit tests, smoke test, Install Server test; ZIG_ANALYZER=<server> VSCODE_EXECUTABLE=<code> are optional
 npm run package          # build zig-analyzer-<version>.vsix
 ```

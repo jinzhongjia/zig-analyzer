@@ -41,7 +41,7 @@ zig-analyzer is a language server (LSP) for Zig 0.17. Current stage: feature-com
 ## Layers
 
 ```
-server/       LSP main loop, scheduling, cancellation, workspace and project management, configuration
+server/       LSP main loop, scheduling, cancellation, workspace and project management
 ide/          hover · completion · goto · refs · rename · inlay hints · code actions · naming · unused · lint …
 ide_db/       reference search · call-site seeds
 sema/         InternPool · type inference · comptime interpreter · type rendering
@@ -58,6 +58,7 @@ lsp/          types generated from metaModel.json · JSON-RPC · transport
 
 - Each layer depends only on the layers below it; tests may reference higher layers to drive end-to-end scenarios.
 - All queries are registered in `database.zig` to form a single `Db` type. The names layer and the layers above it obtain `Db.Ctx` and the queries of the lower layers through it.
+- `Config.zig` (the settings and the project configuration file) sits beside `database.zig`: its settings use types of the IDE layers, and the IDE layer reads its schema to complete `zig-analyzer.zon`.
 
 ---
 
@@ -372,7 +373,7 @@ Edit-triggered publishing is debounced per file; live diagnostics are computed o
 
 ### Configuration
 
-Options come from the client (`initializationOptions`, `workspace/configuration`), and a project-root `zig-analyzer.zon` can override project options; `src/server/Config.zig` describes each option. Pulled or pushed settings replace the current ones; a `null` section in a pull reply leaves them in effect.
+Options come from the client (`initializationOptions`, `workspace/configuration`), and a project-root `zig-analyzer.zon` can override project options; `src/Config.zig` describes each option. Pulled or pushed settings replace the current ones; a `null` section in a pull reply leaves them in effect.
 
 ### Exit
 

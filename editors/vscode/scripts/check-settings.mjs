@@ -1,10 +1,10 @@
 // Checks that the settings contributed in package.json match the server's settings table in
-// src/server/Config.zig: every server setting has a VS Code setting and the other way around.
+// src/Config.zig: every server setting has a VS Code setting and the other way around.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const root = new URL("../../../", import.meta.url);
-const config = readFileSync(fileURLToPath(new URL("src/server/Config.zig", root)), "utf8");
+const config = readFileSync(fileURLToPath(new URL("src/Config.zig", root)), "utf8");
 const table = config.slice(config.indexOf("const settings = [_]Setting{"));
 const server = new Set(
   [...table.slice(0, table.indexOf("};")).matchAll(/\.section = "(\w+)", \.key = "(\w+)"/g)].map((m) => `${m[1]}.${m[2]}`),

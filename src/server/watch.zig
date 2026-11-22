@@ -49,7 +49,7 @@ const types = za.lsp.types;
 const uri = za.base.uri;
 const Vfs = za.base.Vfs;
 const Server = @import("Server.zig");
-const Config = @import("Config.zig");
+const Config = @import("../Config.zig");
 const origin = @import("origin.zig");
 const workspace_files = @import("workspace_files.zig");
 
