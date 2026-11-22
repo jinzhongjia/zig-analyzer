@@ -1209,12 +1209,7 @@ test "a module graph update does not cancel the folding and selection requests i
         const held = try h.send(r[0], r[1]);
         try gate.entered.wait(testing.io);
         // Another default builtin.zig changes the module graph, as a zig environment query does
-        {
-            h.server.env_mutex.lockUncancelable(testing.io);
-            defer h.server.env_mutex.unlock(testing.io);
-            if (h.server.default_builtin) |p| testing.allocator.free(p);
-            h.server.default_builtin = try std.fmt.allocPrint(testing.allocator, "/zig-analyzer-test/builtin-{d}.zig", .{i});
-        }
+        try setDefaultBuiltin(&h.server, try std.fmt.allocPrint(testing.allocator, "/zig-analyzer-test/builtin-{d}.zig", .{i}));
         const update = try std.Thread.spawn(.{}, Server.updateModuleGraph, .{&h.server});
         defer update.join();
         // The update waits for the held request
@@ -1257,12 +1252,7 @@ test "a request interrupted by an update the server made on its own is answered,
     const hover = try h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
     try gate.entered.wait(testing.io);
     // Another default builtin.zig changes the module graph, as a zig environment query does
-    {
-        h.server.env_mutex.lockUncancelable(testing.io);
-        defer h.server.env_mutex.unlock(testing.io);
-        if (h.server.default_builtin) |p| testing.allocator.free(p);
-        h.server.default_builtin = try testing.allocator.dupe(u8, "/zig-analyzer-test/builtin-retry.zig");
-    }
+    try setDefaultBuiltin(&h.server, try testing.allocator.dupe(u8, "/zig-analyzer-test/builtin-retry.zig"));
     const update = try std.Thread.spawn(.{}, Server.updateModuleGraph, .{&h.server});
     defer update.join();
     // The update waits for the held request, whose reads are canceled from here on
@@ -2579,4 +2569,10 @@ test "case-variant URIs of one file: each keeps its text and gets the diagnostic
     try testing.expectEqualStrings("disk", names[0]);
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
+}
+
+/// Replaces the default builtin.zig of the current toolchain, taking ownership of `path`
+fn setDefaultBuiltin(server: *Server, path: []const u8) !void {
+    const current = server.toolchain.load(.acquire);
+    try server.setToolchain(.{ .env = current.env, .source_tree = current.source_tree, .default_builtin = path });
 }

@@ -116,16 +116,15 @@ repeated_builds: std.atomic.Value(u64) = .init(0),
 /// Environment variables of the process: zig child processes are started with the zig path
 /// overrides applied on top of them (see `ZigEnv.withOverrides`)
 environ: std.process.Environ = .empty,
+/// Protects `detected_env`, `envs`, `toolchains`, and `warned`
 env_mutex: Io.Mutex = .init,
-/// The effective zig environment: the detected one with the path overrides from the
-/// configuration applied (see `applyZigPaths`). Queried in the background after startup; null
-/// until the query completes
-zig_env: ?*const ZigEnv = null,
-/// The lib directory of `zig_env` is the `lib` directory of Zig's own source tree (see
-/// `origin.Rules.zig_source_tree`); set together with it
-zig_source_tree: bool = false,
-/// `childEnviron` of `zig_env`, set together with it: the environment of the zig child processes
-/// that queries start (`zig ast-check` of live diagnostics, read through `Env`)
+/// The effective zig environment and what is derived from it (see `setToolchain`)
+toolchain: std.atomic.Value(*const Toolchain) = .init(&no_toolchain),
+/// Every toolchain set so far: a replaced one may still be read, so all are freed only in deinit
+toolchains: std.ArrayList(*Toolchain) = .empty,
+/// `childEnviron` of the toolchain's environment, set together with it: the environment of the
+/// zig child processes that queries start (`zig ast-check` of live diagnostics, read through
+/// `Env`, which cannot depend on `Toolchain`)
 zig_environ: std.atomic.Value(?*const std.process.Environ.Map) = .init(null),
 /// The environment detected by `zig env`; null until the query completes
 detected_env: ?*const ZigEnv = null,
@@ -151,8 +150,6 @@ config_pulling: std.atomic.Value(bool) = .init(false),
 /// (see `wakeProjectWaiters`)
 project_wait_mutex: Io.Mutex = .init,
 project_wait_cond: Io.Condition = .init,
-/// builtin.zig for files that belong to no project (native target, Debug); protected by env_mutex
-default_builtin: ?[]u8 = null,
 warned: bool = false,
 workspaces_mutex: Io.Mutex = .init,
 /// Currently visible instance of each project (one reference held on each). Before an instance is
@@ -274,6 +271,21 @@ sent: Sent = .{},
 
 pub const State = enum { uninitialized, running, shutdown };
 
+/// The effective zig environment and what is derived from it. Replaced as a whole and never
+/// changed, so a reader sees values that belong together without taking a lock.
+pub const Toolchain = struct {
+    /// The detected environment with the path overrides from the configuration applied (see
+    /// `applyZigPaths`); null until the environment is queried in the background after startup
+    env: ?*const ZigEnv = null,
+    /// The lib directory of `env` is the `lib` directory of Zig's own source tree (see
+    /// `origin.Rules.zig_source_tree`)
+    source_tree: bool = false,
+    /// builtin.zig for files that belong to no project (native target, Debug)
+    default_builtin: ?[]const u8 = null,
+};
+
+const no_toolchain: Toolchain = .{};
+
 pub const TestHooks = if (@import("builtin").is_test) struct {
     /// Holds the read and semantic requests of one method at a point of their execution (see
     /// `TestGate`)
@@ -297,15 +309,6 @@ pub const TestHooks = if (@import("builtin").is_test) struct {
     /// test can make a write transaction wait for the lock during the comparison
     graph: ?*OnceGate = null,
 } else struct {};
-
-/// Every field is protected by `mutex`
-const PublishQueue = struct {
-    mutex: Io.Mutex = .init,
-    jobs: std.ArrayList(PublishJob) = .empty,
-    workers: usize = 0,
-    /// Files queued or being published; see `publishFiles`
-    files: std.AutoHashMapUnmanaged(Vfs.FileId, PublishState) = .empty,
-};
 
 const Indexing = struct {
     /// Counts the module graph updates: a pass indexes the module graph as of its generation or
@@ -344,6 +347,15 @@ const Scans = struct {
     /// `waitScans`)
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
+};
+
+/// Every field is protected by `mutex`
+const PublishQueue = struct {
+    mutex: Io.Mutex = .init,
+    jobs: std.ArrayList(PublishJob) = .empty,
+    workers: usize = 0,
+    /// Files queued or being published; see `publishFiles`
+    files: std.AutoHashMapUnmanaged(Vfs.FileId, PublishState) = .empty,
 };
 
 /// Every field is protected by `mutex`
@@ -498,7 +510,11 @@ pub fn deinit(server: *Server) void {
         server.gpa.destroy(env);
     }
     server.envs.deinit(server.gpa);
-    if (server.default_builtin) |p| server.gpa.free(p);
+    for (server.toolchains.items) |t| {
+        if (t.default_builtin) |p| server.gpa.free(p);
+        server.gpa.destroy(t);
+    }
+    server.toolchains.deinit(server.gpa);
     server.builtin_targets.deinit(server.gpa);
     for (server.docs.open.values()) |*o| o.deinit(server.gpa);
     server.docs.open.deinit(server.gpa);
@@ -1218,11 +1234,7 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
         defer server.gpa.free(p);
         break :blk try server.vfs.intern(p);
     } else null;
-    const default_builtin: ?Vfs.FileId = blk: {
-        server.env_mutex.lockUncancelable(server.io);
-        defer server.env_mutex.unlock(server.io);
-        break :blk if (server.default_builtin) |p| try server.vfs.intern(p) else null;
-    };
+    const default_builtin: ?Vfs.FileId = if (server.toolchain.load(.acquire).default_builtin) |p| try server.vfs.intern(p) else null;
     const graph = try server.gpa.create(ModuleGraph);
     graph.* = b.finish(std_root, default_builtin) catch |err| {
         server.gpa.destroy(graph);
@@ -2925,14 +2937,11 @@ fn watchRegistrationFailed(server: *Server) void {
 /// roots_mutex and then workspaces_mutex; must not be called inside a write transaction.
 pub fn originRules(server: *Server, arena: Allocator) Allocator.Error!origin.Rules {
     var rules: origin.Rules = .{};
-    {
-        server.env_mutex.lockUncancelable(server.io);
-        defer server.env_mutex.unlock(server.io);
-        if (server.zig_env) |env| {
-            rules.zig_lib = try arena.dupe(u8, env.lib_dir);
-            rules.global_cache = try arena.dupe(u8, env.global_cache_dir);
-            rules.zig_source_tree = server.zig_source_tree;
-        }
+    const toolchain = server.toolchain.load(.acquire);
+    if (toolchain.env) |env| {
+        rules.zig_lib = try arena.dupe(u8, env.lib_dir);
+        rules.global_cache = try arena.dupe(u8, env.global_cache_dir);
+        rules.zig_source_tree = toolchain.source_tree;
     }
     rules.roots = try server.rootsAlloc(arena);
     var local_caches: std.ArrayList([]const u8) = .empty;
@@ -3442,11 +3451,15 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
     const io = server.io;
     server.zig_paths_mutex.lockUncancelable(io);
     defer server.zig_paths_mutex.unlock(io);
-    const detected, const current = blk: {
+    const detected = blk: {
         server.env_mutex.lockUncancelable(io);
         defer server.env_mutex.unlock(io);
-        break :blk .{ server.detected_env orelse return .{}, server.zig_env };
+        break :blk server.detected_env orelse return .{};
     };
+    // Toolchains are set only here, under `zig_paths_mutex`: this is still the current one when
+    // the new one is set
+    const old = server.toolchain.load(.acquire);
+    const current = old.env;
     var config = server.configSnapshot() catch Config{};
     defer config.deinit(gpa);
     var buf: [2048]u8 = undefined;
@@ -3496,26 +3509,34 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
     };
 
     const source_tree = if (std.fs.path.dirname(env.lib_dir)) |parent| server.hasBuildZig(parent) catch false else false;
-    var change: ZigPathsChange = .{};
-    var unused_builtin: ?[]u8 = default_builtin;
-    {
-        server.env_mutex.lockUncancelable(io);
-        defer server.env_mutex.unlock(io);
-        change.env = server.zig_env != env;
-        server.zig_env = env;
-        server.zig_source_tree = source_tree;
-        server.zig_environ.store(env.childEnviron(), .release);
-        if (!eqlOptionalStr(server.default_builtin, default_builtin)) {
-            change.builtin = true;
-            // The default builtin.zig is read only while holding the lock (see
-            // `updateModuleGraphInner`): the replaced path can be freed outside the lock
-            unused_builtin = server.default_builtin;
-            server.default_builtin = default_builtin;
-        }
-    }
-    if (unused_builtin) |p| gpa.free(p);
+    const change: ZigPathsChange = .{
+        .env = old.env != env,
+        .builtin = !eqlOptionalStr(old.default_builtin, default_builtin),
+    };
+    if (change.env or change.builtin or old.source_tree != source_tree) {
+        server.setToolchain(.{ .env = env, .source_tree = source_tree, .default_builtin = default_builtin }) catch {
+            log.err("out of memory while applying the zig path settings", .{});
+            return .{};
+        };
+    } else if (default_builtin) |p| gpa.free(p);
     if (notes.end != 0) server.showWarning(notes.buffered());
     return change;
+}
+
+/// Makes `toolchain` current, taking ownership of its `default_builtin` (allocated with `gpa`,
+/// freed also on error). Only `applyZigPaths` and tests set toolchains.
+pub fn setToolchain(server: *Server, toolchain: Toolchain) Allocator.Error!void {
+    errdefer if (toolchain.default_builtin) |p| server.gpa.free(p);
+    const ptr = try server.gpa.create(Toolchain);
+    errdefer server.gpa.destroy(ptr);
+    ptr.* = toolchain;
+    {
+        server.env_mutex.lockUncancelable(server.io);
+        defer server.env_mutex.unlock(server.io);
+        try server.toolchains.append(server.gpa, ptr);
+    }
+    server.toolchain.store(ptr, .release);
+    server.zig_environ.store(if (toolchain.env) |env| env.childEnviron() else null, .release);
 }
 
 /// Appends a note about a configuration problem to `w`; the notes are merged into a single
@@ -4319,9 +4340,7 @@ pub fn isShuttingDown(server: *Server) bool {
 }
 
 pub fn zigEnv(server: *Server) ?*const ZigEnv {
-    server.env_mutex.lockUncancelable(server.io);
-    defer server.env_mutex.unlock(server.io);
-    return server.zig_env;
+    return server.toolchain.load(.acquire).env;
 }
 
 /// Unknown entries and entries of the wrong type in the configuration: combined into one warning.
@@ -5185,7 +5204,7 @@ test "updateModuleGraph keeps the old inputs when an allocation fails" {
 
     // When a later update fails, the old graph and TargetAbi are kept. Switch to another default
     // builtin.zig so that the new graph differs from the old one and the write is reached.
-    server.default_builtin = try failing.allocator().dupe(u8, "/zig-analyzer-test/builtin.zig");
+    try server.setToolchain(.{ .default_builtin = try server.gpa.dupe(u8, "/zig-analyzer-test/builtin.zig") });
     fail_index = 0;
     while (true) : (fail_index += 1) {
         try std.testing.expect(fail_index < 10_000);
@@ -5226,7 +5245,7 @@ test "updateModuleGraph takes no write transaction when nothing changed" {
     // changed would cancel in-flight computations and requests
     try server.updateModuleGraphInner();
     try std.testing.expectEqual(writes, server.db.writes.load(.monotonic));
-    server.default_builtin = try std.testing.allocator.dupe(u8, "/zig-analyzer-test/builtin.zig");
+    try server.setToolchain(.{ .default_builtin = try server.gpa.dupe(u8, "/zig-analyzer-test/builtin.zig") });
     try server.updateModuleGraphInner();
     try std.testing.expectEqual(writes + 1, server.db.writes.load(.monotonic));
 }
