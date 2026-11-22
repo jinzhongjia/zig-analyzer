@@ -349,7 +349,8 @@ pub fn stdRootLookup(r: *Resolver, def: Def) resolve.Error!?Problem {
 /// missed by the rename (which no longer resolve to the declaration) are all reported. The
 /// position is mapped back to the text before the rename
 pub fn verifyAstGen(r: *Resolver, file: FileId, edits: []const Edit) resolve.Error!?Problem {
-    const errors = try astGenErrors(r, file, edits);
+    const errors = try astGenErrors(r, file, edits) orelse
+        return .{ .file = file, .offset = if (edits.len > 0) edits[0].start else 0, .message = unchecked_message };
     // Errors are matched by message text; errors that existed before the rename do not count.
     // Counts are not compared: a new error may keep AstGen from reporting an existing one
     var known: std.StringHashMapUnmanaged(u32) = .empty;
@@ -367,9 +368,14 @@ pub fn verifyAstGen(r: *Resolver, file: FileId, edits: []const Edit) resolve.Err
     return null;
 }
 
+/// Reason for refusing edits whose AstGen errors are unknown (`astGenErrors` returned null)
+pub const unchecked_message = "AstGen could not check the edited text";
+
 /// AstGen errors of the file before and after applying `edits` (sorted by position,
 /// non-overlapping). Positions of the errors after are mapped back to the text before applying.
-pub fn astGenErrors(r: *Resolver, file: FileId, edits: []const Edit) resolve.Error!struct { before: []const AstGenError, after: []const AstGenError } {
+/// Null when either check could not run (`live.Result.complete`): its empty result says nothing
+/// about the text, so the edits can be neither confirmed nor refused by the errors.
+pub fn astGenErrors(r: *Resolver, file: FileId, edits: []const Edit) resolve.Error!?struct { before: []const AstGenError, after: []const AstGenError } {
     const ctx = r.ctx;
     const gpa = ctx.db.gpa;
     const text = (try ctx.get(database.syntax.SourceText, file)).text;
@@ -392,8 +398,10 @@ pub fn astGenErrors(r: *Resolver, file: FileId, edits: []const Edit) resolve.Err
         own_before = try live.checkWith(gpa, ctx.db.io, backend, environ_map, text, mode);
         break :blk own_before.?;
     };
+    if (!before.complete) return null;
     const after = try live.checkWith(gpa, ctx.db.io, backend, environ_map, edited.items, mode);
     defer after.destroy(gpa);
+    if (!after.complete) return null;
     const out_before = try r.arena.alloc(AstGenError, before.items.len);
     for (before.items, out_before) |d, *o| o.* = .{ .start = d.start, .message = try r.arena.dupe(u8, d.message) };
     const out_after = try r.arena.alloc(AstGenError, after.items.len);

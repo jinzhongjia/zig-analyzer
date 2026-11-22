@@ -302,8 +302,7 @@ pub fn executeCommand(server: *Server, arena: Allocator, params: types.ExecuteCo
     var progress = server.progress.begin(server, title, false);
     defer if (progress) |p| server.progress.end(server, p, "failed");
 
-    var config = config_sync.configSnapshot(server) catch |err| return err;
-    defer config.deinit(server.gpa);
+    const config = server.config.load(.acquire);
     const argv = [_][]const u8{ config.zig_path orelse "zig", "fetch", args.url };
     const result = std.process.run(server.gpa, server.io, .{
         .argv = &argv,

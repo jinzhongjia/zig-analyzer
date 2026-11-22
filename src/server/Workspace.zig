@@ -221,7 +221,7 @@ pub fn start(server: *Server, root: []const u8, crash_restarts: u8) !*Workspace 
         defer gpa.free(text);
         hash.* = std.hash.Wyhash.hash(0, text);
     }
-    ws.config = try config_sync.configSnapshot(server);
+    ws.config = try server.config.load(.acquire).clone(gpa);
     errdefer ws.config.deinit(gpa);
     ws.project = try loadProjectConfig(server, root);
     errdefer if (ws.project) |*p| p.deinit(gpa);

@@ -193,9 +193,7 @@ const index_progress_delay_ms = 200;
 /// Whether auto-import is still enabled: the indexing task checks again before each batch and
 /// stops indexing once it is disabled
 pub fn autoImportEnabled(server: *Server) bool {
-    server.config_mutex.lockUncancelable(server.io);
-    defer server.config_mutex.unlock(server.io);
-    return server.config.completion_auto_import;
+    return server.config.load(.acquire).completion_auto_import;
 }
 
 /// Whether a Zig document is open. Virtual documents opened with languageId `zig` have a `.zig`

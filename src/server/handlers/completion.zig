@@ -46,12 +46,8 @@ pub fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types
     // progress (the previous round failed, or the task could not start), it starts again.
     const imports_ready = auto_import and
         server.index.imports_basis.load(.acquire) == indexing.importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
-    const max_auto_imports, const snippets, const placeholders = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        const c = &server.config;
-        break :blk .{ c.completion_max_auto_imports, c.completion_snippets, c.completion_argument_placeholders };
-    };
+    const config = server.config.load(.acquire);
+    const max_auto_imports, const snippets, const placeholders = .{ config.completion_max_auto_imports, config.completion_snippets, config.completion_argument_placeholders };
     const import_options = server.importOptionsFor(file);
     // `/` and `"` are trigger characters for paths; typed elsewhere they start no name
     const path_trigger = blk: {
@@ -93,6 +89,7 @@ pub fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types
                 .file => .File,
                 .folder => .Folder,
                 .label => .Reference,
+                .keyword => .Keyword,
                 .snippet => .Snippet,
             }),
             .documentation = if (it.doc) |d| .{ .MarkupContent = try Server.markup(arena, server.caps.completion_markdown, d) } else null,

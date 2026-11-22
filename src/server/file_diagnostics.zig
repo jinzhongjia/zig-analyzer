@@ -302,11 +302,7 @@ fn appendUnloadedProjectHint(server: *Server, arena: Allocator, file: Vfs.FileId
 
 /// Inactive code is shown only for open files: it requires inferring all members of the file
 fn wantsInactiveCode(server: *Server, file: Vfs.FileId) bool {
-    {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        if (!server.config.inactive_code) return false;
-    }
+    if (!server.config.load(.acquire).inactive_code) return false;
     server.docs.mutex.lockUncancelable(server.io);
     defer server.docs.mutex.unlock(server.io);
     return server.docs.open.contains(file);
@@ -373,18 +369,11 @@ const NamingSettings = struct {
 pub fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const u8) Allocator.Error!?NamingSettings {
     if (!hintsEligible(server, file, text)) return null;
     const path = server.vfs.path(file);
-    var enable: bool = undefined;
-    var ignore: []const []const u8 = undefined;
-    var exclude: []const []const u8 = undefined;
-    var rules: Config.NamingRules = undefined;
-    {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        enable = server.config.naming_enable;
-        ignore = try Server.dupeStrings(arena, server.config.naming_ignore);
-        exclude = try Server.dupeStrings(arena, server.config.naming_exclude);
-        rules = server.config.naming_rules;
-    }
+    const config = server.config.load(.acquire);
+    var enable = config.naming_enable;
+    var ignore = config.naming_ignore;
+    var exclude = config.naming_exclude;
+    var rules = config.naming_rules;
     // `naming.exclude` paths are relative to the workspace root directory, or to the project root
     // directory when they come from `zig-analyzer.zon`
     var base = try server.rootOf(arena, path);
@@ -440,12 +429,7 @@ fn hintsEligible(server: *Server, file: Vfs.FileId, text: []const u8) bool {
 fn unusedFor(server: *Server, file: Vfs.FileId, text: []const u8) bool {
     if (!hintsEligible(server, file, text)) return false;
     const path = server.vfs.path(file);
-    var enable = false;
-    {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        enable = server.config.unused_enable;
-    }
+    var enable = server.config.load(.acquire).unused_enable;
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);
@@ -466,14 +450,9 @@ fn unusedFor(server: *Server, file: Vfs.FileId, text: []const u8) bool {
 pub fn lintFor(server: *Server, file: Vfs.FileId, text: []const u8) ?Config.LintRules {
     if (!hintsEligible(server, file, text)) return null;
     const path = server.vfs.path(file);
-    var enable = false;
-    var rules: Config.LintRules = .{};
-    {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        enable = server.config.lint_enable;
-        rules = server.config.lint_rules;
-    }
+    const config = server.config.load(.acquire);
+    var enable = config.lint_enable;
+    var rules = config.lint_rules;
     {
         server.workspaces_mutex.lockUncancelable(server.io);
         defer server.workspaces_mutex.unlock(server.io);

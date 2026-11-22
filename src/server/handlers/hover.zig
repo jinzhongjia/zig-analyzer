@@ -21,11 +21,12 @@ pub fn hover(server: *Server, r: *Resolver, arena: Allocator, params: types.Hove
     const at = try server.textPosition(r, arena, params.textDocument.uri, params.position) orelse return null;
     // Checked before computing: a load that ends during the computation cancels this read
     const incomplete = project_set.projectsPending(server);
+    const config = server.config.load(.acquire);
     const info = try ide.hover.hoverWith(r, at.file, at.offset, .{
         .roots = try server.rootsAlloc(arena),
-        .instances = server.config.hover_instances,
-        .layout = server.config.hover_layout,
-        .fqn = server.config.hover_fqn,
+        .instances = config.hover_instances,
+        .layout = config.hover_layout,
+        .fqn = config.hover_fqn,
         // Links to source locations open the file at the line in the client; plain text has none
         .links = if (server.caps.hover_markdown) .{ .ctx = server, .uri = hoverUri } else null,
     }) orelse return null;

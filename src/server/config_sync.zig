@@ -45,34 +45,36 @@ pub fn didChangeConfiguration(server: *Server, _: Allocator, params: types.DidCh
 fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
     var new = fresh;
     server.reportConfigWarnings("zig-analyzer settings", &new);
-    server.config_mutex.lockUncancelable(server.io);
-    const zig_changed = !server.config.sameZig(&new);
-    const zig_paths_changed = !server.config.sameZigPaths(&new);
-    const build_changed = !server.config.sameBuild(&new);
-    const semantic_changed = server.config.callsite_seeding != new.callsite_seeding or server.config.semantic_tokens_mode != new.semantic_tokens_mode or
-        server.config.semantic_tokens_global_var != new.semantic_tokens_global_var;
-    const imports_enabled = !server.config.completion_auto_import and new.completion_auto_import;
-    const inactive_changed = server.config.inactive_code != new.inactive_code;
-    const naming_changed = !server.config.sameNaming(&new);
-    const unused_changed = server.config.unused_enable != new.unused_enable;
-    const lint_changed = !server.config.sameLint(&new);
-    const build_was_enabled = server.config.build_enable;
-    const sub_projects_changed = server.config.build_sub_projects != new.build_sub_projects;
-    const watcher_changed = server.config.files_watcher != new.files_watcher;
-    const inlay_changed = server.config.inlay_types != new.inlay_types or server.config.inlay_capture_types != new.inlay_capture_types or
-        server.config.inlay_field_types != new.inlay_field_types or
-        server.config.inlay_anonymous_containers != new.inlay_anonymous_containers or
-        server.config.inlay_parameters != new.inlay_parameters or server.config.inlay_builtin_parameters != new.inlay_builtin_parameters or
-        server.config.inlay_exclude_single_argument != new.inlay_exclude_single_argument or
-        server.config.hide_redundant_param_names != new.hide_redundant_param_names or server.config.inlay_max_length != new.inlay_max_length or
-        server.config.callsite_seeding != new.callsite_seeding;
-    const compiler_disabled = server.config.compiler_diagnostics and !new.compiler_diagnostics;
-    const log_file_changed = !eqlOptionalStr(server.config.log_file, new.log_file);
+    const old = server.config.load(.acquire);
+    if (old.same(&new)) {
+        new.deinit(server.gpa);
+        return;
+    }
+    const zig_changed = !old.sameZig(&new);
+    const zig_paths_changed = !old.sameZigPaths(&new);
+    const build_changed = !old.sameBuild(&new);
+    const semantic_changed = old.callsite_seeding != new.callsite_seeding or old.semantic_tokens_mode != new.semantic_tokens_mode or
+        old.semantic_tokens_global_var != new.semantic_tokens_global_var;
+    const imports_enabled = !old.completion_auto_import and new.completion_auto_import;
+    const inactive_changed = old.inactive_code != new.inactive_code;
+    const naming_changed = !old.sameNaming(&new);
+    const unused_changed = old.unused_enable != new.unused_enable;
+    const lint_changed = !old.sameLint(&new);
+    const build_was_enabled = old.build_enable;
+    const sub_projects_changed = old.build_sub_projects != new.build_sub_projects;
+    const watcher_changed = old.files_watcher != new.files_watcher;
+    const inlay_changed = old.inlay_types != new.inlay_types or old.inlay_capture_types != new.inlay_capture_types or
+        old.inlay_field_types != new.inlay_field_types or
+        old.inlay_anonymous_containers != new.inlay_anonymous_containers or
+        old.inlay_parameters != new.inlay_parameters or old.inlay_builtin_parameters != new.inlay_builtin_parameters or
+        old.inlay_exclude_single_argument != new.inlay_exclude_single_argument or
+        old.hide_redundant_param_names != new.hide_redundant_param_names or old.inlay_max_length != new.inlay_max_length or
+        old.callsite_seeding != new.callsite_seeding;
+    const compiler_disabled = old.compiler_diagnostics and !new.compiler_diagnostics;
+    const log_file_changed = !eqlOptionalStr(old.log_file, new.log_file);
     applyLogging(server, &new, log_file_changed);
     applyCacheLimits(server, &new);
-    server.config.deinit(server.gpa);
-    server.config = new;
-    server.config_mutex.unlock(server.io);
+    try setConfig(server, new);
     project_set.wakeProjectWaiters(server);
     if (inactive_changed or naming_changed or unused_changed or lint_changed) publishing.publishOpenFiles(server);
     if (watcher_changed) file_changes.resyncWatcher(server);
@@ -118,19 +120,13 @@ fn applyConfig(server: *Server, fresh: Config) Allocator.Error!void {
 
 /// Whether build system integration and compiler diagnostics are enabled
 pub fn buildFlags(server: *Server) struct { build: bool, compiler: bool } {
-    server.config_mutex.lockUncancelable(server.io);
-    defer server.config_mutex.unlock(server.io);
-    return .{ .build = server.config.build_enable, .compiler = server.config.compiler_diagnostics };
+    const config = server.config.load(.acquire);
+    return .{ .build = config.build_enable, .compiler = config.compiler_diagnostics };
 }
 
-/// Log level and slow request threshold; with `reopen_file`, reopens the log file as configured
+/// Log level; with `reopen_file`, reopens the log file as configured
 pub fn applyLogging(server: *Server, config: *const Config, reopen_file: bool) void {
     za.util.log.setLevel(config.log_level);
-    server.slow_request_ms.store(config.slow_request_ms, .monotonic);
-    server.debounce_ms.store(config.debounce_ms, .monotonic);
-    server.max_intern_pool_mb.store(config.max_intern_pool_mb, .monotonic);
-    server.callsite_seeding.store(config.callsite_seeding, .monotonic);
-    server.sub_projects_enabled.store(config.build_sub_projects, .release);
     if (!reopen_file) return;
     za.util.log.setFile(config.log_file) catch |err| {
         log.warn("cannot open log file {s}: {t}", .{ config.log_file.?, err });
@@ -208,11 +204,17 @@ pub fn handleConfigResponse(server: *Server, id: []const u8, result: json.Value,
     try applyConfig(server, fresh);
 }
 
-/// A copy of the current configuration (freed by the caller)
-pub fn configSnapshot(server: *Server) Allocator.Error!Config {
-    server.config_mutex.lockUncancelable(server.io);
-    defer server.config_mutex.unlock(server.io);
-    return server.config.clone(server.gpa);
+/// Publishes `config` as the current configuration (taking ownership of it, freed also on
+/// error); `callsite_seeding` is set together with it. Only the main loop sets configurations.
+pub fn setConfig(server: *Server, config: Config) Allocator.Error!void {
+    var owned = config;
+    errdefer owned.deinit(server.gpa);
+    const ptr = try server.gpa.create(Config);
+    errdefer server.gpa.destroy(ptr);
+    try server.configs.append(server.gpa, ptr);
+    ptr.* = owned;
+    server.config.store(ptr, .release);
+    server.callsite_seeding.store(ptr.callsite_seeding, .release);
 }
 
 fn endConfigPull(server: *Server) void {

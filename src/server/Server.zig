@@ -201,21 +201,14 @@ graph_mutex: Io.Mutex = .init,
 /// builtin.zig files are named by the hash of their contents, so a path always has the same
 /// contents.
 builtin_targets: std.AutoHashMapUnmanaged(Vfs.FileId, za.sema.InternPool.Target) = .empty,
-/// Config option `sema.callsite_seeding` (read by the IDE layer through `Env`)
+/// Config option `sema.callsite_seeding`, set together with `config`: read by the IDE layer
+/// through `Env`, which cannot depend on `Config`
 callsite_seeding: std.atomic.Value(bool) = .init(true),
-/// Config option `build.sub_projects`, readable where `config_mutex` cannot be taken (with
-/// `workspaces_mutex` held, see `startWorkspace`)
-sub_projects_enabled: std.atomic.Value(bool) = .init(true),
 /// Counting allocator (set by the executable; used for `heap_bytes` in `zig-analyzer/status`)
 heap: ?*const za.util.mem.Counting = null,
 /// Statistics of the release allocator (set by the executable; `allocator` in
 /// `zig-analyzer/status`)
 allocator_stats: ?*const fn (Allocator) Allocator.Error!za.util.PagedAllocator.Stats = null,
-/// Slow request log threshold (ms, 0 disables it), from the config option `log.slow_request_ms`
-slow_request_ms: std.atomic.Value(u32) = .init(100),
-/// Once the InternPool exceeds this many MB, type information is reclaimed as a whole
-/// generation (0 disables reclaiming); from the config option `sema.max_intern_pool_mb`
-max_intern_pool_mb: std.atomic.Value(u32) = .init(64),
 /// The most type information that one request or diagnostics publish has added (InternPool bytes
 /// and keys of the type-information queries, see `maybeResetSema`). A reclaim waits until the
 /// type information is at least twice that: one that discards what a single request needs makes
@@ -224,9 +217,6 @@ sema_peak_growth: struct {
     bytes: std.atomic.Value(usize) = .init(0),
     keys: std.atomic.Value(usize) = .init(0),
 } = .{},
-/// Debounce (ms) of diagnostic publishing triggered by edits, from the config option
-/// `diagnostics.debounce_ms`
-debounce_ms: std.atomic.Value(u32) = .init(50),
 /// Files pending publication due to edits (see `publishDebounced`)
 edits_mutex: Io.Mutex = .init,
 edits: std.AutoHashMapUnmanaged(Vfs.FileId, Edit) = .empty,
@@ -237,8 +227,12 @@ live_prepared: live.Prepared = undefined,
 index: Indexing = .{},
 /// Scans of the workspace for source files (see `scheduleScan`)
 scan: Scans = .{},
-config_mutex: Io.Mutex = .init,
-config: Config = .{},
+/// The current configuration (see `setConfig`): replaced as a whole and never modified, so a
+/// reader sees one consistent configuration without a lock
+config: std.atomic.Value(*const Config) = .init(&default_config),
+/// Every configuration set so far: a replaced one may still be read, so all are freed only in
+/// deinit (accessed only by `setConfig`, which the main loop serializes)
+configs: std.ArrayList(*Config) = .empty,
 /// What the client supports, read from `initialize` (accessed only on the main loop)
 caps: ClientCaps = .{},
 /// The client answered a registration of file watchers with an error: it does not watch files
@@ -317,6 +311,7 @@ pub const Toolchain = struct {
 };
 
 const no_toolchain: Toolchain = .{};
+const default_config: Config = .{};
 
 pub const TestHooks = if (@import("builtin").is_test) struct {
     /// Holds the read and semantic requests of one method at a point of their execution (see
@@ -570,7 +565,11 @@ pub fn deinit(server: *Server) void {
     server.semantic_cache.deinit(server.gpa);
     server.watched_built.deinit(server.gpa);
     server.progress.deinit(server.gpa);
-    server.config.deinit(server.gpa);
+    for (server.configs.items) |c| {
+        c.deinit(server.gpa);
+        server.gpa.destroy(c);
+    }
+    server.configs.deinit(server.gpa);
     server.pending.deinit(server.gpa);
     server.db.deinit();
     server.ip.deinit();
@@ -1202,16 +1201,17 @@ fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams)
     }
     server.caps.read(params.capabilities);
     if (params.initializationOptions) |options| if (options != .null) {
-        server.config = Config.parse(server.gpa, options) catch |err| switch (err) {
+        var config: Config = Config.parse(server.gpa, options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidConfig => blk: {
                 server.showWarning("invalid zig-analyzer initializationOptions, using defaults");
                 break :blk .{};
             },
         };
-        server.reportConfigWarnings("zig-analyzer settings", &server.config);
-        config_sync.applyLogging(server, &server.config, server.config.log_file != null);
-        config_sync.applyCacheLimits(server, &server.config);
+        server.reportConfigWarnings("zig-analyzer settings", &config);
+        config_sync.applyLogging(server, &config, config.log_file != null);
+        config_sync.applyCacheLimits(server, &config);
+        try config_sync.setConfig(server, config);
     };
     log.info("initialized, position encoding {t}", .{server.encoding});
     if (params.processId) |pid| server.watchParent(pid);
@@ -1466,7 +1466,7 @@ pub fn subProjectGap(server: *Server, r: *Resolver, name: []const u8, use: Scope
         try missing.append(r.arena, .{ .dir = dir, .state = state });
     }
     if (missing.items.len == 0) return null;
-    const enabled = server.sub_projects_enabled.load(.acquire);
+    const enabled = server.config.load(.acquire).build_sub_projects;
     // A project that failed to load stays so until build.zig changes: waiting would not help
     if (enabled) if (handler_sub_projects) |wait| if (!wait.awaited) {
         for (missing.items) |m| if (m.state != .failed) try wait.dirs.append(wait.arena, try wait.arena.dupe(u8, m.dir));
@@ -1513,12 +1513,7 @@ pub fn searchScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
 /// since, or when indexing stopped early) are indexed in the request.
 pub fn symbolScope(server: *Server, r: *Resolver) ![]const Vfs.FileId {
     const scope = try server.searchScope(r);
-    const dependencies = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        break :blk server.config.workspace_symbol_dependencies;
-    };
-    if (dependencies) return scope;
+    if (server.config.load(.acquire).workspace_symbol_dependencies) return scope;
     const rules = try server.originRules(r.arena);
     var user: std.ArrayList(Vfs.FileId) = .empty;
     for (scope) |f| if (!origin.classify(&server.vfs, rules, server.vfs.path(f), false).isLibrary()) try user.append(r.arena, f);
@@ -1656,11 +1651,7 @@ pub fn dupeStrings(arena: Allocator, list: []const []const u8) Allocator.Error![
 /// Layout rules of the import block for `file`: the client's settings, overridden by the
 /// `zig-analyzer.zon` of the project containing the file (the innermost one when nested)
 pub fn importOptionsFor(server: *Server, file: Vfs.FileId) ImportOptions {
-    var options = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        break :blk server.config.importOptions();
-    };
+    var options = server.config.load(.acquire).importOptions();
     const path = server.vfs.path(file);
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);

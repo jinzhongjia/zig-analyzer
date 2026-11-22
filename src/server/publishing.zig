@@ -208,7 +208,7 @@ fn debounceTask(server: *Server, file: Vfs.FileId) Io.Cancelable!void {
             }
             seen = edit.generation;
         }
-        const ms = server.debounce_ms.load(.monotonic);
+        const ms = server.config.load(.acquire).debounce_ms;
         if (ms > 0) try (Io.Clock.Duration{ .raw = .fromMilliseconds(ms), .clock = .awake }).sleep(server.io);
     }
     const start = semaUsage(server);
@@ -260,7 +260,7 @@ pub fn semaUsage(server: *Server) SemaUsage {
 /// `sema_peak_growth`). Called when a request or a diagnostics publish that started at `start`
 /// finishes, outside read transactions.
 pub fn maybeResetSema(server: *Server, start: SemaUsage) void {
-    const limit = server.max_intern_pool_mb.load(.monotonic);
+    const limit = server.config.load(.acquire).max_intern_pool_mb;
     if (limit == 0) return;
     const now = semaUsage(server);
     // A reclaim in the meantime counts as no growth

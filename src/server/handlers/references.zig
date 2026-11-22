@@ -83,11 +83,7 @@ pub fn documentHighlight(server: *Server, r: *Resolver, arena: Allocator, params
 
 pub fn workspaceSymbol(server: *Server, r: *Resolver, arena: Allocator, params: types.WorkspaceSymbolParams) HandlerError!types.ResultType("workspace/symbol") {
     const scope = try server.symbolScope(r);
-    const limit = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        break :blk server.config.workspace_symbol_limit;
-    };
+    const limit = server.config.load(.acquire).workspace_symbol_limit;
     const syms = try ide.workspace_symbol.search(r, scope, params.query, if (limit == 0) std.math.maxInt(usize) else limit);
     const out = try arena.alloc(types.WorkspaceSymbol, syms.len);
     var m: RangeMapper = .{ .server = server, .r = r };

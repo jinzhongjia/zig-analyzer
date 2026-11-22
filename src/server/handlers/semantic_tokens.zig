@@ -30,9 +30,8 @@ pub fn semanticTokensDelta(server: *Server, r: *Resolver, arena: Allocator, para
 }
 
 fn semanticTokensOptions(server: *Server) ide.semantic_tokens.Options {
-    server.config_mutex.lockUncancelable(server.io);
-    defer server.config_mutex.unlock(server.io);
-    return .{ .partial = server.config.semantic_tokens_mode == .partial, .global_var = server.config.semantic_tokens_global_var };
+    const config = server.config.load(.acquire);
+    return .{ .partial = config.semantic_tokens_mode == .partial, .global_var = config.semantic_tokens_global_var };
 }
 
 fn semanticTokensResult(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, data: []const u32, previous_id: ?[]const u8) HandlerError!SemanticCache.Result {

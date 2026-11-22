@@ -212,8 +212,7 @@ fn startup(server: *Server) Io.Cancelable!void {
     // The origin rules (the Zig installation and the global cache) are known from here on, also
     // when the zig environment cannot be queried
     defer indexing.scheduleScan(server);
-    var config = config_sync.configSnapshot(server) catch return;
-    defer config.deinit(server.gpa);
+    const config = server.config.load(.acquire);
     const queried = ZigEnv.query(server.gpa, server.io, config.zig_path) catch |err| {
         if (err == error.Canceled) return error.Canceled;
         // `zig build test` deliberately cannot find zig (see `ZigEnv.query`)
@@ -314,8 +313,7 @@ fn applyZigPaths(server: *Server) Io.Cancelable!ZigPathsChange {
     // the new one is set
     const old = server.toolchain.load(.acquire);
     const current = old.env;
-    var config = config_sync.configSnapshot(server) catch Config{};
-    defer config.deinit(gpa);
+    const config = server.config.load(.acquire);
     var buf: [2048]u8 = undefined;
     var notes: std.Io.Writer = .fixed(&buf);
 
@@ -482,7 +480,7 @@ pub fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
     const path = server.vfs.path(file);
     const build = config_sync.buildFlags(server).build;
     if (build) {
-        const sub_projects = server.sub_projects_enabled.load(.acquire);
+        const sub_projects = server.config.load(.acquire).build_sub_projects;
         server.roots_mutex.lockUncancelable(server.io);
         defer server.roots_mutex.unlock(server.io);
         for (server.roots.items, server.root_has_build.items) |root, has_build| {
@@ -551,12 +549,7 @@ pub fn projectsPending(server: *Server) bool {
 /// way from the client
 pub fn holdForProjects(server: *Server) bool {
     if (server.config_pulling.load(.acquire)) return true;
-    const enabled = blk: {
-        server.config_mutex.lockUncancelable(server.io);
-        defer server.config_mutex.unlock(server.io);
-        break :blk server.config.wait_for_project;
-    };
-    return enabled and projectsPending(server);
+    return server.config.load(.acquire).wait_for_project and projectsPending(server);
 }
 
 /// Holds a semantic request back (see `holdForProjects`) until it can be answered, or until it is
@@ -573,7 +566,7 @@ pub fn waitForProjects(server: *Server, pending: *const Pending) bool {
 }
 
 /// Called after changing anything `waitForProjects` checks. The caller must not hold the locks it
-/// takes while checking (`config_mutex`, `workspaces_mutex`, a workspace's mutex).
+/// takes while checking (`workspaces_mutex`, a workspace's mutex).
 pub fn wakeProjectWaiters(server: *Server) void {
     server.project_wait_mutex.lockUncancelable(server.io);
     defer server.project_wait_mutex.unlock(server.io);
@@ -638,7 +631,7 @@ pub fn isProjectRoot(server: *Server, root: []const u8) bool {
 /// build.zig, or, while `build.sub_projects` is on, a sub-project (see `sub_projects`) under a root
 /// directory that still has one
 fn startsProject(server: *Server, root: []const u8) bool {
-    const enabled = server.sub_projects_enabled.load(.acquire);
+    const enabled = server.config.load(.acquire).build_sub_projects;
     server.roots_mutex.lockUncancelable(server.io);
     defer server.roots_mutex.unlock(server.io);
     for (server.roots.items, server.root_has_build.items) |r, has_build| {
@@ -677,7 +670,7 @@ pub fn subProjectOf(server: *Server, a: Allocator, path: []const u8) Allocator.E
 /// its project, while `build.sub_projects` is on (and once the zig environment is known; startup
 /// starts it otherwise, see `refreshSubProjects`)
 pub fn startSubProjectFor(server: *Server, path: []const u8) void {
-    if (!server.sub_projects_enabled.load(.acquire) or zigEnv(server) == null) return;
+    if (!server.config.load(.acquire).build_sub_projects or zigEnv(server) == null) return;
     const dir = (subProjectOf(server, server.gpa, path) catch return) orelse return;
     defer server.gpa.free(dir);
     startWorkspace(server, dir);
@@ -685,7 +678,7 @@ pub fn startSubProjectFor(server: *Server, path: []const u8) void {
 
 /// Starts the projects of the sub-projects that contain open documents (see `startSubProjectFor`)
 pub fn startOpenSubProjects(server: *Server) void {
-    if (!server.sub_projects_enabled.load(.acquire) or zigEnv(server) == null) return;
+    if (!server.config.load(.acquire).build_sub_projects or zigEnv(server) == null) return;
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();

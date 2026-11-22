@@ -21,7 +21,7 @@ pub fn reportIfSlow(server: *Server, ctx: *Db.Ctx, method: []const u8, t0: Io.Ti
     // build output show a misleading `failed command`; the report contents are covered by tests
     // that call writeSlowReport directly
     if (@import("builtin").is_test) return;
-    const threshold = server.slow_request_ms.load(.monotonic);
+    const threshold = server.config.load(.acquire).slow_request_ms;
     if (threshold == 0) return;
     const ns: u64 = @intCast(@max(0, t0.durationTo(Io.Clock.awake.now(server.io)).nanoseconds));
     if (ns < @as(u64, threshold) * std.time.ns_per_ms) return;

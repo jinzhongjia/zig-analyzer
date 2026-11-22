@@ -500,9 +500,7 @@ pub const WatchScope = enum {
 };
 
 pub fn watchScope(server: *Server) WatchScope {
-    server.config_mutex.lockUncancelable(server.io);
-    defer server.config_mutex.unlock(server.io);
-    return switch (server.config.files_watcher) {
+    return switch (server.config.load(.acquire).files_watcher) {
         .auto => if (clientWatches(server)) .outside_roots else .all,
         .client => .none,
         .server => .all,
