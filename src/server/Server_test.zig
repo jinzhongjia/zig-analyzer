@@ -1557,7 +1557,11 @@ test "completion triggered by `/` or `\"` lists only paths" {
         const items = if (result == .array) result.array.items else result.object.get("items").?.array.items;
         var labels: std.ArrayList([]const u8) = .empty;
         defer labels.deinit(testing.allocator);
-        for (items) |it| try labels.append(testing.allocator, it.object.get("label").?.string);
+        for (items) |it| {
+            // Keywords (`CompletionItemKind.Keyword`)
+            if (it.object.get("kind").?.integer == 14) continue;
+            try labels.append(testing.allocator, it.object.get("label").?.string);
+        }
         const got = try std.mem.join(testing.allocator, " ", labels.items);
         defer testing.allocator.free(got);
         testing.expectEqualStrings(c[4], got) catch |err| {

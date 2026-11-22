@@ -6359,6 +6359,7 @@ fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types.Com
                 .file => .File,
                 .folder => .Folder,
                 .label => .Reference,
+                .keyword => .Keyword,
                 .snippet => .Snippet,
             }),
             .documentation = if (it.doc) |d| .{ .MarkupContent = try markup(arena, server.caps.completion_markdown, d) } else null,

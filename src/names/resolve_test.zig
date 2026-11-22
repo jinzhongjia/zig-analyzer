@@ -265,14 +265,15 @@ pub const World = struct {
         return std.fmt.allocPrint(w.arena.allocator(), "{s}:{s}", .{ std.fs.path.basename(w.vfs.path(t.file)), text[t.start..t.end] });
     }
 
-    /// Completion labels, sorted alphabetically and joined with spaces
+    /// Completion labels other than keywords, sorted alphabetically and joined with spaces
     fn complete(w: *World, file: FileId, offset: u32) ![]const u8 {
         var ctx = w.db.beginRead(w.arena.allocator());
         defer ctx.end();
         var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
         const items = (try completion.complete(&r, file, offset, .{ .auto_import = false })).items;
-        const labels = try w.arena.allocator().alloc([]const u8, items.len);
-        for (items, labels) |it, *l| l.* = it.label;
+        var list: std.ArrayList([]const u8) = .empty;
+        for (items) |it| if (it.kind != .keyword) try list.append(w.arena.allocator(), it.label);
+        const labels = list.items;
         std.mem.sort([]const u8, labels, {}, struct {
             fn lt(_: void, a: []const u8, b: []const u8) bool {
                 return std.mem.lessThan(u8, a, b);

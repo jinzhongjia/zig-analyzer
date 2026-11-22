@@ -15,7 +15,7 @@ Match scores come from `ide_db/fuzzy.zig`, ported from gopls's `internal/fuzzy` 
 | Members of the enclosing container | 0.94 (0.02 less per outer level, at least 0.86) |
 | Member paths of local values | 0.9 |
 | Auto-import through a visible name | 0.85 |
-| Statement and declaration snippets | 0.8 |
+| Keywords, statement and declaration snippets | 0.8 |
 | Auto-import needing a new import | 0.75 |
 
 Member paths and auto-import candidates are also multiplied by a depth factor that drops 0.05 per extra path segment (at least 0.5).
@@ -27,6 +27,21 @@ When the name at the cursor has an expected type, the scores of candidates that 
 - **Source**: the parent expression and the inference result at the cursor, such as a call parameter, an annotation, a return type, an initializer field, an assignment target, or the other side of a comparison. Branches of `if`, `switch`, `orelse`, and `catch` take the type of the expression they produce. Only concrete types count: anytype parameters and parameters depending on comptime parameters give none.
 - **Trust**: it is not computed when the statement at the cursor contains a syntax error, the previous item is an error node, or the call or initializer at the cursor is unclosed, since error recovery can produce a wrong structure. A missing `;` on the previous statement does not count.
 - **Fitting** counts only what can be decided exactly, following the compiler's coercions: the same type, `T` for `?T` or `E!T`, error sets within `E`, `*T` as `*const T`, arrays as slices, compatible pointer attributes, and functions whose return value fits when they complete as a call. Function types must match, including the calling convention. Integer widening, `comptime_int`, and other conversions do not count.
+
+## Keywords
+
+Keywords are offered in `.zig` files, with or without snippets, only where the syntax admits them:
+
+- **Container members**: `pub`, `const`, `var`, `fn`, `test`, `comptime`, `extern`, `export`, `inline`, `noinline`, `threadlocal`; after `pub` not `pub`, `test`, and `comptime`, after a doc comment not `test` and `comptime`, and none between fields.
+- **Statements**: `const`, `var`, `if`, `for`, `while`, `switch`, `defer`, `errdefer`, `try`, `comptime`, `inline`, `unreachable`.
+- **Expressions**: `if`, `switch`, `for`, `while`, `inline`, `try`, `comptime`, `unreachable`, and those that start a type (`struct`, `enum`, `union`, `opaque`, `error`, `fn`, `packed`, `extern`).
+- **Types** (annotations, return types, children of `?`, `!`, pointer, slice and array types, tag types of enums and unions): `struct`, `enum`, `union`, `opaque`, `error`, `fn`, `packed`, `extern`, `comptime`, `if`, `switch`; after `*` or `[]` also the pointer attributes not written yet (`const`, `volatile`, `allowzero`, `align`, `addrspace`); as a parameter type also `anytype`.
+- **Parameters**: `comptime` and `noalias` before the name; a parameter of a function type may be a type alone.
+- **Switch cases**: `else` as the only item of a case.
+
+In statements and expressions, `return` is offered only in the body of a function or test, `break` only in a loop or a labeled block or switch, and `continue` only in a loop or a labeled switch; none of them inside `defer` or `errdefer`, which control cannot leave, except for the loops and labels inside it.
+
+An empty word, or one that is already a keyword, has no node of its own in the syntax tree after error recovery, so the member at the cursor is parsed again with a name in place of the word, and the position is that of the name. No keywords are offered in declaration, capture, and label names, after `.` or `@`, or inside numbers, operators, comments, and strings.
 
 ## Member completion
 
