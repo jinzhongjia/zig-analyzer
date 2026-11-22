@@ -2050,7 +2050,12 @@ const Inferrer = struct {
         }
         if (eq(u8, name, "@src")) return .{ .ty = try inf.stdType(&.{ "builtin", "SourceLocation" }) orelse .unknown };
         if (eq(u8, name, "@as")) {
-            if (args.len != 2) return .unknown;
+            if (args.len != 2) {
+                // Type the present arguments when one is missing: completion at the missing
+                // second argument uses the type expression
+                for (args) |a| _ = try inf.infer(a, null);
+                return .unknown;
+            }
             const t = (try inf.infer(args[0], null)).asType() orelse .unknown;
             const v = try inf.infer(args[1], if (t != .unknown) t else null);
             return .{ .ty = t, .val = if (v.ty == t) v.val else null };
