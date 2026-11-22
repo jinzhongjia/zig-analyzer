@@ -17,6 +17,10 @@ In a file already formatted with `zig fmt`, the edit is laid out by `zig fmt`, s
 
 On a dependency with a `.url`, the server offers **fetch hash for `name`**, or **update hash for `name`** when it already has one (`quickfix`). The action carries the `zig-analyzer/fetchDependencyHash` command, so the network request starts only when the user selects it: the server runs `zig fetch <url>` with the configured `zig.path` (or `zig` in `PATH`), in the manifest's directory, with work-done progress. It then reads the manifest again (the dependency and its URL must be unchanged), replaces the `.hash` string or inserts `.hash = "..."` after `.url`, and applies the edit with `workspace/applyEdit`. The editor must declare `workspace.applyEdit` for the action to be offered; the result is still checked by the compiler.
 
+## Unfetched dependencies in `build.zig`
+
+On an `@import` of a dependency that is not fetched (the `build.unfetched_dependency` warning, see [`diagnostics.md`](../diagnostics.md#analyzer-owned-diagnostics)), the server offers **fetch the dependencies** (`quickfix`), or **fetch the dependencies, lazy ones included** for a lazy dependency. The action carries the `zig-analyzer/fetchDependencies` command, so the network request starts only when the user selects it: the server runs `zig build --fetch` (or `--fetch=all`) in the project with its `build.args` and work-done progress, then restarts the project, which configures with the fetched packages. A failure is shown with zig's first error. The server never fetches on its own beyond what `zig build` does when it configures.
+
 ## Organize imports (`source.organizeImports`, `ide_db/organize_imports.zig`)
 
 - **Blocks**: consecutive top-level imports and declarations derived from them, with only blank lines between, are organized in place. Attached comments move with their declaration, and a file header stays first. Declarations are never moved between blocks or removed, and nothing is organized with syntax errors.

@@ -728,6 +728,9 @@ const Mode = enum {
 /// The command of a code action on a `build.zig.zon` dependency: runs `zig fetch` and applies the
 /// hash to the manifest
 pub const fetch_hash_command = "zig-analyzer/fetchDependencyHash";
+/// The command of the code action on an `@import` in build.zig of a dependency that is not
+/// fetched: runs `zig build --fetch` in the project and restarts it
+pub const fetch_dependencies_command = "zig-analyzer/fetchDependencies";
 /// IDs of the `workspace/applyEdit` requests (a string, so that no progress request ID is reused)
 pub const apply_edit_prefix = "zig-analyzer/apply-edit/";
 
@@ -1252,7 +1255,7 @@ fn initialize(server: *Server, arena: Allocator, params: types.InitializeParams)
             .documentHighlightProvider = .{ .boolean = true },
             .renameProvider = if (server.caps.prepare_rename) .{ .RenameOptions = .{ .prepareProvider = true } } else .{ .boolean = true },
             .workspaceSymbolProvider = .{ .boolean = true },
-            .executeCommandProvider = if (server.caps.apply_edit) .{ .commands = &.{fetch_hash_command} } else null,
+            .executeCommandProvider = .{ .commands = if (server.caps.apply_edit) &.{ fetch_hash_command, fetch_dependencies_command } else &.{fetch_dependencies_command} },
             .workspace = .{ .workspaceFolders = .{ .supported = true, .changeNotifications = .{ .boolean = true } } },
             // Every action is a `CodeAction` literal: most carry an edit, and the dependency hash
             // action carries a command

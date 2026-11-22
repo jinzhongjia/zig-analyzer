@@ -109,8 +109,11 @@ Hints that are not compiler output have `source = "zig-analyzer"` and a code. Th
 | `lint.constant_comparison` | a comparison that the range of a fixed-width integer type decides | `lint.enable`, `lint.rules` |
 | `lint.dead_errdefer` | an `errdefer` that never runs | `lint.enable`, `lint.rules` |
 | `inactive` | code that is not compiled under the current build configuration | `diagnostics.inactive_code` |
+| `build.unfetched_dependency` | an `@import` in build.zig of a dependency that build.zig.zon gives by `.hash` but that is not in the package directory | always |
 
 Hints are published for open files of user code (or files outside the workspace), not for dependency libraries, generated files, or the Zig installation; `naming.exclude` applies to the naming check. Hints on unused declarations, inactive code, redundant casts and dead `errdefer` statements are tagged `Unnecessary`, which editors show faded; a constant comparison is a warning, since it is most likely a bug (such as a loop that never ends).
+
+An unfetched dependency is a warning, published only once the maker has read the build graph or failed to: it fetches the dependencies before it configures, so until then a missing package may still be on its way. A lazy dependency is fetched only when the build asks for it, so its message says so. The quick fix on it runs `zig build --fetch` (`--fetch=all` for a lazy dependency), see [`features/code-actions.md`](features/code-actions.md#unfetched-dependencies-in-buildzig).
 
 ### Unused declarations
 

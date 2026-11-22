@@ -398,6 +398,134 @@ test "build scripts: live diagnostics in build.zig, build.zig.zon and files buil
     try shutdown(&h);
 }
 
+/// A package fetched by `file://` URL from the FIFO `dep.tar`, so the test decides when the
+/// download ends; `deps_hash` is the hash of `deps_files`
+const deps_hash = "fifodep-0.0.0-7pBy_aIAAABi9F2RUkPhLegdTdCqGq1UAmD-e8Zx1Off";
+const deps_files = [_]fixture.File{
+    .{ .path = "build.zig", .text = "pub const answer = 7;\npub fn build(_: *@import(\"std\").Build) void {}\n" },
+    .{ .path = "build.zig.zon", .text = ".{ .name = .fifodep, .version = \"0.0.0\", .fingerprint = 0x289710a9fd7290ee, .paths = .{\"\"} }\n" },
+};
+const deps_build =
+    \\const std = @import("std");
+    \\const fifodep = @import("fifodep");
+    \\pub fn build(b: *std.Build) void {
+    \\    _ = b;
+    \\    _ = fifodep.answer;
+    \\}
+    \\
+;
+
+test "build scripts: a dependency the configure fetches resolves in build.zig" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&.{.{ .path = "build.zig", .text = deps_build }});
+    defer project.deinit();
+    const a = testing.allocator;
+    const tar_path = try project.path(a, "dep.tar");
+    defer a.free(tar_path);
+    const zon = try std.fmt.allocPrint(a, ".{{ .name = .demo, .version = \"0.0.0\", .fingerprint = 0xd642dfa0858809cc, .paths = .{{\"\"}}, " ++
+        ".dependencies = .{{ .fifodep = .{{ .url = \"file://{s}\", .hash = \"{s}\" }} }} }}\n", .{ tar_path, deps_hash });
+    defer a.free(zon);
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "build.zig.zon", .data = zon });
+    try createFifo(&project, "dep.tar");
+    // A copy in the global cache would be taken instead of the download
+    const cached = try std.fs.path.join(a, &.{ project.env.global_cache_dir, "p", deps_hash ++ ".tar.gz" });
+    defer a.free(cached);
+    std.Io.Dir.cwd().deleteFile(testing.io, cached) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+    var tar: std.Io.Writer.Allocating = .init(a);
+    defer tar.deinit();
+    var tar_writer: std.tar.Writer = .{ .underlying_writer = &tar.writer };
+    for (deps_files) |f| try tar_writer.writeFileBytes(f.path, f.text, .{});
+    try tar_writer.finishPedantically();
+
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initialize(&h, project.root, false);
+    // The package is on disk only once the download ends, after the project has started
+    try writeFifo(&h, &project, "dep.tar", tar.written());
+    try waitIdle(&h);
+    const uri = try open(&h, try project.path(h.arena.allocator(), "build.zig"), deps_build);
+    const target = try definitionPath(&h, uri, deps_build, "answer;");
+    try testing.expectEqualStrings(try project.path(h.arena.allocator(), "zig-pkg/" ++ deps_hash ++ "/build.zig"), target);
+    try shutdown(&h);
+}
+
+/// A second package for the fetch command (another hash than `deps_hash`, so the two tests do not
+/// share its copy in the global cache)
+const fetch_hash = "fifodep-0.0.0-7pBy_aIAAAA6tkT1GyEs-xE2H5uMsaSefq6slrvoIB8l";
+const fetch_files = [_]fixture.File{
+    .{ .path = "build.zig", .text = "pub const answer = 8;\npub fn build(_: *@import(\"std\").Build) void {}\n" },
+    .{ .path = "build.zig.zon", .text = deps_files[1].text },
+};
+
+test "build scripts: an import of an unfetched dependency gets a warning and a fix that fetches it" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var project = try fixture.Project.create(&.{.{ .path = "build.zig", .text = deps_build }});
+    defer project.deinit();
+    const a = testing.allocator;
+    const tar_path = try project.path(a, "dep.tar");
+    defer a.free(tar_path);
+    const zon = try std.fmt.allocPrint(a, ".{{ .name = .demo, .version = \"0.0.0\", .fingerprint = 0xd642dfa0858809cc, .paths = .{{\"\"}}, " ++
+        ".dependencies = .{{ .fifodep = .{{ .url = \"file://{s}\", .hash = \"{s}\" }} }} }}\n", .{ tar_path, fetch_hash });
+    defer a.free(zon);
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "build.zig.zon", .data = zon });
+    const cached = try std.fs.path.join(a, &.{ project.env.global_cache_dir, "p", fetch_hash ++ ".tar.gz" });
+    defer a.free(cached);
+    std.Io.Dir.cwd().deleteFile(testing.io, cached) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    const ha = h.arena.allocator();
+    _ = try h.request("initialize", .{
+        .rootUri = try za.base.uri.fromPath(ha, project.root),
+        .capabilities = .{ .textDocument = .{ .codeAction = .{ .codeActionLiteralSupport = .{ .codeActionKind = .{ .valueSet = &[_][]const u8{"quickfix"} } } } } },
+    });
+    try h.notify("initialized", Empty{});
+    // dep.tar does not exist yet: the fetch fails
+    try waitIdle(&h);
+    const uri = try open(&h, try project.path(ha, "build.zig"), deps_build);
+    try waitIdle(&h);
+    const lines = (try h.diagnostics()).get("build.zig") orelse &.{};
+    try testing.expect(anyContains(lines, "1:24 zig-analyzer: dependency `fifodep` is not fetched"));
+
+    // Inside the string of `@import("fifodep")`
+    const actions = (try h.request("textDocument/codeAction", .{
+        .textDocument = .{ .uri = uri },
+        .range = .{ .start = .{ .line = 1, .character = 26 }, .end = .{ .line = 1, .character = 26 } },
+        .context = .{ .diagnostics = &.{} },
+    })).object.get("result").?.array.items;
+    var command: ?std.json.Value = null;
+    for (actions) |action| {
+        const c = action.object.get("command") orelse continue;
+        if (std.mem.eql(u8, c.object.get("command").?.string, "zig-analyzer/fetchDependencies")) command = c;
+    }
+    try testing.expect(command != null);
+    const arguments = command.?.object.get("arguments").?.array.items;
+    try testing.expectEqualStrings(project.root, arguments[0].object.get("root").?.string);
+    try testing.expectEqual(false, arguments[0].object.get("all").?.bool);
+
+    // The download works now
+    var tar: std.Io.Writer.Allocating = .init(a);
+    defer tar.deinit();
+    var tar_writer: std.tar.Writer = .{ .underlying_writer = &tar.writer };
+    for (fetch_files) |f| try tar_writer.writeFileBytes(f.path, f.text, .{});
+    try tar_writer.finishPedantically();
+    try project.tmp.dir.writeFile(testing.io, .{ .sub_path = "dep.tar", .data = tar.written() });
+    _ = try h.request("workspace/executeCommand", .{ .command = "zig-analyzer/fetchDependencies", .arguments = arguments });
+    try waitIdle(&h);
+    try testing.expect(!anyContains((try h.diagnostics()).get("build.zig") orelse &.{}, "is not fetched"));
+    const target = try definitionPath(&h, uri, deps_build, "answer;");
+    try testing.expectEqualStrings(try project.path(ha, "zig-pkg/" ++ fetch_hash ++ "/build.zig"), target);
+    try shutdown(&h);
+}
+
 test "columns are UTF-16 when multi-byte characters precede the error" {
     var project = try fixture.Project.create(&.{
         .{ .path = "build.zig", .text = simple_build },
@@ -515,12 +643,17 @@ fn awaitGate(h: *Harness, started: std.Io.Clock.Timestamp, what: []const u8) !vo
     try testing.io.sleep(.fromMilliseconds(10), .awake);
 }
 
-/// Lets `build()` continue once it has opened the FIFO `gate`. A blocking open for writing would
-/// wait for a reader, forever when `build()` never gets there; with O_NONBLOCK, the open fails with
-/// ENXIO while there is no reader, and a reader blocked in its own open counts as one.
+/// Lets `build()` continue once it has opened the FIFO `gate`
 fn openGate(h: *Harness, project: *fixture.Project) !void {
+    try writeFifo(h, project, "gate", "x");
+}
+
+/// Writes `bytes` to the FIFO `name` once the project's zig has opened it. A blocking open for
+/// writing would wait for a reader, forever when zig never gets there; with O_NONBLOCK, the open
+/// fails with ENXIO while there is no reader, and a reader blocked in its own open counts as one.
+fn writeFifo(h: *Harness, project: *fixture.Project, name: []const u8, bytes: []const u8) !void {
     const posix = std.posix;
-    const path = try project.path(h.arena.allocator(), "gate");
+    const path = try project.path(h.arena.allocator(), name);
     // Close-on-exec: a copy of the write end in a process the server starts meanwhile would keep
     // `build()` from reading the end of the file
     const flags: posix.O = .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true };
@@ -528,7 +661,7 @@ fn openGate(h: *Harness, project: *fixture.Project) !void {
     const fd = while (true) {
         break posix.openat(posix.AT.FDCWD, path, flags, 0) catch |err| switch (err) {
             error.NoDevice => {
-                try awaitGate(h, started, "the gate");
+                try awaitGate(h, started, name);
                 continue;
             },
             else => |e| return e,
@@ -536,7 +669,7 @@ fn openGate(h: *Harness, project: *fixture.Project) !void {
     };
     const gate: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
     defer gate.close(testing.io);
-    try gate.writeStreamingAll(testing.io, "x");
+    try gate.writeStreamingAll(testing.io, bytes);
 }
 
 /// Waits until `build()` of a gated project has created the file `name` in the project

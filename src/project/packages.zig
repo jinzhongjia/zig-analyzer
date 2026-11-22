@@ -8,7 +8,8 @@
 //! `.hash` lies in `<package directory>/<hash>` (`--pkg-dir`, `--system`, `ZIG_LOCAL_PKG_DIR`, or
 //! `<build root>/zig-pkg`, as the maker decides) once fetched. Dependencies that are not on disk
 //! (lazy dependencies not fetched yet) and packages without a build.zig are left out, as the maker
-//! does.
+//! does. The dependencies given by `.hash` whose directory does not exist are listed apart
+//! (`Package.unfetched`): `@import("dep")` in build.zig cannot resolve until they are fetched.
 
 const std = @import("std");
 const Io = std.Io;
@@ -20,6 +21,14 @@ pub const Package = struct {
     root: []const u8,
     /// Dependencies with a build.zig, by the names this package's build.zig.zon gives them
     deps: []const Dep,
+    /// Dependencies given by `.hash` that are not in the package directory
+    unfetched: []const Unfetched = &.{},
+};
+
+pub const Unfetched = struct {
+    name: []const u8,
+    /// `.lazy = true`: the maker fetches it only when the build asks for it
+    lazy: bool,
 };
 
 pub const Dep = struct {
@@ -67,11 +76,13 @@ pub fn discover(gpa: Allocator, io: Io, build_root: []const u8, pkg_dir: []const
     const a = arena_state.allocator();
     var roots: std.StringArrayHashMapUnmanaged(void) = .empty;
     var deps: std.ArrayList([]const Dep) = .empty;
+    var unfetched: std.ArrayList([]const Unfetched) = .empty;
     try roots.put(a, try a.dupe(u8, build_root), {});
     var i: usize = 0;
     while (i < roots.count()) : (i += 1) {
         const root = roots.keys()[i];
         var list: std.ArrayList(Dep) = .empty;
+        var missing: std.ArrayList(Unfetched) = .empty;
         const zon_path = try std.fs.path.join(a, &.{ root, "build.zig.zon" });
         const text = Io.Dir.cwd().readFileAllocOptions(io, zon_path, gpa, .limited(16 * 1024 * 1024), .of(u8), 0) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -89,15 +100,20 @@ pub fn discover(gpa: Allocator, io: Io, build_root: []const u8, pkg_dir: []const
                 else
                     continue;
                 const build_zig = try std.fs.path.join(a, &.{ dep_root, "build.zig" });
-                Io.Dir.cwd().access(io, build_zig, .{}) catch continue;
+                Io.Dir.cwd().access(io, build_zig, .{}) catch {
+                    if (d.path == null) Io.Dir.cwd().access(io, dep_root, .{}) catch
+                        try missing.append(a, .{ .name = try a.dupe(u8, d.name), .lazy = d.lazy });
+                    continue;
+                };
                 const gop = try roots.getOrPut(a, dep_root);
                 try list.append(a, .{ .name = try a.dupe(u8, d.name), .package = @intCast(gop.index) });
             }
         }
         try deps.append(a, list.items);
+        try unfetched.append(a, missing.items);
     }
     const packages = try a.alloc(Package, roots.count());
-    for (packages, roots.keys(), deps.items) |*p, root, d| p.* = .{ .root = root, .deps = d };
+    for (packages, roots.keys(), deps.items, unfetched.items) |*p, root, d, u| p.* = .{ .root = root, .deps = d, .unfetched = u };
     return .{ .arena = arena_state.state, .list = packages };
 }
 
@@ -120,7 +136,7 @@ const Dependencies = struct {
     vals: Zoir.Node.Index.Range = .{ .start = .root, .len = 0 },
     next_index: u32 = 0,
 
-    const Entry = struct { name: []const u8, path: ?[]const u8, hash: ?[]const u8 };
+    const Entry = struct { name: []const u8, path: ?[]const u8, hash: ?[]const u8, lazy: bool };
 
     fn init(gpa: Allocator, text: [:0]const u8) Allocator.Error!Dependencies {
         var ast = try std.zig.Ast.parse(gpa, text, .{ .mode = .zon });
@@ -158,13 +174,17 @@ const Dependencies = struct {
                 .struct_literal => |s| s,
                 else => continue,
             };
-            var entry: Entry = .{ .name = d.names[i].get(&d.zoir), .path = null, .hash = null };
+            var entry: Entry = .{ .name = d.names[i].get(&d.zoir), .path = null, .hash = null, .lazy = false };
             for (fields.names, 0..) |n, j| {
+                const field = n.get(&d.zoir);
                 const value = switch (fields.vals.at(@intCast(j)).get(&d.zoir)) {
                     .string_literal => |s| s,
+                    .true => {
+                        if (std.mem.eql(u8, field, "lazy")) entry.lazy = true;
+                        continue;
+                    },
                     else => continue,
                 };
-                const field = n.get(&d.zoir);
                 if (std.mem.eql(u8, field, "path")) entry.path = value;
                 if (std.mem.eql(u8, field, "hash")) entry.hash = value;
             }
@@ -190,6 +210,9 @@ test discover {
             \\        .@"fetched-dep" = .{ .url = "https://example.com/x.tar.gz", .hash = "x-0.0.0-AAAA" },
             \\        .lazy = .{ .url = "https://example.com/y.tar.gz", .hash = "y-0.0.0-BBBB", .lazy = true },
             \\        .nobuild = .{ .path = "nobuild" },
+            \\        .eager = .{ .url = "https://example.com/z.tar.gz", .hash = "z-0.0.0-CCCC" },
+            \\        .fetched_nobuild = .{ .url = "https://example.com/w.tar.gz", .hash = "nobuild-0.0.0-DDDD" },
+            \\        .missing_path = .{ .path = "missing" },
             \\    },
             \\}
         },
@@ -197,6 +220,7 @@ test discover {
         .{ "helper/build.zig.zon", ".{ .name = .helper, .dependencies = .{ .shared = .{ .path = \"../app/zig-pkg/x-0.0.0-AAAA\" } } }" },
         .{ "app/zig-pkg/x-0.0.0-AAAA/build.zig", "" },
         .{ "app/nobuild/a.zig", "" },
+        .{ "app/zig-pkg/nobuild-0.0.0-DDDD/a.zig", "" },
     };
     for (files) |f| {
         if (std.fs.path.dirname(f[0])) |d| try tmp.dir.createDirPath(testing.io, d);
@@ -224,6 +248,14 @@ test discover {
     const helper = p.list[p.list[0].deps[0].package];
     try testing.expectEqual(1, helper.deps.len);
     try testing.expectEqual(fetched, helper.deps[0].package);
+    // Only `.hash` dependencies whose directory is missing are unfetched
+    const unfetched = p.list[0].unfetched;
+    try testing.expectEqual(2, unfetched.len);
+    try testing.expectEqualStrings("lazy", unfetched[0].name);
+    try testing.expect(unfetched[0].lazy);
+    try testing.expectEqualStrings("eager", unfetched[1].name);
+    try testing.expect(!unfetched[1].lazy);
+    try testing.expectEqual(0, helper.unfetched.len);
 }
 
 test packageDir {

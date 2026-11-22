@@ -104,14 +104,21 @@ resolve_set: ?CompileSet.Result = null,
 /// Build scripts (see `CompileSet.buildScripts`) of the project and of its dependency packages
 /// with a build.zig (see `dependency_packages.discover`): all of them are compiled into the
 /// configure program, so a change to any of them reconfigures. Computed when the background task
-/// starts, from the current text of the files (open files use their buffers, the rest are read
-/// from disk); valid even when reading the build graph fails
+/// starts and again once the build graph is read (the maker fetches the dependency packages
+/// before it configures, so on a fresh checkout they appear on disk only then), from the current
+/// text of the files (open files use their buffers, the rest are read from disk); valid even when
+/// reading the build graph fails
 build_scripts: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty,
 /// The modules of the build scripts (one per package, rooted at its build.zig and importing the
 /// build.zig modules of its dependencies by name) and the files that belong to them, computed
 /// with `build_scripts`; added to the module graph so `@import("dep")` in build.zig resolves
 script_model: ?ProjectModel = null,
 script_set: ?CompileSet.Result = null,
+/// The packages found with `build_scripts`
+packages: ?dependency_packages.Packages = null,
+/// The maker has read the build graph or failed to: the dependency packages it fetches are on
+/// disk by then, so the ones `packages` lists as unfetched stay so (see `unfetchedDependencies`)
+configure_ended: bool = false,
 /// Compiler diagnostics of the most recent build
 result: ?*compiler.BuildResult = null,
 /// Compile result sequence number taken when `result` was stored (see
@@ -306,6 +313,7 @@ fn destroy(ws: *Workspace) void {
     ws.build_scripts.deinit(gpa);
     if (ws.script_model) |*m| m.deinit(gpa);
     if (ws.script_set) |*s| s.deinit(gpa);
+    if (ws.packages) |*p| p.deinit(gpa);
     if (ws.result) |r| r.release(gpa);
     ws.result_files.deinit(gpa);
     ws.diag_steps.deinit(gpa);
@@ -488,6 +496,13 @@ pub fn isLoading(ws: *Workspace) bool {
     return !ws.load_done;
 }
 
+/// The maker has read the build graph or failed to (see `configure_ended`)
+fn endConfigure(ws: *Workspace) void {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    ws.configure_ended = true;
+}
+
 /// Ends the first load: single-file compiles deferred until now proceed with the files' context
 /// at this point
 fn finishLoading(ws: *Workspace) void {
@@ -533,6 +548,23 @@ pub fn inModuleGraph(ws: *Workspace) bool {
     ws.mutex.lockUncancelable(ws.server.io);
     defer ws.mutex.unlock(ws.server.io);
     return ws.model != null and ws.compile_set != null;
+}
+
+/// The dependencies the build.zig.zon of the package in `dir` gives by `.hash` that are not
+/// fetched, copied into `arena`; none while the maker may still be fetching them (before it has
+/// read the build graph or failed to) or when `dir` is not a package of this project
+pub fn unfetchedDependencies(ws: *Workspace, arena: Allocator, dir: []const u8) Allocator.Error![]const dependency_packages.Unfetched {
+    ws.mutex.lockUncancelable(ws.server.io);
+    defer ws.mutex.unlock(ws.server.io);
+    if (!ws.configure_ended) return &.{};
+    const found = ws.packages orelse return &.{};
+    for (found.list) |p| {
+        if (!ws.server.vfs.samePath(p.root, dir)) continue;
+        const out = try arena.alloc(dependency_packages.Unfetched, p.unfetched.len);
+        for (p.unfetched, out) |u, *o| o.* = .{ .name = try arena.dupe(u8, u.name), .lazy = u.lazy };
+        return out;
+    }
+    return &.{};
 }
 
 /// Whether the file is a build script of this project: a change requires reconfiguring
@@ -762,6 +794,10 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 _ = try ws.server.vfs.intern(input.path);
             };
             if (ws.model.?.configure_inputs.len != 0) file_changes.resyncWatcher(ws.server);
+            // The maker has fetched the dependency packages by now; the module graph takes the
+            // build scripts, and open files the unfetched dependencies, with the compile set below
+            try ws.computeBuildScripts();
+            ws.endConfigure();
             try ws.recomputeCompileSet();
             // If the old instance has no model worth keeping, there is no need to wait for the
             // whole build to finish
@@ -797,6 +833,14 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             }
             try ws.bundles.append(ws.gpa, eb.*);
             eb.* = .empty;
+            // The dependency packages the maker could fetch are on disk now; the others stay
+            // unfetched
+            try ws.computeBuildScripts();
+            ws.endConfigure();
+            if (project_set.isVisible(ws.server, ws)) {
+                indexing.updateModuleGraph(ws.server);
+                publishing.publishOpenFiles(ws.server);
+            }
             // After a restart, an old instance with a build graph stays in effect: without a build
             // graph, named imports would stop resolving and references and rename would miss
             // their importers until the configuration is fixed. The configuration errors replace
@@ -1334,7 +1378,8 @@ fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
         const pkg_dir = try dependency_packages.packageDir(a, ws.root, ws.config.build_args, env_pkg_dir);
         break :blk try dependency_packages.discover(gpa, io, ws.root, pkg_dir);
     };
-    defer found.deinit(gpa);
+    var kept = false;
+    defer if (!kept) found.deinit(gpa);
     var rounds: usize = 0;
     while (rounds < 256) : (rounds += 1) {
         var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -1381,6 +1426,9 @@ fn computeBuildScripts(ws: *Workspace) Allocator.Error!void {
         ws.script_set = script_set;
         if (ws.script_model) |*m| m.deinit(gpa);
         ws.script_model = script_model;
+        if (ws.packages) |*old| old.deinit(gpa);
+        ws.packages = found;
+        kept = true;
         return;
     }
     log.warn("{s}: build script computation did not converge", .{ws.root});
