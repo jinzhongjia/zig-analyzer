@@ -90,7 +90,7 @@ pub fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types
                 .folder => .Folder,
                 .label => .Reference,
                 .keyword => .Keyword,
-                .snippet => .Snippet,
+                .snippet, .postfix => .Snippet,
                 .primitive_type => .Class,
                 .primitive_value => .Keyword,
             }),
@@ -114,10 +114,12 @@ pub fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types
             } } else .{ .TextEdit = .{ .range = replace, .newText = new_text } };
             if (it.snippet != null) o.insertTextFormat = .Snippet;
         }
-        if (it.import_edit) |edit| {
-            const edits = try arena.alloc(types.TextEdit, 1);
-            edits[0] = .{ .range = try ranges.get(arena, edit.start, edit.end), .newText = edit.text };
-            o.additionalTextEdits = edits;
+        if (it.import_edit != null or it.prefix_edit != null) {
+            var edits: std.ArrayList(types.TextEdit) = .empty;
+            for ([_]?za.ide_db.imports.Edit{ it.import_edit, it.prefix_edit }) |e| if (e) |edit| {
+                try edits.append(arena, .{ .range = try ranges.get(arena, edit.start, edit.end), .newText = edit.text });
+            };
+            o.additionalTextEdits = edits.items;
         }
     }
     if (result.is_incomplete or imports_waiting) return .{ .CompletionList = .{ .isIncomplete = true, .items = out } };

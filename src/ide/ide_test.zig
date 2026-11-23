@@ -46,10 +46,11 @@ fn setup(w: *World) !FileId {
     return (try w.add("/p/main.zig", src)).file;
 }
 
-/// Not a keyword, primitive type, or primitive value: the names these tests check
+/// Not a keyword, primitive type, primitive value, or postfix completion: the names these tests
+/// check
 fn isName(kind: completion.Item.Kind) bool {
     return switch (kind) {
-        .keyword, .primitive_type, .primitive_value => false,
+        .keyword, .primitive_type, .primitive_value, .postfix => false,
         else => true,
     };
 }
@@ -498,7 +499,7 @@ test "member completion and goto definition through types" {
     // After `ptr.` (through a pointer): fields and methods
     const items = (try completion.complete(&r, file, offsetOf("ptr.x", 0) + 4, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
-    for (items) |it| try labels.append(w.arena.allocator(), it.label);
+    for (items) |it| if (isName(it.kind)) try labels.append(w.arena.allocator(), it.label);
     try testing.expectEqualStrings("x y dist", try std.mem.join(w.arena.allocator(), " ", labels.items));
     try testing.expectEqualStrings("i32", items[0].detail.?);
     // Slices
@@ -2720,7 +2721,7 @@ fn memberLabels(w: *World, r: *resolve.Resolver, file: FileId, text: []const u8,
     const at: u32 = @intCast(std.mem.indexOf(u8, text, needle).? + std.mem.lastIndexOfScalar(u8, needle, '.').? + 1);
     const items = (try completion.complete(r, file, at, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
-    for (items) |it| try labels.append(w.arena.allocator(), it.label);
+    for (items) |it| if (isName(it.kind)) try labels.append(w.arena.allocator(), it.label);
     return std.mem.join(w.arena.allocator(), " ", labels.items);
 }
 
@@ -7243,7 +7244,7 @@ test "callsite seeding follows a container type passed as a comptime argument to
     var r = resolver(&w, &ctx);
     const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
-    for (items) |it| try labels.append(w.arena.allocator(), it.label);
+    for (items) |it| if (isName(it.kind)) try labels.append(w.arena.allocator(), it.label);
     try testing.expectEqualStrings("n", try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
 
@@ -7562,7 +7563,7 @@ test "completion through single pointers to arrays, tuples and slices" {
         var r = resolver(&w, &ctx);
         const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
         var labels: std.ArrayList([]const u8) = .empty;
-        for (items) |it| try labels.append(w.arena.allocator(), it.label);
+        for (items) |it| if (isName(it.kind)) try labels.append(w.arena.allocator(), it.label);
         try testing.expectEqualStrings(c[1], try std.mem.join(w.arena.allocator(), " ", labels.items));
     }
 }
@@ -9300,6 +9301,102 @@ test "completion: primitives rank by the input after names in scope" {
     }
     try testing.expectEqual(added.cursor - 2, usize_item.?.replace.?.start);
     try testing.expect(std.mem.order(u8, usage.?.sort.?, usize_item.?.sort.?) == .lt);
+}
+
+/// The postfix items at the cursor as `label@start-end`, with the range relative to the cursor, the
+/// edit before it as `+start:text`, and the detail as `(detail)`, joined by spaces
+fn postfixItems(text: []const u8, snippets: bool) ![]const u8 {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const at = try w.add("/p/main.zig", text);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    for ((try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false, .snippets = snippets })).items) |it| {
+        if (it.kind != .postfix) continue;
+        if (out.items.len != 0) try out.append(testing.allocator, ' ');
+        const range = it.replace.?;
+        try out.print(testing.allocator, "{s}@{d}-{d}", .{ it.label, @as(i64, range.start) - at.cursor, @as(i64, range.end) - at.cursor });
+        if (it.prefix_edit) |e| try out.print(testing.allocator, "+{d}:{s}", .{ @as(i64, e.start) - at.cursor, e.text });
+        if (it.detail) |d| try out.print(testing.allocator, "({s})", .{d});
+    }
+    return out.toOwnedSlice(testing.allocator);
+}
+
+test "completion: postfix completions follow the type of the left-hand side" {
+    const decls = "fn f() error{ A, B }!u8 {\n    return 1;\n}\nfn g() anyerror!u8 {\n    return 1;\n}\nconst S = struct { x: u8 };\n";
+    const cases = [_]struct { []const u8, []const u8 }{
+        // `.*` on a single-item pointer that is not a function pointer
+        .{ "fn t(p: *u32) void {\n    _ = p.<|>;\n}", "*@0-0(u32)" },
+        .{ "fn t(p: *const S) void {\n    _ = p.x<|>;\n}", "*@-1-0(S)" },
+        .{ "fn t(p: *const [4]u8) void {\n    _ = p.<|>;\n}", "*@0-0([4]u8)" },
+        .{ "fn t(p: *const fn () void) void {\n    _ = p.<|>;\n}", "" },
+        .{ "fn t(p: []u8, q: [*]u8) void {\n    _ = p.<|>;\n    _ = q;\n}", "" },
+        // `.?` on an optional
+        .{ "fn t(p: ?u8) void {\n    _ = p.<|>;\n}", "?@0-0(u8)" },
+        .{ "fn t(p: ?*u8) void {\n    _ = p.<|>;\n}", "?@0-0(*u8)" },
+        // `.try` and `.catch` on an error union replace the `.` and the word; `try ` goes before
+        // the left-hand side
+        .{ "fn t() !void {\n    _ = f().<|>;\n}", "try@-1-0+-4:try (try f()) catch@-1-0(catch |err| switch (err) {…})" },
+        .{ "fn t() !void {\n    _ = f().tr<|>;\n}", "try@-3-0+-6:try (try f()) catch@-3-0(catch |err| switch (err) {…})" },
+        .{ "test \"x\" {\n    _ = g().<|>;\n}", "try@-1-0+-4:try (try g()) catch@-1-0(catch |err| switch (err) {…})" },
+        // `try` needs a function returning the errors, outside deferred expressions
+        .{ "fn t() void {\n    _ = f().<|>;\n}", "catch@-1-0(catch |err| switch (err) {…})" },
+        .{ "fn t() error{A}!void {\n    _ = f().<|>;\n}", "catch@-1-0(catch |err| switch (err) {…})" },
+        .{ "fn t() error{ A, B, C }!void {\n    _ = f().<|>;\n}", "try@-1-0+-4:try (try f()) catch@-1-0(catch |err| switch (err) {…})" },
+        .{ "fn t() error{A}!void {\n    _ = g().<|>;\n}", "catch@-1-0(catch |err| switch (err) {…})" },
+        .{ "fn t() anyerror!void {\n    _ = f().<|>;\n}", "try@-1-0+-4:try (try f()) catch@-1-0(catch |err| switch (err) {…})" },
+        .{ "fn t() !void {\n    defer _ = f().<|>;\n}", "catch@-1-0(catch |err| switch (err) {…})" },
+        .{ "const c = f().<|>;", "catch@-1-0(catch |err| switch (err) {…})" },
+        // `catch` would take the whole operator expression as its operand
+        .{ "fn t() !void {\n    _ = 1 + f().<|>;\n}", "try@-1-0+-4:try (try f())" },
+        .{ "fn t(o: ?u8) !void {\n    _ = o orelse f().<|>;\n}", "try@-1-0+-4:try (try f())" },
+        // None on types and namespaces
+        .{ "const c = S.<|>;", "" },
+    };
+    for (cases, 0..) |c, i| {
+        const text = try std.mem.concat(testing.allocator, u8, &.{ decls, c[0], "\n" });
+        defer testing.allocator.free(text);
+        const got = try postfixItems(text, true);
+        defer testing.allocator.free(got);
+        testing.expectEqualStrings(c[1], got) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+    // Without snippets, only `.*` and `.?`
+    const no_snippets = [_]struct { []const u8, []const u8 }{
+        .{ "fn t(p: *u32) void {\n    _ = p.<|>;\n}", "*@0-0(u32)" },
+        .{ "fn t() !void {\n    _ = f().<|>;\n}", "" },
+    };
+    for (no_snippets) |c| {
+        const text = try std.mem.concat(testing.allocator, u8, &.{ decls, c[0], "\n" });
+        defer testing.allocator.free(text);
+        const got = try postfixItems(text, false);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c[1], got);
+    }
+}
+
+test "completion: postfix catch lists a prong per error of a known error set" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "fn f() error{ A, @\"b c\" }!u8 {\n    return 1;\n}\nfn t() void {\n    _ = f().<|>;\n}", " catch |${1:err}| switch (${1:err}) {\n    error.A => $2,\n    error.@\"b c\" => $3,\n}$0" },
+        .{ "fn f() !u8 {\n    return error.Oops;\n}\nfn t() void {\n    _ = f().<|>;\n}", " catch |${1:err}| switch (${1:err}) {\n    error.Oops => $2,\n}$0" },
+        .{ "fn f() anyerror!u8 {\n    return 1;\n}\nfn t() void {\n    _ = f().<|>;\n}", " catch |${1:err}| switch (${1:err}) {\n    else => $2,\n}$0" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", c[0]);
+        testing.expectEqualStrings(c[1], try snippetOf(&w, added.file, added.cursor, "catch", .{ .auto_import = false, .snippets = true })) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
 }
 
 test "completion: keywords replace the word at the cursor and rank by the input" {

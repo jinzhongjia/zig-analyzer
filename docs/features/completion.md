@@ -51,6 +51,15 @@ An empty word, or one that is already a keyword, has no node of its own in the s
 
 After `.` on a value (a single-item pointer is dereferenced once), completion lists its fields and the functions callable on it as methods; those in other files must be `pub`. As the compiler requires, a non-const pointer receiver needs a value that can be modified, by the same rule that infers `&x`. A first parameter that is `anytype` or cannot be computed counts as receiving the value.
 
+## Postfix completion
+
+After `.` on a value, completions by its type follow its members (sort text `~`):
+
+- `.*` on a single-item pointer that is not a function pointer, and `.?` on an optional; the detail is the type they give.
+- With snippets, on an error union: `.try` replaces `.word` with nothing and inserts `try ` before the left-hand side (an additional edit, so a left-hand side spanning lines works), offered in the body of a function or test, not inside `defer` or `errdefer`, and, when the function at the cursor declares its error set, only if the errors fit in it. `.catch` replaces `.word` with `catch |err| switch (err) { ... }`, with a prong per error of a known error set, or an `else` prong for `anyerror` or a set that cannot be computed; it is not offered where the access is an operand of a prefix or binary operator or of another `catch`, since `catch` would take the whole expression as its operand. Their filter text includes the `.` (`.try`, `.catch`).
+
+A word that is already a keyword (`f().try`) is not a field access after error recovery, so these are found while it is still a prefix (`f().tr`).
+
 ## Member paths of local values
 
 After a non-empty prefix of a plain name expression, members of visible local values are candidates too, labeled and inserted by whole path (`gpa` → `sema.gpa`). In enclosing functions, only values known at comptime are expanded, since a nested container cannot access runtime values.
