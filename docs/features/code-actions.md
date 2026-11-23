@@ -4,6 +4,8 @@
 
 Edits are built from the CST, anchored at the spans of compiler diagnostics.
 
+The live diagnostics are read through the resolver. When the result for the current text is not prepared, the request ends its read transaction, prepares it outside (see `publishing.prepareLive`), and runs again, so AstGen or `zig ast-check` does not run in the transaction while typing.
+
 - **Discards**: a `var`, an error set, or an error union is discarded by address (`_ = &x;`), since Sema rejects discarding errors and a discard does not count as mutating a `var`.
 - **`const`**: a never-mutated local `var` becomes `const` by replacing only the keyword; `comptime var` also wraps the initializer in `comptime`.
 

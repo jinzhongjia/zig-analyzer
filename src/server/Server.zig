@@ -455,6 +455,12 @@ pub const Pending = struct {
     document: ?HeldDocument = null,
     /// The scan generation a semantic request has waited for (see `waitScans`); 0 until it waits
     scans_awaited: u64 = 0,
+    /// The file whose live diagnostics a semantic request prepares outside its read transaction
+    /// before running again (see `HandlerError.LivePending`)
+    live_file: ?Vfs.FileId = null,
+    /// Preparing `live_file` failed: the handler then computes the live diagnostics itself, as a
+    /// publish does when its preparation fails
+    live_prepare_failed: bool = false,
     /// Type information when the task started (see `maybeResetSema`)
     sema_start: SemaUsage = .{},
 };
@@ -469,6 +475,9 @@ pub const TestGate = struct {
         before_read,
         /// In the read transaction, before the handler runs
         in_read,
+        /// After the read transaction ended, before the live diagnostics the handler needs are
+        /// prepared outside it (see `HandlerError.LivePending`)
+        before_live,
     },
     /// Set when a request reaches the gate
     entered: Io.Event = .unset,
@@ -510,6 +519,9 @@ pub const HandlerError = error{
     /// Sub-projects whose files may refer to the symbol are not loaded: the request starts their
     /// projects, waits until they have loaded, and runs again (see `subProjectGap`)
     SubProjectsPending,
+    /// The live diagnostics of the document are not prepared: the request prepares them outside
+    /// the read transaction and runs again (see `requireLivePrepared`)
+    LivePending,
 };
 
 /// Initializes in place: the query engine holds a pointer to `server.env`, so the Server must not
@@ -1009,6 +1021,12 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
                 .after_scans => indexing.waitScans(server, pending),
                 // Likewise: loading a project writes the module graph
                 .after_sub_projects => project_set.loadSubProjects(server, pending, &sub_projects),
+                // Likewise: AstGen or `zig ast-check` must not run inside a read transaction
+                .after_live => {
+                    server.testGate(method, .before_live, pending);
+                    pending.live_prepare_failed = !publishing.prepareLive(server, pending.live_file.?);
+                    server.db.waitPendingWrites();
+                },
             };
         }
 
@@ -1021,6 +1039,9 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             /// Run again once the sub-projects recorded have loaded (see
             /// `HandlerError.SubProjectsPending`)
             after_sub_projects,
+            /// Run again once the live diagnostics of `pending.live_file` are prepared (see
+            /// `HandlerError.LivePending`)
+            after_live,
         };
 
         fn attempt(server: *Server, pending: *Pending, params: Params, waited_for_projects: bool, sub_projects: *SubProjectWait) Next {
@@ -1055,6 +1076,10 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
                 sub_projects.dirs.clearRetainingCapacity();
                 handler_sub_projects = sub_projects;
                 defer handler_sub_projects = null;
+                handler_live_file = null;
+                defer handler_live_file = null;
+                handler_live_skip = pending.live_prepare_failed;
+                defer handler_live_skip = false;
                 const result = func(server, &r, a, params) catch |err| break :outcome failed(server, &ctx, pending, sub_projects, err, &response);
                 // As in ReadTask: a handler that swallowed `Canceled` has an incomplete result
                 ctx.checkCanceled() catch |err| break :outcome failed(server, &ctx, pending, sub_projects, err, &response);
@@ -1076,6 +1101,11 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             // Likewise once: sub-projects still not loaded after the wait are left out (see
             // `subProjectGap`), which does not report them again
             if (err == error.SubProjectsPending and !sub_projects.awaited and go_on) return .after_sub_projects;
+            // The live check runs outside the read transaction (see `HandlerError.LivePending`)
+            if (err == error.LivePending and go_on) if (handler_live_file) |file| {
+                pending.live_file = file;
+                return .after_live;
+            };
             return if (server.answerFailureBytes(ctx, pending, err, response)) .answered else .again;
         }
     };
@@ -1553,6 +1583,27 @@ pub const SubProjectWait = struct {
 /// `SemanticTask`); null for other handlers
 threadlocal var handler_sub_projects: ?*SubProjectWait = null;
 
+/// The file whose live diagnostics the semantic request on this thread needs prepared outside its
+/// read transaction (see `requireLivePrepared` and `HandlerError.LivePending`)
+threadlocal var handler_live_file: ?Vfs.FileId = null;
+
+/// Preparing `handler_live_file` failed in a previous attempt: the handler computes the live
+/// diagnostics itself, as a publish does when its preparation fails (see `publishing.prepareLive`)
+threadlocal var handler_live_skip = false;
+
+/// Called by a handler before it reads `live.AstCheck`: when the result for the current text has
+/// not been prepared outside a read transaction, returns `error.LivePending` so that `SemanticTask`
+/// ends the transaction, prepares it (see `publishing.prepareLive`), and runs the handler again.
+/// AstGen and `zig ast-check` do not check for cancellation, so running them inside the
+/// transaction would make typing wait for them. When a previous preparation failed, the handler
+/// runs the check itself, as a publish does.
+pub fn requireLivePrepared(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) HandlerError!void {
+    if (handler_live_skip) return;
+    if (try publishing.liveReady(server, ctx, file)) return;
+    handler_live_file = file;
+    return error.LivePending;
+}
+
 /// What a request does with the references it finds (see `scopeIncompleteFor`)
 pub const ScopeUse = enum {
     /// Lists them: uses in sub-projects that cannot be loaded are left out, as are those in a
@@ -1972,7 +2023,7 @@ fn handlerErrorBytes(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by
         error.InvalidIdentifier => .{ .code = jsonrpc.error_codes.request_failed, .message = "new name is not a valid identifier" },
         // Answered only when the wait for scans or sub-projects was cut short, by a cancellation or
         // the shutdown (see `SemanticTask`)
-        error.ScanPending, error.SubProjectsPending => if (canceled_by_client)
+        error.ScanPending, error.SubProjectsPending, error.LivePending => if (canceled_by_client)
             .{ .code = jsonrpc.error_codes.request_cancelled, .message = "request cancelled" }
         else
             .{ .code = jsonrpc.error_codes.request_failed, .message = "the server is shutting down" },

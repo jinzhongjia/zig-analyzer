@@ -1395,6 +1395,64 @@ test "an edit during formatting is answered with ContentModified" {
     try h.notify("exit", {});
 }
 
+test "code actions after an edit prepare the live check outside the read transaction" {
+    // Guards against AstGen (or the user's `zig ast-check`) running inside the code action's read
+    // transaction, which would make the edit that triggered the request wait for it.
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    // The debounced publish has not prepared the edited text when the request runs
+    _ = try h.request("initialize", .{
+        .capabilities = .{ .textDocument = .{ .codeAction = .{ .codeActionLiteralSupport = .{ .codeActionKind = .{ .valueSet = &[_][]const u8{"quickfix"} } } } } },
+        .initializationOptions = .{ .diagnostics = .{ .debounce_ms = 3000 } },
+    });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:code-action-edit.zig";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text =
+        \\fn f() u32 {
+        \\    const x: u32 = 1;
+        \\    return x;
+        \\}
+        \\
+    } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .text =
+        \\fn f() u32 {
+        \\    var x: u32 = 1;
+        \\    return x;
+        \\}
+        \\
+    }} });
+
+    var gate: Server.TestGate = .{ .method = "textDocument/codeAction", .point = .before_live };
+    h.server.hooks.request = &gate;
+    defer h.server.hooks.request = null;
+    defer gate.release.set(testing.io);
+    const held = try h.send("textDocument/codeAction", .{
+        .textDocument = .{ .uri = uri },
+        .range = .{ .start = .{ .line = 1, .character = 0 }, .end = .{ .line = 1, .character = 20 } },
+        .context = .{ .diagnostics = &[_]std.json.Value{}, .only = &[_][]const u8{"quickfix"} },
+    });
+    try gate.entered.wait(testing.io);
+    // The request has ended its read transaction while its live diagnostics are prepared
+    try testing.expectEqual(0, h.server.db.active_readers.load(.acquire));
+    gate.release.set(testing.io);
+
+    const response = try h.response(held);
+    try testing.expect(response.object.get("error") == null);
+    var found = false;
+    for (response.object.get("result").?.array.items) |action| {
+        if (std.mem.indexOf(u8, action.object.get("title").?.string, "use 'const'") != null) found = true;
+    }
+    try testing.expect(found);
+
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "a response is written after the read transaction has ended" {
     // Guards against holding the shared side of the database lock while the client drains a
     // response: later edits and `$/cancelRequest` would wait for the write.
