@@ -39,6 +39,8 @@ pub fn lower(gpa: Allocator, member: SyntaxNode, owner: Owner) Error!Body {
     var type_expr: ?ExprId = null;
     var align_expr: ?ExprId = null;
     var params: std.ArrayList(BindingId) = .empty;
+    var signature_exprs: u32 = 0;
+    var signature_bindings: u32 = 0;
     if (owner == .zon) value = try l.expr(member) else switch (member.kind()) {
         .fn_decl => {
             const decl = ast.cast(ast.FnDecl, member).?;
@@ -62,18 +64,24 @@ pub fn lower(gpa: Allocator, member: SyntaxNode, owner: Owner) Error!Body {
                 };
                 type_expr = try l.optExpr(proto.returnType());
             }
+            signature_exprs = @intCast(l.exprs.items.len);
+            signature_bindings = @intCast(l.bindings.items.len);
             if (decl.body()) |b| value = try l.expr(b.syntax);
         },
         .var_decl => {
             const decl = ast.cast(ast.VarDecl, member).?;
             type_expr = try l.optExpr(decl.typeExpr());
             align_expr = try l.clauses(member);
+            signature_exprs = @intCast(l.exprs.items.len);
+            signature_bindings = @intCast(l.bindings.items.len);
             value = try l.optExpr(decl.initExpr());
         },
         .container_field => {
             const field = ast.cast(ast.ContainerField, member).?;
             type_expr = if (owner == .bare_field) null else try l.optExpr(field.typeExpr());
             align_expr = try l.clauses(member);
+            signature_exprs = @intCast(l.exprs.items.len);
+            signature_bindings = @intCast(l.bindings.items.len);
             value = try l.optExpr(field.defaultValue());
         },
         .test_decl => if (ast.cast(ast.TestDecl, member).?.body()) |b| {
@@ -97,6 +105,8 @@ pub fn lower(gpa: Allocator, member: SyntaxNode, owner: Owner) Error!Body {
         .type_expr = type_expr,
         .align_expr = align_expr,
         .clauses = l.clause_list.items,
+        .signature_exprs = signature_exprs,
+        .signature_bindings = signature_bindings,
     };
     body.arena = arena.state;
     return body;
