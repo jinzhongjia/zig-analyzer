@@ -339,6 +339,8 @@ pub const TestHooks = if (@import("builtin").is_test) struct {
     /// (`moduleGraphUnchanged`) in its read transaction, before anything is compared, so that a
     /// test can make a write transaction wait for the lock during the comparison
     graph: ?*OnceGate = null,
+    /// Counts the reads of builtin.zig files in module graph updates (see `indexing.builtinTarget`)
+    builtin_target_reads: ?*std.atomic.Value(usize) = null,
     /// Whether the auto-import index is built ahead of the first completion (see
     /// `requestAutoImportIndex`). Off, a completion still builds it when it needs it, but the
     /// first completion after opening has no auto-imports. Indexing the standard library takes
