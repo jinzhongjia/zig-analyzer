@@ -480,7 +480,7 @@ pub fn explicitTagType(r: *Resolver, t: Index) Error!?Index {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
     defer ev.deinit();
     if (!value.isEnumType(ev.ip, t)) return null;
-    const decl = ev.containerSyntax(t) catch |err| switch (err) {
+    const decl = ev.containerSyntax(t, true) catch |err| switch (err) {
         error.Abort, error.Break, error.Continue, error.Return => return null,
         error.Canceled => return error.Canceled,
         error.OutOfMemory => return error.OutOfMemory,
@@ -584,7 +584,7 @@ pub fn stringValue(r: *Resolver, tv: TypedValue) Error!?[]const u8 {
 pub fn containerLayout(r: *Resolver, t: Index) Error!?InternPool.Reified.Layout {
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = r.arena };
     defer ev.deinit();
-    const decl = ev.containerSyntax(t) catch |err| switch (err) {
+    const decl = ev.containerSyntax(t, false) catch |err| switch (err) {
         error.Abort, error.Break, error.Continue, error.Return => return null,
         error.Canceled => return error.Canceled,
         error.OutOfMemory => return error.OutOfMemory,
@@ -1154,6 +1154,10 @@ const Evaluator = struct {
     /// incomplete: the `DeclType` memos they come from do not change within a read transaction.
     /// Allocated in `a`
     container_fields: std.AutoHashMapUnmanaged(Index, []const Field) = .empty,
+    /// The argument of the declaration of each container type (`enum(u8)`, `packed struct(u32)`,
+    /// see `containerSyntax`), read while the result was not incomplete so that a result that may
+    /// still change is not kept. Allocated in `a`
+    container_args: std.AutoHashMapUnmanaged(Index, ?Index) = .empty,
 
     fn deinit(ev: *Evaluator) void {
         if (!ev.owns_calls) return;
@@ -5782,7 +5786,7 @@ const Evaluator = struct {
             // given explicitly; an integer that does not fit in it is a compile error (as is one
             // that no member of an exhaustive enum has)
             if (!try ev.nonexhaustive(t)) return error.Abort;
-            const tag = (try ev.containerSyntax(t)).arg orelse return .{ .ty = t };
+            const tag = (try ev.containerSyntax(t, true)).arg orelse return .{ .ty = t };
             if (!value.intFitsFrom(ip, v.ty, tag, x)) return error.Abort;
             const tag_int = try ip.get(.{ .int_value = .{ .ty = tag, .value = x } });
             return Val.of(t, try ip.get(.{ .enum_unnamed = .{ .ty = t, .int = tag_int } }));
@@ -6006,7 +6010,7 @@ const Evaluator = struct {
             else => return null,
         }
         if (value.isEnumType(ev.ip, t)) return null;
-        return (try ev.containerSyntax(t)).layout;
+        return (try ev.containerSyntax(t, false)).layout;
     }
 
     fn isExternStruct(ev: *Evaluator, t: Index) EvalError!bool {
@@ -6181,7 +6185,7 @@ const Evaluator = struct {
         var buf: [16]u8 = @splat(0);
         if (!try ev.writeBits(v, &buf, 0)) return null;
         const raw = std.mem.readInt(u128, &buf, .little);
-        const backing = (try ev.containerSyntax(t)).arg orelse return raw;
+        const backing = (try ev.containerSyntax(t, true)).arg orelse return raw;
         const info = value.intInfo(ip, backing) orelse return null;
         return @bitCast(intFromBits(info, raw));
     }
@@ -6769,7 +6773,7 @@ const Evaluator = struct {
         // Enum: its tag integer
         if (value.isEnumType(ip, t)) return value.typeLayout(ip, try ev.enumTagType(t) orelse return null);
         const fields = try ev.layoutFields(t, depth) orelse return null;
-        if (ev.isUnion(t)) return ev.unionLayout(t, try ev.containerSyntax(t), fields, depth);
+        if (ev.isUnion(t)) return ev.unionLayout(t, try ev.containerSyntax(t, true), fields, depth);
         return (try ev.structLayoutOf(t, fields) orelse return null).layout;
     }
 
@@ -6805,7 +6809,7 @@ const Evaluator = struct {
             out.alignment = if (attrs.alignment) |a| .fromBytes(a) else .natural;
             return out;
         }
-        const layout = (try ev.containerSyntax(agg)).layout;
+        const layout = (try ev.containerSyntax(agg, false)).layout;
         if (layout == .auto) return ev.autoFieldPtrAttrs(out, agg, field_ty, attrs.alignment);
         if (ev.isUnion(agg)) {
             // An extern or packed union: the alignment of the union pointer
@@ -6890,8 +6894,8 @@ const Evaluator = struct {
             .error_set_type, .inferred_error_set => return false,
             .simple_type => |s| return s != .anyerror,
             .array_type => |a| return ev.hasBitRepr(a.child),
-            .union_tag_type => |u| return (try ev.containerSyntax(u)).arg != null,
-            .container_type => |c| return c.kind != .@"enum" or (try ev.containerSyntax(t)).arg != null,
+            .union_tag_type => |u| return (try ev.containerSyntax(u, true)).arg != null,
+            .container_type => |c| return c.kind != .@"enum" or (try ev.containerSyntax(t, true)).arg != null,
             else => return true,
         }
     }
@@ -6905,7 +6909,7 @@ const Evaluator = struct {
             .simple_type => |s| return s == .void or s == .bool or value.intInfo(ip, t) != null or (ip.isFloat(t) and s != .comptime_float),
             .container_type, .reified_type, .union_tag_type => {
                 if (value.isEnumType(ip, t)) return ev.hasBitRepr(t);
-                return (try ev.containerSyntax(t)).layout == .@"packed";
+                return (try ev.containerSyntax(t, false)).layout == .@"packed";
             },
             else => return false,
         }
@@ -6976,7 +6980,7 @@ const Evaluator = struct {
     /// Layout and field bit offsets of a struct (including tuples and anonymous structs)
     fn structLayoutOf(ev: *Evaluator, t: Index, fields: []const LayoutField) EvalError!?StructLayout {
         if (ev.ip.key(t) == .tuple_type) return try ev.tupleLayout(fields);
-        return ev.structLayout(try ev.containerSyntax(t), fields);
+        return ev.structLayout(try ev.containerSyntax(t, true), fields);
     }
 
     /// Layout of a tuple (the tuple branches of `Type.structFieldOffset` and `abiAlignment`): in
@@ -7472,9 +7476,9 @@ const Evaluator = struct {
 
     const ContainerSyntax = struct { layout: InternPool.Reified.Layout = .auto, auto_enum: bool = false, arg: ?Index = null };
 
-    /// Syntactic information of a container declaration: layout, `union(enum)`, and the value of
-    /// the argument expression
-    fn containerSyntax(ev: *Evaluator, t: Index) EvalError!ContainerSyntax {
+    /// Syntactic information of a container declaration: layout, `union(enum)`, and (when
+    /// `need_arg`) the value of the argument expression
+    fn containerSyntax(ev: *Evaluator, t: Index, need_arg: bool) EvalError!ContainerSyntax {
         const ip = ev.ip;
         switch (ip.key(t)) {
             .reified_type => |rt| return .{ .layout = rt.layout, .arg = rt.tag },
@@ -7491,7 +7495,8 @@ const Evaluator = struct {
                     },
                     .auto_enum = container.auto_enum,
                 };
-                out.arg = try ev.containerArg(ns, c.inst);
+                // Without an argument the scan of the enclosing member's body finds none
+                if (need_arg and container.has_arg) out.arg = try ev.containerArg(t, ns, c.inst);
                 return out;
             },
             else => return .{},
@@ -7500,12 +7505,16 @@ const Evaluator = struct {
 
     /// Argument of `enum(u8)` / `union(E)` / `packed struct(u32)` (in the inference result of the
     /// enclosing member)
-    fn containerArg(ev: *Evaluator, ns: Namespace, inst: ?Index) Error!?Index {
-        return (try containerArgValue(ev.r, ns, inst) orelse return null).asType();
+    fn containerArg(ev: *Evaluator, t: Index, ns: Namespace, inst: ?Index) Error!?Index {
+        if (ev.container_args.getEntry(t)) |e| return e.value_ptr.*;
+        const v = try containerArgValue(ev.r, ns, inst);
+        const arg = if (v) |tv| tv.asType() else null;
+        if (!ev.r.ctx.incomplete()) try ev.container_args.put(ev.a, t, arg);
+        return arg;
     }
 
     fn layoutOf(ev: *Evaluator, t: Index) EvalError!InternPool.Reified.Layout {
-        return (try ev.containerSyntax(t)).layout;
+        return (try ev.containerSyntax(t, false)).layout;
     }
 
     /// Tag integer type of an enum: the explicit one of `enum(u8)`, otherwise the unsigned integer
@@ -7513,9 +7522,9 @@ const Evaluator = struct {
     fn enumTagType(ev: *Evaluator, t: Index) EvalError!?Index {
         const ip = ev.ip;
         switch (ip.key(t)) {
-            .container_type, .reified_type => if ((try ev.containerSyntax(t)).arg) |arg| return arg,
+            .container_type, .reified_type => if ((try ev.containerSyntax(t, true)).arg) |arg| return arg,
             // Tag enum of `union(enum(u8))`
-            .union_tag_type => |u| if ((try ev.containerSyntax(u)).arg) |arg| return arg,
+            .union_tag_type => |u| if ((try ev.containerSyntax(u, true)).arg) |arg| return arg,
             else => {},
         }
         const values = try ev.enumValues(t);
@@ -7543,7 +7552,7 @@ const Evaluator = struct {
     /// `union(enum)`, otherwise null. The argument of a packed union is its backing integer, not
     /// a tag type.
     fn unionTagType(ev: *Evaluator, t: Index) EvalError!?Index {
-        const s = try ev.containerSyntax(t);
+        const s = try ev.containerSyntax(t, true);
         if (s.auto_enum) return try ev.ip.get(.{ .union_tag_type = t });
         if (s.layout == .@"packed") return null;
         return s.arg;
@@ -7556,7 +7565,7 @@ const Evaluator = struct {
             .container_type, .reified_type => {},
             else => return null,
         }
-        const decl = try ev.containerSyntax(t);
+        const decl = try ev.containerSyntax(t, true);
         // Packed container without an explicit backing integer: the compiler reports an error for
         // `@backingInt`
         if (decl.layout == .@"packed") return decl.arg;
@@ -7569,7 +7578,7 @@ const Evaluator = struct {
     /// field (union)
     fn backingInteger(ev: *Evaluator, t: Index, layout: InternPool.Reified.Layout, types: []const Index, is_union: bool) EvalError!Index {
         if (layout != .@"packed") return .null_value;
-        if ((try ev.containerSyntax(t)).arg) |arg| return arg;
+        if ((try ev.containerSyntax(t, true)).arg) |arg| return arg;
         var bits: u64 = 0;
         for (types) |ty| {
             const field_bits = (try ev.typeLayout(ty, 0) orelse return error.Abort).bits orelse return error.Abort;
