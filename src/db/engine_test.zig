@@ -422,6 +422,37 @@ const ReadBoundedLen = struct {
     }
 };
 
+/// A query whose values read transactions evict above 20 bytes, with sizes taken from the text
+const ReadSized = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = []const u8;
+    pub const lru: usize = 1000;
+    pub const lru_bytes: usize = 1;
+    pub const lru_read_bytes: usize = 20;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return ctx.db.gpa.dupe(u8, try ctx.get(Text, key));
+    }
+    pub fn bytes(v: Value) usize {
+        return v.len;
+    }
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(u8, a, b);
+    }
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.*);
+    }
+};
+
+const ReadSizedLen = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = usize;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return (try ctx.get(ReadSized, key)).len;
+    }
+};
+
 /// Whether the value of `ReadBounded` it read stays intact while it reads many others
 const ReadBoundedHolder = struct {
     pub const kind: db.Kind = .derived;
@@ -602,7 +633,7 @@ fn crossStarted(which: usize) void {
     while (!cross_started[1 - which].load(.acquire)) std.Thread.yield() catch {};
 }
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Doubled, TensVia, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Prefix, PrefixLen, Gated, CrossA, CrossB, FixA, FixB, OwnedCycleA, OwnedCycleB, OwnedCycleLen, ReadBounded, ReadBoundedLen, ReadBoundedHolder, ReadBoundedOther, ReadBoundedBoth });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Doubled, TensVia, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Prefix, PrefixLen, Gated, CrossA, CrossB, FixA, FixB, OwnedCycleA, OwnedCycleB, OwnedCycleLen, ReadBounded, ReadBoundedLen, ReadBoundedHolder, ReadBoundedOther, ReadBoundedBoth, ReadSized, ReadSizedLen });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions(Q);
@@ -1810,6 +1841,61 @@ test "lru_read_bytes: a read transaction evicts the values no query holds" {
     for (0..read_bounded_keys) |k| try testing.expectEqual(10, try ctx.get(ReadBoundedLen, @intCast(k)));
     try testing.expect(d.tables[comptime Db.queryIndex(ReadBounded)].live_bytes <= 40);
     try testing.expectEqual(read_bounded_keys, executions(&d, ReadBounded));
+}
+
+test "lru_read_bytes: eviction removes exactly the least recently used unpinned values" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setReadBoundedTexts(&d);
+    var ctx = d.beginRead(testing.allocator);
+    defer ctx.end();
+    // Pinned until the transaction ends, so it survives although it is the oldest
+    try testing.expectEqualStrings("value-0000", try ctx.get(ReadBounded, 0));
+    for (1..9) |k| try testing.expectEqual(10, try ctx.get(ReadBoundedLen, @intCast(k)));
+
+    const table = &d.tables[comptime Db.queryIndex(ReadBounded)];
+    for (1..7) |k| {
+        const index = table.keys.getIndex(@intCast(k)).?;
+        try testing.expect(table.slots.items[index].memo.?.evicted);
+    }
+    for (7..9) |k| {
+        const index = table.keys.getIndex(@intCast(k)).?;
+        try testing.expect(!table.slots.items[index].memo.?.evicted);
+    }
+    const pinned = table.keys.getIndex(0).?;
+    try testing.expect(!table.slots.items[pinned].memo.?.evicted);
+    try testing.expectEqual(1, table.slots.items[pinned].pins);
+    try testing.expectEqual(3, table.live);
+}
+
+test "lru_read_bytes: eviction selects by recency, not by value size" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    // 2 + 10 + 10 bytes are retained; the 20-byte limit keeps the newest value after the pass
+    try setText(&d, 0, "ab");
+    try setText(&d, 1, "0123456789");
+    try setText(&d, 2, "abcdefghij");
+    try setText(&d, 3, "klmnopqrst");
+    var ctx = d.beginRead(testing.allocator);
+    defer ctx.end();
+    try testing.expectEqual(2, try ctx.get(ReadSizedLen, 0));
+    try testing.expectEqual(10, try ctx.get(ReadSizedLen, 1));
+    try testing.expectEqual(10, try ctx.get(ReadSizedLen, 2));
+    // The record to remove is 7 bytes: the oldest 2 + 10 bytes reach it, although the newer
+    // 10-byte value alone would too, so both oldest values are evicted
+    try testing.expectEqual(10, try ctx.get(ReadSizedLen, 3));
+
+    const table = &d.tables[comptime Db.queryIndex(ReadSized)];
+    for (0..2) |k| {
+        const index = table.keys.getIndex(@intCast(k)).?;
+        try testing.expect(table.slots.items[index].memo.?.evicted);
+    }
+    for (2..4) |k| {
+        const index = table.keys.getIndex(@intCast(k)).?;
+        try testing.expect(!table.slots.items[index].memo.?.evicted);
+    }
+    try testing.expectEqual(2, table.live);
+    try testing.expectEqual(20, table.live_bytes);
 }
 
 test "lru_read_bytes: a value stays valid while a compute holds it" {
