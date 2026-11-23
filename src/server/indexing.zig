@@ -587,6 +587,7 @@ fn indexFiles(ctx: *Db.Ctx, files: []const Vfs.FileId, auto_import: bool) za.db.
             continue;
         }
         _ = try ctx.get(za.syntax.FileIndex.Query, f);
+        _ = try ctx.get(za.syntax.StringLiterals.Query, f);
         _ = try ctx.get(syntax_q.FileItemTree, f);
         _ = try ctx.get(syntax_q.ItemSummaries, f);
     }

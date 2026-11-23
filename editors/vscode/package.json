@@ -403,6 +403,11 @@
           "default": true,
           "markdownDescription": "Functions and builtins complete as calls, and common snippets are offered where a statement or a declaration starts."
         },
+        "zig-analyzer.completion.call_snippets": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "With snippets, functions and builtins complete as calls; off inserts their name alone, and signature help shows the parameters once `(` is typed."
+        },
         "zig-analyzer.completion.argument_placeholders": {
           "type": "boolean",
           "default": true,

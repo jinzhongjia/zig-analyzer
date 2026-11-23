@@ -7,7 +7,9 @@
 //! `syntaxAt`), lists the names visible at the cursor (local names and the declarations of
 //! enclosing containers). When `build.zig.zon` has no result type, its fields
 //! and paths are listed by the built-in schema (see `manifest.zig`).
-//! Keywords are offered where the syntax admits them (see `addKeywords`).
+//! Keywords, primitive types and primitive values are offered where the syntax admits them (see
+//! `addKeywords` and `addPrimitives`); after `.` on a pointer, an optional, or an error union,
+//! postfix completions follow the members (see `addPostfix`).
 //! No completion in comments and strings (other than `@import("` and the paths of `build.zig.zon`).
 //! With snippets, functions and builtins complete as calls (see `addCallSnippets`), and common
 //! snippets are also offered where a statement or a declaration starts (see `addKeywordSnippets`).
@@ -62,6 +64,8 @@ pub const Options = struct {
     /// Use snippets (the client supports them and they are enabled): functions complete as calls,
     /// and common snippets are offered where a statement or a declaration starts
     snippets: bool = false,
+    /// With `snippets`, functions and builtins complete as calls; otherwise as their name alone
+    call_snippets: bool = true,
     /// Call snippets insert a placeholder for each argument; otherwise only the parentheses
     argument_placeholders: bool = true,
     /// Complete only paths (`@import` strings and the paths of `build.zig.zon`), with no items
@@ -99,6 +103,9 @@ pub const Item = struct {
     weight: f32 = 0,
     score: f32 = 0,
     import_edit: ?imports.Edit = null,
+    /// Another edit before the replaced range: the `try ` a postfix `.try` inserts before the
+    /// left-hand side
+    prefix_edit: ?imports.Edit = null,
     /// The definition referred to, from which the signature and documentation are given when the
     /// item is selected (see `describe`): for auto-import candidates and functions (for an alias of
     /// a function, the function it refers to)
@@ -121,7 +128,7 @@ pub const Item = struct {
         target: imports.Target,
     };
 
-    pub const Kind = enum { param, type_param, constant, variable, function, method, namespace, @"struct", @"enum", type, field, enum_member, error_name, builtin, module, file, folder, label, keyword, snippet };
+    pub const Kind = enum { param, type_param, constant, variable, function, method, namespace, @"struct", @"enum", type, field, enum_member, error_name, builtin, module, file, folder, label, keyword, snippet, primitive_type, primitive_value, postfix };
     pub const Range = struct { start: u32, end: u32 };
 };
 
@@ -152,7 +159,11 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     };
     var items: std.ArrayList(Item) = .empty;
     try items.appendSlice(r.arena, base);
-    if (pos) |p| try addKeywords(r.arena, text, visible, p, &items);
+    if (pos) |p| {
+        try addKeywords(r.arena, text, visible, p, &items);
+        try addPrimitives(r, visible, p, &items);
+    }
+    try addPostfix(r, text, root, visible, options.snippets, &items);
     if (name == null and !options.snippets) {
         try rankExpected(items.items, expected);
         return .{ .items = items.items, .is_incomplete = incomplete };
@@ -221,7 +232,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
         try items.appendSlice(r.arena, extra.items);
     }
     if (options.snippets) {
-        try addCallSnippets(r, file, text, root, offset, visible, pos, items.items, options.argument_placeholders);
+        if (options.call_snippets) try addCallSnippets(r, file, text, root, offset, visible, pos, items.items, options.argument_placeholders);
         if (pos) |p| try addKeywordSnippets(r, file, text, offset, visible, p, &items);
     }
     if (name) |n| try rank(r.arena, items.items, n.prefix, try expectedAt(r, file, offset, visible.at)) else try rankExpected(items.items, expected);
@@ -329,6 +340,8 @@ const Visible = struct {
     /// `.keyword_only`, reused by keyword and snippet completion without reparsing the member)
     pos: ?Position = null,
     syntax: SyntaxAt = .{},
+    /// `.member` on a value: the access the postfix completions apply to (see `addPostfix`)
+    postfix: ?Postfix = null,
 
     const Context = enum {
         /// Not in any member
@@ -426,7 +439,8 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
             // Methods receiving `*T` need a value that can be modified (see `receives`)
             const mutable = !tv.isType() and !try infer.placeIsConst(r, a.file, a.item, a.body, a, fa.lhs);
             try typedMembers(r, &out, tv, mutable, file);
-            return .{ .items = out.items.items, .context = .member, .bound = !tv.isType(), .at = a };
+            const postfix = if (tv.isType()) null else postfixAt(text, node.offset, b, e, fa.lhs, offset);
+            return .{ .items = out.items.items, .context = .member, .bound = !tv.isType(), .at = a, .postfix = postfix };
         },
         else => {},
     };
@@ -2153,7 +2167,8 @@ fn coerces(ip: *InternPool, want: Index, have: Index) bool {
     if (have == .unknown) return false;
     if (value.eqlTypes(ip, want, have) orelse false) return true;
     switch (ip.key(want)) {
-        .optional_type => |child| return coerces(ip, child, have),
+        // `null` as any optional
+        .optional_type => |child| return have == .null_type or coerces(ip, child, have),
         .error_union_type => |eu| {
             if (coerces(ip, eu.payload, have)) return true;
             // An error set that fits in `E`, and `E'!T` whose error set fits in `E`
@@ -2954,6 +2969,201 @@ fn addKeywordList(arena: Allocator, items: *std.ArrayList(Item), list: []const [
 
 fn addKeyword(arena: Allocator, items: *std.ArrayList(Item), keyword: []const u8, range: Item.Range) Allocator.Error!void {
     try items.append(arena, .{ .label = keyword, .kind = .keyword, .replace = range, .weight = keyword_weight });
+}
+
+/// Primitive values (`true`, `false`, `null`, `undefined`) offered in expressions
+const primitive_values = [_][]const u8{ "true", "false", "null", "undefined" };
+
+/// Primitive type names offered in expressions and types. Integer types of other widths (`u7`) are
+/// valid too, but only the common widths are listed
+const primitive_types = [_][]const u8{
+    "bool",       "void",        "type",         "noreturn", "anyerror", "anyopaque", "comptime_int", "comptime_float",
+    "usize",      "isize",       "u8",           "u16",      "u32",      "u64",       "u128",         "i8",
+    "i16",        "i32",         "i64",          "i128",     "f16",      "f32",       "f64",          "f80",
+    "f128",       "c_char",      "c_short",      "c_ushort", "c_int",    "c_uint",    "c_long",       "c_ulong",
+    "c_longlong", "c_ulonglong", "c_longdouble",
+};
+
+/// Primitive type names and values where the syntax admits them (see `addKeywords`): types and
+/// values in expressions (a type is a value), types alone in type positions. The type of each is
+/// known, so they take part in ranking by the expected type (`Item.Origin`)
+fn addPrimitives(r: *Resolver, visible: Visible, pos: Position, items: *std.ArrayList(Item)) resolve.Error!void {
+    if (visible.context == .none) return;
+    const values = switch (visible.syntax.keywords) {
+        .expression => true,
+        .type, .ptr_type => false,
+        .param => |p| if (p.has_colon or (p.fn_type and !p.has_any)) false else return,
+        else => return,
+    };
+    const range: Item.Range = .{ .start = pos.start, .end = pos.end };
+    const ip = r.ctx.db.env.ip;
+    if (values) for (primitive_values) |name| {
+        const tv = (try infer.primitive(ip, name)).?;
+        try items.append(r.arena, .{ .label = name, .kind = .primitive_value, .replace = range, .weight = keyword_weight, .origin = .{ .value = tv } });
+    };
+    for (primitive_types) |name| {
+        const tv = (try infer.primitive(ip, name)).?;
+        try items.append(r.arena, .{ .label = name, .kind = .primitive_type, .replace = range, .weight = keyword_weight, .origin = .{ .value = tv } });
+    }
+}
+
+// ── postfix ──────────────────────────────────────────────────────────
+
+/// A field access `lhs.word` at the cursor whose left-hand side is a value (see `addPostfix`).
+/// Offsets are in the file
+const Postfix = struct {
+    lhs_start: u32,
+    /// The `.` after the left-hand side
+    dot: u32,
+    /// End of the word at the cursor
+    end: u32,
+    /// The left-hand side and the field access
+    lhs: Body.ExprId,
+    access: Body.ExprId,
+};
+
+/// The postfix position of the field access `access` (its left-hand side `lhs`) at the cursor:
+/// only a word, from the `.` to the cursor
+fn postfixAt(text: []const u8, base: u32, b: *const Body, access: Body.ExprId, lhs: Body.ExprId, offset: u32) ?Postfix {
+    const lhs_range = b.range(lhs);
+    var dot = base + lhs_range.end;
+    while (dot < offset and std.ascii.isWhitespace(text[dot])) dot += 1;
+    if (dot >= offset or text[dot] != '.') return null;
+    for (text[dot + 1 .. offset]) |c| if (!isIdentChar(c)) return null;
+    return .{ .lhs_start = base + lhs_range.start, .dot = dot, .end = identEnd(text, offset), .lhs = lhs, .access = access };
+}
+
+/// Postfix completions on a value by its type, sorted after its members: `.*` on a single-item
+/// pointer that is not a function pointer, `.?` on an optional, and, with snippets, `.try` (`try
+/// lhs`, where the enclosing function can return the errors) and `.catch` (`lhs catch |err|
+/// switch (err) { ... }` with a prong per error of a known error set, where `catch` takes `lhs`
+/// alone as its operand) on an error union
+fn addPostfix(r: *Resolver, text: []const u8, root: SyntaxNode, visible: Visible, snippets: bool, items: *std.ArrayList(Item)) resolve.Error!void {
+    const p = visible.postfix orelse return;
+    const a = visible.at orelse return;
+    const ip = a.ip;
+    const ty = a.exprType(p.lhs).ty;
+    if (ty == .unknown) return;
+    const word: Item.Range = .{ .start = p.dot + 1, .end = p.end };
+    switch (ip.key(ty)) {
+        .ptr_type => |ptr| {
+            if (ptr.size != .one or ip.key(ptr.child) == .fn_type) return;
+            try items.append(r.arena, .{ .label = "*", .kind = .postfix, .detail = try postfixDetail(r, ptr.child), .replace = word, .sort = postfix_sort });
+        },
+        .optional_type => |child| try items.append(r.arena, .{ .label = "?", .kind = .postfix, .detail = try postfixDetail(r, child), .replace = word, .sort = postfix_sort }),
+        .error_union_type => |eu| {
+            if (!snippets) return;
+            const whole: Item.Range = .{ .start = p.dot, .end = p.end };
+            const lhs_text = text[p.lhs_start..p.dot];
+            if (try tryAllowed(r, root, a, p, eu.err)) try items.append(r.arena, .{
+                .label = "try",
+                .kind = .postfix,
+                .detail = try std.fmt.allocPrint(r.arena, "try {s}", .{std.mem.trimEnd(u8, lhs_text, " \t\r\n")}),
+                .replace = whole,
+                .filter = ".try",
+                .snippet = "",
+                .prefix_edit = .{ .start = p.lhs_start, .end = p.lhs_start, .text = "try " },
+                .sort = postfix_sort,
+            });
+            if (catchAllowed(a.body, p.access)) try items.append(r.arena, .{
+                .label = "catch",
+                .kind = .postfix,
+                .detail = "catch |err| switch (err) {…}",
+                .replace = whole,
+                .filter = ".catch",
+                .snippet = try catchSnippet(r, eu.err),
+                .sort = postfix_sort,
+            });
+        },
+        else => {},
+    }
+}
+
+/// Sort text of postfix completions: after the members, which have none
+const postfix_sort = "~";
+
+fn postfixDetail(r: *Resolver, ty: Index) resolve.Error!?[]const u8 {
+    return if (ty == .unknown) null else try render.typeAlloc(r, ty);
+}
+
+/// Whether `try` is valid before the left-hand side: in the body of a function or a test, not in a
+/// deferred expression, and, when the function at the cursor is the member and declares its error
+/// set, the errors of `have` are in it
+fn tryAllowed(r: *Resolver, root: SyntaxNode, a: context.At, p: Postfix, have: Index) resolve.Error!bool {
+    const path = try root.coveringPath(r.arena, p.dot);
+    var i = path.len;
+    const decl = while (i > 0) {
+        i -= 1;
+        switch (path[i].kind()) {
+            .defer_stmt, .errdefer_stmt, .container_decl => return false,
+            .test_decl => return true,
+            .fn_decl => break path[i],
+            else => {},
+        }
+    } else return false;
+    // In the body, not in the prototype
+    if (i + 1 >= path.len or path[i + 1].kind() != .block) return false;
+    // A function nested in a container of the member: its return type is not computed here
+    if (decl.offset != a.node.offset) return true;
+    const it = (try r.itemTree(a.file)).items[a.item];
+    if (it.kind != .@"fn" or it.flags.inferred_error_set) return true;
+    const ret = a.exprType(a.body.type_expr orelse return true).asType() orelse return true;
+    if (ret == .unknown) return true;
+    const want = switch (a.ip.key(ret)) {
+        .error_union_type => |eu| eu.err,
+        else => return false,
+    };
+    return errorsReturnable(r, want, have);
+}
+
+/// Whether the errors of the error set `have` can be returned from a function whose error set is
+/// `want`; true when either cannot be computed
+fn errorsReturnable(r: *Resolver, want: Index, have: Index) resolve.Error!bool {
+    const ip = r.ctx.db.env.ip;
+    const want_set = switch (ip.key(want)) {
+        .error_set_type => |es| es,
+        else => return true,
+    };
+    if (have == .anyerror_type) return false;
+    const have_set = try queries.errorSetOf(r, have) orelse return true;
+    for (have_set.names) |name| {
+        for (want_set.names) |n| {
+            if (std.mem.eql(u8, n, name)) break;
+        } else return false;
+    }
+    return true;
+}
+
+/// Whether `lhs catch ...` keeps `lhs` alone as the operand of `catch`, whose precedence is the
+/// lowest: not when the access is the operand of a prefix or binary operator, or of another
+/// `catch`
+fn catchAllowed(b: *const Body, access: Body.ExprId) bool {
+    for (b.exprs) |x| switch (x) {
+        .prefix => |p| if (p.operand == access) return false,
+        .binary => |x_| if (x_.lhs == access or x_.rhs == access) return false,
+        .@"catch" => |c| if (c.lhs == access or c.rhs == access) return false,
+        else => {},
+    };
+    return true;
+}
+
+/// ` catch |err| switch (err) { ... }`: a prong for each error of the error set, or an `else`
+/// prong when the set is `anyerror` or cannot be computed. The capture name is a placeholder that
+/// the switch operand mirrors
+fn catchSnippet(r: *Resolver, err_set: Index) resolve.Error![]const u8 {
+    const names: []const []const u8 = if (err_set == .anyerror_type) &.{} else if (try queries.errorSetOf(r, err_set)) |es| es.names else &.{};
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(r.arena, " catch |${1:err}| switch (${1:err}) {\n");
+    var n: u32 = 2;
+    for (names) |name| {
+        try out.appendSlice(r.arena, "    ");
+        try appendEscaped(r.arena, &out, try std.fmt.allocPrint(r.arena, "error.{f}", .{std.zig.fmtId(name)}));
+        try out.print(r.arena, " => ${d},\n", .{n});
+        n += 1;
+    }
+    if (names.len == 0) try out.print(r.arena, "    else => ${d},\n", .{n});
+    try out.appendSlice(r.arena, "}$0");
+    return out.items;
 }
 
 // ── snippet ──────────────────────────────────────────────────────────

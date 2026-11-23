@@ -15,7 +15,7 @@ Match scores come from `ide_db/fuzzy.zig`, ported from gopls's `internal/fuzzy` 
 | Members of the enclosing container | 0.94 (0.02 less per outer level, at least 0.86) |
 | Member paths of local values | 0.9 |
 | Auto-import through a visible name | 0.85 |
-| Keywords, statement and declaration snippets | 0.8 |
+| Keywords, primitives, statement and declaration snippets | 0.8 |
 | Auto-import needing a new import | 0.75 |
 
 Member paths and auto-import candidates are also multiplied by a depth factor that drops 0.05 per extra path segment (at least 0.5).
@@ -41,6 +41,8 @@ Keywords are offered in `.zig` files, with or without snippets, only where the s
 - **Parameters**: `comptime` and `noalias` before the name; a parameter of a function type may be a type alone.
 - **Switch cases**: `else` as the only item of a case.
 
+Primitive values (`true`, `false`, `null`, `undefined`) and the common primitive types (`bool`, `void`, `type`, `noreturn`, `anyerror`, `anyopaque`, `comptime_int`, `comptime_float`, `usize`, `isize`, the integers of 8 to 128 bits, the floats, and the C types) are offered with the keywords: values and types in expressions, types alone in type positions, and none at the start of a statement or a member. Their types are known, so they rank by the expected type: `true` and `false` fit `bool`, `null` fits an optional, the types fit `type`; `undefined` fits anything and is never ranked first.
+
 In statements and expressions, `return` is offered only in the body of a function or test, `break` only in a loop or a labeled block or switch, and `continue` only in a loop or a labeled switch; none of them inside `defer` or `errdefer`, which control cannot leave, except for the loops and labels inside it.
 
 An empty word, or one that is already a keyword, has no node of its own in the syntax tree after error recovery, so the member at the cursor is parsed again with a name in place of the word, and the position is that of the name. The same classification decides whether names in scope are offered: only where the syntax admits a name reference (expressions, types, decltest names, inline-assembly output variables, and tuple struct fields), never in declaration, capture, label, error-set, parameter, or field names, non-tuple container member positions, numbers, operators, comments, or strings. No keywords are offered in declaration, capture, and label names, after `.` or `@`, or inside numbers, operators, comments, and strings.
@@ -48,6 +50,15 @@ An empty word, or one that is already a keyword, has no node of its own in the s
 ## Member completion
 
 After `.` on a value (a single-item pointer is dereferenced once), completion lists its fields and the functions callable on it as methods; those in other files must be `pub`. As the compiler requires, a non-const pointer receiver needs a value that can be modified, by the same rule that infers `&x`. A first parameter that is `anytype` or cannot be computed counts as receiving the value.
+
+## Postfix completion
+
+After `.` on a value, completions by its type follow its members (sort text `~`):
+
+- `.*` on a single-item pointer that is not a function pointer, and `.?` on an optional; the detail is the type they give.
+- With snippets, on an error union: `.try` replaces `.word` with nothing and inserts `try ` before the left-hand side (an additional edit, so a left-hand side spanning lines works), offered in the body of a function or test, not inside `defer` or `errdefer`, and, when the function at the cursor declares its error set, only if the errors fit in it. `.catch` replaces `.word` with `catch |err| switch (err) { ... }`, with a prong per error of a known error set, or an `else` prong for `anyerror` or a set that cannot be computed; it is not offered where the access is an operand of a prefix or binary operator or of another `catch`, since `catch` would take the whole expression as its operand. Their filter text includes the `.` (`.try`, `.catch`).
+
+A word that is already a keyword (`f().try`) is not a field access after error recovery, so these are found while it is still a prefix (`f().tr`).
 
 ## Member paths of local values
 
@@ -64,7 +75,7 @@ After a non-empty prefix of a plain name expression, members of visible local va
 
 Controlled by `completion.snippets` (on by default), used only with `completionItem.snippetSupport` and in `.zig` documents; otherwise items insert only the name.
 
-- **Calls**: functions and builtins complete as calls (`add(${1:a}, ${2:b})`), skipping the receiver of a method called through a value. With `completion.argument_placeholders` off, only the parentheses are inserted.
+- **Calls**: functions and builtins complete as calls (`add(${1:a}, ${2:b})`), skipping the receiver of a method called through a value. With `completion.argument_placeholders` off, only the parentheses are inserted. With `completion.call_snippets` off, they insert their name alone, and signature help (triggered by `(` and `,`) shows the parameters once `(` is typed; the other snippets are unaffected.
 - **Name only**: where `(` already follows the cursor, where the position expects a function value, and in declaration positions. A function value is expected by `&f`, the callee of `@call`, typed positions whose type is a function or pointer to one, and `anytype` parameters that the callee calls or forwards, followed through every call of the chain (`std.Thread.spawn`).
 - **Statements and declarations**: keyword snippets at the start of statements and container members. Statements: `if` (plain, `else`, optional capture, error union with `else |err|`), `for` (plain, with an index, a `0..` range, `inline`), `while` (plain, optional capture, continue expression), `switch`, `defer`, `errdefer`, `try`, and `const`/`var` declarations. Members: functions, tests, `const`, structs (plain, `packed`, `extern`), enums (plain and with a tag type), unions (plain and `union(enum)`), error sets, imports, and `comptime` blocks. Snippets that use `std` (printing, assertions, logging, and `std.testing` checks) are offered only when `std` is the standard library; `std`, `builtin`, `main`, and `format` only when not declared yet.
 - **Ranges** are converted within the cursor's line (`offsets.Line`), and ranges outside it with the file's cached line table (`LineStarts`). With `insertReplaceSupport`, items carry both ranges.

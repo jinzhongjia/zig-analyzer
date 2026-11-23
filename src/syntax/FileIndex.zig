@@ -70,6 +70,7 @@ pub fn importStrings(a: Allocator, root: SyntaxNode) Allocator.Error![]const []c
 }
 
 fn walkImports(a: Allocator, node: SyntaxNode, imports: *std.ArrayList([]const u8)) Allocator.Error!void {
+    if (!node.green.flags.has_import) return;
     if (ast.cast(ast.BuiltinCall, node)) |call| if (call.name()) |n| if (std.mem.eql(u8, n.text, "@import")) {
         var args = call.args();
         if (args.next()) |arg| if (arg.firstToken()) |t| if (t.kind == .string_literal) {
@@ -91,6 +92,7 @@ pub fn importSites(a: Allocator, root: SyntaxNode) Allocator.Error![]const Impor
 }
 
 fn walkImportSites(a: Allocator, node: SyntaxNode, sites: *std.ArrayList(ImportSite)) Allocator.Error!void {
+    if (!node.green.flags.has_import) return;
     if (ast.cast(ast.BuiltinCall, node)) |call| if (call.name()) |n| if (std.mem.eql(u8, n.text, "@import")) {
         var args = call.args();
         if (args.next()) |arg| if (arg.firstToken()) |t| if (t.kind == .string_literal) {
@@ -275,4 +277,33 @@ test importSites {
     try std.testing.expectEqual(2, sites.len);
     try std.testing.expectEqualStrings("dep", sites[1].name);
     try std.testing.expectEqualStrings("\"d\\x65p\"", text[sites[1].start..sites[1].end]);
+}
+
+test "imports in a function body survive an incremental body edit" {
+    // The member's node and its ancestors on the path to the root are copies: a walk that trusts
+    // their summary bits must still find the import in the body
+    const old = try Parse.create(std.testing.allocator,
+        \\const a = @import("a");
+        \\fn f() void {
+        \\    _ = @import("b");
+        \\}
+        \\
+    , .zig);
+    defer old.destroy();
+    const inc = (try Parse.reparseBlock(std.testing.allocator, old,
+        \\const a = @import("a");
+        \\fn f() void {
+        \\    _ = @import("c");
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer inc.destroy();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const imports = try importStrings(arena.allocator(), inc.rootNode());
+    try std.testing.expectEqual(2, imports.len);
+    try std.testing.expectEqualStrings("a", imports[0]);
+    try std.testing.expectEqualStrings("c", imports[1]);
+    const sites = try importSites(arena.allocator(), inc.rootNode());
+    try std.testing.expectEqual(2, sites.len);
 }
