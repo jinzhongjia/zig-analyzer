@@ -9,6 +9,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const vector_width = @import("../util/vector.zig").width;
 const kind_mod = @import("kind.zig");
 const SyntaxKind = kind_mod.SyntaxKind;
 const lexer = @import("lexer.zig");
@@ -244,20 +245,55 @@ const unconsumed = "block reparse: unconsumed tokens";
 
 /// The edited part of the text: the bytes before the common prefix of the old and new text, and
 /// those after their common suffix
-const EditRange = struct {
+pub const EditRange = struct {
     /// Length of the common prefix; 0 when the texts differ in their first byte
     prefix: u32,
     /// Length of the common suffix, which does not reach into the common prefix
     suffix: u32,
 };
 
-/// The edit range of `old_text` → `text`; null when the texts are identical
-fn editRange(old_text: []const u8, text: []const u8) ?EditRange {
-    const prefix = std.mem.indexOfDiff(u8, old_text, text) orelse return null;
+/// The edit range of `old_text` → `text`; null when the texts are identical (used by tests)
+pub fn editRange(old_text: []const u8, text: []const u8) ?EditRange {
+    const prefix = commonPrefix(old_text, text);
+    if (prefix == old_text.len and old_text.len == text.len) return null;
     const max_suffix = @min(old_text.len, text.len) - prefix;
-    var suffix: usize = 0;
-    while (suffix < max_suffix and old_text[old_text.len - 1 - suffix] == text[text.len - 1 - suffix]) suffix += 1;
+    const suffix = commonSuffix(old_text, text, max_suffix);
     return .{ .prefix = @intCast(prefix), .suffix = @intCast(suffix) };
+}
+
+/// Length of the common prefix of `a` and `b`: the first byte at which they differ, or the length
+/// of the shorter when one starts with the other
+fn commonPrefix(a: []const u8, b: []const u8) usize {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    if (comptime vector_width > 0) {
+        const Chunk = @Vector(vector_width, u8);
+        while (i + vector_width <= n) : (i += vector_width) {
+            const x: Chunk = a[i..][0..vector_width].*;
+            const y: Chunk = b[i..][0..vector_width].*;
+            const differs = x != y;
+            if (@reduce(.Or, differs)) return i + std.simd.firstTrue(differs).?;
+        }
+    }
+    while (i < n and a[i] == b[i]) i += 1;
+    return i;
+}
+
+/// Length of the common suffix of `a` and `b`, at most `max`: the last byte at which they differ
+/// when scanning backwards, which stops before the suffix reaches the prefix
+fn commonSuffix(a: []const u8, b: []const u8, max: usize) usize {
+    var n: usize = 0;
+    if (comptime vector_width > 0) {
+        const Chunk = @Vector(vector_width, u8);
+        while (n + vector_width <= max) : (n += vector_width) {
+            const x: Chunk = a[a.len - n - vector_width ..][0..vector_width].*;
+            const y: Chunk = b[b.len - n - vector_width ..][0..vector_width].*;
+            const differs = x != y;
+            if (@reduce(.Or, differs)) return n + vector_width - 1 - std.simd.lastTrue(differs).?;
+        }
+    }
+    while (n < max and a[a.len - 1 - n] == b[b.len - 1 - n]) n += 1;
+    return n;
 }
 
 /// Nodes that can be reparsed on their own: the edit must lie strictly between their `{` and `}`
@@ -646,4 +682,5 @@ test {
     _ = @import("parse_test.zig");
     _ = @import("reparse_test.zig");
     _ = @import("parse_fuzz.zig");
+    _ = @import("edit_range_fuzz.zig");
 }

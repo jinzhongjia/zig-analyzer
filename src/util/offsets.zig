@@ -29,13 +29,8 @@ pub const Encoding = enum {
     }
 };
 
-/// Bytes compared at once when scanning for line breaks and ASCII text: the vector length the
-/// target prefers (16 with NEON or SSE2, 32 with AVX2), or 0 for a byte-by-byte scan. Vectors are
-/// used on the backends `std.mem` uses them on; the others do not support them.
-const vector_len: usize = switch (builtin.zig_backend) {
-    .stage2_aarch64, .stage2_loongarch, .stage2_powerpc, .stage2_riscv64, .stage2_spirv => 0,
-    else => std.simd.suggestVectorLength(u8) orelse 0,
-};
+/// Bytes compared at once when scanning for line breaks and ASCII text
+const vector_len: usize = @import("vector.zig").width;
 
 /// Offset of the first `\r` or `\n` at or after `start`
 fn findBreak(text: []const u8, start: usize) ?usize {
