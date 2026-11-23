@@ -3,8 +3,8 @@
 //!
 //! Find references, call-site seeding, and workspace symbol use it to pre-filter candidate files,
 //! then resolve precisely within the candidates.
-//! Names have the `@"..."` quotes removed. Depends only on the syntax tree: when the content is
-//! unchanged, downstream is not recomputed.
+//! Names have the `@"..."` quotes removed; only their hashes are kept. Depends only on the syntax
+//! tree: when the content is unchanged, downstream is not recomputed.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -21,13 +21,22 @@ const green = @import("green.zig");
 const FileIndex = @This();
 
 arena: std.heap.ArenaAllocator.State,
-/// Deduplicated and sorted lexicographically
-names: []const []const u8,
+/// Deduplicated and sorted hashes of the identifier names (see `nameHash`)
+hashes: []const u64,
+
+/// Hash of an identifier name. A collision only adds a file to a pre-filter, whose files are then
+/// checked precisely.
+pub const NameHash = u64;
+
+pub fn nameHash(name: []const u8) NameHash {
+    return std.hash.Wyhash.hash(0, name);
+}
 
 pub fn contains(index: *const FileIndex, name: []const u8) bool {
-    return std.sort.binarySearch([]const u8, index.names, name, struct {
-        fn order(n: []const u8, x: []const u8) std.math.Order {
-            return std.mem.order(u8, n, x);
+    const hash = nameHash(name);
+    return std.sort.binarySearch(u64, index.hashes, hash, struct {
+        fn order(key: u64, h: u64) std.math.Order {
+            return std.math.order(key, h);
         }
     }.order) != null;
 }
@@ -36,25 +45,20 @@ pub fn build(gpa: Allocator, root: SyntaxNode) Allocator.Error!FileIndex {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
-    var names: std.StringArrayHashMapUnmanaged(void) = .empty;
-    defer names.deinit(gpa);
-    try walk(gpa, a, root, &names);
+    var hashes: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
+    defer hashes.deinit(gpa);
+    try walk(gpa, a, root, &hashes);
 
-    const sorted = try a.alloc([]const u8, names.count());
-    for (names.keys(), sorted) |k, *s| s.* = try a.dupe(u8, k);
-    std.mem.sort([]const u8, sorted, {}, struct {
-        fn lt(_: void, x: []const u8, y: []const u8) bool {
-            return std.mem.lessThan(u8, x, y);
-        }
-    }.lt);
-    return .{ .arena = arena.state, .names = sorted };
+    const sorted = try a.dupe(u64, hashes.keys());
+    std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
+    return .{ .arena = arena.state, .hashes = sorted };
 }
 
-fn walk(gpa: Allocator, a: Allocator, node: SyntaxNode, names: *std.StringArrayHashMapUnmanaged(void)) Allocator.Error!void {
+fn walk(gpa: Allocator, a: Allocator, node: SyntaxNode, hashes: *std.AutoArrayHashMapUnmanaged(u64, void)) Allocator.Error!void {
     var it = node.children();
     while (it.next()) |e| switch (e) {
-        .token => |t| if (t.kind == .identifier) try names.put(gpa, try ast.identNameAlloc(a, t.text), {}),
-        .node => |c| try walk(gpa, a, c, names),
+        .token => |t| if (t.kind == .identifier) try hashes.put(gpa, nameHash(try ast.identNameAlloc(a, t.text)), {}),
+        .node => |c| try walk(gpa, a, c, hashes),
     };
 }
 
@@ -123,7 +127,10 @@ pub const Query = struct {
     }
 
     pub fn eql(a: Value, b: Value) bool {
-        return deepEql(a.names, b.names);
+        // A name set that changed to the same hashes (a collision) keeps the old value: the
+        // consumers only test membership by hash, so the result of a colliding file stays a
+        // superset of what they would accept
+        return std.mem.eql(u64, a.hashes, b.hashes);
     }
 
     pub fn deinit(v: *Value, gpa: Allocator) void {
@@ -237,6 +244,22 @@ test build {
     const imports = try importStrings(arena.allocator(), p.rootNode());
     try std.testing.expectEqual(2, imports.len);
     try std.testing.expectEqualStrings("lib/a.zig", imports[1]);
+}
+
+test "build stores the sorted unique hashes of the names" {
+    const p = try Parse.create(std.testing.allocator,
+        \\const a = 1;
+        \\const b = a;
+        \\const c = a;
+    , .zig);
+    defer p.destroy();
+    var index = try build(std.testing.allocator, p.rootNode());
+    defer index.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), index.hashes.len);
+    try std.testing.expect(std.sort.isSorted(u64, index.hashes, {}, std.sort.asc(u64)));
+    try std.testing.expect(index.contains("a"));
+    try std.testing.expect(index.contains("c"));
+    try std.testing.expect(!index.contains("d"));
 }
 
 test importSites {

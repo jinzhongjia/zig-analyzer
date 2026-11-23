@@ -2,7 +2,7 @@
 
 ## How references are found
 
-`FileIndex` filters files by name → the Bloom filter of `ItemNames` filters members → each occurrence is confirmed by precise resolution.
+`FileIndex` filters files by the hashes of the names they contain → the Bloom filter of `ItemNames` filters members → each occurrence is confirmed by precise resolution.
 
 The candidate files are those reaching the definition through an `@import` chain, plus the files those reach: generic code can access a definition's members through an `anytype` value or comptime type parameter without importing its file, while a file none of them reaches is never compiled with the definition. In files not importing the definition, only generic code and typed `.zon` roots are checked.
 
