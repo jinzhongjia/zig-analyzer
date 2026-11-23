@@ -1590,6 +1590,26 @@ pub fn inProject(server: *Server, file: Vfs.FileId) bool {
     return false;
 }
 
+/// The innermost workspace whose root directory contains `path`; the caller holds
+/// `workspaces_mutex`
+fn innermostWorkspaceLocked(server: *Server, path: []const u8) ?*Workspace {
+    var best: ?*Workspace = null;
+    for (server.workspaces.items) |ws| {
+        if (server.vfs.isUnder(path, ws.root) and (best == null or ws.root.len > best.?.root.len)) best = ws;
+    }
+    return best;
+}
+
+/// The innermost workspace whose root directory contains `path`, with a reference held (release
+/// with `Workspace.release`); null when no workspace contains it
+pub fn innermostWorkspace(server: *Server, path: []const u8) ?*Workspace {
+    server.workspaces_mutex.lockUncancelable(server.io);
+    defer server.workspaces_mutex.unlock(server.io);
+    const ws = innermostWorkspaceLocked(server, path) orelse return null;
+    ws.acquire();
+    return ws;
+}
+
 /// Origin of the file (see `origin.classify`)
 pub fn fileOrigin(server: *Server, file: Vfs.FileId) origin.Origin {
     return server.originOf(file, server.inProject(file));
@@ -1688,11 +1708,7 @@ pub fn importOptionsFor(server: *Server, file: Vfs.FileId) ImportOptions {
     const path = server.vfs.path(file);
     server.workspaces_mutex.lockUncancelable(server.io);
     defer server.workspaces_mutex.unlock(server.io);
-    var best: ?*Workspace = null;
-    for (server.workspaces.items) |ws| {
-        if (server.vfs.isUnder(path, ws.root) and (best == null or ws.root.len > best.?.root.len)) best = ws;
-    }
-    if (best) |ws| if (ws.project) |*p| {
+    if (innermostWorkspaceLocked(server, path)) |ws| if (ws.project) |*p| {
         if (p.isSet("imports_derived")) options.derived = p.imports_derived;
         if (p.isSet("imports_sort")) options.sort = p.imports_sort;
     };
