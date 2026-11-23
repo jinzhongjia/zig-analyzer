@@ -63,9 +63,10 @@ pub fn references(server: *Server, r: *Resolver, arena: Allocator, params: types
     const refs = try za.ide_db.search.symbolsReferences(r, found.symbols, .{ .scope = try server.searchScope(r) });
     var out: std.ArrayList(types.Location) = .empty;
     var m: RangeMapper = .{ .server = server, .r = r };
+    var uris: Server.UriCache = .{ .server = server, .arena = arena };
     for (refs) |ref| {
         if (ref.is_decl and !params.context.includeDeclaration) continue;
-        try out.append(arena, .{ .uri = try server.uriFor(arena, ref.file), .range = try m.range(ref.file, ref.start, ref.end) });
+        try out.append(arena, .{ .uri = try uris.get(ref.file), .range = try m.range(ref.file, ref.start, ref.end) });
     }
     return .{ .ok = out.items };
 }
@@ -87,11 +88,12 @@ pub fn workspaceSymbol(server: *Server, r: *Resolver, arena: Allocator, params: 
     const syms = try ide.workspace_symbol.search(r, scope, params.query, if (limit == 0) std.math.maxInt(usize) else limit);
     const out = try arena.alloc(types.WorkspaceSymbol, syms.len);
     var m: RangeMapper = .{ .server = server, .r = r };
+    var uris: Server.UriCache = .{ .server = server, .arena = arena };
     for (syms, out) |s, *o| o.* = .{
         .name = s.name,
         .kind = Server.clientSymbolKind(server.caps.workspace_symbol_kinds, s.kind),
         .containerName = s.container,
-        .location = .{ .Location = .{ .uri = try server.uriFor(arena, s.file), .range = try m.range(s.file, s.start, s.end) } },
+        .location = .{ .Location = .{ .uri = try uris.get(s.file), .range = try m.range(s.file, s.start, s.end) } },
     };
     return .{ .array_of_WorkspaceSymbol = out };
 }
