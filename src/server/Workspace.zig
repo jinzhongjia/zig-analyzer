@@ -163,7 +163,9 @@ generated_recompute_ns: u64 = 0,
 stopping: bool = false,
 /// Project loading progress (from startup until the first compile set is computed)
 loading: ?*Progress = null,
-/// Progress of the current build and the number of completed steps
+/// Progress of the current build and the number of completed steps. Only the task reading build
+/// events ends it (or the thread that fails to send a round's request, before the build produces
+/// events), so that task may use the pointer after releasing `mutex` to write a message.
 build_progress: ?*Progress = null,
 build_total: u32 = 0,
 build_done: u32 = 0,
@@ -357,7 +359,16 @@ fn takeChanged(ws: *Workspace) std.AutoArrayHashMapUnmanaged(FileId, void) {
 /// project is restarted instead (its build would fail).
 pub fn requestBuild(ws: *Workspace) void {
     const io = ws.server.io;
-    const replaced = blk: {
+    const Start = struct {
+        /// Identity of the maker the round was reserved with
+        client: *bsp.Client,
+        /// Only a label: the model may be replaced while the create request is written, and the
+        /// steps are recomputed under `mutex` below
+        title: []const u8,
+    };
+    var round: ?Start = null;
+    var replaced = false;
+    {
         ws.mutex.lockUncancelable(io);
         defer ws.mutex.unlock(io);
         const client = ws.client orelse return;
@@ -367,20 +378,78 @@ pub fn requestBuild(ws: *Workspace) void {
             ws.rebuild = true;
             return;
         }
-        if (ws.cacheReplaced()) break :blk true;
-        const steps = model.buildSteps(ws.gpa, ws.config.compiler_diagnostics) catch return;
-        defer ws.gpa.free(steps);
-        if (steps.len != 0) {
-            ws.building = true;
-            ws.server.busyBegin();
-            ws.build_progress = ws.server.progress.begin(ws.server, buildTitle(model, ws.config.compiler_diagnostics), true);
-            ws.startBuild(client, model, steps);
-            return;
+        if (ws.cacheReplaced()) {
+            replaced = true;
+        } else {
+            const steps = model.buildSteps(ws.gpa, ws.config.compiler_diagnostics) catch return;
+            defer ws.gpa.free(steps);
+            if (steps.len != 0) {
+                ws.building = true;
+                ws.server.busyBegin();
+                // `buildTitle` writes a thread-local buffer, which stays valid after the unlock
+                round = .{ .client = client, .title = buildTitle(model, ws.config.compiler_diagnostics) };
+            } else {
+                // The empty result below covers the requests made so far
+                ws.requests_sent = ws.server.build_requests.load(.acquire);
+            }
         }
-        // The empty result below covers the requests made so far
-        ws.requests_sent = ws.server.build_requests.load(.acquire);
-        break :blk false;
-    };
+    }
+    if (round) |s| {
+        // The create request is written outside `mutex`: a client that stops reading must not
+        // block project state. The round is reserved by `building`; the instance may be stopped
+        // while the request is written, and then `run` wraps the round up.
+        const progress = ws.server.progress.begin(ws.server, s.title, true);
+        var result: ?StartResult = null;
+        var aborted = false;
+        {
+            ws.mutex.lockUncancelable(io);
+            defer ws.mutex.unlock(io);
+            if (!ws.stopping and ws.building) if (ws.client) |client| if (client == s.client) {
+                // The build graph may have been replaced while the create request was written;
+                // the new model's steps are not the old model's indices, so recompute them
+                if (ws.model) |*model| {
+                    if (model.buildSteps(ws.gpa, ws.config.compiler_diagnostics)) |steps| {
+                        defer ws.gpa.free(steps);
+                        if (steps.len == 0) {
+                            // The new build graph needs no build; the configuration handler
+                            // requests one again when it finishes
+                            ws.building = false;
+                            ws.rebuild = false;
+                            aborted = true;
+                        } else {
+                            ws.build_progress = progress;
+                            result = ws.startBuild(client, model, steps);
+                        }
+                    } else |_| {
+                        log.err("{s}: out of memory while computing the build steps", .{ws.root});
+                        ws.building = false;
+                        ws.rebuild = false;
+                        aborted = true;
+                    }
+                } else {
+                    // The model is gone while a configuration is being handled: it requests a
+                    // build again when it finishes
+                    ws.building = false;
+                    ws.rebuild = false;
+                    aborted = true;
+                }
+            };
+        }
+        if (result) |r| {
+            switch (r) {
+                .started => {},
+                .failed => |p| {
+                    ws.server.progress.end(ws.server, p, "Failed to send build request");
+                    ws.server.busyEnd();
+                },
+            }
+        } else {
+            ws.server.progress.end(ws.server, progress, "Build interrupted");
+            // When the reservation was still ours, no `run` cleanup counts this round as finished
+            if (aborted) ws.server.busyEnd();
+        }
+        return;
+    }
     if (replaced) {
         log.info("{s}: the local cache directory of zig build was deleted or replaced, restarting", .{ws.root});
         project_set.restartWorkspace(ws.server, ws, 0);
@@ -424,28 +493,38 @@ fn buildTitle(model: *const ProjectModel, with_diagnostics: bool) []const u8 {
     return w.buffered();
 }
 
+/// Whether the build request of a round was sent (see `startBuild`)
+const StartResult = union(enum) {
+    started,
+    /// The request could not be sent: the caller ends this progress outside `mutex` and counts
+    /// the round as finished (`busyEnd`)
+    failed: ?*Progress,
+};
+
 /// Sends the build request of a round that is `building` (with its busy count and progress); the
 /// caller holds mutex. When the maker has exited (it closed its end of the pipe: the 0.17 maker can
 /// panic right after a build, see docs/zig-maker-build-request-race.md), the round stays in
 /// progress like one the maker exits during: the reading task reads the end of the stream, ends
 /// the round and restarts the project, whose first build covers this request. The maker is ended
-/// so that the end of the stream comes. Other failures end the round without a build.
-fn startBuild(ws: *Workspace, client: *bsp.Client, model: *const ProjectModel, steps: []const u32) void {
+/// so that the end of the stream comes. Other failures end the round without a build: the caller
+/// ends the progress outside `mutex`.
+fn startBuild(ws: *Workspace, client: *bsp.Client, model: *const ProjectModel, steps: []const u32) StartResult {
     sendBuild(ws, client, model, steps) catch |err| {
         const cause = if (err == error.WriteFailed) client.writeError() else null;
         const exited = if (cause) |c| c == error.BrokenPipe else false;
         if (exited) {
             log.info("{s}: build system exited before reading the build request ({t}, {?t})", .{ ws.root, err, cause });
             client.terminate();
-            return;
+            return .started;
         }
         log.err("{s}: failed to send build request: {t} ({?t})", .{ ws.root, err, cause });
         ws.building = false;
         ws.rebuild = false;
-        ws.server.progress.end(ws.server, ws.build_progress, "Failed to send build request");
+        const progress = ws.build_progress;
         ws.build_progress = null;
-        ws.server.busyEnd();
+        return .{ .failed = progress };
     };
+    return .started;
 }
 
 /// Sends a build request and resets the progress counters; the caller holds mutex
@@ -688,11 +767,13 @@ fn run(ws: *Workspace) Io.Cancelable!void {
     ws.changed_during_build.clearRetainingCapacity();
     const c = ws.client;
     ws.client = null;
-    ws.server.progress.end(ws.server, ws.build_progress, "Build interrupted");
+    const build_progress = ws.build_progress;
     ws.build_progress = null;
-    ws.server.progress.end(ws.server, ws.loading, if (config_failed) "build.zig has errors" else if (configure_exited) "zig build failed to configure" else null);
+    const loading = ws.loading;
     ws.loading = null;
     ws.mutex.unlock(ws.server.io);
+    ws.server.progress.end(ws.server, build_progress, "Build interrupted");
+    ws.server.progress.end(ws.server, loading, if (config_failed) "build.zig has errors" else if (configure_exited) "zig build failed to configure" else null);
     ws.finishLoading();
     // Count as idle only after the progress ends: by the time waitIdle (e.g. in shutdown)
     // returns, the client has received the end
@@ -856,10 +937,22 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             } else try ws.finishBuild();
         },
         .step_started => |step| {
-            ws.mutex.lockUncancelable(io);
-            defer ws.mutex.unlock(io);
-            const name = if (ws.model) |*m| if (step < m.steps.len) m.steps[step].name else null else null;
-            ws.server.progress.report(ws.server, ws.build_progress, name, ws.build_done * 100 / @max(ws.build_total, 1));
+            // Read the state the message reflects under `mutex`, then write it to the client
+            // outside: a client that stops reading must not block project state. `name` points
+            // into the model, which only this task replaces, so it stays valid after the unlock.
+            var name: ?[]const u8 = null;
+            var percentage: u32 = 0;
+            var progress: ?*Progress = null;
+            {
+                ws.mutex.lockUncancelable(io);
+                defer ws.mutex.unlock(io);
+                if (ws.model) |*m| if (step < m.steps.len) {
+                    name = m.steps[step].name;
+                };
+                percentage = ws.build_done * 100 / @max(ws.build_total, 1);
+                progress = ws.build_progress;
+            }
+            ws.server.progress.report(ws.server, progress, name, percentage);
         },
         .step_completed => |*sc| {
             var roots_changed = false;
@@ -920,14 +1013,29 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 // Files were saved again during the build, or differ on disk from what the latest
                 // rebuild was based on: the result may not match the disk; discard it and rebuild
                 ws.clearBundles();
-                ws.mutex.lockUncancelable(io);
-                defer ws.mutex.unlock(io);
-                ws.server.progress.report(ws.server, ws.build_progress, "Files changed, rebuilding", 0);
-                if (ws.client) |c| if (ws.model) |*m| {
-                    const steps = m.buildSteps(ws.gpa, ws.config.compiler_diagnostics) catch return;
-                    defer ws.gpa.free(steps);
-                    ws.startBuild(c, m, steps);
-                };
+                const RoundStart = struct { client: *bsp.Client, model: *ProjectModel, steps: []u32 };
+                var next: ?RoundStart = null;
+                var progress: ?*Progress = null;
+                var result: StartResult = .started;
+                {
+                    ws.mutex.lockUncancelable(io);
+                    defer ws.mutex.unlock(io);
+                    progress = ws.build_progress;
+                    if (ws.client) |c| if (ws.model) |*m| {
+                        const steps = m.buildSteps(ws.gpa, ws.config.compiler_diagnostics) catch return;
+                        next = .{ .client = c, .model = m, .steps = steps };
+                        result = ws.startBuild(c, m, steps);
+                    };
+                }
+                ws.server.progress.report(ws.server, progress, "Files changed, rebuilding", 0);
+                if (next) |s| ws.gpa.free(s.steps);
+                switch (result) {
+                    .started => {},
+                    .failed => |p| {
+                        ws.server.progress.end(ws.server, p, "Failed to send build request");
+                        ws.server.busyEnd();
+                    },
+                }
                 return;
             }
             {
@@ -937,8 +1045,9 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 // replaces them.
                 ws.mutex.lockUncancelable(io);
                 const replaced = ws.cacheReplaced();
+                var progress: ?*Progress = null;
                 if (replaced) {
-                    ws.server.progress.end(ws.server, ws.build_progress, "Cache directory deleted, restarting");
+                    progress = ws.build_progress;
                     ws.build_progress = null;
                     ws.building = false;
                     ws.rebuild = false;
@@ -946,6 +1055,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 }
                 ws.mutex.unlock(io);
                 if (replaced) {
+                    ws.server.progress.end(ws.server, progress, "Cache directory deleted, restarting");
                     ws.clearBundles();
                     log.info("{s}: the local cache directory of zig build was deleted or replaced during the build, restarting", .{ws.root});
                     project_set.restartWorkspace(ws.server, ws, 0);
@@ -957,9 +1067,11 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
             for (ws.bundles.items) |eb| errors += eb.errorMessageCount();
             var warning_buf: [768]u8 = undefined;
             var warning: ?[]const u8 = null;
+            var buf: [256]u8 = undefined;
+            var w: Io.Writer = .fixed(&buf);
+            var progress: ?*Progress = null;
+            var end_message: ?[]const u8 = null;
             {
-                var buf: [256]u8 = undefined;
-                var w: Io.Writer = .fixed(&buf);
                 ws.mutex.lockUncancelable(io);
                 defer ws.mutex.unlock(io);
                 if (errors != 0) w.print("{d} error(s)", .{errors}) catch {};
@@ -989,9 +1101,11 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                         "a zig build step failed without reporting errors: run zig build to see why";
                 }
                 ws.silent_warned = key;
-                ws.server.progress.end(ws.server, ws.build_progress, if (w.end == 0) "Done" else w.buffered());
+                progress = ws.build_progress;
                 ws.build_progress = null;
+                end_message = if (w.end == 0) "Done" else w.buffered();
             }
+            ws.server.progress.end(ws.server, progress, end_message);
             if (warning) |message| ws.server.showWarning(message);
             try ws.finishBuild();
             ws.generated_dirty = false;
@@ -1148,15 +1262,17 @@ fn generateOne(gpa: Allocator, io: Io, env: *const ZigEnv, args: []const []const
 
 fn reportLoading(ws: *Workspace, message: ?[]const u8) void {
     ws.mutex.lockUncancelable(ws.server.io);
-    defer ws.mutex.unlock(ws.server.io);
-    ws.server.progress.report(ws.server, ws.loading, message, null);
+    const loading = ws.loading;
+    ws.mutex.unlock(ws.server.io);
+    ws.server.progress.report(ws.server, loading, message, null);
 }
 
 fn endLoading(ws: *Workspace, message: ?[]const u8) void {
     ws.mutex.lockUncancelable(ws.server.io);
-    defer ws.mutex.unlock(ws.server.io);
-    ws.server.progress.end(ws.server, ws.loading, message);
+    const loading = ws.loading;
     ws.loading = null;
+    ws.mutex.unlock(ws.server.io);
+    ws.server.progress.end(ws.server, loading, message);
 }
 
 /// Discards what this round collected: error bundles and failed steps
