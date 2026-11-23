@@ -812,6 +812,10 @@ const Finder = struct {
     /// Files that can reach the file containing the definition through an `@import` chain (`.item`
     /// definitions). In other files, only code in generic functions may reference the definition
     importing: std.AutoHashMapUnmanaged(FileId, void) = .empty,
+    /// The import names of each file and their targets (see `Resolver.moduleAlternatives`), for
+    /// the matching uses of this request; keyed by the file, and reused only in the resolver
+    /// context the list was computed in
+    module_targets: resolve.ImportTargetCache = .empty,
     /// Call-site instances of the most recent member (`instances`)
     cached: ?struct { file: FileId, item: u32, list: []const InternPool.Index, complete: bool } = null,
 
@@ -1102,7 +1106,7 @@ const Finder = struct {
     fn matches(f: *Finder, file: FileId, d: Def, path_alternatives: []const Def, at: Reference) resolve.Error!Target {
         var hit = deepEql(d, f.def);
         var miss = !hit;
-        for (try f.r.moduleAlternatives(file, d)) |alt| {
+        for (try f.r.moduleAlternatives(file, d, &f.module_targets)) |alt| {
             if (deepEql(alt, f.def)) hit = true else miss = true;
         }
         for (path_alternatives) |alt| {

@@ -41,6 +41,18 @@ pub const Error = error{ Canceled, OutOfMemory };
 /// Same as the recursion limit for glob imports in rust-analyzer's name resolution.
 pub const max_depth = 100;
 
+/// An import name of a file and the files it may target (see `resolveImportTargets`)
+pub const ImportTargets = struct { name: []const u8, targets: []const FileId };
+
+/// The import names and targets of one file as computed in one resolver context: `r.context` can
+/// change within a request, and `@import("std")`, `@import("builtin")` and `@import("root")`
+/// resolve in the current context
+pub const ImportTargetsEntry = struct { context: ?u32, list: []const ImportTargets };
+
+/// The import names of files and their targets, cached per request by callers that ask for the
+/// module alternatives of many definitions in the same files
+pub const ImportTargetCache = std.AutoHashMapUnmanaged(FileId, ImportTargetsEntry);
+
 pub const Resolver = struct {
     ctx: *Db.Ctx,
     arena: Allocator,
@@ -384,6 +396,19 @@ pub const Resolver = struct {
         return targets;
     }
 
+    /// The import names of `file` with their targets, in import order; with `cache`, reused by the
+    /// later calls of the same request for the same file and resolver context
+    fn importTargetLists(r: *Resolver, file: FileId, cache: ?*ImportTargetCache) Error![]const ImportTargets {
+        if (cache) |c| if (c.get(file)) |entry| if (entry.context == r.context) return entry.list;
+        var list: std.ArrayList(ImportTargets) = .empty;
+        for ((try r.ctx.get(FileIndex.ImportStrings, file)).imports) |name| {
+            try list.append(r.arena, .{ .name = name, .targets = try r.resolveImportTargets(file, name) });
+        }
+        const out = try list.toOwnedSlice(r.arena);
+        if (cache) |c| try c.put(r.arena, file, .{ .context = r.context, .list = out });
+        return out;
+    }
+
     /// The files that may be the root module of `file`, a file outside the module graph: such a
     /// file is compiled on its own as the root module (single-file mode compiles it with
     /// `zig build-obj`; `zig run` does the same), or imported through relative paths by a file
@@ -462,7 +487,7 @@ pub const Resolver = struct {
     /// resolution and inference use the highest-priority module. Empty when `def` is not in such a
     /// file, or is not reached by a path of names (a container returned by a function). Like
     /// `resolveImportTargets`, meant for requests such as goto, and must not be used in inference.
-    pub fn moduleAlternatives(r: *Resolver, file: FileId, def: Def) Error![]const Def {
+    pub fn moduleAlternatives(r: *Resolver, file: FileId, def: Def, cache: ?*ImportTargetCache) Error![]const Def {
         const def_file = switch (def) {
             .item => |it| it.file,
             .file => |f| f,
@@ -473,8 +498,8 @@ pub const Resolver = struct {
         if ((graph.entry(file) orelse return &.{}).others.len == 0) return &.{};
         var out: std.ArrayList(Def) = .empty;
         var path: ?[]const []const u8 = null;
-        for ((try r.ctx.get(FileIndex.ImportStrings, file)).imports) |name| {
-            const targets = try r.resolveImportTargets(file, name);
+        for (try r.importTargetLists(file, cache)) |import| {
+            const targets = import.targets;
             if (targets.len < 2 or targets[0] != def_file) continue;
             const names = path orelse switch (def) {
                 .item => |it| try r.memberPath(it.file, it.item) orelse return &.{},
