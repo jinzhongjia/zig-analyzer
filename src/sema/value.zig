@@ -1130,13 +1130,6 @@ pub fn isComptimeOnly(ip: *InternPool, t: Index) bool {
     };
 }
 
-fn anyComptimeOnly(ip: *InternPool, types: []const Index) bool {
-    for (types) |t| if (isComptimeOnly(ip, t)) return true;
-    return false;
-}
-
-/// Tuples and anonymous structs: comptime fields (such as `comptime comptime_int = 5`) do not
-/// make the type comptime-only
 /// The value of a tuple or anonymous struct type whose fields are all comptime fields (the type
 /// of `.{ 1, "a" }`): it is the only value of the type, so it is known at comptime even when it
 /// is passed to a runtime parameter. Null for other types.
