@@ -1158,6 +1158,23 @@ const Found = struct {
     },
 };
 
+/// The label and qualifier of a built candidate: what `Builder.add` keeps unique
+const CandidateKey = struct { label: []const u8, qualifier: []const u8 };
+
+const CandidateKeyContext = struct {
+    pub fn hash(_: CandidateKeyContext, key: CandidateKey) u64 {
+        var h: std.hash.Wyhash = .init(0);
+        h.update(key.label);
+        h.update(&.{0});
+        h.update(key.qualifier);
+        return h.final();
+    }
+
+    pub fn eql(_: CandidateKeyContext, a: CandidateKey, b: CandidateKey) bool {
+        return std.mem.eql(u8, a.label, b.label) and std.mem.eql(u8, a.qualifier, b.qualifier);
+    }
+};
+
 const Builder = struct {
     r: *Resolver,
     file: FileId,
@@ -1179,6 +1196,8 @@ const Builder = struct {
     visible_names: std.StringHashMapUnmanaged(?resolve.Def) = .empty,
     found: std.ArrayList(Found) = .empty,
     items: std.ArrayList(Candidate) = .empty,
+    /// The label and qualifier of each built candidate: the first one wins
+    item_keys: std.HashMapUnmanaged(CandidateKey, void, CandidateKeyContext, std.hash_map.default_max_load_percentage) = .empty,
     incomplete: bool = false,
     /// Ordering rules for import declarations (by which a new import is placed where it belongs
     /// in the organized block)
@@ -1380,9 +1399,9 @@ const Builder = struct {
         }
     }
     fn add(b: *Builder, candidate: Candidate) resolve.Error!void {
-        for (b.items.items) |existing| {
-            if (std.mem.eql(u8, existing.label, candidate.label) and std.mem.eql(u8, existing.qualifier, candidate.qualifier)) return;
-        }
+        const key: CandidateKey = .{ .label = candidate.label, .qualifier = candidate.qualifier };
+        if (b.item_keys.contains(key)) return;
+        try b.item_keys.put(b.r.arena, key, {});
         try b.items.append(b.r.arena, candidate);
     }
     /// Kind of a built candidate (see `symbol_kind`). First takes the resident results already
@@ -1663,6 +1682,27 @@ fn prefixStart(comptime T: type, items: []const T, prefix: []const u8) usize {
         if (std.ascii.lessThanIgnoreCase(items[mid].name, prefix)) low = mid + 1 else high = mid;
     }
     return low;
+}
+
+test "a built candidate is kept once for each label and qualifier, the first one winning" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var r: resolve.Resolver = .{ .ctx = undefined, .arena = arena.allocator() };
+    var b: Builder = .{ .r = &r, .file = @fromBackingInt(@intCast(0)), .offset = 0, .prefix = "", .current = undefined, .matcher = undefined };
+    const make = struct {
+        fn candidate(label: []const u8, qualifier: []const u8) Candidate {
+            return .{ .label = label, .kind = .constant, .filter = label, .qualifier = qualifier, .score = 0, .target = .{ .file = @fromBackingInt(@intCast(0)) } };
+        }
+    }.candidate;
+    try b.add(make("A", "x"));
+    try b.add(make("A", "x"));
+    try b.add(make("A", "y"));
+    try b.add(make("B", "x"));
+    try std.testing.expectEqual(@as(usize, 3), b.items.items.len);
+    try std.testing.expectEqualStrings("A", b.items.items[0].label);
+    try std.testing.expectEqualStrings("x", b.items.items[0].qualifier);
+    try std.testing.expectEqualStrings("y", b.items.items[1].qualifier);
+    try std.testing.expectEqualStrings("B", b.items.items[2].label);
 }
 
 test {
