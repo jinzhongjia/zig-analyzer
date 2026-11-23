@@ -538,7 +538,8 @@ pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const t
     server.changes_mutex.lockUncancelable(server.io);
     defer server.changes_mutex.unlock(server.io);
     var prepared = prepareFileChanges(server, arena, changes, source) catch |err| {
-        log.err("applying changes on disk failed: {t}", .{err});
+        // A canceled batch is dropped, not a failure: the server is shutting down (see `Server.deinit`)
+        if (err != error.Canceled) log.err("applying changes on disk failed: {t}", .{err});
         return &.{};
     };
     defer prepared.deinit(server.gpa);
@@ -551,7 +552,8 @@ pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const t
     server.busyBegin();
     defer server.busyEnd();
     const changed = applyFileChanges(server, arena, &prepared, source, &deferred) catch |err| blk: {
-        log.err("applying changes on disk failed: {t}", .{err});
+        // A canceled batch is dropped, not a failure: the server is shutting down (see `Server.deinit`)
+        if (err != error.Canceled) log.err("applying changes on disk failed: {t}", .{err});
         break :blk true;
     };
     counted = changed or source == .notified;
