@@ -32,11 +32,12 @@
 //! cycle are still not written. Exceeding the stack depth limit is not a cycle, and its fallback
 //! value cannot stand in for the complete result, so `depthFallback` must be declared.
 //!
-//! A query that declares `lru_bytes` may also declare `pub const lru_read_bytes: usize = N`: when
-//! the retained values exceed N bytes during read transactions, the least recently used values
-//! that no compute and no read outside a compute holds are evicted without waiting for the
-//! transactions to end. One read transaction can otherwise retain every value it computes. Such a
-//! query cannot declare `computeIncremental`, and `Ctx.memoized` cannot read it.
+//! A query that declares `lru` and `lru_bytes` may also declare
+//! `pub const lru_read_bytes: usize = N`: when the retained values exceed N bytes during read
+//! transactions, the least recently used values that no compute and no read outside a compute
+//! holds are evicted without waiting for the transactions to end. One read transaction can
+//! otherwise retain every value it computes. Such a query cannot declare `computeIncremental`, and
+//! `Ctx.memoized` cannot read it.
 //!
 //! A derived query may instead declare `computeIncremental(ctx, key, prev: ?Value)`: when
 //! recomputing, the engine passes in the previous value (null on the first computation). The
@@ -221,6 +222,60 @@ const Counters = struct {
     max_ns: std.atomic.Value(u64) = .init(0),
     incomplete: std.atomic.Value(u64) = .init(0),
 };
+
+/// A memo collected for LRU eviction: its recency, its slot, and the size of the value it retains
+const LruEntry = struct {
+    tick: u64,
+    slot: u32,
+    bytes: usize,
+};
+
+/// The number of leading entries of `entries` whose bytes reach `need`, after partially ordering
+/// them so that those are the entries with the smallest `tick`; all entries when their bytes do
+/// not reach it. Only the set is selected, not the order within it, so the caller evicts all of
+/// them: stopping at the first byte total that reaches `need` would make the set depend on that
+/// order. With unique ticks this is the set that evicting in ascending tick order would remove.
+/// Recency ties are resolved arbitrarily, unlike the stable sort of the sweep; which of equally
+/// recent memos is evicted does not change any result.
+fn selectLru(entries: []LruEntry, need: usize) usize {
+    var remaining = need;
+    var lo: usize = 0;
+    var hi: usize = entries.len;
+    while (lo < hi) {
+        // Median of three, so that ticks that are already ordered do not give quadratic work
+        const a = entries[lo].tick;
+        const b = entries[lo + (hi - lo) / 2].tick;
+        const c = entries[hi - 1].tick;
+        const pivot = @max(@min(a, b), @min(@max(a, b), c));
+        // Three-way partition: [lo, lt) below the pivot, [lt, gt) at it, [gt, hi) above it
+        var lt = lo;
+        var i = lo;
+        var gt = hi;
+        while (i < gt) {
+            if (entries[i].tick < pivot) {
+                std.mem.swap(LruEntry, &entries[lt], &entries[i]);
+                lt += 1;
+                i += 1;
+            } else if (entries[i].tick > pivot) {
+                gt -= 1;
+                std.mem.swap(LruEntry, &entries[i], &entries[gt]);
+            } else i += 1;
+        }
+        var below: usize = 0;
+        for (entries[lo..lt]) |e| below += e.bytes;
+        var at: usize = 0;
+        for (entries[lt..gt]) |e| at += e.bytes;
+        if (below >= remaining) {
+            hi = lt;
+        } else if (below + at >= remaining) {
+            return gt;
+        } else {
+            remaining -= below + at;
+            lo = gt;
+        }
+    }
+    return hi;
+}
 
 /// `Env`: a read-only environment that queries can access through `ctx.db.env` (must not change
 /// during the lifetime of the Db).
@@ -724,33 +779,50 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         fn evictInRead(db: *Db, comptime Q: type) void {
             const table = &db.tables[comptime queryIndex(Q)];
             const limit = db.readEvictionLimit(Q);
-            const Entry = struct { tick: u64, slot: u32 };
-            var evicted: []Q.Value = &.{};
+
+            // The arrays can be large, so they are allocated before the table lock is taken, with
+            // room for values that concurrent reads may retain meanwhile. The lock is held only to
+            // collect and evict.
+            table.mutex.lockUncancelable(db.io);
+            const capacity = table.live + table.live / 8 + 8;
+            table.mutex.unlock(db.io);
+            var entries = db.gpa.alloc(LruEntry, capacity) catch return db.resetReadEvictionFloor(Q);
+            defer db.gpa.free(entries);
+            var evicted: []Q.Value = db.gpa.alloc(Q.Value, capacity) catch return db.resetReadEvictionFloor(Q);
             var count: usize = 0;
             defer {
                 for (evicted[0..count]) |*value| deinitValue(Q, value, db.gpa);
                 db.gpa.free(evicted);
             }
+
             table.mutex.lockUncancelable(db.io);
             defer table.mutex.unlock(db.io);
-            defer table.read_eviction_floor = if (table.live_bytes > threeQuarters(limit)) table.live_bytes + limit / 8 else 0;
-            const entries = db.gpa.alloc(Entry, table.live) catch return;
-            defer db.gpa.free(entries);
-            evicted = db.gpa.alloc(Q.Value, table.live) catch return;
+            defer table.read_eviction_floor = readEvictionFloor(table.live_bytes, limit);
+            if (table.live > entries.len) {
+                // Concurrent reads retained more values than the slack covered: the pass must not
+                // be skipped while memory keeps growing, so grow the arrays under the lock.
+                const live = table.live;
+                const grown = db.gpa.alloc(LruEntry, live) catch return;
+                const grown_evicted = db.gpa.alloc(Q.Value, live) catch {
+                    db.gpa.free(grown);
+                    return;
+                };
+                db.gpa.free(entries);
+                db.gpa.free(evicted);
+                entries = grown;
+                evicted = grown_evicted;
+            }
             var n: usize = 0;
             for (table.slots.items, 0..) |slot, i| if (slot.memo) |m| if (!m.evicted and slot.pins == 0 and slot.owner == null) {
-                entries[n] = .{ .tick = m.last_used, .slot = @intCast(i) };
+                entries[n] = .{ .tick = m.last_used, .slot = @intCast(i), .bytes = Q.bytes(m.value) };
                 n += 1;
             };
-            std.mem.sort(Entry, entries[0..n], {}, struct {
-                fn lt(_: void, a: Entry, b: Entry) bool {
-                    return a.tick < b.tick;
-                }
-            }.lt);
-            for (entries[0..n]) |e| {
-                if (table.live_bytes <= threeQuarters(limit)) break;
+            const target = threeQuarters(limit);
+            if (table.live_bytes <= target) return;
+            const selected = selectLru(entries[0..n], table.live_bytes - target);
+            for (entries[0..selected]) |e| {
                 const m = &table.slots.items[e.slot].memo.?;
-                table.live_bytes -= Q.bytes(m.value);
+                table.live_bytes -= e.bytes;
                 table.live -= 1;
                 if (@hasDecl(Q, "fingerprint")) m.fingerprint = Q.fingerprint(m.value);
                 evicted[count] = m.value;
@@ -758,6 +830,18 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 m.value = undefined;
                 m.evicted = true;
             }
+            // The selected bytes reach the target; only a table whose evictable values all fall
+            // short of it stays above.
+            assert(selected == n or table.live_bytes <= target);
+        }
+
+        /// Sets the threshold for the next read eviction pass after one that evicted nothing; the
+        /// table must grow by 1/8 of the limit first (see `evictInRead`).
+        fn resetReadEvictionFloor(db: *Db, comptime Q: type) void {
+            const table = &db.tables[comptime queryIndex(Q)];
+            table.mutex.lockUncancelable(db.io);
+            defer table.mutex.unlock(db.io);
+            table.read_eviction_floor = readEvictionFloor(table.live_bytes, db.readEvictionLimit(Q));
         }
 
         fn unpin(db: *Db, deps: []const DepKey) void {
@@ -774,6 +858,13 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         /// ⌊n × 3/4⌋, without overflow when n is the maximum value (unlimited)
         fn threeQuarters(n: usize) usize {
             return n / 4 * 3 + n % 4 * 3 / 4;
+        }
+
+        /// The size below which a read eviction pass is not retried: above 3/4 of the limit it
+        /// waits for 1/8 of the limit of growth, so that values that cannot be evicted do not make
+        /// every read scan the table (see `evictInRead`).
+        fn readEvictionFloor(live_bytes: usize, limit: usize) usize {
+            return if (live_bytes > threeQuarters(limit)) live_bytes + limit / 8 else 0;
         }
 
         fn evictMemo(comptime Q: type, table: *Table(Q), m: *Table(Q).Memo, gpa: Allocator) void {
@@ -1958,8 +2049,8 @@ fn validate(comptime Q: type) void {
     if (!@hasDecl(Q, "eql") and containsPointer(Q.Value)) {
         @compileError(@typeName(Q) ++ " has a Value containing pointers and must declare eql");
     }
-    if (@hasDecl(Q, "lru_read_bytes") and (!@hasDecl(Q, "lru_bytes") or @hasDecl(Q, "computeIncremental"))) {
-        @compileError(@typeName(Q) ++ " declares lru_read_bytes, so it must declare lru_bytes and not computeIncremental");
+    if (@hasDecl(Q, "lru_read_bytes") and (!@hasDecl(Q, "lru") or !@hasDecl(Q, "lru_bytes") or @hasDecl(Q, "computeIncremental"))) {
+        @compileError(@typeName(Q) ++ " declares lru_read_bytes, so it must declare lru and lru_bytes and not computeIncremental");
     }
     if (@hasDecl(Q, "fixpoint") and !(@hasDecl(Q, "cycleFallback") and @hasDecl(Q, "depthFallback"))) {
         @compileError(@typeName(Q) ++ " declares fixpoint and must declare cycleFallback and depthFallback");
