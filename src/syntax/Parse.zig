@@ -66,6 +66,10 @@ shared: ?*Text = null,
 base: ?*Parse = null,
 /// Total capacity of all arenas along the chain (including this one)
 chain_bytes: usize,
+/// Bytes of the shared text buffer of the full parse at the bottom of the chain: the results built
+/// on it keep that buffer alive until the arena is destroyed (see `release`), while their own
+/// sources are freed with their last user
+base_source_bytes: usize = 0,
 /// Arena capacity of the full parse at the bottom of the chain
 full_bytes: usize,
 /// Unique among all parse results of the process (never reused), so that a value derived from one
@@ -126,6 +130,13 @@ fn obtainSource(owner: Allocator, src: Source) Allocator.Error!struct { source: 
             break :blk .{ .source = text.source(), .shared = text };
         },
     };
+}
+
+/// Bytes of the shared buffer of the full parse at the bottom of the chain of `old`, which a result
+/// built on `old` keeps alive until that arena is destroyed
+fn baseSourceBytes(old: *const Parse) usize {
+    if (old.base != null) return old.base_source_bytes;
+    return if (old.shared != null) old.source.len + 1 else 0;
 }
 
 fn createSource(gpa: Allocator, src: Source, mode: Mode, dialect: Dialect) Allocator.Error!*Parse {
@@ -210,6 +221,13 @@ fn release(self: *Parse) void {
 /// Bytes of the source when it is not in the arena (see `owns_source` and `shared`)
 pub fn sourceBytes(self: *const Parse) usize {
     return if (self.owns_source or self.shared != null) self.source.len + 1 else 0;
+}
+
+/// Bytes of the memory a result keeps alive, apart from the `Parse` value itself: the arenas of the
+/// chain, its own source when it is not in an arena, and the shared buffer of the full parse at the
+/// base, which the chain keeps until that arena is destroyed
+pub fn bytes(self: *const Parse) usize {
+    return @sizeOf(Parse) + self.chain_bytes + self.sourceBytes() + self.base_source_bytes;
 }
 
 pub fn rootNode(self: *const Parse) tree.SyntaxNode {
@@ -464,6 +482,7 @@ fn reparseBlockEdit(gpa: Allocator, old: *Parse, src: Source, edit: EditRange) A
         .errors = errors.items,
         .base = old,
         .chain_bytes = 0,
+        .base_source_bytes = baseSourceBytes(old),
         .id = newId(),
         .full_bytes = old.full_bytes,
     };
@@ -634,6 +653,7 @@ fn reparseFrom(gpa: Allocator, old: *Parse, src: Source, from: TopMember, end: u
         .errors = errors.items,
         .base = old,
         .chain_bytes = 0,
+        .base_source_bytes = baseSourceBytes(old),
         .id = newId(),
         .full_bytes = old.full_bytes,
     };

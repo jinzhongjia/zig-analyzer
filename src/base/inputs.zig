@@ -26,8 +26,11 @@ pub const FileText = struct {
         if (v.*) |text| text.release(gpa);
     }
 
+    /// The buffer is counted by the parse results that retain it (see `Parse.bytes`), so that one
+    /// allocation is not counted under both the input and the parse in the statistics
     pub fn bytes(v: Value) usize {
-        return if (v) |text| text.len else 0;
+        _ = v;
+        return 0;
     }
 };
 
