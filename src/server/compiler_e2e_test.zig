@@ -82,6 +82,23 @@ fn progressTitles(h: *Harness) ![]const []const u8 {
     return titles.items;
 }
 
+/// Every token's messages are begin, then reports, then end: a report never comes before a begin
+/// or after an end, and a begin is sent once.
+fn expectProgressOrder(h: *Harness) !void {
+    var kinds: std.StringHashMap([]const u8) = .init(h.arena.allocator());
+    defer kinds.deinit();
+    for (try h.notifications("$/progress")) |m| {
+        const params = m.object.get("params").?.object;
+        const token = params.get("token").?.string;
+        const kind = params.get("value").?.object.get("kind").?.string;
+        if (kinds.get(token)) |prev| {
+            if (std.mem.eql(u8, prev, "end")) return error.ProgressAfterEnd;
+            if (std.mem.eql(u8, kind, "begin")) return error.ProgressBeginAgain;
+        } else if (!std.mem.eql(u8, kind, "begin")) return error.ProgressReportBeforeBegin;
+        try kinds.put(token, kind);
+    }
+}
+
 test "compiler diagnostics: build, remap of unsaved edits, rebuild on save, build progress" {
     var project = try fixture.Project.create(&fixture.basic);
     defer project.deinit();
@@ -131,6 +148,7 @@ test "compiler diagnostics: build, remap of unsaved edits, rebuild on save, buil
     try shutdown(&h);
 
     // 4. Progress: project loading and two builds, each with begin and end; builds have percentages
+    try expectProgressOrder(&h);
     const titles = try progressTitles(&h);
     var ends: usize = 0;
     var percentages: usize = 0;

@@ -304,7 +304,8 @@ pub fn ownerValue(r: *Resolver, owner: hir.OwnerKey, inst: ?Index, want: ?Index)
 
 /// comptime value of an expression under the given bindings: used when type inference cannot
 /// evaluate a value in a comptime context. `quota` is the backward branch quota (see
-/// `bodyQuota`).
+/// `bodyQuota`). `bindings` may be shorter than `body.bindings` (a signature-mode result holds
+/// only the signature prefix): the remaining bindings stay unknown.
 pub fn exprValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, want: ?Index, quota: u32) Error!TypedValue {
     // Evaluations started outside a computation in a compilation (such as by goto) run in the
     // compilation of `file` and `inst`
@@ -315,7 +316,7 @@ pub fn exprValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: Ex
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena, .quota = quota };
     defer ev.deinit();
     var frame = try ev.newFrame(file, item, body, inst);
-    for (bindings, frame.slots) |b, *slot| slot.* = Evaluator.thaw(b);
+    for (bindings, frame.slots[0..bindings.len]) |b, *slot| slot.* = Evaluator.thaw(b);
     const v = ev.eval(&frame, e, want) catch |err| return giveUp(err);
     return ev.toTyped(v) catch |err| giveUp(err);
 }
@@ -537,7 +538,8 @@ pub fn constPointer(r: *Resolver, ptr_ty: Index, pointee: Index) Error!Index {
 /// type `ptr_ty` to that value (see `constPointer`), which records its place when `e` is a
 /// container-level declaration, a constant local, parameter or capture (`Evaluator.localPlace`),
 /// a value captured from an enclosing function or declaration (`Evaluator.capturePlace`), or a
-/// field or element inside one (`InternPool.Key.ptr_base`), as the interpreter's `&` does
+/// field or element inside one (`InternPool.Key.ptr_base`), as the interpreter's `&` does.
+/// `bindings` may be shorter than `body.bindings` (see `exprValue`)
 pub fn addressValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, ptr_ty: Index, pointee: Index) Error!Index {
     const scope = if (r.context == null) try queries.enterContext(r, file, inst) else null;
     defer if (scope) |s| s.leave();
@@ -546,7 +548,7 @@ pub fn addressValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e:
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
     defer ev.deinit();
     var frame = try ev.newFrame(file, item, body, inst);
-    for (bindings, frame.slots) |b, *slot| slot.* = Evaluator.thaw(b);
+    for (bindings, frame.slots[0..bindings.len]) |b, *slot| slot.* = Evaluator.thaw(b);
     const base = ev.addressBase(&frame, e, pointee) catch |err| switch (err) {
         error.Abort, error.Break, error.Continue, error.Return => null,
         else => |x| return x,
@@ -6787,6 +6789,39 @@ const Evaluator = struct {
         return sl.bit_offsets[i];
     }
 
+    /// A field of a container declared in source, found by name
+    const SourceField = struct {
+        /// Position among the fields `fieldsOf` returns
+        index: usize,
+        item: u32,
+        /// The container has the default layout
+        auto_layout: bool,
+    };
+
+    /// Field `name` of the source container `t`, found without computing the types of its
+    /// fields; null when `t` is not a source container or has no such field
+    fn sourceField(ev: *Evaluator, t: Index, name: []const u8) EvalError!?SourceField {
+        const c = switch (ev.ip.key(t)) {
+            .container_type => |c| c,
+            else => return null,
+        };
+        if (!c.kind.isStruct() and c.kind != .@"union") return null;
+        const ns = try queries.namespaceOfType(ev.r, t) orelse return null;
+        const tree = try ev.r.itemTree(ns.file);
+        var index: usize = 0;
+        for (tree.containerMembers(ns.container)) |m| {
+            const it = tree.items[m];
+            if (it.kind != .field) continue;
+            if (std.mem.eql(u8, it.name orelse "", name)) return .{
+                .index = index,
+                .item = m,
+                .auto_layout = tree.containers[ns.container].layout == .auto,
+            };
+            index += 1;
+        }
+        return null;
+    }
+
     /// Attributes of a pointer to the field `name` (of type `field_ty`) of a value of type `agg`
     /// reached through a pointer with attributes `parent` (the compiler's `Type.fieldPtrType` and
     /// `fieldPtrAlign`): a field of a packed struct is a bit pointer into the host integer, and the
@@ -6795,6 +6830,20 @@ const Evaluator = struct {
     fn fieldPtrAttrs(ev: *Evaluator, parent: InternPool.PtrAttrs, agg: Index, name: []const u8, field_ty: Index) EvalError!InternPool.PtrAttrs {
         var out = parent;
         if (parent.alignment == .unknown) return out;
+        // Cases whose result does not depend on the types of the other fields: a comptime field,
+        // and a field of a default-layout aggregate reached through a naturally aligned pointer
+        // without an explicit field alignment (the aggregate's alignment is at least the field's)
+        if (try ev.sourceField(agg, name)) |found| {
+            const attrs = ev.fieldAttrs(agg, found.index, .{ .name = name, .ty = .unknown, .item = found.item }) catch |err| switch (err) {
+                error.Abort => return withUnknownAlign(out),
+                else => |x| return x,
+            };
+            if (attrs.is_comptime) {
+                out.alignment = if (attrs.alignment) |a| .fromBytes(a) else .natural;
+                return out;
+            }
+            if (parent.alignment == .natural and attrs.alignment == null and found.auto_layout) return out;
+        }
         // Slices (`ptr`, `len`) have the default layout and no explicit field alignment
         const fields = try ev.fieldsOf(agg) orelse return ev.autoFieldPtrAttrs(out, agg, field_ty, null);
         const i = for (fields, 0..) |fl, i| {

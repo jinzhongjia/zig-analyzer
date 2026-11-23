@@ -1538,6 +1538,68 @@ test "a container in a function prototype computes its abstract instance once" {
     try testing.expectEqual(1, w.db.executions(queries.SignatureInst));
 }
 
+test "a signature result holds only the signature prefix of the body" {
+    // A signature result sized to the whole body would cost O(body) memory and initialization
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator,
+        \\fn f(x: [blk: {
+        \\    const n = 8;
+        \\    break :blk n;
+        \\}]u8) void {
+        \\
+    );
+    for (0..64) |i| try src.print(testing.allocator, "    var v{d}: u32 = {d};\n    _ = v{d};\n", .{ i, i, i });
+    try src.appendSlice(testing.allocator, "}\n");
+
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", src.items);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const offset = std.mem.indexOf(u8, src.items, "fn f").?;
+    const item = try r.ownerAt(f.file, @intCast(offset), false) orelse return error.NoOwner;
+    const owner = try r.ownerKey(f.file, item);
+    const body = try ctx.get(database.hir.ItemBody, owner);
+    const sig = try ctx.get(queries.Infer, .{ .owner = owner, .mode = .signature });
+    try testing.expect(sig.exprs.len > 0);
+    try testing.expectEqual(@as(usize, body.signature_exprs), sig.exprs.len);
+    try testing.expectEqual(@as(usize, body.signature_bindings), sig.bindings.len);
+    try testing.expectEqual(sig.exprs.len, sig.members.len);
+    // The local of the block in the parameter type is a signature binding too
+    try testing.expectEqual(body.params.len + 1, sig.bindings.len);
+    try testing.expect(sig.exprs.len * 4 < body.exprs.len);
+    try testing.expectEqualStrings("[8]u8", try render.typedValueAlloc(&r, sig.bindings[@backingInt(body.params[0])]));
+}
+
+test "DeclType of a function with no signature expressions stays a function type" {
+    // An incomplete function being typed has no parameter types and no return type: its signature
+    // result has no expressions, which must not be mistaken for the cycle fallback / empty result
+    const src = "fn foo() {\n    _ = 1;\n}\n";
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.add("/p/main.zig", src);
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const offset = std.mem.indexOf(u8, src, "foo").?;
+    const item = try r.ownerAt(f.file, @intCast(offset), false) orelse return error.NoOwner;
+    const owner = try r.ownerKey(f.file, item);
+    const body = try ctx.get(database.hir.ItemBody, owner);
+    try testing.expectEqual(@as(u32, 0), body.signature_exprs);
+    const tv = try ctx.get(queries.DeclType, .{ .owner = owner });
+    switch (ctx.db.env.ip.key(tv.ty)) {
+        .fn_type => |ty| {
+            try testing.expectEqual(@as(usize, 0), ty.params.len);
+            try testing.expect(ty.ret == .unknown);
+        },
+        else => return error.NotFunctionType,
+    }
+}
+
 test "unknown parts stay unknown" {
     try expectTypes(
         \\fn opaqueFn(x: u8) type { _ = x; return u8; }
@@ -8011,6 +8073,45 @@ test "pointers to fields, elements and aligned variables carry their attributes"
         .{ "er", "*align(1) u8" },
         .{ "g", "*align(8) u32" },
         .{ "l", "*align(16) [4]u8" },
+    });
+}
+
+test "pointer attributes of aggregate fields without the types of the other fields" {
+    // Prevents the fast path for default-layout fields from changing pointer types: auto,
+    // comptime, extern, packed and tuple fields keep the attributes the layout path gives them.
+    try expectTypes(
+        \\const Auto = struct { a: u8, b: u32 };
+        \\const Aligned = struct { a: u8 align(8), b: u16 };
+        \\const Comptime = struct { a: u8, comptime b: u8 = 2 };
+        \\const Extern = extern struct { a: u8, b: u32 };
+        \\const Packed = packed struct(u32) { a: u8, b: u24 };
+        \\const Tuple = struct { u8, u32 };
+        \\fn f(x: Auto, e: Aligned, c: Comptime, s: Extern, p: Packed, t: Tuple) void {
+        \\    const auto_a = &x.a;
+        \\    const auto_b = &x.b;
+        \\    const aligned_a = &e.a;
+        \\    const aligned_b = &e.b;
+        \\    const comptime_b = &c.b;
+        \\    const extern_a = &s.a;
+        \\    const extern_b = &s.b;
+        \\    const packed_a = &p.a;
+        \\    const packed_b = &p.b;
+        \\    const tuple_0 = &t[0];
+        \\    const tuple_1 = &t[1];
+        \\    _ = .{ auto_a, auto_b, aligned_a, aligned_b, comptime_b, extern_a, extern_b, packed_a, packed_b, tuple_0, tuple_1 };
+        \\}
+    , &.{
+        .{ "auto_a", "*const u8" },
+        .{ "auto_b", "*const u32" },
+        .{ "aligned_a", "*align(8) const u8" },
+        .{ "aligned_b", "*const u16" },
+        .{ "comptime_b", "*const u8" },
+        .{ "extern_a", "*align(4) const u8" },
+        .{ "extern_b", "*const u32" },
+        .{ "packed_a", "*align(4:0:4) const u8" },
+        .{ "packed_b", "*align(4:8:4) const u24" },
+        .{ "tuple_0", "*const u8" },
+        .{ "tuple_1", "*const u32" },
     });
 }
 
