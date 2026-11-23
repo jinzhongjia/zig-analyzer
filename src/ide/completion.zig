@@ -382,7 +382,7 @@ fn completeVisible(r: *Resolver, file: FileId, offset: u32, cursor_owner: *impor
         if (std.mem.endsWith(u8, r.ctx.db.env.vfs.path(file), ".zon")) return .{ .context = .ignored };
         const range: Item.Range = .{ .start = start, .end = identEnd(text, offset) };
         const dialect = try r.ctx.get(database.syntax.SyntaxDialect, {});
-        for (builtins.entries) |*entry| try out.add(.{ .label = entry.name, .kind = .builtin, .replace = range, .detail = entry.signature, .doc = try builtins.documentation(r.arena, entry, dialect) });
+        for (builtins.entries) |*entry| try out.add(.{ .label = entry.name, .kind = .builtin, .replace = range, .detail = entry.signature, .doc = builtins.documentation(entry, dialect) });
         return .{ .items = out.items.items, .context = .builtin };
     };
     if (try importString(r.arena, root, offset)) |start| {

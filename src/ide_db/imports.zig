@@ -1076,7 +1076,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, owner: Owner, prefix: [
     if (graph) |g| {
         // Module names can be completed even when they have no declarations; not offered while
         // the root is a generated file whose path is unknown.
-        const names = try g.importNames(r.arena, file);
+        const names = (try builder.importsOf(g)).names;
         for ([_][]const []const u8{ &.{ "std", "builtin" }, names }) |group| for (group) |name| {
             const target = g.importTarget(file, name) orelse continue;
             const ns: Namespace = .{ .file = target, .container = 0 };
@@ -1175,6 +1175,14 @@ const CandidateKeyContext = struct {
     }
 };
 
+/// The import names of a file and the targets of `std` and `builtin` in it: the per-request
+/// inputs of `importSpec` for every candidate file
+const Imports = struct {
+    names: []const []const u8,
+    std: ?FileId,
+    builtin: ?FileId,
+};
+
 const Builder = struct {
     r: *Resolver,
     file: FileId,
@@ -1182,6 +1190,8 @@ const Builder = struct {
     prefix: []const u8,
     current: *const DeclIndex,
     matcher: fuzzy.Matcher,
+    /// Computed on first use: every candidate file is compared against the same values
+    imports: ?Imports = null,
     owner: ?u32 = null,
     body: ?*const Body = null,
     scope: Body.ScopeId = .root,
@@ -1309,6 +1319,24 @@ const Builder = struct {
         if (b.reused.contains(decl.target)) return;
         try b.push(.{ .score = score * import_weight, .parts = parts, .what = .{ .import = .{ .name = decl.name, .kind = decl.kind, .is_extern = decl.is_extern, .spec = spec, .path = decl.path, .doc = decl.doc, .target = .{ .decl = .{ .file = decl.file, .item = decl.item } } } } });
     }
+    /// The current file's import names and `std` / `builtin` targets, computed once per request
+    fn importsOf(b: *Builder, g: *const database.ModuleGraph) resolve.Error!Imports {
+        if (b.imports) |imports| return imports;
+        const imports: Imports = .{
+            .names = try g.importNames(b.r.arena, b.file),
+            .std = g.importTarget(b.file, "std"),
+            .builtin = g.importTarget(b.file, "builtin"),
+        };
+        b.imports = imports;
+        return imports;
+    }
+    /// The import name of `target` in the current file (see `importSpec`)
+    fn importSpecOf(b: *Builder, g: *const database.ModuleGraph, target: FileId) resolve.Error!?[]const u8 {
+        const imports = try b.importsOf(g);
+        if (imports.std == target) return "std";
+        if (imports.builtin == target) return "builtin";
+        return importSpecNames(b.r, g, b.file, target, imports.names);
+    }
     /// The project file `file` and its public declarations, imported by relative path
     fn projectFile(b: *Builder, g: *const database.ModuleGraph, file: FileId) resolve.Error!void {
         const r = b.r;
@@ -1320,7 +1348,7 @@ const Builder = struct {
         const stem = basename[0 .. basename.len - ".zig".len];
         const stem_score = try b.matcher.score(stem);
         if (public.len == 0 and stem_score == null) return;
-        const spec = try importSpec(r, g, b.file, file) orelse return;
+        const spec = try b.importSpecOf(g, file) orelse return;
         // A module root imported by its name is offered under that name, with its exports,
         // above; its file name (often `root`) is no name for it
         if (g.importTarget(b.file, spec) == file) return;
@@ -1546,8 +1574,14 @@ fn inStd(r: *Resolver, graph: *const database.ModuleGraph, file: FileId) bool {
 }
 
 fn importSpec(r: *Resolver, graph: *const database.ModuleGraph, from: FileId, target: FileId) resolve.Error!?[]const u8 {
-    for ([_][]const u8{ "std", "builtin" }) |name| if (graph.importTarget(from, name) == target) return name;
-    for (try graph.importNames(r.arena, from)) |name| if (graph.importTarget(from, name) == target) return try r.arena.dupe(u8, name);
+    if (graph.importTarget(from, "std") == target) return "std";
+    if (graph.importTarget(from, "builtin") == target) return "builtin";
+    return importSpecNames(r, graph, from, target, try graph.importNames(r.arena, from));
+}
+
+/// The import name of `target`, after the `std` and `builtin` targets have been checked
+fn importSpecNames(r: *Resolver, graph: *const database.ModuleGraph, from: FileId, target: FileId, names: []const []const u8) resolve.Error!?[]const u8 {
+    for (names) |name| if (graph.importTarget(from, name) == target) return try r.arena.dupe(u8, name);
     const vfs = r.ctx.db.env.vfs;
     // A file in no module (a single-file root, or a build script while the build graph lacks it)
     // is the root of its own module

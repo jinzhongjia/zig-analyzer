@@ -76,7 +76,7 @@ pub fn hoverWith(r: *Resolver, file: FileId, offset: u32, opts: Options) resolve
         var out: std.Io.Writer.Allocating = .init(r.arena);
         const w = &out.writer;
         if (entry.signature) |signature| w.print("```zig\n{s}\n```\n\n", .{signature}) catch return error.OutOfMemory;
-        const doc = try builtins.documentation(r.arena, entry, try r.ctx.get(@import("../database.zig").syntax.SyntaxDialect, {}));
+        const doc = builtins.documentation(entry, try r.ctx.get(@import("../database.zig").syntax.SyntaxDialect, {}));
         w.writeAll(doc) catch return error.OutOfMemory;
         if (try semanticHover(r, file, offset, tok, opts)) |inferred| {
             w.print("\n\nInferred result:\n\n{s}", .{inferred.text}) catch return error.OutOfMemory;

@@ -762,6 +762,10 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                     return;
                 },
             };
+            // The model owns its arena until it is stored in `ws.model`: reading the exported
+            // modules, generating builtin.zig and setting the diagnostics steps can fail
+            var model_stored = false;
+            errdefer if (!model_stored) model.deinit(ws.gpa);
             if (!model.hasCompileSteps()) try ws.loadExports(&model);
             try ws.generateBuiltins(&model);
             {
@@ -778,6 +782,7 @@ fn handle(ws: *Workspace, event: *bsp.Event) Allocator.Error!void {
                 defer ws.mutex.unlock(io);
                 if (ws.model) |*old| old.deinit(ws.gpa);
                 ws.model = model;
+                model_stored = true;
                 ws.cache_identity = identity;
                 ws.diag_steps.deinit(ws.gpa);
                 ws.diag_steps = .{};
@@ -1044,6 +1049,62 @@ test "generated-file recomputes wait at least a second and in proportion to the 
     // not recomputing all the time
     try std.testing.expect(!generatedRecomputeDue(end, 1200 * std.time.ns_per_ms, after(4799)));
     try std.testing.expect(generatedRecomputeDue(end, 1200 * std.time.ns_per_ms, after(4800)));
+}
+
+test "loadFiles frees the file texts it does not store when an allocation fails" {
+    const testing = std.testing;
+    const transport = za.lsp.transport;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = testing.io, .inner = &out.writer };
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var server: Server = undefined;
+    try server.init(testing.io, failing.allocator(), &writer);
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+        server.deinit();
+    }
+    var ws: Workspace = .{
+        .server = &server,
+        .gpa = failing.allocator(),
+        .root = root,
+        .env = undefined,
+        .config = undefined,
+    };
+    defer ws.loaded.deinit(ws.gpa);
+
+    // Every allocation of `loadFiles` fails in one round; the texts read before the failure must
+    // be freed and those already stored must be left to the database
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        try testing.expect(fail_index < 10_000);
+        failing.fail_index = std.math.maxInt(usize);
+        // Fresh files each round: a key already interned in the database no longer allocates, so
+        // the failure inside `db.set` would not be reached
+        var names: [3][]u8 = undefined;
+        var files: [names.len]FileId = undefined;
+        for (&names, &files, 0..) |*name, *file, i| {
+            name.* = try std.fmt.allocPrint(testing.allocator, "{d}-{d}.zig", .{ fail_index, i });
+            defer testing.allocator.free(name.*);
+            try tmp.dir.writeFile(testing.io, .{ .sub_path = name.*, .data = "pub const a = 1;\n" });
+            const path = try std.fs.path.join(testing.allocator, &.{ root, name.* });
+            defer testing.allocator.free(path);
+            file.* = try server.vfs.intern(path);
+        }
+        failing.alloc_index = 0;
+        failing.resize_index = 0;
+        failing.has_induced_failure = false;
+        failing.fail_index = fail_index;
+        if (loadFiles(&ws, &files)) |_| {
+            failing.fail_index = std.math.maxInt(usize);
+            break;
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
 }
 
 /// The build graph has no compile step (a library that only exports modules): merge in the
@@ -1526,6 +1587,9 @@ fn loadFiles(ws: *Workspace, files: []const FileId) Allocator.Error!void {
     const Loaded = struct { file: FileId, text: ?[]u8, durability: database.Durability };
     var batch: std.ArrayList(Loaded) = .empty;
     defer batch.deinit(ws.gpa);
+    // The batch owns a text until it is given to `db.set`; reading the following files and storing
+    // a text can fail
+    errdefer for (batch.items) |l| if (l.text) |t| ws.gpa.free(t);
     var arena: std.heap.ArenaAllocator = .init(ws.gpa);
     defer arena.deinit();
     const rules = try ws.server.originRules(arena.allocator());
@@ -1543,12 +1607,15 @@ fn loadFiles(ws: *Workspace, files: []const FileId) Allocator.Error!void {
     // it and starting after it reads the loaded files instead of failing with ContentModified
     db.beginWriteOf(comptime database.Db.inputSet(&.{FileText}), .unordered);
     defer db.endWrite();
-    for (batch.items) |l| {
+    for (batch.items) |*l| {
+        // `db.set` takes ownership of the text, and frees it itself when it fails
+        const text = l.text;
+        l.text = null;
         // Files the client opened in the meantime: their buffers take precedence
         if (db.peek(FileText, l.file) != null) {
-            if (l.text) |t| ws.gpa.free(t);
+            if (text) |t| ws.gpa.free(t);
             continue;
         }
-        try db.set(FileText, l.file, l.text, l.durability);
+        try db.set(FileText, l.file, text, l.durability);
     }
 }

@@ -966,3 +966,135 @@ test "references to enum members include literals typed by the peer type of brea
     try testing.expectEqualStrings("x:1:b* x:6:b x:9:b x:15:b x:17:b x:20:b x:23:b", try refs(&w, fs, f, at(src, "b", 0), null));
     try testing.expectEqualStrings("x:2:b* x:26:b", try refs(&w, fs, f, at(src, "b: void", 0), null));
 }
+
+/// Reference list as `file:line:name` entries joined by spaces (see `symbolRefs`)
+fn referencesText(w: *World, ctx: *database.Db.Ctx, list: []const search.Reference) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (list, 0..) |ref, i| {
+        const text = (try ctx.get(database.syntax.SourceText, ref.file)).text;
+        const line = std.mem.count(u8, text[0..ref.start], "\n") + 1;
+        if (i > 0) try out.append(w.arena.allocator(), ' ');
+        try out.print(w.arena.allocator(), "{s}:{d}:{s}{s}", .{ std.fs.path.stem(w.vfs.path(ref.file)), line, text[ref.start..ref.end], if (ref.is_decl) "*" else "" });
+    }
+    return out.items;
+}
+
+test "a multi-symbol references request reuses one import graph" {
+    // `assets.files` resolves to a different declaration under each instance of the generic
+    // function, so `symbolsAt` returns two symbols: both searches use the same scope and must
+    // return the same references as when each symbol is searched on its own
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const lib_text =
+        \\pub const A = struct {
+        \\    pub const files = [_][]const u8{"a"};
+        \\};
+        \\pub const B = struct {
+        \\    pub const files = [_][]const u8{ "b", "c" };
+        \\};
+    ;
+    const main_text =
+        \\const lib = @import("lib.zig");
+        \\fn Fs(comptime assets: type) type {
+        \\    return struct {
+        \\        pub fn count() usize {
+        \\            return assets.files.len;
+        \\        }
+        \\    };
+        \\}
+        \\test {
+        \\    _ = Fs(lib.A).count() + Fs(lib.B).count();
+        \\}
+    ;
+    const lib_file = (try w.add("/p/lib.zig", lib_text)).file;
+    const main_file = (try w.add("/p/main.zig", main_text)).file;
+    const scope = [_]FileId{ main_file, lib_file };
+    const opts: search.Options = .{ .scope = &scope };
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const symbols = try definition.symbolsAt(&r, main_file, at(main_text, "files", 0));
+    try testing.expect(symbols.len > 1);
+    const list = try search.symbolsReferences(&r, symbols, opts);
+    try testing.expectEqualStrings("lib:2:files* lib:5:files* main:5:files", try referencesText(&w, &ctx, list));
+    // The same request uses one graph for all symbols; a later call reuses it as well
+    const cached = r.import_graph orelse return error.NoImportGraph;
+    const again = try search.symbolsReferences(&r, symbols, opts);
+    try testing.expectEqual(cached, r.import_graph.?);
+    try testing.expectEqualStrings(try referencesText(&w, &ctx, list), try referencesText(&w, &ctx, again));
+    // Searching each symbol without the shared graph gives the same references
+    for (symbols) |symbol| {
+        var separate: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        const one = try search.symbolReferences(&separate, symbol, opts);
+        const text = try referencesText(&w, &ctx, one);
+        try testing.expect(std.mem.eql(u8, text, "lib:2:files* main:5:files") or std.mem.eql(u8, text, "lib:5:files* main:5:files"));
+    }
+}
+
+/// Candidate files of `file` under `scope`, as file names joined by spaces
+fn candidateNames(w: *World, r: *resolve.Resolver, file: FileId, scope: []const FileId) ![]const u8 {
+    const files = try search.candidateFilesFor(r, file, scope);
+    var out: std.ArrayList(u8) = .empty;
+    for (files, 0..) |f, i| {
+        if (i > 0) try out.append(w.arena.allocator(), ' ');
+        try out.appendSlice(w.arena.allocator(), std.fs.path.basename(w.vfs.path(f)));
+    }
+    return out.items;
+}
+
+test "rename candidate files keep their order with one import graph per request" {
+    // The generic file is in the scope but imports nothing; it is searched because it is reachable
+    // from an importer of the definition. The order is the forward closure from the importers:
+    // lib (the definition), the files that import it, then the files those reach
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const lib_file = (try w.add("/p/lib.zig", "pub fn f() void {}\n")).file;
+    const generic_file = (try w.add("/p/generic.zig", "pub fn g(x: anytype) void {\n    _ = x;\n}\n")).file;
+    const main_file = (try w.add("/p/main.zig", "const lib = @import(\"lib.zig\");\nconst generic = @import(\"generic.zig\");\npub fn main() void {\n    lib.f();\n    _ = generic;\n}\n")).file;
+    const app2_file = (try w.add("/p/app2.zig", "const mid = @import(\"mid.zig\");\npub fn h() void {\n    mid.lib.f();\n}\n")).file;
+    const script_file = (try w.add("/p/script.zig", "pub fn s() void {}\n")).file;
+    _ = try w.add("/p/mid.zig", "pub const lib = @import(\"lib.zig\");\n");
+    const scope = [_]FileId{ script_file, main_file, app2_file, lib_file, generic_file };
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const before = try candidateNames(&w, &r, lib_file, &scope);
+    try testing.expectEqualStrings("lib.zig main.zig app2.zig generic.zig", before);
+    const cached = r.import_graph orelse return error.NoImportGraph;
+    try testing.expectEqualStrings(before, try candidateNames(&w, &r, lib_file, &scope));
+    try testing.expectEqual(cached, r.import_graph.?);
+    // A separate request builds its own graph and returns the same files in the same order
+    var separate: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    try testing.expectEqualStrings(before, try candidateNames(&w, &separate, lib_file, &scope));
+    // A different scope is a different key: the graph is rebuilt
+    _ = try search.candidateFilesFor(&r, lib_file, scope[1..]);
+    try testing.expect(r.import_graph.? != cached);
+}
+
+test "reachable ignores a graph cached under another compilation context" {
+    // `Resolver.context` changes while a semantic query runs; a graph built under one context must
+    // not supply the forward edges of another. Replacing the cached forward edges with none makes
+    // the difference observable: without the guard, `reachable` would return only main.zig.
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const lib_file = (try w.add("/p/lib.zig", "pub fn f() void {}\n")).file;
+    const main_file = (try w.add("/p/main.zig", "const lib = @import(\"lib.zig\");\n")).file;
+    const scope = [_]FileId{ main_file, lib_file };
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    _ = try search.importers(&r, lib_file, &scope);
+    const cached = r.import_graph orelse return error.NoImportGraph;
+    try testing.expectEqual(null, cached.context);
+    const no_forward = try w.arena.allocator().alloc(u32, cached.graph.forward_starts.len);
+    @memset(no_forward, 0);
+    cached.graph.forward_starts = no_forward;
+    r.context = 1;
+    const files = try search.reachable(&r, &.{main_file});
+    try testing.expectEqual(2, files.len);
+    try testing.expectEqual(main_file, files[0]);
+    try testing.expectEqual(lib_file, files[1]);
+}

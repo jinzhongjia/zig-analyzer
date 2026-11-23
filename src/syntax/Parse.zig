@@ -171,8 +171,11 @@ pub fn rootNode(self: *const Parse) tree.SyntaxNode {
 /// a single expression and is usually small, so it is always parsed in full
 pub fn reparse(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!*Parse {
     if (old.mode == .zon) return createIn(gpa, text, .zon, old.dialect);
-    if (try reparseBlock(gpa, old, text)) |p| return p;
-    if (try reparseTopLevel(gpa, old, text)) |p| return p;
+    // The block and the top-level attempt use the same edit range: scanning for it twice costs a
+    // pass over the whole text per edit when the edit is at the top level
+    const edit = editRange(old.source, text) orelse return createIn(gpa, text, old.mode, old.dialect);
+    if (try reparseBlockEdit(gpa, old, text, edit)) |p| return p;
+    if (try reparseTopLevelEdit(gpa, old, text, edit)) |p| return p;
     return createIn(gpa, text, old.mode, old.dialect);
 }
 
@@ -239,6 +242,24 @@ fn runParser(gpa: Allocator, source: []const u8, tokens: []const lexer.Token, di
 
 const unconsumed = "block reparse: unconsumed tokens";
 
+/// The edited part of the text: the bytes before the common prefix of the old and new text, and
+/// those after their common suffix
+const EditRange = struct {
+    /// Length of the common prefix; 0 when the texts differ in their first byte
+    prefix: u32,
+    /// Length of the common suffix, which does not reach into the common prefix
+    suffix: u32,
+};
+
+/// The edit range of `old_text` → `text`; null when the texts are identical
+fn editRange(old_text: []const u8, text: []const u8) ?EditRange {
+    const prefix = std.mem.indexOfDiff(u8, old_text, text) orelse return null;
+    const max_suffix = @min(old_text.len, text.len) - prefix;
+    var suffix: usize = 0;
+    while (suffix < max_suffix and old_text[old_text.len - 1 - suffix] == text[text.len - 1 - suffix]) suffix += 1;
+    return .{ .prefix = @intCast(prefix), .suffix = @intCast(suffix) };
+}
+
 /// Nodes that can be reparsed on their own: the edit must lie strictly between their `{` and `}`
 fn isReparsable(kind: SyntaxKind) bool {
     return kind == .block or kind == .container_decl;
@@ -247,14 +268,17 @@ fn isReparsable(kind: SyntaxKind) bool {
 /// Attempts only a local reparse; returns null when the conditions are not met (used by tests
 /// and corpus cross-checks).
 pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!?*Parse {
+    return reparseBlockEdit(gpa, old, text, editRange(old.source, text) orelse return null);
+}
+
+/// `reparseBlock` with the edit range of `old.source` → `text` already computed
+fn reparseBlockEdit(gpa: Allocator, old: *Parse, text: []const u8, edit: EditRange) Allocator.Error!?*Parse {
+    // Memory reclamation: do a full parse instead when the chain gets too long. `chain_bytes` and
+    // `full_bytes` describe `old`, so this does not depend on the edit
+    if (old.chain_bytes > 2 * old.full_bytes) return null;
     const old_text = old.source;
-    // Edit range: the part outside the common prefix and suffix
-    const prefix = std.mem.indexOfDiff(u8, old_text, text) orelse return null; // texts are identical
-    var suffix: usize = 0;
-    const max_suffix = @min(old_text.len, text.len) - prefix;
-    while (suffix < max_suffix and old_text[old_text.len - 1 - suffix] == text[text.len - 1 - suffix]) suffix += 1;
-    const edit_start: u32 = @intCast(prefix);
-    const edit_end_old: u32 = @intCast(old_text.len - suffix);
+    const edit_start = edit.prefix;
+    const edit_end_old: u32 = @intCast(old_text.len - edit.suffix);
 
     // Find the deepest reparsable node containing the edit range, and record the path from the
     // root to it (for the replacement)
@@ -266,9 +290,6 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
     const old_range = target.range();
     const new_end: usize = @intCast(@as(i64, old_range.end) + delta);
     const node_text = text[old_range.start..new_end];
-
-    // Memory reclamation: do a full parse instead when the chain gets too long
-    if (old.chain_bytes > 2 * old.full_bytes) return null;
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
@@ -367,14 +388,15 @@ pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Err
 /// top level is one expression rather than container members
 pub fn reparseTopLevel(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!?*Parse {
     if (old.mode == .zon) return null;
-    const old_text = old.source;
-    const edit_start: u32 = @intCast(std.mem.indexOfDiff(u8, old_text, text) orelse return null);
+    return reparseTopLevelEdit(gpa, old, text, editRange(old.source, text) orelse return null);
+}
+
+/// `reparseTopLevel` with the edit range of `old.source` → `text` already computed, for Zig mode
+fn reparseTopLevelEdit(gpa: Allocator, old: *Parse, text: []const u8, edit: EditRange) Allocator.Error!?*Parse {
     if (old.chain_bytes > 2 * old.full_bytes) return null;
-    // End of the edit in the old text: the common suffix does not reach into the common prefix
-    const max_suffix = @min(old_text.len, text.len) - edit_start;
-    var suffix: usize = 0;
-    while (suffix < max_suffix and old_text[old_text.len - 1 - suffix] == text[text.len - 1 - suffix]) suffix += 1;
-    const old_edit_end: u32 = @intCast(old_text.len - suffix);
+    const old_text = old.source;
+    const edit_start = edit.prefix;
+    const old_edit_end: u32 = @intCast(old_text.len - edit.suffix);
     const delta: i64 = @as(i64, @intCast(text.len)) - @as(i64, @intCast(old_text.len));
 
     // Top-level member nodes: start two members before the first one that ends after the edit
