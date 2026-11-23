@@ -13,31 +13,47 @@ const Server = @import("Server.zig");
 
 const log = std.log.scoped(.server);
 
-/// Whether requests record a trace: `reportIfSlow` is the only consumer of `Ctx.trace`, and it
-/// produces nothing when the threshold is 0
+/// Whether requests record a trace: `captureIfSlow` is the only consumer of `Ctx.trace`, and
+/// `logReport` writes what it built; nothing is recorded when the threshold is 0
 pub fn traceEnabled(server: *Server) bool {
     return server.config.load(.acquire).slow_request_ms != 0;
 }
 
-/// Logs requests that take longer than `log.slow_request_ms`: self time summed per query, and the
-/// slow paths in the call tree. Called before the read transaction ends (describing a key reads
-/// the ItemTree).
-pub fn reportIfSlow(server: *Server, ctx: *Db.Ctx, method: []const u8, t0: Io.Timestamp, trace: *const za.db.Trace) void {
+/// A slow request report: self time summed per query and the slow paths in the call tree, built
+/// before the read transaction ends (describing a key reads the ItemTree) and logged after it.
+pub const Report = struct {
+    method: []const u8,
+    ns: u64,
+    queries: usize,
+    body: []const u8,
+};
+
+/// Builds the report of a request that took longer than `log.slow_request_ms`; null when the
+/// request is not reported. The report's memory is allocated from `ctx.gpa` and stays valid until
+/// the caller's arena is freed.
+pub fn captureIfSlow(server: *Server, ctx: *Db.Ctx, method: []const u8, t0: Io.Timestamp, trace: *const za.db.Trace) ?Report {
     // In tests, request times vary with machine load, and warn writes to stderr, which makes the
     // build output show a misleading `failed command`; the report contents are covered by tests
     // that call writeSlowReport directly
-    if (@import("builtin").is_test) return;
+    if (@import("builtin").is_test) return null;
     // The trace is recorded only when `traceEnabled` was true when the request began
-    if (ctx.trace == null) return;
+    if (ctx.trace == null) return null;
     const threshold = server.config.load(.acquire).slow_request_ms;
-    if (threshold == 0) return;
+    if (threshold == 0) return null;
     const ns: u64 = @intCast(@max(0, t0.durationTo(Io.Clock.awake.now(server.io)).nanoseconds));
-    if (ns < @as(u64, threshold) * std.time.ns_per_ms) return;
+    if (ns < @as(u64, threshold) * std.time.ns_per_ms) return null;
     var out: std.Io.Writer.Allocating = .init(ctx.gpa);
-    defer out.deinit();
     // The call tree only expands nodes taking at least 2% of the total time (at least 1 ms)
-    writeSlowReport(server, &out.writer, ctx, trace, @max(std.time.ns_per_ms, ns / 50)) catch return;
-    log.warn("slow request {s}: {d:.1} ms, {d} queries executed\n{s}", .{ method, za.db_report.ms(ns), trace.events.items.len, out.written() });
+    writeSlowReport(server, &out.writer, ctx, trace, @max(std.time.ns_per_ms, ns / 50)) catch {
+        out.deinit();
+        return null;
+    };
+    return .{ .method = method, .ns = ns, .queries = trace.events.items.len, .body = out.written() };
+}
+
+/// Writes a report built by `captureIfSlow`; called outside the read transaction.
+pub fn logReport(report: Report) void {
+    log.warn("slow request {s}: {d:.1} ms, {d} queries executed\n{s}", .{ report.method, za.db_report.ms(report.ns), report.queries, report.body });
 }
 
 /// Maximum number of call tree lines in a slow request report

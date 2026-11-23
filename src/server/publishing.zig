@@ -396,11 +396,12 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, always: bool, gene
 /// Runs AstGen on the file's current text outside any read transaction (see `live.Prepared`):
 /// AstGen does not check for cancellation, so if it ran inside a read transaction, write
 /// transactions would have to wait for it to finish. A read transaction is held briefly, only to
-/// read the text and claim its preparation. Returns false when preparing failed: the query then
+/// read the text and claim its preparation. Used by diagnostics publishing and by code action
+/// requests (see `Server.requireLivePrepared`). Returns false when preparing failed: the query then
 /// computes the live diagnostics itself (a publish waiting for a preparation that keeps failing
 /// would never finish). A read canceled by a write transaction is not a failure: it returns true
 /// once the write transaction has the lock, and the caller reads again.
-fn prepareLive(server: *Server, file: Vfs.FileId) bool {
+pub fn prepareLive(server: *Server, file: Vfs.FileId) bool {
     if (!liveEligible(server, file)) return true;
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
@@ -447,7 +448,7 @@ fn prepareLive(server: *Server, file: Vfs.FileId) bool {
 
 /// The live diagnostics of the current text have already been prepared outside a read transaction
 /// (or need no preparation)
-fn liveReady(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) !bool {
+pub fn liveReady(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) !bool {
     if (!liveEligible(server, file)) return true;
     const backend = try ctx.get(live.LiveBackend, {});
     const text = if (try ctx.get(FileText, file)) |t| t.bytes() else return true;

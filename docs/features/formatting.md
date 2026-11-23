@@ -2,6 +2,8 @@
 
 Formatting runs in process, with the renderer of the user's Zig version. `src/ide/render/` holds the complete `std.zig.Ast.Render` of Zig 0.17.0 and 0.17.1 (MIT license, in `LICENSE` there); the only change is how each imports `std`. When zig is not found or its version is not supported, the renderer of the Zig that zig-analyzer was built with is used.
 
+`textDocument/formatting` copies the text and line table inside its read transaction and parses and renders after it ends, so an edit does not wait for the whole-file work. The answer is `ContentModified` when a write to the text, syntax dialect, or renderer began after the request was received. A write of any order that is still waiting for the lock makes the request discard the formatted result and run again once the write has taken the lock, so the retry reads the new text, dialect, or renderer.
+
 The renderers differ in array and tuple initializers: which blank lines are kept, whether elements on one line are split, and how columns are aligned.
 
 The parser is not copied: text is parsed by `std.zig.Ast.parse` of the Zig that zig-analyzer was built with. The result is byte-for-byte identical to `zig fmt` of the user's version, except where the parsers of the two versions accept different text, which only matters when the two versions differ:

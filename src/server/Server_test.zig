@@ -1362,6 +1362,257 @@ test "a request interrupted by a later edit is answered with ContentModified" {
     try h.notify("exit", {});
 }
 
+test "an edit during formatting is answered with ContentModified" {
+    // Guards against applying edits computed against the pre-edit text to the buffer after the
+    // client's edit: formatting runs outside the read transaction, so the answer must re-check that
+    // the text it formatted is still current.
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:formatting-edit.zig";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const  x = 1;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    var gate: Server.OnceGate = .{};
+    h.server.hooks.format = &gate;
+    defer h.server.hooks.format = null;
+    defer gate.release.set(testing.io);
+    const formatting = try h.send("textDocument/formatting", .{ .textDocument = .{ .uri = uri }, .options = .{ .tabSize = 4, .insertSpaces = true } });
+    try gate.entered.wait(testing.io);
+    // The text was formatted and the read transaction has ended
+    const insert = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } };
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .range = insert, .text = "const y = 2;\n" }} });
+    // The main loop has applied the change once it answers a later request
+    try testing.expectEqual(-32601, errorCode(try h.request("zig-analyzer/probe", {})));
+    gate.release.set(testing.io);
+    try testing.expectEqual(-32801, errorCode(try h.response(formatting)));
+
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "formatting retries while an unordered write is pending" {
+    // Guards against answering with the renderer copied before an unordered write that is waiting
+    // for the lock; the request runs again once that write has taken it.
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:formatting-pending.zig";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const  x = 1;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    var format_gate: Server.OnceGate = .{};
+    h.server.hooks.format = &format_gate;
+    defer h.server.hooks.format = null;
+    defer format_gate.release.set(testing.io);
+    var response_gate: Server.OnceGate = .{};
+    h.server.hooks.response = &response_gate;
+    defer h.server.hooks.response = null;
+    defer response_gate.release.set(testing.io);
+    const formatting = try h.send("textDocument/formatting", .{ .textDocument = .{ .uri = uri }, .options = .{ .tabSize = 4, .insertSpaces = true } });
+    try format_gate.entered.wait(testing.io);
+
+    // Hold a read transaction so the write stays pending after formatting has produced its result
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var held = h.server.db.beginRead(arena.allocator());
+    const Write = struct {
+        fn run(db: *Db) void {
+            db.beginWriteOf(comptime Db.inputSet(&.{za.ide.format.ZigFmtRenderer}), .unordered);
+            defer db.endWrite();
+        }
+    };
+    const writer = try std.Thread.spawn(.{}, Write.run, .{&h.server.db});
+    var held_ended = false;
+    var writer_joined = false;
+    defer if (!writer_joined) writer.join();
+    defer if (!held_ended) held.end();
+    while (h.server.db.pending_write.load(.acquire) == 0) std.Thread.yield() catch {};
+    // The pending write makes the request discard its result and wait for the write
+    format_gate.release.set(testing.io);
+    var answered_early = true;
+    response_gate.entered.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {
+        answered_early = false;
+    };
+    try testing.expect(!answered_early);
+
+    // The write completes; the next attempt answers
+    held.end();
+    held_ended = true;
+    writer.join();
+    writer_joined = true;
+    try response_gate.entered.wait(testing.io);
+    response_gate.release.set(testing.io);
+    const response = try h.response(formatting);
+    try testing.expect(response.object.get("error") == null);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "code actions after an edit prepare the live check outside the read transaction" {
+    // Guards against AstGen (or the user's `zig ast-check`) running inside the code action's read
+    // transaction, which would make the edit that triggered the request wait for it.
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    // The debounced publish has not prepared the edited text when the request runs
+    _ = try h.request("initialize", .{
+        .capabilities = .{ .textDocument = .{ .codeAction = .{ .codeActionLiteralSupport = .{ .codeActionKind = .{ .valueSet = &[_][]const u8{"quickfix"} } } } } },
+        .initializationOptions = .{ .diagnostics = .{ .debounce_ms = 3000 } },
+    });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:code-action-edit.zig";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text =
+        \\fn f() u32 {
+        \\    const x: u32 = 1;
+        \\    return x;
+        \\}
+        \\
+    } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .text =
+        \\fn f() u32 {
+        \\    var x: u32 = 1;
+        \\    return x;
+        \\}
+        \\
+    }} });
+
+    var gate: Server.TestGate = .{ .method = "textDocument/codeAction", .point = .before_live };
+    h.server.hooks.request = &gate;
+    defer h.server.hooks.request = null;
+    defer gate.release.set(testing.io);
+    const held = try h.send("textDocument/codeAction", .{
+        .textDocument = .{ .uri = uri },
+        .range = .{ .start = .{ .line = 1, .character = 0 }, .end = .{ .line = 1, .character = 20 } },
+        .context = .{ .diagnostics = &[_]std.json.Value{}, .only = &[_][]const u8{"quickfix"} },
+    });
+    try gate.entered.wait(testing.io);
+    // The request has ended its read transaction while its live diagnostics are prepared
+    try testing.expectEqual(0, h.server.db.active_readers.load(.acquire));
+    gate.release.set(testing.io);
+
+    const response = try h.response(held);
+    try testing.expect(response.object.get("error") == null);
+    var found = false;
+    for (response.object.get("result").?.array.items) |action| {
+        if (std.mem.indexOf(u8, action.object.get("title").?.string, "use 'const'") != null) found = true;
+    }
+    try testing.expect(found);
+
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "a response is written after the read transaction has ended" {
+    // Guards against holding the shared side of the database lock while the client drains a
+    // response: later edits and `$/cancelRequest` would wait for the write.
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:response-after-read.zig";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const alpha_value: u32 = 1;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    var gate: Server.OnceGate = .{};
+    h.server.hooks.response = &gate;
+    defer h.server.hooks.response = null;
+    defer gate.release.set(testing.io);
+    const hover = try h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
+    try gate.entered.wait(testing.io);
+    try testing.expectEqual(0, h.server.db.active_readers.load(.acquire));
+    gate.release.set(testing.io);
+    const response = try h.response(hover);
+    try testing.expect(response.object.get("error") == null);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
+test "a semantic tokens response is written before the refresh of a later edit" {
+    // Guards against a response computed from pre-edit text being written after the refresh caused
+    // by the edit: the client would apply the old tokens on top of the refreshed ones.
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{
+        .capabilities = .{ .workspace = .{ .semanticTokens = .{ .refreshSupport = true } } },
+    });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:semantic-order.zig";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const alpha_value: u32 = 1;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const received_before = h.received.items.len;
+
+    var response_gate: Server.OnceGate = .{};
+    h.server.hooks.response = &response_gate;
+    defer h.server.hooks.response = null;
+    defer response_gate.release.set(testing.io);
+    const tokens = try h.send("textDocument/semanticTokens/full", .{ .textDocument = .{ .uri = uri } });
+    try response_gate.entered.wait(testing.io);
+    // The response was computed from the text before this edit, and its read transaction has ended
+    const insert = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } };
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .range = insert, .text = "const gamma_value: u32 = 2;\n" }} });
+    try testing.expectEqual(-32601, errorCode(try h.request("zig-analyzer/probe", {})));
+
+    // The refresh caused by the edit waits for the response to be written.
+    var refresh_gate: Server.OnceGate = .{};
+    h.server.hooks.semantic_refresh = &refresh_gate;
+    defer h.server.hooks.semantic_refresh = null;
+    defer refresh_gate.release.set(testing.io);
+    const Refresh = struct {
+        fn run(server: *Server) void {
+            server.requestSemanticRefresh();
+        }
+    };
+    const refresh_thread = try std.Thread.spawn(.{}, Refresh.run, .{&h.server});
+    try refresh_gate.entered.wait(testing.io);
+    // The refresh is claimed and about to take the send order; the response is still held.
+    refresh_gate.release.set(testing.io);
+    response_gate.release.set(testing.io);
+    refresh_thread.join();
+
+    const response = try h.response(tokens);
+    try testing.expect(response.object.get("error") == null);
+    var response_at: ?usize = null;
+    var refresh_at: ?usize = null;
+    while (refresh_at == null) {
+        for (h.received.items[received_before..], received_before..) |msg, i| {
+            if (msg.object.get("id")) |id| {
+                if (id == .integer and id.integer == tokens) response_at = i;
+            }
+            if (msg.object.get("method")) |m| {
+                if (std.mem.eql(u8, m.string, "workspace/semanticTokens/refresh")) refresh_at = i;
+            }
+        }
+        if (refresh_at != null) break;
+        _ = try h.next();
+    }
+    try testing.expect(response_at.? < refresh_at.?);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "function completions carry no signature in the list and resolve to the signature and doc" {
     const Harness = @import("test_harness.zig").Harness;
     const Empty = struct {};

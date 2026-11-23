@@ -50,6 +50,12 @@ pub fn codeAction(server: *Server, r: *Resolver, arena: Allocator, params: types
     const text = lines.text;
     const start, const end = server.rangeOffsets(lines, params.range);
     const only = params.context.only;
+    // Quick fixes read `AstCheck` through the resolver; the result for the current text must be
+    // prepared outside the read transaction first (see `requireLivePrepared`)
+    if (wantsKind(only, types.CodeActionKind.QuickFix) or wantsKind(only, types.CodeActionKind.RefactorExtract) or
+        wantsKind(only, types.CodeActionKind.RefactorRewrite) or
+        (only != null and wantsKind(only, types.CodeActionKind.SourceFixAll)))
+        try Server.requireLivePrepared(server, r.ctx, file);
     const import_options = server.importOptionsFor(file);
     var actions: std.ArrayList(ide.code_actions.Action) = .empty;
     if (wantsKind(only, types.CodeActionKind.QuickFix) or wantsKind(only, types.CodeActionKind.RefactorExtract) or wantsKind(only, types.CodeActionKind.RefactorRewrite))
@@ -304,6 +310,8 @@ pub fn codeActionResolve(server: *Server, r: *Resolver, arena: Allocator, params
     if (data.naming) |d| {
         const at = try server.textPosition(r, arena, d.uri, .{ .line = d.line, .character = d.character }) orelse
             return .{ .failed = "cannot rename: the document is no longer available" };
+        // The rename checks the edited text with AstGen (see `requireLivePrepared`)
+        try Server.requireLivePrepared(server, r.ctx, at.file);
         // The document may have changed between the two requests: find the name again by its position
         const found = for (try ide.naming.findings(r, at.file, .{ .start = at.offset, .end = at.offset })) |f| {
             if (f.start == at.offset and std.mem.eql(u8, f.name, d.name) and std.mem.eql(u8, f.suggestion, d.new_name)) break f;
@@ -315,6 +323,8 @@ pub fn codeActionResolve(server: *Server, r: *Resolver, arena: Allocator, params
     } else if (data.remove_param) |d| {
         const at = try server.textPosition(r, arena, d.uri, .{ .line = d.line, .character = d.character }) orelse
             return .{ .failed = "cannot remove parameter: the document is no longer available" };
+        // Finding the parameter reads `AstCheck` (see `requireLivePrepared`)
+        try Server.requireLivePrepared(server, r.ctx, at.file);
         const found = for (try ide.remove_param.targets(r, at.file, at.offset, at.offset)) |t| {
             if (t.start == at.offset and std.mem.eql(u8, t.name, d.name)) break t;
         } else return .{ .failed = "cannot remove parameter: the parameter has changed since the fix was offered" };
