@@ -7922,6 +7922,45 @@ test "pointers to fields, elements and aligned variables carry their attributes"
     });
 }
 
+test "pointer attributes of aggregate fields without the types of the other fields" {
+    // Prevents the fast path for default-layout fields from changing pointer types: auto,
+    // comptime, extern, packed and tuple fields keep the attributes the layout path gives them.
+    try expectTypes(
+        \\const Auto = struct { a: u8, b: u32 };
+        \\const Aligned = struct { a: u8 align(8), b: u16 };
+        \\const Comptime = struct { a: u8, comptime b: u8 = 2 };
+        \\const Extern = extern struct { a: u8, b: u32 };
+        \\const Packed = packed struct(u32) { a: u8, b: u24 };
+        \\const Tuple = struct { u8, u32 };
+        \\fn f(x: Auto, e: Aligned, c: Comptime, s: Extern, p: Packed, t: Tuple) void {
+        \\    const auto_a = &x.a;
+        \\    const auto_b = &x.b;
+        \\    const aligned_a = &e.a;
+        \\    const aligned_b = &e.b;
+        \\    const comptime_b = &c.b;
+        \\    const extern_a = &s.a;
+        \\    const extern_b = &s.b;
+        \\    const packed_a = &p.a;
+        \\    const packed_b = &p.b;
+        \\    const tuple_0 = &t[0];
+        \\    const tuple_1 = &t[1];
+        \\    _ = .{ auto_a, auto_b, aligned_a, aligned_b, comptime_b, extern_a, extern_b, packed_a, packed_b, tuple_0, tuple_1 };
+        \\}
+    , &.{
+        .{ "auto_a", "*const u8" },
+        .{ "auto_b", "*const u32" },
+        .{ "aligned_a", "*align(8) const u8" },
+        .{ "aligned_b", "*const u16" },
+        .{ "comptime_b", "*const u8" },
+        .{ "extern_a", "*align(4) const u8" },
+        .{ "extern_b", "*const u32" },
+        .{ "packed_a", "*align(4:0:4) const u8" },
+        .{ "packed_b", "*align(4:8:4) const u24" },
+        .{ "tuple_0", "*const u8" },
+        .{ "tuple_1", "*const u32" },
+    });
+}
+
 test "slices, pointer arithmetic, captures and peers keep pointer attributes" {
     // Prevents derived pointers from dropping the attributes of the pointer they come from.
     // Expected values: zig 0.17.0 `@compileLog(@TypeOf(...))` of each name.
