@@ -365,6 +365,46 @@ test "decl literals" {
     });
 }
 
+test "decl literals of another file resolve only when pub" {
+    // `.secret` with a result type from another file is a compile error, not the declaration
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    _ = try w.add("/p/a.zig",
+        \\pub const S = struct {
+        \\    v: i32 = 1,
+        \\    const secret: S = .{ .v = 7 };
+        \\    pub const shown: S = .{ .v = 8 };
+        \\    fn hidden() S { return .{ .v = 9 }; }
+        \\    const own: S = .secret;
+        \\};
+        \\
+    );
+    const src =
+        \\const a = @import("a.zig");
+        \\const x: a.S = .secret;
+        \\const y: a.S = .shown;
+        \\const z = blk: { const s: a.S = .hidden(); break :blk s; };
+        \\const none: a.S = .missing;
+        \\
+    ;
+    const main = try w.add("/p/main.zig", src);
+    try w.setGraph(null, &.{}, &.{});
+    const cases = [_]struct { []const u8, []const u8 }{
+        // A private declaration is treated like a name the type does not declare
+        .{ "none", "S = .missing" },
+        .{ "x", "S = .secret" },
+        .{ "y", "S = .{ .v = 8 }" },
+        .{ "z", "S" },
+    };
+    for (cases) |c| {
+        testing.expectEqualStrings(c[1], try typeAt(&w, main.file, src, c[0], 0)) catch |err| {
+            std.debug.print("type of `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}
+
 test "generic type constructors and instances" {
     try expectTypes(
         \\fn List(comptime T: type) type {

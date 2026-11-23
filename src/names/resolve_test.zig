@@ -1030,6 +1030,46 @@ test "members of another file resolve only when pub" {
     try testing.expectEqualStrings("E shown", try w.complete(main, f.cursor.?.offset));
 }
 
+test "decl literals of another file resolve only when pub" {
+    // `.secret` with a result type from another file is a compile error, not a reference
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/other.zig
+        \\pub const S = struct {
+        \\    v: i32 = 1,
+        \\    const secret: S = .{ .v = 7 };
+        \\    pub const shown: S = .{ .v = 8 };
+        \\    fn hidden() S { return .{ .v = 9 }; }
+        \\    const own: S = .secret;
+        \\};
+        \\//- /p/main.zig
+        \\const other = @import("other.zig");
+        \\test {
+        \\    const x: other.S = .secret;
+        \\    const y: other.S = .shown;
+        \\    const z: other.S = .hidden();
+        \\    _ = .{ x, y, z };
+        \\}
+    );
+    const main = f.file("/p/main.zig");
+    const other = f.file("/p/other.zig");
+    const at = struct {
+        fn of(w2: *World, file: FileId, needle: []const u8) !u32 {
+            var ctx = w2.db.beginRead(w2.arena.allocator());
+            defer ctx.end();
+            const t = (try ctx.get(database.syntax.SourceText, file)).text;
+            return @intCast(std.mem.indexOf(u8, t, needle).?);
+        }
+    }.of;
+    try testing.expectEqualStrings("null", try w.goto(main, try at(&w, main, "secret;")));
+    try testing.expectEqualStrings("other.zig:shown", try w.goto(main, try at(&w, main, "shown;")));
+    try testing.expectEqualStrings("null", try w.goto(main, try at(&w, main, "hidden(")));
+    // A private declaration is a decl literal in its own file
+    try testing.expectEqualStrings("other.zig:secret", try w.goto(other, try at(&w, other, "secret;")));
+}
+
 test "members of the same file resolve through a self-import" {
     var w: World = undefined;
     try w.init();
