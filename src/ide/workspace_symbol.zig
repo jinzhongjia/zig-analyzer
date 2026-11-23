@@ -312,6 +312,35 @@ test "equal-key matches are kept in scan order" {
     }
 }
 
+test "the selection orders by the rendered symbol name" {
+    // A blank name is rendered as `@"..."`, which is longer than the decoded name, so the rendered
+    // name decides which matches the limit keeps, as sorting every match does
+    const text =
+        \\pub fn a() void {}
+        \\pub fn abc() void {}
+        \\pub fn @" "() void {}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const a = w.arena.allocator();
+    for ([_]struct { limit: usize, expected: []const u8 }{
+        .{ .limit = 1, .expected = "a" },
+        .{ .limit = 2, .expected = "a abc" },
+        .{ .limit = 3, .expected = "a abc @\" \"" },
+        .{ .limit = 4, .expected = "a abc @\" \"" },
+    }) |c| {
+        var names: std.ArrayList([]const u8) = .empty;
+        for (try search(&r, &.{file}, "", c.limit)) |s| try names.append(a, s.name);
+        try testing.expectEqualStrings(c.expected, try std.mem.join(a, " ", names.items));
+    }
+}
+
 test "blank names are shown in their quoted form" {
     const text = "pub fn @\" \"() void {}\nconst @\"\" = 1;\n";
     var w: World = undefined;
