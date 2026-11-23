@@ -127,9 +127,9 @@ pub const Query = struct {
     }
 
     pub fn eql(a: Value, b: Value) bool {
-        // A name set that changed to the same hashes (a collision) keeps the old value: the
-        // consumers only test membership by hash, so the result of a colliding file stays a
-        // superset of what they would accept
+        // Equal hash arrays answer every membership query the same way, so keeping the old value
+        // when the hashes match is exact: a name set that changed to the same hashes (a collision)
+        // is indistinguishable to the consumers, which only test membership by hash
         return std.mem.eql(u64, a.hashes, b.hashes);
     }
 

@@ -1690,8 +1690,7 @@ fn contains(names: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-/// A name in `NameIndex`. A collision only adds a file to a pre-filter, whose files are then checked
-/// precisely.
+/// A name in `NameIndex` (see `FileIndex.NameHash`)
 const NameHash = FileIndex.NameHash;
 
 fn nameHash(name: []const u8) NameHash {
