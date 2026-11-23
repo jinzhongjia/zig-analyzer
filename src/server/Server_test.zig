@@ -1455,6 +1455,7 @@ test "function completions insert calls with placeholders only for clients that 
     try expectAddCompletion(.{ .textDocument = .{ .completion = .{ .completionItem = .{ .snippetSupport = false } } } }, Empty{}, null);
     try expectAddCompletion(snippet_client, .{ .completion = .{ .snippets = false } }, null);
     try expectAddCompletion(snippet_client, .{ .completion = .{ .argument_placeholders = false } }, "add($1)");
+    try expectAddCompletion(snippet_client, .{ .completion = .{ .call_snippets = false } }, null);
 }
 
 test "postfix try replaces the dot and the word and inserts `try` before the left-hand side" {

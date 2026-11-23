@@ -64,6 +64,8 @@ pub const Options = struct {
     /// Use snippets (the client supports them and they are enabled): functions complete as calls,
     /// and common snippets are offered where a statement or a declaration starts
     snippets: bool = false,
+    /// With `snippets`, functions and builtins complete as calls; otherwise as their name alone
+    call_snippets: bool = true,
     /// Call snippets insert a placeholder for each argument; otherwise only the parentheses
     argument_placeholders: bool = true,
     /// Complete only paths (`@import` strings and the paths of `build.zig.zon`), with no items
@@ -230,7 +232,7 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
         try items.appendSlice(r.arena, extra.items);
     }
     if (options.snippets) {
-        try addCallSnippets(r, file, text, root, offset, visible, pos, items.items, options.argument_placeholders);
+        if (options.call_snippets) try addCallSnippets(r, file, text, root, offset, visible, pos, items.items, options.argument_placeholders);
         if (pos) |p| try addKeywordSnippets(r, file, text, offset, visible, p, &items);
     }
     if (name) |n| try rank(r.arena, items.items, n.prefix, try expectedAt(r, file, offset, visible.at)) else try rankExpected(items.items, expected);

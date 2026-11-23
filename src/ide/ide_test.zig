@@ -8862,6 +8862,31 @@ test "completion: the function argument of std.Thread.spawn takes a function nam
     }
 }
 
+test "completion: without call snippets functions and builtins insert their name, other snippets stay" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "fn t() void {\n    ad<|>\n}", "add" },
+        .{ "fn t(s: S) void {\n    s.ge<|>\n}", "get" },
+        .{ "fn t() void {\n    _ = @a<|>s;\n}", "@as" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const text = try std.mem.concat(w.arena.allocator(), u8, &.{ call_snippet_decls, c[0], "\n" });
+        const added = try w.add("/p/main.zig", text);
+        testing.expectEqualStrings("-", try snippetOf(&w, added.file, added.cursor, c[1], .{ .auto_import = false, .snippets = true, .call_snippets = false })) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+    // Statement snippets are still offered
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", "fn t() void {\n    <|>\n}\n");
+    try testing.expectEqualStrings("if ($1) {$0}", try snippetOf(&w, added.file, added.cursor, "if", .{ .auto_import = false, .snippets = true, .call_snippets = false }));
+}
+
 test "completion: call snippets without argument placeholders, and nothing changes without snippets" {
     const cases = [_]struct { []const u8, []const u8, []const u8 }{
         .{ "fn t() void {\n    ad<|>\n}", "add", "add($1)" },

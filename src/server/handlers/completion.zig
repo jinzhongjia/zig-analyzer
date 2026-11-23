@@ -48,6 +48,7 @@ pub fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types
         server.index.imports_basis.load(.acquire) == indexing.importsBasis(try r.ctx.get(ModuleGraph.Input, {}));
     const config = server.config.load(.acquire);
     const max_auto_imports, const snippets, const placeholders = .{ config.completion_max_auto_imports, config.completion_snippets, config.completion_argument_placeholders };
+    const call_snippets = config.completion_call_snippets;
     const import_options = server.importOptionsFor(file);
     // `/` and `"` are trigger characters for paths; typed elsewhere they start no name
     const path_trigger = blk: {
@@ -61,6 +62,7 @@ pub fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types
         .max_auto_imports = if (max_auto_imports == 0) std.math.maxInt(usize) else max_auto_imports,
         .imports = import_options,
         .snippets = server.caps.snippet_support and snippets,
+        .call_snippets = call_snippets,
         .argument_placeholders = placeholders,
         .paths_only = path_trigger,
     });

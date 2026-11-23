@@ -14,7 +14,8 @@
 //!       "semantic_tokens": { "mode": "full", "global_var": false },
 //!       "hover": { "instances": "count", "layout": true, "fqn": false },
 //!       "imports": { "derived": "with_import", "sort": "path" },
-//!       "completion": { "auto_import": true, "max_auto_imports": 128, "snippets": true, "argument_placeholders": true },
+//!       "completion": { "auto_import": true, "max_auto_imports": 128, "snippets": true, "call_snippets": true,
+//!                       "argument_placeholders": true },
 //!       "sema": { "callsite_seeding": true, "wait_for_project": false },
 //!       "cache": { "capacity": 64, "queries": { "Infer": { "count": 16384, "mb": 48 } } },
 //!       "workspace_symbol": { "dependencies": false, "limit": 256 },
@@ -136,6 +137,9 @@ completion_max_auto_imports: u32 = 128,
 /// already follow the cursor), and common snippets are offered where statements and declarations
 /// start
 completion_snippets: bool = true,
+/// With snippets, functions and builtins complete as calls; when off, as their name alone, and
+/// signature help shows the parameters once `(` is typed
+completion_call_snippets: bool = true,
 /// Call snippets insert a placeholder for each argument; when off, only the parentheses
 completion_argument_placeholders: bool = true,
 /// Inside a generic function body without concrete types, infer from the instances at call sites
@@ -300,6 +304,7 @@ const settings = [_]Setting{
     .{ .section = "completion", .key = "auto_import", .field = "completion_auto_import" },
     .{ .section = "completion", .key = "max_auto_imports", .field = "completion_max_auto_imports" },
     .{ .section = "completion", .key = "snippets", .field = "completion_snippets" },
+    .{ .section = "completion", .key = "call_snippets", .field = "completion_call_snippets" },
     .{ .section = "completion", .key = "argument_placeholders", .field = "completion_argument_placeholders" },
     .{ .section = "sema", .key = "callsite_seeding", .field = "callsite_seeding" },
     .{ .section = "sema", .key = "wait_for_project", .field = "wait_for_project" },
@@ -751,12 +756,12 @@ test "parse: nested fields, optional wrapper" {
     try testing.expect(!no_layout.hover_layout);
     try testing.expectEqual(0, no_layout.warnings.len);
 
-    try testing.expect(empty.completion_snippets and empty.completion_argument_placeholders);
+    try testing.expect(empty.completion_snippets and empty.completion_call_snippets and empty.completion_argument_placeholders);
     var no_snippets = try parseText(
-        \\{"completion": {"snippets": false, "argument_placeholders": false}}
+        \\{"completion": {"snippets": false, "call_snippets": false, "argument_placeholders": false}}
     );
     defer no_snippets.deinit(testing.allocator);
-    try testing.expect(!no_snippets.completion_snippets and !no_snippets.completion_argument_placeholders and no_snippets.completion_auto_import);
+    try testing.expect(!no_snippets.completion_snippets and !no_snippets.completion_call_snippets and !no_snippets.completion_argument_placeholders and no_snippets.completion_auto_import);
     try testing.expectEqual(0, no_snippets.warnings.len);
 
     try testing.expect(empty.cache_capacity == 64 and empty.cache_queries.Infer.count == null and empty.cache_queries.Infer.mb == null);
