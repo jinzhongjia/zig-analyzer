@@ -454,6 +454,9 @@ const Inferrer = struct {
     /// `uncertain` at the declaration of each `comptime var` (parallel to `bindings`, allocated on
     /// the first declaration)
     var_levels: []u32 = &.{},
+    /// The expressions that modify a `comptime var` (see `outerComptimeVars`), computed after the
+    /// first `comptime var` declaration
+    outer_writes: ?[]const OuterWrite = null,
     /// See `Result.iteration_vars`
     iteration_vars: std.ArrayList(Result.IterationVar) = .empty,
     /// `defer` / `errdefer` statements reached in the blocks being inferred, innermost last: the
@@ -3367,34 +3370,45 @@ const Inferrer = struct {
     /// Assignments within `e` to `comptime var`s declared outside it, including the targets of
     /// destructures (`v, _ = .{ a, b }`)
     fn outerComptimeVars(inf: *Inferrer, e: ExprId, out: ?*std.ArrayList(Body.BindingId)) Error!bool {
-        const b = inf.body;
-        // When the member has no `comptime var`, the left-hand sides of assignments need not be
-        // resolved one by one
-        if (inf.var_levels.len == 0) {
-            for (b.bindings) |x| {
-                if (x.kind == .local_var and x.is_comptime) break;
-            } else return false;
-        }
-        const range = b.range(e);
+        // A `comptime var` cannot be modified before its declaration, so before the first
+        // declaration is inferred there is none to find (and name resolution cannot report one)
+        if (inf.var_levels.len == 0) return false;
+        const range = inf.body.range(e);
         var any = false;
+        for (try inf.outerWrites()) |w| {
+            if (w.range.start < range.start or w.range.end > range.end) continue;
+            if (try inf.outerVar(range, w.binding, out) orelse return true) any = true;
+        }
+        return any;
+    }
+
+    /// A modification of a `comptime var` and the range of the expression holding it; for a
+    /// destructure, the range is that of the block holding the statement
+    const OuterWrite = struct { range: Body.Range, binding: Body.BindingId };
+
+    /// The candidates of `outerComptimeVars`, computed once per inference: after the first
+    /// `comptime var` declaration, the name resolution they use does not change
+    fn outerWrites(inf: *Inferrer) Error![]const OuterWrite {
+        if (inf.outer_writes) |writes| return writes;
+        const b = inf.body;
+        var out: std.ArrayList(OuterWrite) = .empty;
         for (b.exprs, b.expr_ranges) |x, rg| {
-            if (rg.start < range.start or rg.end > range.end) continue;
             // A destructure is a statement, not an expression: its targets are found through the
             // block holding it
             if (x == .block) for (x.block.stmts) |s| switch (s.kind) {
                 .destructure => |d| for (d.targets) |t| switch (t) {
-                    .expr => |te| if (try inf.comptimeVarPlace(te)) |v| {
-                        if (try inf.outerVar(range, v, out) orelse return true) any = true;
-                    },
+                    .expr => |te| if (try inf.comptimeVarPlace(te)) |v| try out.append(inf.scratch, .{ .range = rg, .binding = v }),
                     .binding => {},
                 },
                 else => {},
             };
             const v = (if (x == .assign) try inf.comptimeVarOf(x.assign.lhs) else null) orelse
                 try inf.indirectlyModifiedVar(x) orelse continue;
-            if (try inf.outerVar(range, v, out) orelse return true) any = true;
+            try out.append(inf.scratch, .{ .range = rg, .binding = v });
         }
-        return any;
+        const writes = try out.toOwnedSlice(inf.scratch);
+        inf.outer_writes = writes;
+        return writes;
     }
 
     /// A `comptime var` modified within `range`: whether it is declared outside it, after

@@ -3282,6 +3282,41 @@ test "containers in a function capture a comptime var where the body reaches the
     });
 }
 
+test "comptime var writes are found in loops and defers after the declaration" {
+    // Prevents reusing a scan made before the first `comptime var` declaration, when name
+    // resolution could not report one yet, for a later loop or defer.
+    try expectTypes(
+        \\fn BeforeDecl(comptime n: u32) type {
+        \\    for (0..0) |_| {}
+        \\    comptime var x: u32 = 0;
+        \\    inline for (0..n) |_| x += 1;
+        \\    return struct { pub const v = x; };
+        \\}
+        \\fn Loops(comptime n: u32) type {
+        \\    comptime var x: u32 = 0;
+        \\    inline for (0..n) |_| x += 1;
+        \\    inline for (0..n) |_| x += 1;
+        \\    return struct { pub const v = x; };
+        \\}
+        \\fn Defers(comptime n: u32) type {
+        \\    comptime var x: u32 = 0;
+        \\    inline for (0..n) |_| {
+        \\        defer x += 1;
+        \\        const seen = x;
+        \\        _ = seen;
+        \\    }
+        \\    return struct { pub const v = x; };
+        \\}
+        \\const before_decl = BeforeDecl(3).v;
+        \\const loops = Loops(2).v;
+        \\const defers = Defers(3).v;
+    , &.{
+        .{ "before_decl", "u32 = 3" },
+        .{ "loops", "u32 = 4" },
+        .{ "defers", "u32 = 3" },
+    });
+}
+
 test "defer and errdefer write comptime vars at the exit of their block" {
     // Prevents applying a deferred write at the defer statement and applying errdefer writes on
     // the success path; expected values are the results of `zig run`
@@ -5221,6 +5256,63 @@ test "container layouts match the compiler" {
         .{ "align_xl", "comptime_int = 1" },
         .{ "size_al", "comptime_int = 8" },
         .{ "size_ua", "comptime_int = 8" },
+    });
+}
+
+test "container layout and backing queries handle declarations with and without an argument" {
+    // Prevents reading the argument of a container through the enclosing member's body when the
+    // declaration has none (`struct`, `union(enum)`, `enum`, packed containers without a backing
+    // integer) or when only the layout is needed.
+    try expectTypes(
+        \\const Plain = struct { a: u8, b: u32 };
+        \\const PackedArg = packed struct(u32) { a: u16, b: u16 };
+        \\const PackedAuto = packed struct { a: u3, b: u5 };
+        \\const PackedUnionArg = packed union(u16) { a: u16, b: i16 };
+        \\const PackedUnionAuto = packed union { a: u8, b: i8 };
+        \\const TaggedAuto = union(enum) { a: u8, b: u32 };
+        \\const TaggedInt = union(enum(u8)) { a: u8, b: u32 };
+        \\const Tag = enum(u16) { a, b };
+        \\const Tagged = union(Tag) { a: u8, b: u16 };
+        \\const EInt = enum(u8) { a, b };
+        \\const EAuto = enum { a, b };
+        \\const plain_size = @sizeOf(Plain);
+        \\const plain_align = @alignOf(Plain);
+        \\const packed_arg_size = @sizeOf(PackedArg);
+        \\const packed_arg_align = @alignOf(PackedArg);
+        \\const packed_arg_bits = @bitSizeOf(PackedArg);
+        \\const packed_arg_backing = @backingInt(PackedArg{ .a = 1, .b = 2 });
+        \\const packed_auto_size = @sizeOf(PackedAuto);
+        \\const packed_auto_bits = @bitSizeOf(PackedAuto);
+        \\const packed_union_arg_bits = @bitSizeOf(PackedUnionArg);
+        \\const packed_union_arg_backing = @backingInt(PackedUnionArg{ .a = 1 });
+        \\const packed_union_auto_bits = @bitSizeOf(PackedUnionAuto);
+        \\const tagged_auto_size = @sizeOf(TaggedAuto);
+        \\const tagged_int_size = @sizeOf(TaggedInt);
+        \\const tagged_size = @sizeOf(Tagged);
+        \\const enum_int_bits = @bitSizeOf(EInt);
+        \\const enum_int_backing = @backingInt(EInt.b);
+        \\const enum_auto_bits = @bitSizeOf(EAuto);
+        \\const enum_auto_backing = @backingInt(EAuto.b);
+    , &.{
+        .{ "plain_size", "comptime_int = 8" },
+        .{ "plain_align", "comptime_int = 4" },
+        .{ "packed_arg_size", "comptime_int = 4" },
+        .{ "packed_arg_align", "comptime_int = 4" },
+        .{ "packed_arg_bits", "comptime_int = 32" },
+        .{ "packed_arg_backing", "u32 = 131073" },
+        .{ "packed_auto_size", "comptime_int = 1" },
+        .{ "packed_auto_bits", "comptime_int = 8" },
+        .{ "packed_union_arg_bits", "comptime_int = 16" },
+        .{ "packed_union_arg_backing", "u16 = 1" },
+        .{ "packed_union_auto_bits", "comptime_int = 8" },
+        // The tag of `union(enum)` and `union(enum(u8))` takes part in the layout
+        .{ "tagged_auto_size", "comptime_int = 8" },
+        .{ "tagged_int_size", "comptime_int = 8" },
+        .{ "tagged_size", "comptime_int = 4" },
+        .{ "enum_int_bits", "comptime_int = 8" },
+        .{ "enum_int_backing", "u8 = 1" },
+        .{ "enum_auto_bits", "comptime_int = 1" },
+        .{ "enum_auto_backing", "u1 = 1" },
     });
 }
 

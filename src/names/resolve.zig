@@ -51,6 +51,9 @@ pub const Resolver = struct {
     /// `fileContext` results already read by this resolver. A resolver belongs to one computation
     /// (or one request), whose first read records the dependency.
     file_contexts: std.AutoHashMapUnmanaged(FileId, ?u32) = .empty,
+    /// The import graph of one search scope, built for this resolver's request (see
+    /// `importGraph`). The scope slices it holds are allocated in `arena`.
+    import_graph: ?*ImportGraphCache = null,
 
     fn vfs(r: *Resolver) *Vfs {
         return r.ctx.db.env.vfs;
@@ -64,6 +67,17 @@ pub const Resolver = struct {
             return err;
         };
         return gop.value_ptr.*;
+    }
+
+    /// The import graph over `scope`, reused while `scope` has the same files in the same order:
+    /// the scope order decides the order of the importers (see `ImportGraph`)
+    pub fn importGraph(r: *Resolver, scope: []const FileId) Error!*const ImportGraph {
+        if (r.import_graph) |cached| if (cached.context == r.context and std.mem.eql(FileId, cached.scope, scope)) return &cached.graph;
+        const graph = try ImportGraph.build(r.arena, r, scope);
+        const cached = try r.arena.create(ImportGraphCache);
+        cached.* = .{ .scope = try r.arena.dupe(FileId, scope), .context = r.context, .graph = graph };
+        r.import_graph = cached;
+        return &cached.graph;
     }
 
     /// `.zon` files: `@import` of one yields the value in it, not a namespace
@@ -612,12 +626,12 @@ pub const Resolver = struct {
     /// The innermost member containing `offset` (`inclusive_end`: a cursor at the end of the member
     /// also counts)
     pub fn ownerAt(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) Error!?u32 {
-        const tree = try r.itemTree(file);
+        // `AstIdMap.items` is parallel to `ItemTree.items`: each entry is the node of that item's
+        // AstId
         const map = try r.ctx.get(syntax.FileAstIdMap, file);
         var best: ?u32 = null;
         var best_len: u32 = std.math.maxInt(u32);
-        for (tree.items, 0..) |it, i| {
-            const node = map.get(it.ast_id) orelse continue;
+        for (map.items, 0..) |node, i| {
             const range = node.range();
             const inside = range.start <= offset and (offset < range.end or (inclusive_end and offset == range.end));
             if (inside and range.end - range.start < best_len) {
@@ -650,6 +664,107 @@ pub const Resolver = struct {
                 return .{ .file = l.file, .start = node.offset + range.start, .end = node.offset + range.end };
             },
         }
+    }
+};
+
+/// One cached import graph and the exact scope (contents and order) it was built for
+pub const ImportGraphCache = struct {
+    scope: []const FileId,
+    /// The compilation `@import("std")` and friends resolved in (see `Resolver.context`)
+    context: ?u32,
+    graph: ImportGraph,
+};
+
+/// Reverse and forward `@import` edges over the files in a scope and the files they reach (see
+/// `search.importers`). Does not depend on the target, so the importers of every file in one scope
+/// can share it; the forward edges give the closure from any node without resolving imports again
+/// (see `search.reachable`).
+pub const ImportGraph = struct {
+    /// Files in scope first (indices below `scope_len`), followed by the reachable files outside
+    /// the scope
+    nodes: []const FileId,
+    scope_len: u32,
+    /// Importers of `nodes[i]`: `edges[edge_starts[i]..edge_starts[i + 1]]`, in the order the
+    /// imports were found
+    edge_starts: []const u32,
+    edges: []const FileId,
+    /// Files `nodes[i]` imports: `forward_edges[forward_starts[i]..forward_starts[i + 1]]`, in the
+    /// order the imports were found
+    forward_starts: []const u32,
+    forward_edges: []const FileId,
+    /// Index of each file in `nodes`
+    index: std.AutoHashMapUnmanaged(FileId, u32),
+
+    /// The graph is allocated with `a`; temporary data with `r.arena`
+    pub fn build(a: Allocator, r: *Resolver, scope: []const FileId) Error!ImportGraph {
+        const temp = r.arena;
+        var nodes: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+        var forward: std.ArrayList(std.ArrayList(FileId)) = .empty;
+        for (scope) |f| {
+            const gop = try nodes.getOrPut(temp, f);
+            if (!gop.found_existing) try forward.append(temp, .empty);
+        }
+        const scope_len: u32 = @intCast(nodes.count());
+        // Imported file → the files importing it
+        var reverse: std.AutoHashMapUnmanaged(FileId, std.ArrayList(FileId)) = .empty;
+        var n: usize = 0;
+        while (n < nodes.count()) : (n += 1) {
+            const f = nodes.keys()[n];
+            const file_index = try r.ctx.get(FileIndex.ImportStrings, f);
+            // Every module the file belongs to may import a different file under a name
+            for (file_index.imports) |s| for (try r.resolveImportTargets(f, s)) |to| {
+                try forward.items[n].append(temp, to);
+                const gop = try reverse.getOrPut(temp, to);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(temp, f);
+                const node = try nodes.getOrPut(temp, to);
+                if (!node.found_existing) try forward.append(temp, .empty);
+            };
+        }
+        const keys = try a.dupe(FileId, nodes.keys());
+        const edge_starts = try a.alloc(u32, keys.len + 1);
+        var edge_count: usize = 0;
+        var it = reverse.valueIterator();
+        while (it.next()) |from| edge_count += from.items.len;
+        var edges: std.ArrayList(FileId) = try .initCapacity(a, edge_count);
+        const forward_starts = try a.alloc(u32, keys.len + 1);
+        var forward_count: usize = 0;
+        for (forward.items) |targets| forward_count += targets.items.len;
+        var forward_edges: std.ArrayList(FileId) = try .initCapacity(a, forward_count);
+        var index: std.AutoHashMapUnmanaged(FileId, u32) = .empty;
+        try index.ensureTotalCapacity(a, @intCast(keys.len));
+        for (keys, 0..) |f, i| {
+            edge_starts[i] = @intCast(edges.items.len);
+            if (reverse.get(f)) |from| edges.appendSliceAssumeCapacity(from.items);
+            forward_starts[i] = @intCast(forward_edges.items.len);
+            forward_edges.appendSliceAssumeCapacity(forward.items[i].items);
+            index.putAssumeCapacity(f, @intCast(i));
+        }
+        edge_starts[keys.len] = @intCast(edges.items.len);
+        forward_starts[keys.len] = @intCast(forward_edges.items.len);
+        return .{ .nodes = keys, .scope_len = scope_len, .edge_starts = edge_starts, .edges = edges.items, .forward_starts = forward_starts, .forward_edges = forward_edges.items, .index = index };
+    }
+
+    /// See `search.importers`
+    pub fn importersOf(g: *const ImportGraph, a: Allocator, target: FileId) Allocator.Error![]const FileId {
+        var seen: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
+        try seen.put(a, target, {});
+        var i: usize = 0;
+        while (i < seen.count()) : (i += 1) {
+            const n = g.index.get(seen.keys()[i]) orelse continue;
+            for (g.edges[g.edge_starts[n]..g.edge_starts[n + 1]]) |x| try seen.put(a, x, {});
+        }
+        var out: std.ArrayList(FileId) = .empty;
+        for (seen.keys()) |f| {
+            if (f == target or g.index.get(f).? < g.scope_len) try out.append(a, f);
+        }
+        return out.items;
+    }
+
+    pub fn eql(a: *const ImportGraph, b: *const ImportGraph) bool {
+        return a.scope_len == b.scope_len and std.mem.eql(FileId, a.nodes, b.nodes) and
+            std.mem.eql(u32, a.edge_starts, b.edge_starts) and std.mem.eql(FileId, a.edges, b.edges) and
+            std.mem.eql(u32, a.forward_starts, b.forward_starts) and std.mem.eql(FileId, a.forward_edges, b.forward_edges);
     }
 };
 

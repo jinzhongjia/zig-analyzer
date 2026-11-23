@@ -26,7 +26,13 @@ const publishing = @import("publishing.zig");
 const log = std.log.scoped(.server);
 
 pub fn didChangeWatchedFiles(server: *Server, arena: Allocator, params: types.DidChangeWatchedFilesParams) !void {
-    _ = try applyFileChanges(server, arena, params.changes, .notified, null);
+    server.changes_mutex.lockUncancelable(server.io);
+    defer server.changes_mutex.unlock(server.io);
+    var prepared = try prepareFileChanges(server, arena, params.changes, .notified);
+    defer prepared.deinit(server.gpa);
+    server.write_mutex.lockUncancelable(server.io);
+    defer server.write_mutex.unlock(server.io);
+    _ = try applyFileChanges(server, arena, &prepared, .notified, null);
 }
 
 /// How changes on disk were found
@@ -40,6 +46,89 @@ pub const ChangeSource = enum {
     verified,
 };
 
+/// Disk contents of one file of a batch of external changes
+const Read = struct {
+    /// Contents read from disk; null if the file does not exist (or is too big)
+    text: ?[]u8,
+    /// Hash of `text`; null if there are no contents
+    hash: ?u64,
+};
+
+/// A batch of external changes with the disk contents of its files read before `write_mutex` was
+/// taken (see `prepareFileChanges`). Its maps live in the caller's arena; `deinit` frees the disk
+/// contents that `applyFileChanges` did not take: those of files that were opened in between, or
+/// that it does not need.
+pub const Prepared = struct {
+    /// The file events, with the known files under a changed folder added (see
+    /// `addFolderContents`); the last of several events for a path wins
+    events: std.StringArrayHashMapUnmanaged(types.FileChangeType) = .empty,
+    /// Disk contents of the files that were read, by path
+    reads: std.StringArrayHashMapUnmanaged(Read) = .empty,
+    /// An event was a folder (see `addFolderContents`)
+    folders: bool = false,
+
+    pub fn deinit(p: *Prepared, gpa: Allocator) void {
+        for (p.reads.values()) |r| if (r.text) |t| gpa.free(t);
+        p.* = .{};
+    }
+};
+
+/// Reads the disk contents of the files of a batch of external changes, and adds the known files
+/// under the folders in it (see `addFolderContents`), before `write_mutex` is taken. The files
+/// that `applyFileChanges` needs are read; it reads one itself when the state changed in between
+/// such that the read was skipped. Files that it would skip are not read.
+pub fn prepareFileChanges(server: *Server, arena: Allocator, file_events: []const types.FileEvent, source: ChangeSource) !Prepared {
+    var prepared: Prepared = .{};
+    errdefer prepared.deinit(server.gpa);
+    for (file_events) |event| {
+        const path = uri.toPath(arena, event.uri) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedScheme, error.InvalidUri => continue,
+        };
+        if (!std.fs.path.isAbsolute(path)) continue;
+        try prepared.events.put(arena, path, event.type);
+    }
+    prepared.folders = try addFolderContents(server, arena, &prepared.events);
+    try prepared.reads.ensureTotalCapacity(arena, prepared.events.count());
+    for (prepared.events.keys(), prepared.events.values()) |path, kind| {
+        // A deleted file has no contents to read
+        if (kind == .Deleted) continue;
+        const file = try server.vfs.lookup(path);
+        const read = if (file) |id| blk: {
+            const is_open = blk_open: {
+                server.docs.mutex.lockUncancelable(server.io);
+                defer server.docs.mutex.unlock(server.io);
+                break :blk_open server.docs.open.contains(id);
+            };
+            // The same files `applyFileChanges` skips
+            if (source == .verified) {
+                if (is_open) continue;
+                switch (knownTextOf(server, arena, id)) {
+                    .none, .reading => continue,
+                    .known => {},
+                }
+            }
+            break :blk server.vfs.readFromDisk(id, server.gpa) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Canceled => return error.Canceled,
+                error.FileTooBig => null,
+            };
+        } else blk: {
+            // A file never seen has no known contents to update (a new file is loaded when it is
+            // imported); project files count as changed unless the project started with these
+            // contents
+            if (source == .verified or !doc_sync.isProjectFile(std.fs.path.basename(path))) continue;
+            break :blk Io.Dir.cwd().readFileAlloc(server.io, path, server.gpa, .limited(Vfs.max_file_size)) catch |err| switch (err) {
+                error.OutOfMemory, error.Canceled => |e| return e,
+                else => null,
+            };
+        };
+        const hash: ?u64 = if (read) |t| std.hash.Wyhash.hash(0, t) else null;
+        prepared.reads.putAssumeCapacity(path, .{ .text = read, .hash = hash });
+    }
+    return prepared;
+}
+
 /// External changes on disk (outside the editor: git checkout, code generation, etc.). For open
 /// files the buffer is authoritative, but the builds read the disk, so they are rebuilt as well;
 /// other known files are updated from the disk contents (deleted ones become nonexistent),
@@ -50,11 +139,13 @@ pub const ChangeSource = enum {
 /// is rebuilt when the disk contents equal those the last rebuild was based on (see `didSave`). A
 /// project in the middle of a build compares a notified change when the build completes (see
 /// `Workspace.deferChanges`). Returns whether anything changed: a known file's text or rebuild
-/// basis, or a project started or stopped. When `deferred` is given, the files being read from
-/// disk are added to it instead of being compared with the disk: what the read gets is not known
-/// yet, so their text is compared again once the read is done (see `applyWatchedChanges`). The
-/// rebuild of a notified change does not wait for that, since the builds read the disk.
-fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const types.FileEvent, source: ChangeSource, deferred: ?*std.ArrayList([]const u8)) !bool {
+/// basis, or a project started or stopped. The disk contents were read before `write_mutex` was
+/// taken (see `prepareFileChanges`); the state decisions and the database writes re-check the
+/// state and take the reads. When `deferred` is given, the files being read from disk are added to
+/// it instead of being compared with the disk: what the read gets is not known yet, so their text
+/// is compared again once the read is done (see `applyWatchedChanges`). The rebuild of a notified
+/// change does not wait for that, since the builds read the disk.
+fn applyFileChanges(server: *Server, arena: Allocator, prepared: *Prepared, source: ChangeSource, deferred: ?*std.ArrayList([]const u8)) !bool {
     const Change = struct {
         file: Vfs.FileId,
         path: []const u8,
@@ -79,20 +170,9 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
     var build_zig_dirs: std.ArrayList([]const u8) = .empty;
     // Known files that changed
     var known: std.ArrayList(Vfs.FileId) = .empty;
-    // When a file changes several times in one batch, the last change wins: an atomic save first
-    // deletes and then recreates the file, and with unchanged contents the two together are not a
-    // change
-    var events: std.StringArrayHashMapUnmanaged(types.FileChangeType) = .empty;
-    for (file_events) |event| {
-        const path = uri.toPath(arena, event.uri) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.UnsupportedScheme, error.InvalidUri => continue,
-        };
-        if (!std.fs.path.isAbsolute(path)) continue;
-        try events.put(arena, path, event.type);
-    }
+    const events = &prepared.events;
     // A folder created, deleted, moved or renamed is reported by its own path only
-    const folders = try addFolderContents(server, arena, &events);
+    const folders = prepared.folders;
     // A file created or deleted may change what the paths of open documents resolve to
     for (events.values()) |kind| if (kind != .Changed) {
         server.docs.mutex.lockUncancelable(server.io);
@@ -113,11 +193,18 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
         // contents
         const file = try server.vfs.lookup(path) orelse {
             if (source == .verified or !doc_sync.isProjectFile(base)) continue;
-            const read = if (kind == .Deleted) null else Io.Dir.cwd().readFileAlloc(server.io, path, arena, .limited(Vfs.max_file_size)) catch |err| switch (err) {
-                error.OutOfMemory, error.Canceled => |e| return e,
-                else => null,
+            const disk: ?u64 = if (kind == .Deleted) null else blk: {
+                if (prepared.reads.get(path)) |r| break :blk r.hash;
+                // The read was skipped because the state said so (see `prepareFileChanges`): read
+                // it here
+                const read = Io.Dir.cwd().readFileAlloc(server.io, path, server.gpa, .limited(Vfs.max_file_size)) catch |err| switch (err) {
+                    error.OutOfMemory, error.Canceled => |e| return e,
+                    else => null,
+                };
+                defer if (read) |t| server.gpa.free(t);
+                break :blk if (read) |t| std.hash.Wyhash.hash(0, t) else null;
             };
-            if (!doc_sync.projectStartedWith(server, path, if (read) |t| std.hash.Wyhash.hash(0, t) else null)) try build_files.append(arena, dir);
+            if (!doc_sync.projectStartedWith(server, path, disk)) try build_files.append(arena, dir);
             continue;
         };
         const is_open = blk: {
@@ -137,12 +224,25 @@ fn applyFileChanges(server: *Server, arena: Allocator, file_events: []const type
             },
             .known => {},
         };
-        const read = if (kind == .Deleted) null else server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Canceled => return error.Canceled,
-            error.FileTooBig => null,
-        };
-        const disk: ?u64 = if (read) |t| std.hash.Wyhash.hash(0, t) else null;
+        // The disk contents were read before `write_mutex`; the read moved the text into `read`
+        var read: ?[]u8 = null;
+        var disk: ?u64 = null;
+        if (kind != .Deleted) {
+            if (prepared.reads.getPtr(path)) |r| {
+                read = r.text;
+                r.text = null;
+                disk = r.hash;
+            } else {
+                // The read was skipped because the state said so (see `prepareFileChanges`), and
+                // the state has changed: read it here
+                read = server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Canceled => return error.Canceled,
+                    error.FileTooBig => null,
+                };
+                disk = if (read) |t| std.hash.Wyhash.hash(0, t) else null;
+            }
+        }
         const text = if (is_open) blk: {
             if (read) |t| server.gpa.free(t);
             break :blk null;
@@ -418,7 +518,8 @@ fn knownTextOf(server: *Server, arena: Allocator, file: Vfs.FileId) KnownText {
 
 /// External changes discovered by the server: handled the same way as the client's
 /// `workspace/didChangeWatchedFiles` notification (see `applyFileChanges`), serialized with main
-/// loop message handling. Returns the files being read from disk (allocated in `arena`), to be
+/// loop message handling. The disk is read before `write_mutex` is taken (see
+/// `prepareFileChanges`). Returns the files being read from disk (allocated in `arena`), to be
 /// compared with the disk again.
 pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const types.FileEvent, source: ChangeSource) []const []const u8 {
     var deferred: std.ArrayList([]const u8) = .empty;
@@ -430,6 +531,13 @@ pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const t
         server.watch_mutex.unlock(server.io);
         server.watch_cond.broadcast(server.io);
     };
+    server.changes_mutex.lockUncancelable(server.io);
+    defer server.changes_mutex.unlock(server.io);
+    var prepared = prepareFileChanges(server, arena, changes, source) catch |err| {
+        log.err("applying changes on disk failed: {t}", .{err});
+        return &.{};
+    };
+    defer prepared.deinit(server.gpa);
     server.write_mutex.lockUncancelable(server.io);
     defer server.write_mutex.unlock(server.io);
     if (server.state != .running or server.isShuttingDown()) return &.{};
@@ -438,7 +546,7 @@ pub fn applyWatchedChanges(server: *Server, arena: Allocator, changes: []const t
     // waits for idle (waitIdle, shutdown) must not be allowed to return in between
     server.busyBegin();
     defer server.busyEnd();
-    const changed = applyFileChanges(server, arena, changes, source, &deferred) catch |err| blk: {
+    const changed = applyFileChanges(server, arena, &prepared, source, &deferred) catch |err| blk: {
         log.err("applying changes on disk failed: {t}", .{err});
         break :blk true;
     };
@@ -520,4 +628,119 @@ pub fn watchRegistrationFailed(server: *Server) void {
     if (server.watch_registration_failed.swap(true, .acq_rel)) return;
     log.info("the client cannot watch files, watching them on the server instead", .{});
     resyncWatcher(server);
+}
+
+const test_support = struct {
+    fn text(server: *Server, a: Allocator, file: Vfs.FileId) !?[]const u8 {
+        var ctx = server.db.beginRead(a);
+        defer ctx.end();
+        const value = try ctx.get(FileText, file);
+        return if (value) |t| try a.dupe(u8, t) else null;
+    }
+
+    fn isSet(server: *Server, a: Allocator, file: Vfs.FileId) !bool {
+        var ctx = server.db.beginRead(a);
+        defer ctx.end();
+        return ctx.isSet(FileText, file);
+    }
+};
+
+test "a document opened after the disk read keeps its buffer" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: za.lsp.transport.Writer = .{ .io = testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(testing.io, gpa, &writer);
+    defer server.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    const path = try std.fs.path.join(a, &.{ dir, "a.zig" });
+    const disk = "const disk = 1;\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = disk });
+    const file = try server.vfs.intern(path);
+    {
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        try server.db.set(FileText, file, try gpa.dupe(u8, disk), .low);
+    }
+    // The rebuild basis is the disk contents: opening the document need not rebuild
+    {
+        server.watched_built_mutex.lockUncancelable(server.io);
+        defer server.watched_built_mutex.unlock(server.io);
+        try server.watched_built.put(gpa, file, std.hash.Wyhash.hash(0, disk));
+    }
+    const event: types.FileEvent = .{ .uri = try uri.fromPath(a, path), .type = .Changed };
+    var prepared = try prepareFileChanges(&server, a, &.{event}, .notified);
+    defer prepared.deinit(server.gpa);
+    // The client opened the document after the disk read: the buffer is authoritative
+    const buffer = "const buffer = 2;\n";
+    {
+        var doc: doc_sync.OpenDoc = .{};
+        try doc.docs.append(gpa, .{ .uri = try gpa.dupe(u8, event.uri), .version = 1 });
+        try server.docs.open.put(gpa, file, doc);
+    }
+    {
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        try server.db.set(FileText, file, try gpa.dupe(u8, buffer), .low);
+    }
+    try testing.expect(!try applyFileChanges(&server, a, &prepared, .notified, null));
+    try testing.expectEqualStrings(buffer, (try test_support.text(&server, a, file)).?);
+}
+
+test "a batch of created, changed and deleted files applies from the disk contents" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: za.lsp.transport.Writer = .{ .io = testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(testing.io, gpa, &writer);
+    defer server.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", a);
+    const mod_path = try std.fs.path.join(a, &.{ dir, "mod.zig" });
+    const del_path = try std.fs.path.join(a, &.{ dir, "del.zig" });
+    const new_path = try std.fs.path.join(a, &.{ dir, "new.zig" });
+    const mod_disk = "pub const mod = 2;\n";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "mod.zig", .data = mod_disk });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "new.zig", .data = "pub const new = 3;\n" });
+    const mod = try server.vfs.intern(mod_path);
+    const del = try server.vfs.intern(del_path);
+    {
+        server.db.beginWrite();
+        defer server.db.endWrite();
+        try server.db.set(FileText, mod, try gpa.dupe(u8, "pub const mod = 1;\n"), .low);
+        try server.db.set(FileText, del, try gpa.dupe(u8, "pub const del = 1;\n"), .low);
+    }
+    // Both rebuilds are based on the new state: neither file is rebuilt
+    {
+        server.watched_built_mutex.lockUncancelable(server.io);
+        defer server.watched_built_mutex.unlock(server.io);
+        try server.watched_built.put(gpa, mod, std.hash.Wyhash.hash(0, mod_disk));
+        try server.watched_built.put(gpa, del, null);
+    }
+    const events = [_]types.FileEvent{
+        .{ .uri = try uri.fromPath(a, mod_path), .type = .Changed },
+        .{ .uri = try uri.fromPath(a, del_path), .type = .Deleted },
+        .{ .uri = try uri.fromPath(a, new_path), .type = .Created },
+    };
+    var prepared = try prepareFileChanges(&server, a, &events, .notified);
+    defer prepared.deinit(server.gpa);
+    try testing.expect(try applyFileChanges(&server, a, &prepared, .notified, null));
+    try testing.expectEqualStrings(mod_disk, (try test_support.text(&server, a, mod)).?);
+    try testing.expect(try test_support.isSet(&server, a, del));
+    try testing.expect((try test_support.text(&server, a, del)) == null);
+    // A file that was never seen is not loaded
+    try testing.expect((try server.vfs.lookup(new_path)) == null);
 }

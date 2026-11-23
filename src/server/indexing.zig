@@ -23,11 +23,16 @@ const Pending = Server.Pending;
 
 const log = std.log.scoped(.server);
 
+/// The target parsed from each builtin.zig during one module graph update: a module graph has
+/// far fewer distinct builtins than modules and compilations, and reads within one update cannot
+/// legitimately differ, so each file is read and parsed at most once.
+const BuiltinTargets = std.AutoArrayHashMapUnmanaged(Vfs.FileId, za.sema.InternPool.Target);
+
 /// Target-dependent parameters of value operations outside every compilation (pointer bit width,
 /// layout rules of vector and scalar types): taken from the parts the builtins of all modules and
 /// compilations agree on; parts that disagree are unknown (values depending on them are unknown);
 /// without project modules, the default builtin (native) is used
-fn targetAbi(server: *Server, graph: *const ModuleGraph) Allocator.Error!za.sema.InternPool.Target {
+fn targetAbi(server: *Server, graph: *const ModuleGraph, cache: *BuiltinTargets) Allocator.Error!za.sema.InternPool.Target {
     var result: za.sema.InternPool.Target = .{};
     // Modules with the same parameters share the same builtin, and merging the same target again
     // does not change the result: each one is read and parsed only once
@@ -36,7 +41,7 @@ fn targetAbi(server: *Server, graph: *const ModuleGraph) Allocator.Error!za.sema
     for (graph.modules) |m| if (m.builtin) |file| try seen.put(server.gpa, file, {});
     for (graph.compiles) |c| if (c.builtin) |file| try seen.put(server.gpa, file, {});
     for (seen.keys(), 0..) |file, i| {
-        const t = try builtinTarget(server, file);
+        const t = try builtinTarget(server, cache, file);
         if (i == 0) {
             result = t;
             continue;
@@ -46,7 +51,7 @@ fn targetAbi(server: *Server, graph: *const ModuleGraph) Allocator.Error!za.sema
         if (result.endian != t.endian) result.endian = null;
         result.scalar_abi = result.scalar_abi.merge(t.scalar_abi);
     }
-    if (seen.count() == 0) result = if (graph.default_builtin) |f| try builtinTarget(server, f) else .{};
+    if (seen.count() == 0) result = if (graph.default_builtin) |f| try builtinTarget(server, cache, f) else .{};
     // The error limit is set per compile step (the compilation of files outside every compile
     // step uses the default)
     var bits: ?u16 = null;
@@ -61,15 +66,25 @@ fn targetAbi(server: *Server, graph: *const ModuleGraph) Allocator.Error!za.sema
 }
 
 /// Target parameters of a builtin.zig; when it cannot be read, the ones last parsed from it (see
-/// `builtin_targets`). The caller holds `graph_mutex`.
-fn builtinTarget(server: *Server, file: Vfs.FileId) Allocator.Error!za.sema.InternPool.Target {
+/// `builtin_targets`). The result is recorded in `cache` and reused for the rest of the update.
+/// The caller holds `graph_mutex`.
+fn builtinTarget(server: *Server, cache: *BuiltinTargets, file: Vfs.FileId) Allocator.Error!za.sema.InternPool.Target {
+    if (cache.get(file)) |result| return result;
+    if (@import("builtin").is_test) {
+        if (server.hooks.builtin_target_reads) |reads| _ = reads.fetchAdd(1, .monotonic);
+    }
     const text = Io.Dir.cwd().readFileAlloc(server.io, server.vfs.path(file), server.gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return server.builtin_targets.get(file) orelse .{ .pointer_bits = null, .scalar_abi = .unknown, .endian = null },
+        else => {
+            const result: za.sema.InternPool.Target = server.builtin_targets.get(file) orelse .{ .pointer_bits = null, .scalar_abi = .unknown, .endian = null };
+            try cache.put(server.gpa, file, result);
+            return result;
+        },
     };
     defer server.gpa.free(text);
     const result = targetOfBuiltin(text);
     try server.builtin_targets.put(server.gpa, file, result);
+    try cache.put(server.gpa, file, result);
     return result;
 }
 
@@ -84,6 +99,34 @@ pub fn targetOfBuiltin(text: []const u8) za.sema.InternPool.Target {
         .scalar_abi = if (target) |*t| .of(t) else .unknown,
         .endian = if (target) |*t| t.cpu.arch.endian() else null,
     };
+}
+
+/// The target of files outside every compilation and of every compilation, for one module graph
+/// update (`graph.compiles`). Builtins are shared between the two and read at most once each.
+const Targets = struct {
+    common: za.sema.InternPool.Target,
+    compiles: []za.sema.InternPool.Target,
+
+    fn deinit(t: *Targets, gpa: Allocator) void {
+        gpa.free(t.compiles);
+    }
+};
+
+fn computeTargets(server: *Server, graph: *const ModuleGraph, dialect: za.syntax.Parse.Dialect) Allocator.Error!Targets {
+    var cache: BuiltinTargets = .empty;
+    defer cache.deinit(server.gpa);
+    var common = try targetAbi(server, graph, &cache);
+    common.dialect = dialect;
+    // Each compilation uses the target of its builtin (the root module's); when that is unknown,
+    // the parameters common to all compilations. The error limit is the compilation's own.
+    const compiles = try server.gpa.alloc(za.sema.InternPool.Target, graph.compiles.len);
+    errdefer server.gpa.free(compiles);
+    for (graph.compiles, compiles) |c, *ct| {
+        ct.* = if (c.builtin) |file| try builtinTarget(server, &cache, file) else common;
+        ct.error_bits = za.sema.InternPool.errorBitsOf(c.error_limit);
+        ct.dialect = dialect;
+    }
+    return .{ .common = common, .compiles = compiles };
 }
 
 /// Combines the build graphs and compile sets of all projects and updates the module graph input
@@ -126,17 +169,10 @@ fn updateModuleGraphInner(server: *Server) Allocator.Error!void {
     var graph_owned = true;
     defer if (graph_owned) ModuleGraph.Input.deinit(&graph_value, server.gpa);
     const dialect: za.syntax.Parse.Dialect = if (project_set.zigEnv(server)) |env| .of(env.version) else .latest;
-    var t = try targetAbi(server, graph);
-    t.dialect = dialect;
-    // Each compilation uses the target of its builtin (the root module's); when that is unknown,
-    // the parameters common to all compilations. The error limit is the compilation's own.
-    const targets = try server.gpa.alloc(za.sema.InternPool.Target, graph.compiles.len);
-    defer server.gpa.free(targets);
-    for (graph.compiles, targets) |c, *ct| {
-        ct.* = if (c.builtin) |file| try builtinTarget(server, file) else t;
-        ct.error_bits = za.sema.InternPool.errorBitsOf(c.error_limit);
-        ct.dialect = dialect;
-    }
+    var computed = try computeTargets(server, graph, dialect);
+    defer computed.deinit(server.gpa);
+    const t = computed.common;
+    const targets = computed.compiles;
     // Do not open a write transaction when neither the module graph nor the targets have changed:
     // every build that finishes gets here, and a write transaction cancels in-flight computations
     // and makes in-flight requests start over
@@ -812,6 +848,82 @@ test "updateModuleGraph takes no write transaction when nothing changed" {
     try project_set.setToolchain(&server, .{ .default_builtin = try server.gpa.dupe(u8, "/zig-analyzer-test/builtin.zig") });
     try updateModuleGraphInner(&server);
     try std.testing.expectEqual(writes + 1, server.db.writes.load(.monotonic));
+}
+
+test "computeTargets reads each builtin once per update and reads it again in the next" {
+    const text32 =
+        \\pub const abi: std.Target.Abi = .musl;
+        \\pub const cpu: std.Target.Cpu = .{
+        \\    .arch = .x86,
+        \\    .model = &std.Target.x86.cpu.i686,
+        \\    .features = std.Target.x86.featureSet(&.{
+        \\        .@"32bit_mode",
+        \\    }),
+        \\};
+        \\pub const os: std.Target.Os = .{
+        \\    .tag = .linux,
+        \\};
+    ;
+    const text64 =
+        \\pub const abi: std.Target.Abi = .gnu;
+        \\pub const cpu: std.Target.Cpu = .{
+        \\    .arch = .x86_64,
+        \\    .model = &std.Target.x86.cpu.x86_64,
+        \\    .features = std.Target.x86.featureSet(&.{
+        \\        .@"64bit",
+        \\    }),
+        \\};
+        \\pub const os: std.Target.Os = .{
+        \\    .tag = .linux,
+        \\};
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "builtin.zig", .data = text32 });
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "builtin.zig" });
+    defer std.testing.allocator.free(path);
+
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, std.testing.allocator, &writer);
+    defer server.deinit();
+    const builtin = try server.vfs.intern(path);
+    const modules = [_]ModuleGraph.Module{
+        .{ .root = null, .builtin = builtin, .imports = &.{} },
+        .{ .root = null, .builtin = builtin, .imports = &.{} },
+    };
+    const compiles = [_]ModuleGraph.Compile{
+        .{ .root = null, .builtin = builtin },
+        .{ .root = null, .builtin = builtin },
+        .{ .root = null, .builtin = builtin },
+    };
+    const graph: ModuleGraph = .{ .arena = .{}, .std_root = null, .modules = &modules, .compiles = &compiles, .files = &.{} };
+
+    var reads: std.atomic.Value(usize) = .init(0);
+    server.hooks.builtin_target_reads = &reads;
+    defer server.hooks.builtin_target_reads = null;
+    {
+        var targets = try computeTargets(&server, &graph, .latest);
+        defer targets.deinit(server.gpa);
+        // Three compilations, two modules and the common target all use the same builtin
+        try std.testing.expectEqual(1, reads.load(.monotonic));
+        try std.testing.expectEqual(@as(?u16, 32), targets.common.pointer_bits);
+        for (targets.compiles) |target| try std.testing.expectEqual(@as(?u16, 32), target.pointer_bits);
+    }
+    // An editable builtin (`zig.builtin_path`) is read again in the next update, not taken from
+    // the target recorded in `builtin_targets`
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "builtin.zig", .data = text64 });
+    {
+        var targets = try computeTargets(&server, &graph, .latest);
+        defer targets.deinit(server.gpa);
+        try std.testing.expectEqual(2, reads.load(.monotonic));
+        try std.testing.expectEqual(@as(?u16, 64), targets.common.pointer_bits);
+        for (targets.compiles) |target| try std.testing.expectEqual(@as(?u16, 64), target.pointer_bits);
+    }
 }
 
 test "scanOnce: a comparison canceled by an edit is made again instead of writing the same files" {

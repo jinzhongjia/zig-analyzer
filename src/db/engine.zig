@@ -234,9 +234,9 @@ const LruEntry = struct {
 /// them so that those are the entries with the smallest `tick`; all entries when their bytes do
 /// not reach it. Only the set is selected, not the order within it, so the caller evicts all of
 /// them: stopping at the first byte total that reaches `need` would make the set depend on that
-/// order. With unique ticks this is the set that evicting in ascending tick order would remove.
-/// Recency ties are resolved arbitrarily, unlike the stable sort of the sweep; which of equally
-/// recent memos is evicted does not change any result.
+/// order. Ticks are unique within a table, so this is the set that evicting in ascending tick
+/// order would remove. Recency ties are resolved arbitrarily, unlike the stable sort of the
+/// sweep; which of equally recent memos is evicted does not change any result.
 fn selectLru(entries: []LruEntry, need: usize) usize {
     var remaining = need;
     var lo: usize = 0;
@@ -367,8 +367,6 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         deep_verifications: std.atomic.Value(u64) = .init(0),
         /// See `Stats.writes`
         writes: std.atomic.Value(u64) = .init(0),
-        /// Counter for the last-use times of memos (LRU)
-        access_tick: std.atomic.Value(u64) = .init(0),
         /// Some query that declares `lru` is over capacity and waits for `sweep`
         sweep_wanted: std.atomic.Value(bool) = .init(false),
         /// Current capacities of the queries that declare `lru` (see `setLru`), indexed like
@@ -416,6 +414,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 live: usize = 0,
                 /// Bytes of the retained values (counted only for queries that declare `lru_bytes`)
                 live_bytes: usize = 0,
+                /// Counter for the last-use times of this table's memos (LRU), incremented under
+                /// `mutex`; `last_used` is compared only within one table
+                access_tick: u64 = 0,
                 /// A read transaction evicts only above this many bytes (see `claimReadEviction`)
                 read_eviction_floor: usize = 0,
 
@@ -844,15 +845,27 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             table.read_eviction_floor = readEvictionFloor(table.live_bytes, db.readEvictionLimit(Q));
         }
 
+        /// Releases the pins the read transaction holds on `deps`. The caller holds no table lock.
         fn unpin(db: *Db, deps: []const DepKey) void {
-            for (deps) |dep| inline for (queries, 0..) |Q, qi| {
-                if (comptime @hasDecl(Q, "lru_read_bytes")) if (dep.query == qi) {
-                    const table = &db.tables[qi];
+            inline for (queries, 0..) |Q, qi| {
+                if (comptime @hasDecl(Q, "lru_read_bytes")) unpinTable(db, qi, deps);
+            }
+        }
+
+        /// Releases all pins of `deps` in table `qi`, taking its lock once for all of them. Only one
+        /// table lock is held at a time.
+        fn unpinTable(db: *Db, comptime qi: usize, deps: []const DepKey) void {
+            const table = &db.tables[qi];
+            var locked = false;
+            defer if (locked) table.mutex.unlock(db.io);
+            for (deps) |dep| {
+                if (dep.query != qi) continue;
+                if (!locked) {
                     table.mutex.lockUncancelable(db.io);
-                    defer table.mutex.unlock(db.io);
-                    table.slots.items[dep.index].pins -= 1;
-                };
-            };
+                    locked = true;
+                }
+                table.slots.items[dep.index].pins -= 1;
+            }
         }
 
         /// ⌊n × 3/4⌋, without overflow when n is the maximum value (unlimited)
@@ -1488,7 +1501,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 defer table.mutex.unlock(db.io);
                 const memo = &(table.slots.items[index].memo orelse return null);
                 if (memo.verified_at != db.revision or memo.evicted) return null;
-                memo.last_used = db.access_tick.fetchAdd(1, .monotonic);
+                table.access_tick += 1;
+                memo.last_used = table.access_tick;
                 return .{ .value = memo.value, .changed_at = memo.changed_at, .durability = memo.durability };
             }
 
@@ -1946,13 +1960,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     if (@hasDecl(Q, "lru_bytes")) table.live_bytes += Q.bytes(value);
                 }
                 if (@hasDecl(Q, "lru") and db.overLru(Q, table)) db.sweep_wanted.store(true, .monotonic);
+                table.access_tick += 1;
                 slot.memo = .{
                     .value = value,
                     .verified_at = db.revision,
                     .changed_at = changed_at,
                     .durability = frame.durability,
                     .deps = deps,
-                    .last_used = db.access_tick.fetchAdd(1, .monotonic),
+                    .last_used = table.access_tick,
                 };
                 return .{ .value = value, .changed_at = changed_at, .durability = frame.durability, .executed = true };
             }
@@ -2009,8 +2024,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         /// The memo of a derived query as it is now, marked as used (LRU). The caller must hold
         /// the table's mutex.
         fn useMemoLocked(db: *Db, comptime Q: type, index: u32) ?Table(Q).Memo {
-            const memo = &(db.tables[comptime queryIndex(Q)].slots.items[index].memo orelse return null);
-            memo.last_used = db.access_tick.fetchAdd(1, .monotonic);
+            const table = &db.tables[comptime queryIndex(Q)];
+            const memo = &(table.slots.items[index].memo orelse return null);
+            table.access_tick += 1;
+            memo.last_used = table.access_tick;
             return memo.*;
         }
 

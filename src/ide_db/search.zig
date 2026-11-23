@@ -609,9 +609,21 @@ pub fn candidateFilesFor(r: *Resolver, file: FileId, scope: []const FileId) reso
 pub fn reachable(r: *Resolver, from: []const FileId) resolve.Error![]const FileId {
     var seen: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
     for (from) |f| try seen.put(r.arena, f, {});
+    // The request's import graph has the forward edges of every file in its scope and the files
+    // they reach; reuse them only under the compilation context the graph was built for, since
+    // import resolution depends on it. A file outside the graph (a target that is in no scope) is
+    // resolved here.
+    const graph: ?*const ImportGraph = blk: {
+        const cached = r.import_graph orelse break :blk null;
+        break :blk if (cached.context == r.context) &cached.graph else null;
+    };
     var i: usize = 0;
     while (i < seen.count()) : (i += 1) {
         const f = seen.keys()[i];
+        if (graph) |g| if (g.index.get(f)) |n| {
+            for (g.forward_edges[g.forward_starts[n]..g.forward_starts[n + 1]]) |to| try seen.put(r.arena, to, {});
+            continue;
+        };
         const index = try r.ctx.get(FileIndex.ImportStrings, f);
         // Every module the file belongs to may import a different file under a name
         for (index.imports) |s| for (try r.resolveImportTargets(f, s)) |to| try seen.put(r.arena, to, {});
@@ -625,82 +637,12 @@ pub fn reachable(r: *Resolver, from: []const FileId) resolve.Error![]const FileI
 /// files reachable from the files in scope are collected by following imports, and reverse edges
 /// are built over them; files outside the scope other than `target` are not in the result
 pub fn importers(r: *Resolver, target: FileId, scope: []const FileId) resolve.Error![]const FileId {
-    const graph = try ImportGraph.build(r.arena, r, scope);
-    return graph.importersOf(r.arena, target);
+    return (try r.importGraph(scope)).importersOf(r.arena, target);
 }
 
-/// Reverse `@import` edges over the files in a scope and the files they reach (see `importers`).
-/// Does not depend on the target, so the importers of every file in one scope can share it
-pub const ImportGraph = struct {
-    /// Files in scope first (indices below `scope_len`), followed by the reachable files outside
-    /// the scope
-    nodes: []const FileId,
-    scope_len: u32,
-    /// Importers of `nodes[i]`: `edges[edge_starts[i]..edge_starts[i + 1]]`, in the order the
-    /// imports were found
-    edge_starts: []const u32,
-    edges: []const FileId,
-    /// Index of each file in `nodes`
-    index: std.AutoHashMapUnmanaged(FileId, u32),
-
-    /// The graph is allocated with `a`; temporary data with `r.arena`
-    pub fn build(a: std.mem.Allocator, r: *Resolver, scope: []const FileId) resolve.Error!ImportGraph {
-        const temp = r.arena;
-        var nodes: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
-        for (scope) |f| try nodes.put(temp, f, {});
-        const scope_len: u32 = @intCast(nodes.count());
-        // Imported file → the files importing it
-        var reverse: std.AutoHashMapUnmanaged(FileId, std.ArrayList(FileId)) = .empty;
-        var n: usize = 0;
-        while (n < nodes.count()) : (n += 1) {
-            const f = nodes.keys()[n];
-            const file_index = try r.ctx.get(FileIndex.ImportStrings, f);
-            // Every module the file belongs to may import a different file under a name
-            for (file_index.imports) |s| for (try r.resolveImportTargets(f, s)) |to| {
-                const gop = try reverse.getOrPut(temp, to);
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-                try gop.value_ptr.append(temp, f);
-                try nodes.put(temp, to, {});
-            };
-        }
-        const keys = try a.dupe(FileId, nodes.keys());
-        const edge_starts = try a.alloc(u32, keys.len + 1);
-        var edge_count: usize = 0;
-        var it = reverse.valueIterator();
-        while (it.next()) |from| edge_count += from.items.len;
-        var edges: std.ArrayList(FileId) = try .initCapacity(a, edge_count);
-        var index: std.AutoHashMapUnmanaged(FileId, u32) = .empty;
-        try index.ensureTotalCapacity(a, @intCast(keys.len));
-        for (keys, 0..) |f, i| {
-            edge_starts[i] = @intCast(edges.items.len);
-            if (reverse.get(f)) |from| edges.appendSliceAssumeCapacity(from.items);
-            index.putAssumeCapacity(f, @intCast(i));
-        }
-        edge_starts[keys.len] = @intCast(edges.items.len);
-        return .{ .nodes = keys, .scope_len = scope_len, .edge_starts = edge_starts, .edges = edges.items, .index = index };
-    }
-
-    /// See `importers`
-    pub fn importersOf(g: *const ImportGraph, a: std.mem.Allocator, target: FileId) std.mem.Allocator.Error![]const FileId {
-        var seen: std.AutoArrayHashMapUnmanaged(FileId, void) = .empty;
-        try seen.put(a, target, {});
-        var i: usize = 0;
-        while (i < seen.count()) : (i += 1) {
-            const n = g.index.get(seen.keys()[i]) orelse continue;
-            for (g.edges[g.edge_starts[n]..g.edge_starts[n + 1]]) |x| try seen.put(a, x, {});
-        }
-        var out: std.ArrayList(FileId) = .empty;
-        for (seen.keys()) |f| {
-            if (f == target or g.index.get(f).? < g.scope_len) try out.append(a, f);
-        }
-        return out.items;
-    }
-
-    pub fn eql(a: *const ImportGraph, b: *const ImportGraph) bool {
-        return a.scope_len == b.scope_len and std.mem.eql(FileId, a.nodes, b.nodes) and
-            std.mem.eql(u32, a.edge_starts, b.edge_starts) and std.mem.eql(FileId, a.edges, b.edges);
-    }
-};
+/// Reverse and forward `@import` edges over the files in a scope (see `importers` and
+/// `reachable`)
+pub const ImportGraph = resolve.ImportGraph;
 
 /// Whether `from` can reach `target` through an `@import` chain (through any files)
 pub fn reaches(r: *Resolver, from: FileId, target: FileId) resolve.Error!bool {
@@ -806,6 +748,9 @@ const Finder = struct {
     /// Checks member `item` in file `file`
     fn item(f: *Finder, file: FileId, item_index: u32) resolve.Error!void {
         const r = f.r;
+        // The name in a decltest `test helper` is an identifier token of the member node, so the
+        // Bloom filter covers it even though it is not in the Body
+        if (!try r.mayMention(file, item_index, f.name)) return;
         // The name of a decltest is not in the Body: the identifier in `test helper` is a
         // reference to helper
         if (try r.itemNode(file, item_index)) |node| if (node.kind() == .test_decl) if (node.childToken(.identifier)) |t| {
@@ -816,7 +761,6 @@ const Finder = struct {
                 };
             }
         };
-        if (!try r.mayMention(file, item_index, f.name)) return;
         const body = try r.body(file, item_index);
         if (!mentions(body, f.name)) return;
         // In a file that does not import the file containing the definition, code outside generic

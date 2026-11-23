@@ -554,6 +554,38 @@ test "decltest identifier is a reference to the declaration" {
     try testing.expectEqual(3, refs.len);
 }
 
+// The candidate filter must keep the name of a decltest whose body never mentions it: the
+// identifier is not in the Body, only in the member node.
+test "decltest name is a reference when the body does not mention it" {
+    const text =
+        \\fn helper(x: u32) u32 {
+        \\    return x + 1;
+        \\}
+        \\test helper {
+        \\    _ = 1;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+
+    const test_name: u32 = @intCast(std.mem.indexOf(u8, text, "test helper").? + "test ".len);
+    const fn_name: u32 = @intCast(std.mem.indexOf(u8, text, "fn helper").? + "fn ".len);
+    const def = (try definition.defAt(&r, file, fn_name)) orelse return error.NoDefinition;
+    const refs = try search.findReferences(&r, def, .{ .scope = &.{file} });
+    var saw_test = false;
+    for (refs) |ref| {
+        if (ref.start == test_name) saw_test = true;
+    }
+    try testing.expect(saw_test);
+    try testing.expectEqual(2, refs.len);
+}
+
 test "definition of bare primitive names skips escaped declarations" {
     const text =
         \\pub fn escaped(@"u32": u32) u32 {

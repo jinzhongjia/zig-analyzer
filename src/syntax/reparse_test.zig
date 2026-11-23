@@ -210,6 +210,36 @@ test "deep nesting: edits in the innermost block reparse locally" {
     try expectConsistent(old, edited);
 }
 
+test "an edit inside a block is parsed in full once the chain is over the limit" {
+    // Memory reclamation past the chain limit does not depend on where the edit lies
+    const a = testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    try text.appendSlice(a, "fn f() void {\n    g();\n}\n");
+    const at = std.mem.indexOf(u8, text.items, "g();").?;
+    var chain = try Parse.create(a, text.items, .zig);
+    defer chain.destroy();
+    var exceeded = false;
+    for (0..64) |_| {
+        try text.insert(a, at, ' ');
+        const inc = try Parse.reparseBlock(a, chain, text.items) orelse {
+            try testing.expect(chain.chain_bytes > 2 * chain.full_bytes);
+            exceeded = true;
+            break;
+        };
+        chain.destroy();
+        chain = inc;
+    }
+    try testing.expect(exceeded);
+    // The edit that the block reparse declined is parsed in full, as any other fallback
+    const full = try Parse.create(a, text.items, .zig);
+    defer full.destroy();
+    const inc = try Parse.reparse(a, chain, text.items);
+    defer inc.destroy();
+    try testing.expect(inc.base == null);
+    try testing.expect(inc.sameAs(full));
+}
+
 test "zon files keep the zon mode and are always parsed in full" {
     const old_text = ".{\n    .a = .{\n        .b = 1,\n    },\n}\n";
     const old = try Parse.create(testing.allocator, old_text, .zon);
