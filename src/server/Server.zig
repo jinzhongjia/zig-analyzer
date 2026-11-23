@@ -922,7 +922,7 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
             defer ctx.end();
             server.testGate(method, .in_read, pending);
             var trace: za.db.Trace = .{ .gpa = a };
-            ctx.trace = &trace;
+            if (slow_log.traceEnabled(server)) ctx.trace = &trace;
             var pc: panic_context.Text = .{};
             requestContext(&pc, method, params);
             defer pc.leave();
@@ -993,7 +993,7 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             };
             server.testGate(method, .in_read, pending);
             var trace: za.db.Trace = .{ .gpa = a };
-            ctx.trace = &trace;
+            if (slow_log.traceEnabled(server)) ctx.trace = &trace;
             var pc: panic_context.Text = .{};
             requestContext(&pc, method, params);
             defer pc.leave();
