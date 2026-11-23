@@ -17,6 +17,7 @@ const ZigEnv = za.project.ZigEnv;
 const Workspace = @import("Workspace.zig");
 const Config = @import("../Config.zig");
 const watch = @import("watch.zig");
+const origin = @import("origin.zig");
 
 const Server = @import("Server.zig");
 const config_sync = @import("config_sync.zig");
@@ -471,7 +472,13 @@ pub const FileContext = enum {
 
 pub fn fileContext(server: *Server, file: Vfs.FileId) FileContext {
     const in_project = server.inProject(file);
-    switch (server.originOf(file, in_project)) {
+    return fileContextWithOrigin(server, file, server.originOf(file, in_project), in_project);
+}
+
+/// `fileContext` with the origin of the file and whether some project contains it already
+/// classified (as `Server.fileOrigin` does), so that one computation can serve several checks
+pub fn fileContextWithOrigin(server: *Server, file: Vfs.FileId, file_origin: origin.Origin, in_project: bool) FileContext {
+    switch (file_origin) {
         .virtual => return .none,
         .zig_lib, .generated, .package => return .library,
         .user, .outside, .other => {},

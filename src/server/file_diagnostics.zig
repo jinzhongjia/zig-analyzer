@@ -19,6 +19,7 @@ const live = database.live;
 const ide = za.ide;
 const compiler = za.diagnostics.compiler;
 const Workspace = @import("Workspace.zig");
+const origin = @import("origin.zig");
 const dependency_packages = za.project.packages;
 const Resolver = za.names.resolve.Resolver;
 const Config = @import("../Config.zig");
@@ -61,13 +62,42 @@ const OtherFiles = struct {
     }
 };
 
+/// The state one diagnostic publish reads from the projects: classifying the origin and finding
+/// the innermost workspace both take the workspace locks, so they are computed once and shared by
+/// the compiler result and the analyzer-owned checks
+const PublishContext = struct {
+    origin: origin.Origin,
+    file_context: project_set.FileContext,
+    hints_eligible: bool,
+    /// The innermost workspace containing the file (see `Server.innermostWorkspace`), with a
+    /// reference held; null when no workspace contains it or when hints are not eligible
+    workspace: ?*Workspace = null,
+
+    fn init(server: *Server, file: Vfs.FileId, text: ?[]const u8) PublishContext {
+        const in_project = server.inProject(file);
+        const file_origin = server.originOf(file, in_project);
+        var self: PublishContext = .{
+            .origin = file_origin,
+            .file_context = project_set.fileContextWithOrigin(server, file, file_origin, in_project),
+            .hints_eligible = false,
+        };
+        if (text) |t| self.hints_eligible = hintsEligibleFor(server, file, file_origin, t);
+        if (self.hints_eligible) self.workspace = server.innermostWorkspace(server.vfs.path(file));
+        return self;
+    }
+
+    fn deinit(self: *PublishContext) void {
+        if (self.workspace) |ws| ws.release();
+    }
+};
+
 /// Compiler diagnostics of `file`: the results of the latest build of each project
 /// that contains it; whether single-file compile results are used depends on the
 /// file's context (see `FileContext.usesSingle`). Multiple results are merged with
 /// `compiler.combine`, taking the text read by the newest compile as authoritative.
 /// A reference to each result is taken under its lock and recorded in `other`; no lock is held
 /// while merging.
-fn compilerResult(server: *Server, arena: Allocator, file: Vfs.FileId, other: *OtherFiles) Allocator.Error!?*const compiler.FileResult {
+fn compilerResult(server: *Server, arena: Allocator, file: Vfs.FileId, file_context: project_set.FileContext, other: *OtherFiles) Allocator.Error!?*const compiler.FileResult {
     const Found = struct {
         generation: u64,
         result: *const compiler.FileResult,
@@ -91,7 +121,7 @@ fn compilerResult(server: *Server, arena: Allocator, file: Vfs.FileId, other: *O
             try found.append(arena, .{ .generation = ws.result_generation, .result = try other.use(arena, fr, build) });
         }
     }
-    if (project_set.fileContext(server, file).usesSingle()) {
+    if (file_context.usesSingle()) {
         server.single.mutex.lockUncancelable(server.io);
         defer server.single.mutex.unlock(server.io);
         for (server.single.entries.values()) |*sf| if (sf.files.get(file)) |fr| {
@@ -118,6 +148,8 @@ fn compilerResult(server: *Server, arena: Allocator, file: Vfs.FileId, other: *O
 pub fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) !types.PublishDiagnosticsParams {
     const document_uri = try server.uriFor(arena, file);
     const text = try ctx.get(FileText, file);
+    var publish = PublishContext.init(server, file, text);
+    defer publish.deinit();
 
     // Live diagnostics: the file is loaded, and it belongs to no project or one of its projects
     // wants them (see `Workspace.liveEligible`)
@@ -130,7 +162,7 @@ pub fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file:
     // reported by the project or root file that compiles it
     var other: OtherFiles = .{ .server = server, .ctx = ctx };
     defer other.release();
-    const fr = try compilerResult(server, arena, file, &other);
+    const fr = try compilerResult(server, arena, file, publish.file_context, &other);
     const current = text orelse if (fr) |r| r.base_text else "";
     // With `FileText`, the `SourceText` is that text, whose line table is cached
     const lines = if (text != null) try Server.sourceLines(ctx, file) else try offsets.LineIndex.init(arena, current);
@@ -147,17 +179,19 @@ pub fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file:
     if (text != null) if (wantsInactiveCode(server, file)) {
         diags = try appendInactiveCode(server, ctx, arena, file, lines, diags);
     };
-    if (text) |t| if (try namingFor(server, arena, file, t)) |settings| {
-        diags = try appendNaming(server, ctx, arena, file, lines, settings, diags);
-    };
-    if (text) |t| if (unusedFor(server, file, t)) {
-        diags = try appendUnused(server, ctx, arena, file, lines, diags);
-    };
-    if (text) |t| if (lintFor(server, file, t)) |rules| {
-        diags = try appendLint(server, ctx, arena, file, lines, rules, diags);
-    };
-    if (text != null) diags = try appendUnloadedProjectHint(server, arena, file, lines, diags);
-    if (text != null) diags = try appendUnfetchedDependencies(server, ctx, arena, file, lines, diags);
+    if (publish.hints_eligible) {
+        if (try namingForFile(server, arena, server.vfs.path(file), publish.workspace)) |settings| {
+            diags = try appendNaming(server, ctx, arena, file, lines, settings, diags);
+        }
+        if (unusedForFile(server, publish.workspace)) {
+            diags = try appendUnused(server, ctx, arena, file, lines, diags);
+        }
+        if (lintForFile(server, publish.workspace)) |rules| {
+            diags = try appendLint(server, ctx, arena, file, lines, rules, diags);
+        }
+    }
+    if (text != null) diags = try appendUnloadedProjectHint(server, arena, file, publish.file_context, lines, diags);
+    if (text != null) diags = try appendUnfetchedDependencies(server, ctx, arena, file, publish.origin, lines, diags);
     if (text != null) if (is_zon and std.mem.eql(u8, std.fs.path.basename(server.vfs.path(file)), Config.project_file)) {
         diags = try appendProjectConfigProblems(server, arena, lines, diags);
     };
@@ -274,10 +308,10 @@ fn appendProjectConfigProblems(server: *Server, arena: Allocator, lines: offsets
 /// belong to no crate, it is a Hint marking only the first few characters of the file. No hint
 /// before startup finishes or while projects are loading for the first time: the file may later
 /// show up in a project's module graph (modules added by path).
-fn appendUnloadedProjectHint(server: *Server, arena: Allocator, file: Vfs.FileId, lines: offsets.LineIndex, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+fn appendUnloadedProjectHint(server: *Server, arena: Allocator, file: Vfs.FileId, file_context: project_set.FileContext, lines: offsets.LineIndex, diags: []const types.Diagnostic) ![]const types.Diagnostic {
     const path = server.vfs.path(file);
     if (!file_changes.isOpen(server, path) or !server.startup_done.load(.acquire) or project_set.projectsLoading(server)) return diags;
-    if (project_set.fileContext(server, file) != .unloaded_project) return diags;
+    if (file_context != .unloaded_project) return diags;
     const sub_project = try project_set.subProjectOf(server, arena, path);
     const dir = sub_project orelse project_set.projectDirOf(server, path) orelse return diags;
     const text = lines.text;
@@ -316,10 +350,16 @@ pub const UnfetchedImport = struct {
 /// The `@import`s in a build.zig of the dependencies its build.zig.zon gives by `.hash` that are
 /// not fetched (see `Workspace.unfetchedDependencies`)
 pub fn unfetchedImports(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) ![]const UnfetchedImport {
+    if (!std.mem.eql(u8, std.fs.path.basename(server.vfs.path(file)), "build.zig")) return &.{};
+    return unfetchedImportsWithOrigin(server, ctx, arena, file, server.fileOrigin(file));
+}
+
+/// `unfetchedImports` with the origin of the file already classified
+fn unfetchedImportsWithOrigin(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, file_origin: origin.Origin) ![]const UnfetchedImport {
     const path = server.vfs.path(file);
     if (!std.mem.eql(u8, std.fs.path.basename(path), "build.zig")) return &.{};
     // A fetched package is not edited and its dependencies are fetched through the project
-    if (server.fileOrigin(file) != .user) return &.{};
+    if (file_origin != .user) return &.{};
     const dir = std.fs.path.dirname(path) orelse return &.{};
     var deps: []const dependency_packages.Unfetched = &.{};
     var root: []const u8 = "";
@@ -347,8 +387,8 @@ pub fn unfetchedImports(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: V
 
 /// A warning on each `@import` in build.zig of a dependency that is not fetched: the import does
 /// not resolve, and the configure fails, until it is fetched
-fn appendUnfetchedDependencies(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, lines: offsets.LineIndex, diags: []const types.Diagnostic) ![]const types.Diagnostic {
-    const found = try unfetchedImports(server, ctx, arena, file);
+fn appendUnfetchedDependencies(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId, file_origin: origin.Origin, lines: offsets.LineIndex, diags: []const types.Diagnostic) ![]const types.Diagnostic {
+    const found = try unfetchedImportsWithOrigin(server, ctx, arena, file, file_origin);
     if (found.len == 0) return diags;
     var out: std.ArrayList(types.Diagnostic) = .empty;
     try out.appendSlice(arena, diags);
@@ -435,6 +475,14 @@ const NamingSettings = struct {
 pub fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []const u8) Allocator.Error!?NamingSettings {
     if (!hintsEligible(server, file, text)) return null;
     const path = server.vfs.path(file);
+    const workspace = server.innermostWorkspace(path);
+    defer if (workspace) |ws| ws.release();
+    return namingForFile(server, arena, path, workspace);
+}
+
+/// `namingFor` for a file whose hints eligibility and innermost workspace are already known; the
+/// workspace must have a reference held
+fn namingForFile(server: *Server, arena: Allocator, path: []const u8, workspace: ?*Workspace) Allocator.Error!?NamingSettings {
     const config = server.config.load(.acquire);
     var enable = config.naming_enable;
     var ignore = config.naming_ignore;
@@ -443,8 +491,6 @@ pub fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []co
     // `naming.exclude` paths are relative to the workspace root directory, or to the project root
     // directory when they come from `zig-analyzer.zon`
     var base = try server.rootOf(arena, path);
-    const workspace = server.innermostWorkspace(path);
-    defer if (workspace) |ws| ws.release();
     if (workspace) |ws| if (ws.project) |*p| {
         if (p.isSet("naming_enable")) enable = p.naming_enable;
         if (p.isSet("naming_ignore")) ignore = try Server.dupeStrings(arena, p.naming_ignore);
@@ -471,12 +517,17 @@ pub fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []co
 /// Whether the file gets analyzer-owned hints: open user code (or a file outside the workspace),
 /// not generated
 fn hintsEligible(server: *Server, file: Vfs.FileId, text: []const u8) bool {
+    return hintsEligibleFor(server, file, server.fileOrigin(file), text);
+}
+
+/// `hintsEligible` with the origin of the file already classified
+fn hintsEligibleFor(server: *Server, file: Vfs.FileId, file_origin: origin.Origin, text: []const u8) bool {
     {
         server.docs.mutex.lockUncancelable(server.io);
         defer server.docs.mutex.unlock(server.io);
         if (!server.docs.open.contains(file)) return false;
     }
-    switch (server.fileOrigin(file)) {
+    switch (file_origin) {
         .virtual, .user, .outside => {},
         .zig_lib, .generated, .package, .other => return false,
     }
@@ -485,11 +536,8 @@ fn hintsEligible(server: *Server, file: Vfs.FileId, text: []const u8) bool {
 
 /// Whether the file gets unused-declaration hints: the setting from the client or the project of
 /// the file, for open user code that is not generated
-fn unusedFor(server: *Server, file: Vfs.FileId, text: []const u8) bool {
-    if (!hintsEligible(server, file, text)) return false;
+fn unusedForFile(server: *Server, workspace: ?*Workspace) bool {
     var enable = server.config.load(.acquire).unused_enable;
-    const workspace = server.innermostWorkspace(server.vfs.path(file));
-    defer if (workspace) |ws| ws.release();
     if (workspace) |ws| if (ws.project) |*p| {
         if (p.isSet("unused_enable")) enable = p.unused_enable;
     };
@@ -500,11 +548,17 @@ fn unusedFor(server: *Server, file: Vfs.FileId, text: []const u8) bool {
 /// or the project of the file, for open user code that is not generated
 pub fn lintFor(server: *Server, file: Vfs.FileId, text: []const u8) ?Config.LintRules {
     if (!hintsEligible(server, file, text)) return null;
+    const workspace = server.innermostWorkspace(server.vfs.path(file));
+    defer if (workspace) |ws| ws.release();
+    return lintForFile(server, workspace);
+}
+
+/// `lintFor` for a file whose hints eligibility and innermost workspace are already known; the
+/// workspace must have a reference held
+fn lintForFile(server: *Server, workspace: ?*Workspace) ?Config.LintRules {
     const config = server.config.load(.acquire);
     var enable = config.lint_enable;
     var rules = config.lint_rules;
-    const workspace = server.innermostWorkspace(server.vfs.path(file));
-    defer if (workspace) |ws| ws.release();
     if (workspace) |ws| if (ws.project) |*p| {
         if (p.isSet("lint_enable")) enable = p.lint_enable;
         if (p.isSet("lint_rules")) rules = p.lint_rules;

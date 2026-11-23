@@ -226,6 +226,41 @@ test "lint hints are opt-in, follow the rules setting, and redundant casts have 
     try h.notify("exit", {});
 }
 
+test "project file: unused and lint hints can be on while the client settings are off" {
+    const text =
+        \\const unused_const = 1;
+        \\pub fn f(x: u8) bool {
+        \\    _ = @as(u8, x);
+        \\    return x < 256;
+        \\}
+        \\
+    ;
+    var project = try fixture.Project.create(&.{
+        .{ .path = "build.zig", .text = fixture.basic[0].text },
+        .{ .path = "src/lib.zig", .text = "pub fn hello() void {}\n" },
+        .{ .path = "src/main.zig", .text = text },
+        .{ .path = "zig-analyzer.zon", .text =
+        \\.{ .unused = .{ .enable = true }, .lint = .{ .enable = true } }
+        },
+    });
+    defer project.deinit();
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    try initialize(&project, &h, "{\"diagnostics\": {\"compiler\": false}}");
+    const before_open = try publishCount(&h, "main.zig");
+    _ = try open(&h, &project, "src/main.zig", text);
+    try waitPublish(&h, "main.zig", before_open);
+    try testing.expectEqualStrings(
+        \\0:6 unused.declaration declaration `unused_const` is never used
+        \\2:8 lint.redundant_cast `@as` has no effect: the operand already has type `u8`
+        \\3:11 lint.constant_comparison comparison is always true: no value of type `u8` gives another result
+        \\
+    , try hints(&h, "main.zig"));
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "inactive code is a hint with a code, and can be suppressed" {
     const text =
         \\const linux_only = true;
