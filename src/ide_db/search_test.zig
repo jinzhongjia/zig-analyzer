@@ -680,6 +680,11 @@ test "a declaration without pub is searched only in its own file" {
     for (list) |ref| try testing.expectEqual(lib_file, ref.file);
     // The import closure is not built: only the declaration's file is searched
     try testing.expectEqual(null, r.import_graph);
+    // Document highlight (the `only_file` path) searches the file it was given, whatever the
+    // visibility: with another file it does not fall back to the declaration's file
+    try testing.expectEqual(0, (try search.findReferences(&r, def, .{ .scope = &.{}, .only_file = main_file })).len);
+    const own = try search.findReferences(&r, def, .{ .scope = &.{}, .only_file = lib_file });
+    try testing.expectEqualStrings("lib:1:secret* lib:3:secret", try referencesText(&w, &ctx, own));
 }
 
 test "references in generic code of files that do not import the definition" {
