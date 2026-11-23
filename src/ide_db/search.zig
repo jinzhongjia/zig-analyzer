@@ -806,6 +806,9 @@ const Finder = struct {
     /// Checks member `item` in file `file`
     fn item(f: *Finder, file: FileId, item_index: u32) resolve.Error!void {
         const r = f.r;
+        // The name in a decltest `test helper` is an identifier token of the member node, so the
+        // Bloom filter covers it even though it is not in the Body
+        if (!try r.mayMention(file, item_index, f.name)) return;
         // The name of a decltest is not in the Body: the identifier in `test helper` is a
         // reference to helper
         if (try r.itemNode(file, item_index)) |node| if (node.kind() == .test_decl) if (node.childToken(.identifier)) |t| {
@@ -816,7 +819,6 @@ const Finder = struct {
                 };
             }
         };
-        if (!try r.mayMention(file, item_index, f.name)) return;
         const body = try r.body(file, item_index);
         if (!mentions(body, f.name)) return;
         // In a file that does not import the file containing the definition, code outside generic
