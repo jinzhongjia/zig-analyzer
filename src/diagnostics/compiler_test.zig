@@ -334,10 +334,60 @@ test "diffs: a text pair is diffed once and its result is reused" {
     try testing.expectEqual(0, (try diffs.get(path, new, new)).len);
     // Another pair of the same file is diffed on its own
     try testing.expect(edits.ptr != (try diffs.get(path, new, old)).ptr);
+    // So is the same old text with another new text
+    const other_new = "// other\n" ++ old;
+    const other_edits = try diffs.get(path, old, other_new);
+    try testing.expect(edits.ptr != other_edits.ptr);
+    try testing.expect(other_edits.len != 0);
     // The path is only a key: the same texts of another path are diffed again, with the same result
     const other_path = try diffs.get(native("/proj/src/third.zig"), old, new);
     try testing.expect(edits.ptr != other_path.ptr);
     try testing.expectEqualSlices(line_diff.Edit, edits, other_path);
+}
+
+test "merge: a note whose base text came from an older build is not shifted by the seeded diff" {
+    // The published file's build read `base`, and the buffer is `text`; a note of that error points
+    // into the file with the text `old_base` of an older build, so it needs the diff
+    // old_base -> text, not the diff of the file itself (base -> text)
+    const base = "fn f() void {\n    g();\n}\n";
+    const old_base = "// o\n" ++ base;
+    const text = "// a\n// b\n" ++ base;
+    const err = spanOf(base, "g()", 0);
+    const note = spanOf(old_base, "g()", 0);
+    const result: compiler.FileResult = .{ .base_text = base, .items = &.{.{
+        .start = err[0],
+        .end = err[1],
+        .message = "error",
+        .is_astgen = false,
+        .notes = &.{.{ .path = native("/proj/src/main.zig"), .start = note[0], .end = note[1], .message = "note", .base_text = old_base }},
+    }} };
+    const Ctx = struct {
+        fn get(_: *anyopaque, _: Allocator, path: []const u8) ?compiler.OtherFile {
+            if (!std.mem.endsWith(u8, path, "main.zig")) return null;
+            return .{ .uri = "file:///proj/src/main.zig", .text = text };
+        }
+    };
+    var ctx: u8 = 0;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diags = try compiler.merge(a, .{
+        .path = native("/proj/src/main.zig"),
+        .text = text,
+        .lines = try offsets.LineIndex.init(a, text),
+        .encoding = .utf8,
+        .uri = "file:///proj/src/main.zig",
+        .live = null,
+        .compiler = &result,
+        .other_file = Ctx.get,
+        .other_ctx = &ctx,
+    });
+    try testing.expectEqual(1, diags.len);
+    const range = diags[0].relatedInformation.?[0].location.range;
+    // Guards against shifting the note with the diff of the published file's text, which moves it
+    // onto the closing brace
+    try testing.expectEqual(3, range.start.line);
+    try testing.expectEqual(4, range.start.character);
 }
 
 /// Span of the `n`th (from 0) occurrence of `needle` in `text`
