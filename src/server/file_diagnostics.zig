@@ -40,7 +40,7 @@ const OtherFiles = struct {
     fn get(opaque_ctx: *anyopaque, arena: Allocator, path: []const u8) ?compiler.OtherFile {
         const self: *OtherFiles = @ptrCast(@alignCast(opaque_ctx));
         const file = self.server.vfs.lookup(path) catch return null;
-        const loaded: ?[]const u8 = if (file) |f| (self.ctx.get(FileText, f) catch null) orelse null else null;
+        const loaded: ?[]const u8 = if (file) |f| if (self.ctx.get(FileText, f) catch null) |t| t.bytes() else null else null;
         const text = loaded orelse Io.Dir.cwd().readFileAlloc(self.server.io, path, arena, .limited(Vfs.max_file_size)) catch return null;
         const u = if (file) |f| self.server.uriFor(arena, f) catch return null else uri.fromPath(arena, path) catch return null;
         // With `FileText`, the `SourceText` is that text, whose line table is cached
@@ -147,7 +147,7 @@ fn compilerResult(server: *Server, arena: Allocator, file: Vfs.FileId, file_cont
 
 pub fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file: Vfs.FileId) !types.PublishDiagnosticsParams {
     const document_uri = try server.uriFor(arena, file);
-    const text = try ctx.get(FileText, file);
+    const text = if (try ctx.get(FileText, file)) |t| t.bytes() else null;
     var publish = PublishContext.init(server, file, text);
     defer publish.deinit();
 

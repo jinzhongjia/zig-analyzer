@@ -2,7 +2,9 @@ const std = @import("std");
 const testing = std.testing;
 const engine = @import("../db/engine.zig");
 const Vfs = @import("../base/Vfs.zig");
-const FileText = @import("../base/inputs.zig").FileText;
+const inputs = @import("../base/inputs.zig");
+const FileText = inputs.FileText;
+const Text = inputs.Text;
 const q = @import("queries.zig");
 
 /// Downstream query depending on ItemTree: counts the members
@@ -30,7 +32,7 @@ const Db = engine.Engine(void, &.{ FileText, q.SyntaxDialect, q.SourceText, q.Pa
 fn setText(db: *Db, file: Vfs.FileId, text: []const u8) !void {
     db.beginWrite();
     defer db.endWrite();
-    try db.set(FileText, file, try testing.allocator.dupe(u8, text), .low);
+    try db.set(FileText, file, try Text.init(testing.allocator, text), .low);
 }
 
 fn count(db: *Db, file: Vfs.FileId) !usize {
@@ -72,6 +74,38 @@ test "ParseFile bytes include the incremental chain" {
     try testing.expect(inc.base != null);
     try testing.expect(inc.chain_bytes > inc.arena.queryCapacity());
     try testing.expectEqual(@sizeOf(Parse) + inc.chain_bytes + inc.source.len + 1, q.ParseFile.bytes(inc));
+}
+
+test "parse results share the text buffer of FileText" {
+    const Parse = @import("Parse.zig");
+    var db: Db = .init(testing.io, testing.allocator, {});
+    defer db.deinit();
+    const file: Vfs.FileId = @fromBackingInt(@intCast(0));
+    try setText(&db, file, "const a = 1;\n");
+    var kept: *Parse = undefined;
+    {
+        var ctx = db.beginRead(testing.allocator);
+        defer ctx.end();
+        const text = (try ctx.get(FileText, file)).?;
+        const parse = try ctx.get(q.ParseFile, file);
+        // The parse reads the buffer of the input instead of a copy of its own
+        try testing.expectEqual(text.source().ptr, parse.source.ptr);
+        try testing.expectEqual(text.len + 1, q.ParseFile.bytes(parse) - @sizeOf(Parse) - parse.chain_bytes);
+        kept = parse.retain();
+    }
+    // The text is replaced; the retained parse keeps the buffer of its revision alive
+    try setText(&db, file, "const b = 2;\n");
+    try testing.expectEqualStrings("const a = 1;\n", kept.source);
+    {
+        var ctx = db.beginRead(testing.allocator);
+        defer ctx.end();
+        const text = (try ctx.get(FileText, file)).?;
+        const parse = try ctx.get(q.ParseFile, file);
+        // The incremental result of the new revision shares the new buffer
+        try testing.expectEqual(text.source().ptr, parse.source.ptr);
+        try testing.expect(parse.base != null);
+    }
+    kept.destroy();
 }
 
 test "changing the dialect parses files again by its rules" {

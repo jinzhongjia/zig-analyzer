@@ -326,3 +326,50 @@ test "incremental reparse keeps the summary bits of a full parse" {
         try testing.expectEqual(edit.tail_reused, last_old.ptr == last_new.ptr);
     }
 }
+
+test "parses that share the file text buffer give the same results" {
+    const Text = @import("../util/Text.zig");
+    const a = testing.allocator;
+    const old_text = "const a = 1;\nfn f() void {\n    g();\n}\nconst b = 2;\n";
+    const new_text = "const a = 1;\nfn f() void {\n    g(1, 2);\n}\nconst b = 2;\n";
+    const old = try Parse.create(a, old_text, .zig);
+    defer old.destroy();
+    const full = try Parse.create(a, new_text, .zig);
+    defer full.destroy();
+    const buffer: *Text = try .init(a, new_text);
+    defer buffer.release(a);
+
+    // A full parse keeps the buffer of the input and reads it from there
+    const shared = try Parse.createInShared(a, buffer, .zig, .latest);
+    defer shared.destroy();
+    try testing.expect(shared.sameAs(full));
+    try testing.expectEqual(buffer.source().ptr, shared.source.ptr);
+
+    // An incremental result shares the buffer of the new text and gets the same tree
+    const inc = try Parse.reparseShared(a, old, buffer);
+    defer inc.destroy();
+    try testing.expect(inc.base != null);
+    try testing.expect(inc.sameAs(full));
+    try testing.expectEqual(buffer.source().ptr, inc.source.ptr);
+    try testing.expectEqualStrings(new_text, inc.source);
+}
+
+test "the reported bytes of a chain include the text buffers it keeps alive" {
+    const Text = @import("../util/Text.zig");
+    const a = testing.allocator;
+    const old_text = "const a = 1;\nfn f() void {\n    g();\n}\nconst b = 2;\n";
+    const new_text = "const a = 1;\nfn f() void {\n    g(1, 2);\n}\nconst b = 2;\n";
+    const first: *Text = try .init(a, old_text);
+    const base = try Parse.createInShared(a, first, .zig, .latest);
+    defer base.destroy();
+    first.release(a);
+    const second: *Text = try .init(a, new_text);
+    const inc = try Parse.reparseShared(a, base, second);
+    defer inc.destroy();
+    second.release(a);
+
+    // The chain keeps both buffers: the head's own source and the buffer of the full parse at the
+    // base, which lives until its arena is destroyed
+    try testing.expect(inc.base != null);
+    try testing.expectEqual(@sizeOf(Parse) + inc.chain_bytes + inc.source.len + 1 + base.source.len + 1, inc.bytes());
+}

@@ -206,7 +206,7 @@ pub const AstCheck = struct {
     pub const Value = *Result;
 
     pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
-        const text = try ctx.get(inputs.FileText, file) orelse "";
+        const text = if (try ctx.get(inputs.FileText, file)) |t| t.bytes() else "";
         const vfs: *Vfs = ctx.db.env.vfs;
         const mode = modeOf(vfs.path(file));
         const backend = try ctx.get(LiveBackend, {});
