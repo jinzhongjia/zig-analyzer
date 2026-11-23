@@ -1188,8 +1188,9 @@ fn FormattingTask(comptime func: anytype, comptime method: []const u8) type {
                     } else if (server.db.markChanged(pending.since)) {
                         response = server.errorResponseBytes(pending.id, jsonrpc.error_codes.content_modified, "content modified");
                     } else if (server.db.pendingInputWrite(pending.since.inputs)) {
-                        // The final `ctx.checkCanceled` saw pending writes of any order and retried;
-                        // an unordered write can have started after the read transaction ended
+                        // A write of any order waiting for the lock would have made the
+                        // in-transaction check retry; formatting runs after the transaction, so it
+                        // is checked here before answering with the copied renderer or dialect
                         if (server.isShuttingDown()) {
                             response = server.errorResponseBytes(pending.id, jsonrpc.error_codes.content_modified, "content modified");
                         } else {
