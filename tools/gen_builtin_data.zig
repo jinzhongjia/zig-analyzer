@@ -9,6 +9,9 @@ const Metadata = official.Metadata;
 const checkHash = official.checkHash;
 const validateMetadata = official.validateMetadata;
 const documented_count = 124;
+/// The version of the 0.17.0 dialect. Its builtin documentation is the pinned text with its own
+/// version in the links and notes.
+const old_version = "0.17.0";
 const compiler_only = [_][]const u8{ "@Frame", "@frame", "@disableInstrumentation", "@disableIntrinsics" };
 
 fn invalid(comptime fmt: []const u8, args: anytype) error{InvalidOfficialSource} {
@@ -540,18 +543,19 @@ fn generate(a: Allocator, input: []const u8, metadata: Metadata) ![:0]const u8 {
         try w.writeAll(", .parameters = &.{");
         if (doc) |d| for (d.signature.parameters) |param| try w.print("\"{f}\",", .{std.zig.fmtString(param)});
         try w.writeAll("}, .documentation = ");
-        if (doc) |d| {
-            try w.print("\"{f}\"", .{std.zig.fmtString(d.documentation)});
-        } else {
+        const documentation: []const u8 = if (doc) |d| d.documentation else note: {
             var allowed = false;
             for (compiler_only) |known| {
                 if (eql(known, name)) allowed = true;
             }
             if (!allowed) return invalid("compiler builtin lacks official documentation: {s}", .{name});
             const count = if (compiler.param_count) |n| try std.fmt.allocPrint(a, "{d}", .{n}) else "variable";
-            const note = try std.fmt.allocPrint(a, "`{s}` is present in the Zig {s} compiler builtin registry (parameter count: {s}), but has no entry in that version's official Language Reference. No official signature or semantic documentation is available in the vendored source.\n\n[Zig {s} Language Reference]({s}) · [Official compiler source archive]({s}) (`lib/std/zig/BuiltinFn.zig`)", .{ name, metadata.version, count, metadata.version, source_url, metadata.source_archive });
-            try w.print("\"{f}\"", .{std.zig.fmtString(note)});
-        }
+            break :note try std.fmt.allocPrint(a, "`{s}` is present in the Zig {s} compiler builtin registry (parameter count: {s}), but has no entry in that version's official Language Reference. No official signature or semantic documentation is available in the vendored source.\n\n[Zig {s} Language Reference]({s}) · [Official compiler source archive]({s}) (`lib/std/zig/BuiltinFn.zig`)", .{ name, metadata.version, count, metadata.version, source_url, metadata.source_archive });
+        };
+        try w.print("\"{f}\", .documentation_0_17_0 = \"{f}\"", .{
+            std.zig.fmtString(documentation),
+            std.zig.fmtString(try std.mem.replaceOwned(u8, a, documentation, metadata.version, old_version)),
+        });
         try w.print(", .variadic = {}, .documented = {}, .source_url = \"{f}\", .compiler_param_count = ", .{ compiler.param_count == null, doc != null, std.zig.fmtString(source_url) });
         if (compiler.param_count) |count| try w.print("{d}", .{count}) else try w.writeAll("null");
         try w.writeAll(" },\n");
