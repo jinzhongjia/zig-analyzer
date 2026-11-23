@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Parse = @import("Parse.zig");
+const green = @import("green.zig");
 
 /// Asserts that the incremental result for old → new matches a full parse; `expect_incremental`
 /// asserts whether the local reparse path was taken
@@ -261,6 +262,68 @@ test "zon files keep the zon mode and are always parsed in full" {
         try testing.expect(inc.sameAs(full));
         try testing.expect(inc.rootNode().childNode(.init_expr) != null);
         try testing.expect(inc.rootNode().childNode(.container_field) == null);
+    }
+}
+
+/// Asserts that every node of `a` has the same kind and summary bits as the node at the same
+/// position in `b`
+fn expectSameBits(a: *const green.GreenNode, b: *const green.GreenNode) !void {
+    try testing.expectEqual(a.kind, b.kind);
+    try testing.expectEqual(a.flags.has_container, b.flags.has_container);
+    try testing.expectEqual(a.flags.has_import, b.flags.has_import);
+    try testing.expectEqual(a.children.len, b.children.len);
+    for (a.children, b.children) |x, y| switch (x.unpack()) {
+        .node => |n| try expectSameBits(n, y.node() orelse return error.TestUnexpectedResult),
+        .token => try testing.expect(!y.is_node),
+    };
+}
+
+test "incremental reparse keeps the summary bits of a full parse" {
+    const base =
+        \\const a = @import("a");
+        \\const T = struct { x: u8 };
+        \\const b = 1;
+        \\fn f() void {
+        \\    const Local = struct { v: u8 };
+        \\    _ = Local{ .v = 1 };
+        \\    _ = @import("body");
+        \\}
+        \\const c = 2;
+        \\const U = struct { y: u8 };
+        \\const d = @import("d");
+        \\
+    ;
+    const Edit = struct {
+        old: []const u8,
+        new: []const u8,
+        /// The members after the edit are the old nodes (the tail of a top-level reparse)
+        tail_reused: bool,
+    };
+    const edits = [_]Edit{
+        // Body edit: the ancestors on the path to the root are copied by hand
+        .{ .old = ".v = 1", .new = ".v = 2", .tail_reused = true },
+        // Edit in a member with members after it: the new root is built from the fragment and
+        // the old children after the cut
+        .{ .old = "const b = 1;", .new = "const b = 10;", .tail_reused = true },
+        // Edit after the last member: the new root is built from the old children before the
+        // fragment and the fragment
+        .{ .old = "const d = @import(\"d\");\n", .new = "const d = @import(\"d\");\nconst e = @import(\"e\");\n", .tail_reused = false },
+    };
+    for (edits) |edit| {
+        const text = try std.mem.replaceOwned(u8, testing.allocator, base, edit.old, edit.new);
+        defer testing.allocator.free(text);
+        const old = try Parse.create(testing.allocator, base, .zig);
+        defer old.destroy();
+        const inc = try Parse.reparse(testing.allocator, old, text);
+        defer inc.destroy();
+        const full = try Parse.create(testing.allocator, text, .zig);
+        defer full.destroy();
+        try testing.expect(inc.base != null);
+        try testing.expect(inc.sameAs(full));
+        try expectSameBits(inc.root, full.root);
+        const last_old = old.root.children[old.root.children.len - 1];
+        const last_new = inc.root.children[inc.root.children.len - 1];
+        try testing.expectEqual(edit.tail_reused, last_old.ptr == last_new.ptr);
     }
 }
 

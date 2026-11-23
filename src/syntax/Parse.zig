@@ -270,7 +270,10 @@ pub fn sameAs(a: *const Parse, b: *const Parse) bool {
 
 fn greenEql(a: *const green.GreenNode, b: *const green.GreenNode) bool {
     if (a == b) return true;
-    if (a.kind != b.kind or a.text_len != b.text_len or a.children.len != b.children.len) return false;
+    // The flags are derived from the subtree, so comparing them also checks that every site that
+    // builds a node computes them
+    if (a.kind != b.kind or a.flags.has_container != b.flags.has_container or a.flags.has_import != b.flags.has_import or
+        a.text_len != b.text_len or a.children.len != b.children.len) return false;
     for (a.children, b.children) |x, y| switch (x.unpack()) {
         .node => |n| if (y.node() == null or !greenEql(n, y.node().?)) return false,
         .token => |t| if (y.is_node or t.kind != y.kind() or !std.mem.eql(u8, t.text, y.unpack().token.text)) return false,
@@ -447,6 +450,7 @@ fn reparseBlockEdit(gpa: Allocator, old: *Parse, src: Source, edit: EditRange) A
         const copy = try a.create(green.GreenNode);
         copy.* = .{
             .kind = entry.node.kind,
+            .flags = green.GreenNode.flagsOf(entry.node.kind, children),
             .text_len = @intCast(@as(i64, entry.node.text_len) + delta),
             .children = children,
         };
@@ -584,7 +588,12 @@ fn spliceTail(gpa: Allocator, old: *Parse, src: Source, from: TopMember, lookahe
     @memcpy(children[0..p.root.children.len], p.root.children);
     @memcpy(children[p.root.children.len..], rest);
     const new_root = try a.create(green.GreenNode);
-    new_root.* = .{ .kind = old.root.kind, .text_len = @intCast(src.bytes().len), .children = children };
+    new_root.* = .{
+        .kind = old.root.kind,
+        .flags = green.GreenNode.flagsOf(old.root.kind, children),
+        .text_len = @intCast(src.bytes().len),
+        .children = children,
+    };
     var errors: std.ArrayList(parser.Error) = .empty;
     try errors.appendSlice(a, p.errors);
     for (old.errors) |e| if (e.offset > cut.start) try errors.append(a, .{ .offset = @intCast(@as(i64, e.offset) + delta), .message = e.message });
@@ -631,7 +640,12 @@ fn reparseFrom(gpa: Allocator, old: *Parse, src: Source, from: TopMember, end: u
     @memcpy(children[0..from.child], old.root.children[0..from.child]);
     @memcpy(children[from.child..], tail.children);
     const new_root = try a.create(green.GreenNode);
-    new_root.* = .{ .kind = old.root.kind, .text_len = from.start + tail.text_len, .children = children };
+    new_root.* = .{
+        .kind = old.root.kind,
+        .flags = green.GreenNode.flagsOf(old.root.kind, children),
+        .text_len = from.start + tail.text_len,
+        .children = children,
+    };
 
     var errors: std.ArrayList(parser.Error) = .empty;
     for (old.errors) |e| if (e.offset < from.start) try errors.append(a, e);

@@ -14,8 +14,42 @@ pub const GreenToken = struct {
 
 pub const GreenNode = struct {
     kind: SyntaxKind,
+    /// Summary bits of the whole subtree; they take padding that the node already has, so they do
+    /// not enlarge it
+    flags: Flags,
     text_len: u32,
     children: []const GreenElement,
+
+    /// What the subtree contains (the node itself included), so that a walk looking for a
+    /// container or an import can skip a subtree whose bit is clear
+    pub const Flags = packed struct(u8) {
+        /// A `container_decl` node
+        has_container: bool = false,
+        /// An `@import` builtin call
+        has_import: bool = false,
+        padding: u6 = 0,
+    };
+
+    comptime {
+        std.debug.assert(@sizeOf(GreenNode) == 24);
+    }
+
+    /// The flags of a node with `kind` and `children`: the child nodes carry those of their own
+    /// subtrees
+    pub fn flagsOf(kind: SyntaxKind, children: []const GreenElement) Flags {
+        var f: Flags = .{ .has_container = kind == .container_decl };
+        for (children) |e| {
+            if (e.node()) |n| {
+                f.has_container = f.has_container or n.flags.has_container;
+                f.has_import = f.has_import or n.flags.has_import;
+            } else {
+                // The name of a builtin call is a `.builtin` token of that node
+                const t = e.unpack().token;
+                if (kind == .builtin_call and t.kind == .builtin and std.mem.eql(u8, t.text, "@import")) f.has_import = true;
+            }
+        }
+        return f;
+    }
 };
 
 /// Child element of a node: a node or a token. Packed into 16 bytes (a tagged union would need
@@ -92,7 +126,12 @@ pub const Builder = struct {
         var len: u32 = 0;
         for (elems) |e| len += e.textLen();
         const node = try b.arena.create(GreenNode);
-        node.* = .{ .kind = open.kind, .text_len = len, .children = try b.arena.dupe(GreenElement, elems) };
+        node.* = .{
+            .kind = open.kind,
+            .flags = GreenNode.flagsOf(open.kind, elems),
+            .text_len = len,
+            .children = try b.arena.dupe(GreenElement, elems),
+        };
         b.children.shrinkRetainingCapacity(open.start);
         try b.children.append(b.gpa, .initNode(node));
     }
