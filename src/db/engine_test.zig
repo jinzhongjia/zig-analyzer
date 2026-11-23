@@ -434,6 +434,44 @@ const ReadBoundedHolder = struct {
     }
 };
 
+/// A second query whose values read transactions evict: one read holds pins in two tables
+const ReadBoundedOther = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = []const u8;
+    pub const lru: usize = 1000;
+    pub const lru_bytes: usize = 10;
+    pub const lru_read_bytes: usize = 30;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return ctx.db.gpa.dupe(u8, try ctx.get(Text, key));
+    }
+    pub fn bytes(v: Value) usize {
+        return v.len;
+    }
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(u8, a, b);
+    }
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.*);
+    }
+};
+
+/// Reads several values of both queries evicted by reads, so that its frame pins values of both
+/// tables
+const ReadBoundedBoth = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = usize;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        var total: usize = key;
+        for (0..4) |i| {
+            total += (try ctx.get(ReadBounded, @intCast(i))).len;
+            total += (try ctx.get(ReadBoundedOther, @intCast(i))).len;
+        }
+        return total;
+    }
+};
+
 const read_bounded_keys = 20;
 
 const CachedLen = struct {
@@ -564,7 +602,7 @@ fn crossStarted(which: usize) void {
     while (!cross_started[1 - which].load(.acquire)) std.Thread.yield() catch {};
 }
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Doubled, TensVia, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Prefix, PrefixLen, Gated, CrossA, CrossB, FixA, FixB, OwnedCycleA, OwnedCycleB, OwnedCycleLen, ReadBounded, ReadBoundedLen, ReadBoundedHolder });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Doubled, TensVia, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Prefix, PrefixLen, Gated, CrossA, CrossB, FixA, FixB, OwnedCycleA, OwnedCycleB, OwnedCycleLen, ReadBounded, ReadBoundedLen, ReadBoundedHolder, ReadBoundedOther, ReadBoundedBoth });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions(Q);
@@ -1813,6 +1851,15 @@ test "lru_read_bytes: pins are released when allocations fail" {
         for (d.tables[comptime Db.queryIndex(ReadBounded)].slots.items) |slot| try testing.expectEqual(0, slot.pins);
         if (!failed) break;
     }
+}
+
+test "lru_read_bytes: a compute releases the pins of every table it read" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setReadBoundedTexts(&d);
+    try testing.expectEqual(3 + 4 * 10 + 4 * 10, try read(&d, ReadBoundedBoth, 3));
+    for (d.tables[comptime Db.queryIndex(ReadBounded)].slots.items) |slot| try testing.expectEqual(0, slot.pins);
+    for (d.tables[comptime Db.queryIndex(ReadBoundedOther)].slots.items) |slot| try testing.expectEqual(0, slot.pins);
 }
 
 const ReadBoundedWorker = struct {
