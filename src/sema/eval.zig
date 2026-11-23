@@ -6789,6 +6789,39 @@ const Evaluator = struct {
         return sl.bit_offsets[i];
     }
 
+    /// A field of a container declared in source, found by name
+    const SourceField = struct {
+        /// Position among the fields `fieldsOf` returns
+        index: usize,
+        item: u32,
+        /// The container has the default layout
+        auto_layout: bool,
+    };
+
+    /// Field `name` of the source container `t`, found without computing the types of its
+    /// fields; null when `t` is not a source container or has no such field
+    fn sourceField(ev: *Evaluator, t: Index, name: []const u8) EvalError!?SourceField {
+        const c = switch (ev.ip.key(t)) {
+            .container_type => |c| c,
+            else => return null,
+        };
+        if (!c.kind.isStruct() and c.kind != .@"union") return null;
+        const ns = try queries.namespaceOfType(ev.r, t) orelse return null;
+        const tree = try ev.r.itemTree(ns.file);
+        var index: usize = 0;
+        for (tree.containerMembers(ns.container)) |m| {
+            const it = tree.items[m];
+            if (it.kind != .field) continue;
+            if (std.mem.eql(u8, it.name orelse "", name)) return .{
+                .index = index,
+                .item = m,
+                .auto_layout = tree.containers[ns.container].layout == .auto,
+            };
+            index += 1;
+        }
+        return null;
+    }
+
     /// Attributes of a pointer to the field `name` (of type `field_ty`) of a value of type `agg`
     /// reached through a pointer with attributes `parent` (the compiler's `Type.fieldPtrType` and
     /// `fieldPtrAlign`): a field of a packed struct is a bit pointer into the host integer, and the
@@ -6797,6 +6830,20 @@ const Evaluator = struct {
     fn fieldPtrAttrs(ev: *Evaluator, parent: InternPool.PtrAttrs, agg: Index, name: []const u8, field_ty: Index) EvalError!InternPool.PtrAttrs {
         var out = parent;
         if (parent.alignment == .unknown) return out;
+        // Cases whose result does not depend on the types of the other fields: a comptime field,
+        // and a field of a default-layout aggregate reached through a naturally aligned pointer
+        // without an explicit field alignment (the aggregate's alignment is at least the field's)
+        if (try ev.sourceField(agg, name)) |found| {
+            const attrs = ev.fieldAttrs(agg, found.index, .{ .name = name, .ty = .unknown, .item = found.item }) catch |err| switch (err) {
+                error.Abort => return withUnknownAlign(out),
+                else => |x| return x,
+            };
+            if (attrs.is_comptime) {
+                out.alignment = if (attrs.alignment) |a| .fromBytes(a) else .natural;
+                return out;
+            }
+            if (parent.alignment == .natural and attrs.alignment == null and found.auto_layout) return out;
+        }
         // Slices (`ptr`, `len`) have the default layout and no explicit field alignment
         const fields = try ev.fieldsOf(agg) orelse return ev.autoFieldPtrAttrs(out, agg, field_ty, null);
         const i = for (fields, 0..) |fl, i| {
