@@ -4,7 +4,7 @@
 
 `FileIndex` filters files by name → the Bloom filter of `ItemNames` filters members → each occurrence is confirmed by precise resolution.
 
-The candidate files are those reaching the definition through an `@import` chain, plus the files those reach: generic code can access a definition's members through an `anytype` value or comptime type parameter without importing its file, while a file none of them reaches is never compiled with the definition. In files not importing the definition, only generic code and typed `.zon` roots are checked.
+The candidate files are those reaching the definition through an `@import` chain, plus the files those reach: generic code can access a definition's members through an `anytype` value or comptime type parameter without importing its file, while a file none of them reaches is never compiled with the definition. In files not importing the definition, only generic code and typed `.zon` roots are checked. A declaration that is neither `pub` nor a field is visible only in its own file, so only that file is searched: another file cannot refer to it, so a syntax error there, or a member access there that cannot be confirmed, does not make rename refuse.
 
 Document highlight checks only its own file and reports declarations and assignment targets as writes.
 
@@ -30,7 +30,7 @@ Only user code is modified. A rename whose references reach a dependency library
 
 Rename and naming fixes return only a reason and location, with no edit, when:
 
-- a reference cannot be confirmed (ambiguous in a generic function, a member access of unknown type, incomplete instances, a file with syntax errors that mentions the name);
+- a reference cannot be confirmed (ambiguous in a generic function, a member access of unknown type, incomplete instances, a file with syntax errors that mentions the name) in a file that can refer to the declaration;
 - the new name conflicts (a member of the same container, shadowing, a newly ambiguous reference, or any new AstGen error in the declaration's file);
 - a container member's name appears as a string literal in a file that can access it (`@field`, `@hasDecl`, serialization keys). Test names (`test "name" {}`) do not count: they only describe the test.
 

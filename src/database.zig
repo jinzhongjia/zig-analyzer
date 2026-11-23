@@ -7,6 +7,7 @@ pub const Durability = engine.Durability;
 pub const inputs = @import("base/inputs.zig");
 pub const syntax = @import("syntax/queries.zig");
 pub const FileIndex = @import("syntax/FileIndex.zig");
+pub const StringLiterals = @import("syntax/StringLiterals.zig");
 pub const ErrorSets = @import("syntax/ErrorSets.zig");
 pub const live = @import("diagnostics/live.zig");
 pub const hir = @import("hir/queries.zig");
@@ -89,6 +90,7 @@ pub const Db = engine.Engine(*const Env, &.{
     sema.ZonResultType,
     FileIndex.Query,
     FileIndex.ImportStrings,
+    StringLiterals.Query,
     ErrorSets.Query,
     ide_db.seed.Query,
     ide_db.seed.Instances,
