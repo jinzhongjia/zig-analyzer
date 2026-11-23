@@ -317,23 +317,27 @@ fn addFolderContents(server: *Server, arena: Allocator, events: *std.StringArray
     var key: std.ArrayList(u8) = .empty;
     // The paths that are not known files
     var folders: std.StringHashMapUnmanaged(void) = .empty;
+    var folder_paths: std.ArrayList([]const u8) = .empty;
     for (events.keys()) |path| {
         if (try server.vfs.lookup(path) != null) continue;
         const normalized = try Vfs.normalize(.native, arena, path) orelse continue;
-        try folders.put(arena, try arena.dupe(u8, try dirKey(&server.vfs, &key, arena, normalized)), {});
+        const folder_key = try dirKey(&server.vfs, &key, arena, normalized);
+        const gop = try folders.getOrPut(arena, try arena.dupe(u8, folder_key));
+        if (!gop.found_existing) try folder_paths.append(arena, normalized);
     }
-    if (folders.count() == 0) return false;
+    if (folder_paths.items.len == 0) return false;
     var found = false;
     for (0..server.vfs.count()) |i| {
         const path = server.vfs.path(@fromBackingInt(@as(u32, @intCast(i))));
-        var dir = std.fs.path.dirname(path);
-        while (dir) |d| : (dir = std.fs.path.dirname(d)) {
-            if (!folders.contains(try dirKey(&server.vfs, &key, arena, d))) continue;
-            found = true;
-            const gop = try events.getOrPut(arena, path);
-            if (!gop.found_existing) gop.value_ptr.* = .Changed;
+        var under = false;
+        for (folder_paths.items) |folder| if (path.len > folder.len and server.vfs.isUnder(path, folder)) {
+            under = true;
             break;
-        }
+        };
+        if (!under) continue;
+        found = true;
+        const gop = try events.getOrPut(arena, path);
+        if (!gop.found_existing) gop.value_ptr.* = .Changed;
     }
     return found;
 }
