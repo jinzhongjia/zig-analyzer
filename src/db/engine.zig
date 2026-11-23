@@ -1558,6 +1558,28 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 const dep: DepKey = .{ .query = comptime queryIndex(Q), .index = index };
 
                 if (existing) |memo| if (upToDate(memo, db.revision, need_value)) return freshMemo(Q, memo);
+                // A memo whose dependencies did not change at its durability is verified by
+                // `deepVerify` without looking at them. Verifying it then only writes
+                // `verified_at`, so it needs neither the claim nor a second lock pair: concurrent
+                // readers repeating it are harmless. The evicted value that a read needs still
+                // goes through the claim, which brings it back.
+                if (existing) |memo| if (!memo.evicted or !need_value) fast: {
+                    if (memo.verified_at == db.revision) break :fast;
+                    if (db.last_changed[@backingInt(memo.durability)] > memo.verified_at) break :fast;
+                    if (ctx.stackIndex(dep) != null or ctx.unverifiableDepth(dep) != null or ctx.stackExhausted()) break :fast;
+                    table.mutex.lockUncancelable(db.io);
+                    defer table.mutex.unlock(db.io);
+                    const slot = &table.slots.items[index];
+                    const m = &(slot.memo orelse break :fast);
+                    if (upToDate(m.*, db.revision, need_value)) return freshMemo(Q, m.*);
+                    if (m.evicted and need_value) break :fast;
+                    if (db.last_changed[@backingInt(m.durability)] > m.verified_at) break :fast;
+                    const value = if (m.evicted) undefined else m.value;
+                    const changed_at = m.changed_at;
+                    const durability = m.durability;
+                    markVerified(m, db.revision, durability);
+                    return .{ .value = value, .changed_at = changed_at, .durability = durability };
+                };
                 var held: Claim = .{};
                 defer ctx.endClaim(Q, index, &held);
                 const current = switch (try ctx.claim(Q, index, need_value, &held)) {

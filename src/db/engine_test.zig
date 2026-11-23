@@ -836,6 +836,10 @@ test "durability: skip dependency check of high-durability memos when low inputs
     try testing.expectEqual(42, try read(&d, OnlyStable, 1));
     try testing.expectEqual(before, d.deep_verifications.load(.monotonic));
     try testing.expectEqual(1, executions(&d, OnlyStable));
+    // Verified for the current revision without dropping its durability
+    const memo = d.tables[comptime Db.queryIndex(OnlyStable)].slots.items[0].memo.?;
+    try testing.expectEqual(d.revision, memo.verified_at);
+    try testing.expectEqual(db.Durability.high, memo.durability);
 
     // Must be recomputed after a high-durability input changes
     try setNumber(&d, Stable, 1, 50, .high);
