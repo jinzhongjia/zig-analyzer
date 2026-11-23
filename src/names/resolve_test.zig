@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const database = @import("../database.zig");
 const Db = database.Db;
 const FileText = database.inputs.FileText;
+const Text = database.inputs.Text;
 const Vfs = @import("../base/Vfs.zig");
 const FileId = Vfs.FileId;
 const ModuleGraph = @import("ModuleGraph.zig");
@@ -61,9 +62,10 @@ pub const World = struct {
         const file = try w.vfs.intern(path);
         const cursor = std.mem.indexOf(u8, text, "<|>");
         const clean = if (cursor) |c| try std.mem.concat(testing.allocator, u8, &.{ text[0..c], text[c + 3 ..] }) else try testing.allocator.dupe(u8, text);
+        defer testing.allocator.free(clean);
         w.db.beginWrite();
         defer w.db.endWrite();
-        try w.db.set(FileText, file, clean, .low);
+        try w.db.set(FileText, file, try Text.init(testing.allocator, clean), .low);
         return .{ .file = file, .cursor = @intCast(cursor orelse 0) };
     }
 
@@ -822,33 +824,140 @@ test "goto and references on members of a module import that differs between the
     }
 }
 
-test "module alternatives cache is not reused across resolver contexts" {
+test "file import targets follow the import strings and the module graph" {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
     const f = try w.fixture(
         \\//- /p/main.zig module:a deps:cfg=cfga module:b deps:cfg=cfgb
         \\const cfg = @import("cfg");
-        \\const value = cfg.value;
+        \\const lib = @import("lib.zig");
         \\//- /p/cfg_a.zig module:cfga
         \\pub const value: u32 = 1;
         \\//- /p/cfg_b.zig module:cfgb
         \\pub const value: u32 = 2;
+        \\//- /p/lib.zig
     );
     const main = f.file("/p/main.zig");
     const cfg_a = f.file("/p/cfg_a.zig");
-    var ctx = w.db.beginRead(w.arena.allocator());
-    defer ctx.end();
-    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator(), .context = 0 };
-    const text = (try ctx.get(database.syntax.SourceText, cfg_a)).text;
-    const def = try definition.defAt(&r, cfg_a, @intCast(std.mem.indexOf(u8, text, "value").?)) orelse return error.NoDefinition;
-    var cache: resolve.ImportTargetCache = .empty;
-    try testing.expectEqual(@as(usize, 1), (try r.moduleAlternatives(main, def, &cache)).len);
-    try testing.expectEqual(@as(?u32, 0), cache.get(main).?.context);
-    // A list computed for another compilation is not reused
-    r.context = 1;
-    try testing.expectEqual(@as(usize, 1), (try r.moduleAlternatives(main, def, &cache)).len);
-    try testing.expectEqual(@as(?u32, 1), cache.get(main).?.context);
+    const cfg_b = f.file("/p/cfg_b.zig");
+    const lib = f.file("/p/lib.zig");
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        const table = try r.importTargetsTable(main);
+        // In import-string order: every module of the file may import another file under a name
+        try testing.expectEqual(2, table.count());
+        try testing.expectEqualSlices(FileId, &.{ cfg_a, cfg_b }, table.of(0));
+        try testing.expectEqualSlices(FileId, &.{lib}, table.of(1));
+    }
+    // Another module graph gives another target for the same string
+    _ = try w.fixture(
+        \\//- /p/main.zig module:a deps:cfg=cfga module:b deps:cfg=cfga
+        \\const cfg = @import("cfg");
+        \\const lib = @import("lib.zig");
+        \\//- /p/cfg_a.zig module:cfga
+        \\pub const value: u32 = 1;
+        \\//- /p/cfg_b.zig module:cfgb
+        \\pub const value: u32 = 2;
+        \\//- /p/lib.zig
+    );
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        const table = try r.importTargetsTable(main);
+        try testing.expectEqualSlices(FileId, &.{cfg_a}, table.of(0));
+        try testing.expectEqualSlices(FileId, &.{lib}, table.of(1));
+    }
+}
+
+test "@import(\"root\") outside the module graph follows the workspace files" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const app = (try w.add("/p/app.zig", "pub const root = @import(\"root\");\n")).file;
+    const other = (try w.add("/p/other.zig", "const app = @import(\"app.zig\");\n")).file;
+    // `app.zig` is in no module: the files that may be its root module are the workspace files
+    // outside the module graph that reach it (see `Resolver.singleFileRoots`)
+    try w.setGraph(null, &.{}, &.{});
+    try w.setWorkspaceFiles(&.{app});
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualSlices(FileId, &.{app}, (try r.importTargetsTable(app)).of(0));
+    }
+    // A workspace file that imports `app.zig` is its root module instead
+    try w.setWorkspaceFiles(&.{ app, other });
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualSlices(FileId, &.{other}, (try r.importTargetsTable(app)).of(0));
+    }
+}
+
+test "a relative import keeps its target when the imported file is created" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const main = (try w.add("/p/main.zig", "const lib = @import(\"lib.zig\");\n")).file;
+    try w.setGraph(null, &.{}, &.{});
+    var target: FileId = undefined;
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        const targets = (try r.importTargetsTable(main)).of(0);
+        try testing.expectEqual(1, targets.len);
+        target = targets[0];
+        try testing.expectEqualStrings("lib.zig", std.fs.path.basename(w.vfs.path(target)));
+    }
+    const executions = w.db.executions(resolve.FileImportTargets);
+    // Resolution does not check that the imported file exists; creating it keeps the interned
+    // target and changes no dependency of the query
+    const lib = (try w.add("/p/lib.zig", "pub const x = 1;\n")).file;
+    try testing.expectEqual(target, lib);
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualSlices(FileId, &.{lib}, (try r.importTargetsTable(main)).of(0));
+    }
+    try testing.expectEqual(executions, w.db.executions(resolve.FileImportTargets));
+}
+
+test "a module graph change flips the module-root check of a relative import" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const main = (try w.add("/p/src/main.zig", "const other = @import(\"../other.zig\");\n")).file;
+    const other = (try w.add("/p/other.zig", "pub const x = 1;\n")).file;
+    // Without a module graph, a relative import may leave the directory of the importing file
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualSlices(FileId, &.{other}, (try r.importTargetsTable(main)).of(0));
+    }
+    // A module rooted at `/p/src` rejects an import that leaves its directory
+    try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{.{ .file = main, .module = 0, .compile = 0 }});
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualSlices(FileId, &.{}, (try r.importTargetsTable(main)).of(0));
+    }
+    // A graph without the importing file does not limit its imports
+    try w.setGraph(null, &.{}, &.{});
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualSlices(FileId, &.{other}, (try r.importTargetsTable(main)).of(0));
+    }
 }
 
 test "@This, enums, nested containers and generic functions" {
@@ -899,7 +1008,7 @@ test "files that are not loaded are read from disk" {
     {
         w.db.beginWrite();
         defer w.db.endWrite();
-        try w.db.set(FileText, file, try testing.allocator.dupe(u8, text), .low);
+        try w.db.set(FileText, file, try Text.init(testing.allocator, text), .low);
     }
     try testing.expectEqualStrings("other.zig:thing", try w.goto(file, @intCast(std.mem.indexOf(u8, text, "thing").?)));
 }

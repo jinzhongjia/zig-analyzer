@@ -1,5 +1,5 @@
-//! The result of one parse: a copy of the source, the green tree, and the syntax errors, all
-//! allocated in its own arena.
+//! The result of one parse: the source, the green tree, and the syntax errors, all in its own
+//! arena; the source is a copy in the arena or a retained buffer of the file text.
 //!
 //! Incremental reparse (`reparse`) reuses unchanged green nodes of the previous tree, so the new
 //! result holds a reference to the old one (`base`), and the old arena is not freed while any
@@ -9,6 +9,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const Text = @import("../util/Text.zig");
+const vector = @import("../util/vector.zig");
 const kind_mod = @import("kind.zig");
 const SyntaxKind = kind_mod.SyntaxKind;
 const lexer = @import("lexer.zig");
@@ -53,15 +55,21 @@ errors: []const parser.Error,
 refs: std.atomic.Value(u32) = .init(1),
 /// The references that may read `source` (all but those of the results built on this one)
 users: std.atomic.Value(u32) = .init(1),
-/// `source` is allocated on its own and freed with the last user: the tokens of an incremental
+/// `source` is freed with the last user instead of with the arena: the tokens of an incremental
 /// result point into the reparsed fragments, never into `source`, so the results built on it
 /// need only its arena. Otherwise every result along a chain would keep a copy of the whole text.
-/// A full parse's tokens point into its `source`, which then lives in the arena
+/// A full parse's tokens point into its `source`, which then lives as long as the arena
 owns_source: bool = false,
+/// The file text buffer `source` points into, retained; null when `source` is in the arena
+shared: ?*Text = null,
 /// The previous result whose nodes the incremental reparse reused
 base: ?*Parse = null,
 /// Total capacity of all arenas along the chain (including this one)
 chain_bytes: usize,
+/// Bytes of the shared text buffer of the full parse at the bottom of the chain: the results built
+/// on it keep that buffer alive until the arena is destroyed (see `release`), while their own
+/// sources are freed with their last user
+base_source_bytes: usize = 0,
 /// Arena capacity of the full parse at the bottom of the chain
 full_bytes: usize,
 /// Unique among all parse results of the process (never reused), so that a value derived from one
@@ -88,11 +96,57 @@ pub fn create(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Par
 }
 
 pub fn createIn(gpa: Allocator, text: []const u8, mode: Mode, dialect: Dialect) Allocator.Error!*Parse {
+    return createSource(gpa, .{ .copy = text }, mode, dialect);
+}
+
+/// A parse of `text` that shares the buffer of the file text instead of copying it: the result
+/// retains the buffer until it is destroyed
+pub fn createInShared(gpa: Allocator, text: *Text, mode: Mode, dialect: Dialect) Allocator.Error!*Parse {
+    return createSource(gpa, .{ .shared = text }, mode, dialect);
+}
+
+/// Where the text of a new parse comes from
+const Source = union(enum) {
+    /// Copied into the result's arena
+    copy: []const u8,
+    /// The file text buffer, retained by the result
+    shared: *Text,
+
+    fn bytes(src: Source) []const u8 {
+        return switch (src) {
+            .copy => |text| text,
+            .shared => |text| text.bytes(),
+        };
+    }
+};
+
+/// The source of a result: a copy allocated with `owner` (the arena of a full parse, or the gpa
+/// for an incremental result whose source is freed with its last user), or the retained buffer
+fn obtainSource(owner: Allocator, src: Source) Allocator.Error!struct { source: [:0]const u8, shared: ?*Text } {
+    return switch (src) {
+        .copy => |text| .{ .source = try owner.dupeSentinel(u8, text, 0), .shared = null },
+        .shared => |text| blk: {
+            text.retain();
+            break :blk .{ .source = text.source(), .shared = text };
+        },
+    };
+}
+
+/// Bytes of the shared buffer of the full parse at the bottom of the chain of `old`, which a result
+/// built on `old` keeps alive until that arena is destroyed
+fn baseSourceBytes(old: *const Parse) usize {
+    if (old.base != null) return old.base_source_bytes;
+    return if (old.shared != null) old.source.len + 1 else 0;
+}
+
+fn createSource(gpa: Allocator, src: Source, mode: Mode, dialect: Dialect) Allocator.Error!*Parse {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    const source = try a.dupeSentinel(u8, text, 0);
+    const obtained = try obtainSource(a, src);
+    const source = obtained.source;
+    errdefer if (obtained.shared) |text| text.release(gpa);
     const tokens = try lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
     const events = switch (mode) {
@@ -116,6 +170,7 @@ pub fn createIn(gpa: Allocator, text: []const u8, mode: Mode, dialect: Dialect) 
         .mode = mode,
         .dialect = dialect,
         .source = source,
+        .shared = obtained.shared,
         .root = root,
         .errors = errors,
         .chain_bytes = 0,
@@ -138,7 +193,9 @@ pub fn retain(self: *Parse) *Parse {
 /// Releases a reference; the last one frees the source of an incremental result, and the arena
 /// is destroyed once the results built on this one are gone too.
 pub fn destroy(self: *Parse) void {
-    if (self.users.fetchSub(1, .acq_rel) == 1 and self.owns_source) self.gpa.free(self.source);
+    if (self.users.fetchSub(1, .acq_rel) == 1 and self.owns_source) {
+        if (self.shared) |text| text.release(self.gpa) else self.gpa.free(self.source);
+    }
     self.release();
 }
 
@@ -148,17 +205,29 @@ fn retainBase(self: *Parse) void {
 }
 
 /// Releases a reference; the last release destroys the arena and releases the reference to base.
+/// A full parse's source outlives its arena: the green tokens copied from it point into the text.
 fn release(self: *Parse) void {
     if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+    // The fields are read before the arena is destroyed: they live in it
     const base = self.base;
+    const shared = if (self.owns_source) null else self.shared;
+    const gpa = self.gpa;
     var arena = self.arena;
     arena.deinit();
+    if (shared) |text| text.release(gpa);
     if (base) |b| b.release();
 }
 
-/// Bytes of the source when it is not in the arena (see `owns_source`)
+/// Bytes of the source when it is not in the arena (see `owns_source` and `shared`)
 pub fn sourceBytes(self: *const Parse) usize {
-    return if (self.owns_source) self.source.len + 1 else 0;
+    return if (self.owns_source or self.shared != null) self.source.len + 1 else 0;
+}
+
+/// Bytes of the memory a result keeps alive, apart from the `Parse` value itself: the arenas of the
+/// chain, its own source when it is not in an arena, and the shared buffer of the full parse at the
+/// base, which the chain keeps until that arena is destroyed
+pub fn bytes(self: *const Parse) usize {
+    return @sizeOf(Parse) + self.chain_bytes + self.sourceBytes() + self.base_source_bytes;
 }
 
 pub fn rootNode(self: *const Parse) tree.SyntaxNode {
@@ -170,13 +239,22 @@ pub fn rootNode(self: *const Parse) tree.SyntaxNode {
 /// The result is exactly the same as `createIn(gpa, text, old.mode, old.dialect)`. A ZON file holds
 /// a single expression and is usually small, so it is always parsed in full
 pub fn reparse(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!*Parse {
-    if (old.mode == .zon) return createIn(gpa, text, .zon, old.dialect);
+    return reparseSource(gpa, old, .{ .copy = text });
+}
+
+/// `reparse` where the new text is the file text buffer, retained instead of copied
+pub fn reparseShared(gpa: Allocator, old: *Parse, text: *Text) Allocator.Error!*Parse {
+    return reparseSource(gpa, old, .{ .shared = text });
+}
+
+fn reparseSource(gpa: Allocator, old: *Parse, src: Source) Allocator.Error!*Parse {
+    if (old.mode == .zon) return createSource(gpa, src, .zon, old.dialect);
     // The block and the top-level attempt use the same edit range: scanning for it twice costs a
     // pass over the whole text per edit when the edit is at the top level
-    const edit = editRange(old.source, text) orelse return createIn(gpa, text, old.mode, old.dialect);
-    if (try reparseBlockEdit(gpa, old, text, edit)) |p| return p;
-    if (try reparseTopLevelEdit(gpa, old, text, edit)) |p| return p;
-    return createIn(gpa, text, old.mode, old.dialect);
+    const edit = editRange(old.source, src.bytes()) orelse return createSource(gpa, src, old.mode, old.dialect);
+    if (try reparseBlockEdit(gpa, old, src, edit)) |p| return p;
+    if (try reparseTopLevelEdit(gpa, old, src, edit)) |p| return p;
+    return createSource(gpa, src, old.mode, old.dialect);
 }
 
 /// Whether two parse results have exactly the same mode, dialect, syntax tree and errors (used to
@@ -247,20 +325,55 @@ const unconsumed = "block reparse: unconsumed tokens";
 
 /// The edited part of the text: the bytes before the common prefix of the old and new text, and
 /// those after their common suffix
-const EditRange = struct {
+pub const EditRange = struct {
     /// Length of the common prefix; 0 when the texts differ in their first byte
     prefix: u32,
     /// Length of the common suffix, which does not reach into the common prefix
     suffix: u32,
 };
 
-/// The edit range of `old_text` → `text`; null when the texts are identical
-fn editRange(old_text: []const u8, text: []const u8) ?EditRange {
-    const prefix = std.mem.indexOfDiff(u8, old_text, text) orelse return null;
+/// The edit range of `old_text` → `text`; null when the texts are identical (used by tests)
+pub fn editRange(old_text: []const u8, text: []const u8) ?EditRange {
+    const prefix = commonPrefix(old_text, text);
+    if (prefix == old_text.len and old_text.len == text.len) return null;
     const max_suffix = @min(old_text.len, text.len) - prefix;
-    var suffix: usize = 0;
-    while (suffix < max_suffix and old_text[old_text.len - 1 - suffix] == text[text.len - 1 - suffix]) suffix += 1;
+    const suffix = commonSuffix(old_text, text, max_suffix);
     return .{ .prefix = @intCast(prefix), .suffix = @intCast(suffix) };
+}
+
+/// Length of the common prefix of `a` and `b`: the first byte at which they differ, or the length
+/// of the shorter when one starts with the other
+fn commonPrefix(a: []const u8, b: []const u8) usize {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    if (comptime vector.width > 0) {
+        const Chunk = @Vector(vector.width, u8);
+        while (i + vector.width <= n) : (i += vector.width) {
+            const x: Chunk = a[i..][0..vector.width].*;
+            const y: Chunk = b[i..][0..vector.width].*;
+            const differs = x != y;
+            if (std.simd.firstTrue(differs)) |j| return i + j;
+        }
+    }
+    while (i < n and a[i] == b[i]) i += 1;
+    return i;
+}
+
+/// Number of trailing bytes that are equal, at most `max`: it stops before the suffix would reach
+/// into the prefix
+fn commonSuffix(a: []const u8, b: []const u8, max: usize) usize {
+    var n: usize = 0;
+    if (comptime vector.width > 0) {
+        const Chunk = @Vector(vector.width, u8);
+        while (n + vector.width <= max) : (n += vector.width) {
+            const x: Chunk = a[a.len - n - vector.width ..][0..vector.width].*;
+            const y: Chunk = b[b.len - n - vector.width ..][0..vector.width].*;
+            const differs = x != y;
+            if (std.simd.lastTrue(differs)) |j| return n + vector.width - 1 - j;
+        }
+    }
+    while (n < max and a[a.len - 1 - n] == b[b.len - 1 - n]) n += 1;
+    return n;
 }
 
 /// Nodes that can be reparsed on their own: the edit must lie strictly between their `{` and `}`
@@ -271,14 +384,15 @@ fn isReparsable(kind: SyntaxKind) bool {
 /// Attempts only a local reparse; returns null when the conditions are not met (used by tests
 /// and corpus cross-checks).
 pub fn reparseBlock(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!?*Parse {
-    return reparseBlockEdit(gpa, old, text, editRange(old.source, text) orelse return null);
+    return reparseBlockEdit(gpa, old, .{ .copy = text }, editRange(old.source, text) orelse return null);
 }
 
 /// `reparseBlock` with the edit range of `old.source` → `text` already computed
-fn reparseBlockEdit(gpa: Allocator, old: *Parse, text: []const u8, edit: EditRange) Allocator.Error!?*Parse {
+fn reparseBlockEdit(gpa: Allocator, old: *Parse, src: Source, edit: EditRange) Allocator.Error!?*Parse {
     // Memory reclamation: do a full parse instead when the chain gets too long. `chain_bytes` and
     // `full_bytes` describe `old`, so this does not depend on the edit
     if (old.chain_bytes > 2 * old.full_bytes) return null;
+    const text = src.bytes();
     const old_text = old.source;
     const edit_start = edit.prefix;
     const edit_end_old: u32 = @intCast(old_text.len - edit.suffix);
@@ -357,20 +471,22 @@ fn reparseBlockEdit(gpa: Allocator, old: *Parse, text: []const u8, edit: EditRan
     for (events.errors) |e| try errors.append(a, .{ .offset = e.offset + old_range.start, .message = e.message });
     sortErrors(errors.items);
 
-    const source = try gpa.dupeSentinel(u8, text, 0);
-    errdefer gpa.free(source);
+    const obtained = try obtainSource(gpa, src);
+    errdefer if (obtained.shared) |t| t.release(gpa) else gpa.free(obtained.source);
     const result = try a.create(Parse);
     result.* = .{
         .arena = undefined,
         .gpa = gpa,
         .mode = old.mode,
         .dialect = old.dialect,
-        .source = source,
+        .source = obtained.source,
         .owns_source = true,
+        .shared = obtained.shared,
         .root = new_node,
         .errors = errors.items,
         .base = old,
         .chain_bytes = 0,
+        .base_source_bytes = baseSourceBytes(old),
         .id = newId(),
         .full_bytes = old.full_bytes,
     };
@@ -392,12 +508,13 @@ fn reparseBlockEdit(gpa: Allocator, old: *Parse, text: []const u8, edit: EditRan
 /// top level is one expression rather than container members
 pub fn reparseTopLevel(gpa: Allocator, old: *Parse, text: []const u8) Allocator.Error!?*Parse {
     if (old.mode == .zon) return null;
-    return reparseTopLevelEdit(gpa, old, text, editRange(old.source, text) orelse return null);
+    return reparseTopLevelEdit(gpa, old, .{ .copy = text }, editRange(old.source, text) orelse return null);
 }
 
 /// `reparseTopLevel` with the edit range of `old.source` → `text` already computed, for Zig mode
-fn reparseTopLevelEdit(gpa: Allocator, old: *Parse, text: []const u8, edit: EditRange) Allocator.Error!?*Parse {
+fn reparseTopLevelEdit(gpa: Allocator, old: *Parse, src: Source, edit: EditRange) Allocator.Error!?*Parse {
     if (old.chain_bytes > 2 * old.full_bytes) return null;
+    const text = src.bytes();
     const old_text = old.source;
     const edit_start = edit.prefix;
     const old_edit_end: u32 = @intCast(old_text.len - edit.suffix);
@@ -429,9 +546,9 @@ fn reparseTopLevelEdit(gpa: Allocator, old: *Parse, text: []const u8, edit: Edit
         if (n.start > old_edit_end) break i;
     } else null;
     if (after) |e| if (e + 1 < nodes.items.len) {
-        if (try spliceTail(gpa, old, text, from, nodes.items[e], nodes.items[e + 1], delta)) |p| return p;
+        if (try spliceTail(gpa, old, src, from, nodes.items[e], nodes.items[e + 1], delta)) |p| return p;
     };
-    return reparseFrom(gpa, old, text, from, text.len);
+    return reparseFrom(gpa, old, src, from, text.len);
 }
 
 const TopMember = struct { child: usize, start: u32 };
@@ -441,12 +558,12 @@ const TopMember = struct { child: usize, start: u32 };
 /// `lookahead` on is unchanged, and when the fragment gives the same children from `lookahead` to
 /// `cut` as before, with no errors there in either parse, every token the parser looked at before
 /// `cut` is the same. Null when that does not hold
-fn spliceTail(gpa: Allocator, old: *Parse, text: []const u8, from: TopMember, lookahead: TopMember, cut: TopMember, delta: i64) Allocator.Error!?*Parse {
+fn spliceTail(gpa: Allocator, old: *Parse, src: Source, from: TopMember, lookahead: TopMember, cut: TopMember, delta: i64) Allocator.Error!?*Parse {
     // An error at `cut` comes from the recovery of an earlier member, which looked past `cut`
     for (old.errors) |e| if (e.offset >= lookahead.start and e.offset <= cut.start) return null;
     const new_cut: u32 = @intCast(@as(i64, cut.start) + delta);
     const new_lookahead: u32 = @intCast(@as(i64, lookahead.start) + delta);
-    const p = try reparseFrom(gpa, old, text, from, new_cut) orelse return null;
+    const p = try reparseFrom(gpa, old, src, from, new_cut) orelse return null;
     var ok = true;
     for (p.errors) |e| if (e.offset >= new_lookahead) {
         ok = false;
@@ -474,7 +591,7 @@ fn spliceTail(gpa: Allocator, old: *Parse, text: []const u8, from: TopMember, lo
     new_root.* = .{
         .kind = old.root.kind,
         .flags = green.GreenNode.flagsOf(old.root.kind, children),
-        .text_len = @intCast(text.len),
+        .text_len = @intCast(src.bytes().len),
         .children = children,
     };
     var errors: std.ArrayList(parser.Error) = .empty;
@@ -496,7 +613,8 @@ fn elementEql(x: green.GreenElement, y: green.GreenElement) bool {
 /// Parses `text[from.start..end]` as top-level members after the old children before `from`
 /// (the root of the result covers only up to `end`; the source is all of `text`); null when the
 /// fragment has a `//!` doc comment that is not at the start of the file
-fn reparseFrom(gpa: Allocator, old: *Parse, text: []const u8, from: TopMember, end: usize) Allocator.Error!?*Parse {
+fn reparseFrom(gpa: Allocator, old: *Parse, src: Source, from: TopMember, end: usize) Allocator.Error!?*Parse {
+    const text = src.bytes();
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -534,20 +652,22 @@ fn reparseFrom(gpa: Allocator, old: *Parse, text: []const u8, from: TopMember, e
     for (events.errors) |e| try errors.append(a, .{ .offset = e.offset + from.start, .message = e.message });
     sortErrors(errors.items);
 
-    const source = try gpa.dupeSentinel(u8, text, 0);
-    errdefer gpa.free(source);
+    const obtained = try obtainSource(gpa, src);
+    errdefer if (obtained.shared) |t| t.release(gpa) else gpa.free(obtained.source);
     const result = try a.create(Parse);
     result.* = .{
         .arena = undefined,
         .gpa = gpa,
         .mode = old.mode,
         .dialect = old.dialect,
-        .source = source,
+        .source = obtained.source,
         .owns_source = true,
+        .shared = obtained.shared,
         .root = new_root,
         .errors = errors.items,
         .base = old,
         .chain_bytes = 0,
+        .base_source_bytes = baseSourceBytes(old),
         .id = newId(),
         .full_bytes = old.full_bytes,
     };
@@ -660,4 +780,5 @@ test {
     _ = @import("parse_test.zig");
     _ = @import("reparse_test.zig");
     _ = @import("parse_fuzz.zig");
+    _ = @import("edit_range_fuzz.zig");
 }
