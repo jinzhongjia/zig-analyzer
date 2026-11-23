@@ -1482,6 +1482,82 @@ test "a response is written after the read transaction has ended" {
     try h.notify("exit", {});
 }
 
+test "a semantic tokens response is written before the refresh of a later edit" {
+    // Guards against a response computed from pre-edit text being written after the refresh caused
+    // by the edit: the client would apply the old tokens on top of the refreshed ones.
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{
+        .capabilities = .{ .workspace = .{ .semanticTokens = .{ .refreshSupport = true } } },
+        .initializationOptions = .{ .diagnostics = .{ .debounce_ms = 0 } },
+    });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:semantic-order.zig";
+    const other = "untitled:semantic-order-other.zig";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const alpha_value: u32 = 1;\n" } });
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = other, .languageId = "zig", .version = 1, .text = "const beta_value: u32 = 1;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // The refresh requested by opening the second document is answered before this response
+    try testing.expectEqual(-32601, errorCode(try h.request("zig-analyzer/probe", {})));
+    while (h.server.semantic_refresh.pending) _ = try h.request("zig-analyzer/probe", {});
+    const received_before = h.received.items.len;
+
+    var gate: Server.OnceGate = .{};
+    h.server.hooks.response = &gate;
+    defer h.server.hooks.response = null;
+    defer gate.release.set(testing.io);
+    const tokens = try h.send("textDocument/semanticTokens/full", .{ .textDocument = .{ .uri = uri } });
+    try gate.entered.wait(testing.io);
+    // The response was computed from the text before this edit, and its read transaction has ended
+    const insert = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } };
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .range = insert, .text = "const gamma_value: u32 = 2;\n" }} });
+    try testing.expectEqual(-32601, errorCode(try h.request("zig-analyzer/probe", {})));
+
+    // The refresh caused by the edit: with the send order restored it waits for the response.
+    const Refresh = struct {
+        fn run(server: *Server) void {
+            server.requestSemanticRefresh();
+        }
+    };
+    const refresh_thread = try std.Thread.spawn(.{}, Refresh.run, .{&h.server});
+    // Let the refresh be sent when nothing serializes it with the response
+    const started = std.Io.Clock.awake.now(testing.io);
+    while (!h.server.semantic_refresh.pending) {
+        const elapsed: u64 = @intCast(@max(0, started.durationTo(std.Io.Clock.awake.now(testing.io)).nanoseconds));
+        if (elapsed >= std.time.ns_per_s) break;
+        (std.Io.Clock.Duration{ .raw = .fromMilliseconds(1), .clock = .awake }).sleep(testing.io) catch {};
+    }
+    if (h.server.semantic_refresh.pending) refresh_thread.join() else {
+        gate.release.set(testing.io);
+        refresh_thread.join();
+    }
+    gate.release.set(testing.io);
+
+    const response = try h.response(tokens);
+    try testing.expect(response.object.get("error") == null);
+    var response_at: ?usize = null;
+    var refresh_at: ?usize = null;
+    while (refresh_at == null) {
+        for (h.received.items[received_before..], received_before..) |msg, i| {
+            if (msg.object.get("id")) |id| {
+                if (id == .integer and id.integer == tokens) response_at = i;
+            }
+            if (msg.object.get("method")) |m| {
+                if (std.mem.eql(u8, m.string, "workspace/semanticTokens/refresh")) refresh_at = i;
+            }
+        }
+        if (refresh_at != null) break;
+        _ = try h.next();
+    }
+    try testing.expect(response_at.? < refresh_at.?);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "function completions carry no signature in the list and resolve to the signature and doc" {
     const Harness = @import("test_harness.zig").Harness;
     const Empty = struct {};

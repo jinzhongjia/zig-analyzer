@@ -245,6 +245,11 @@ next_apply_edit: std.atomic.Value(u64) = .init(0),
 /// `workspace/semanticTokens/refresh`
 semantic_refresh: Refresh = .{ .id = "zig-analyzer/semanticTokensRefresh", .method = "workspace/semanticTokens/refresh" },
 semantic_cache: SemanticCache = .{},
+/// Serializes semantic token responses with the refresh request caused by a later edit: a
+/// response computed from the pre-edit text holds it from before its read transaction ends until
+/// it is written, and `requestSemanticRefresh` holds it while writing the refresh and retiring the
+/// baselines (see `requestSemanticRefresh`)
+semantic_send: Io.Mutex = .init,
 /// Number of configuration requests sent; only the response to the most recent one is used
 config_requests: u32 = 0,
 /// Number of configuration requests not yet answered: counted as busy while waiting (waitIdle
@@ -1050,6 +1055,8 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             const a = attempt_arena.allocator();
             var response: ?[]u8 = null;
             var slow: ?slow_log.Report = null;
+            var semantic_send_locked = false;
+            defer if (semantic_send_locked) server.semantic_send.unlock(server.io);
             const next = outcome: {
                 var ctx = server.db.beginReadAt(a, pending.since);
                 ctx.cancel = &pending.cancel;
@@ -1087,6 +1094,13 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
                     .ok => |v| response = server.responseBytes(pending.id, v),
                     .failed => |message| response = server.errorResponseBytes(pending.id, jsonrpc.error_codes.request_failed, message),
                 } else response = server.responseBytes(pending.id, result);
+                // Acquired before the read transaction ends: a write can begin only after that, and
+                // the refresh it triggers waits for this response to be written (see
+                // `requestSemanticRefresh`)
+                if (comptime std.mem.startsWith(u8, method, "textDocument/semanticTokens/")) {
+                    server.semantic_send.lockUncancelable(server.io);
+                    semantic_send_locked = true;
+                }
                 break :outcome .answered;
             };
             sendAttempt(server, response, slow);
@@ -1335,6 +1349,11 @@ fn sendRefresh(server: *Server, r: *Refresh) bool {
 }
 
 pub fn requestSemanticRefresh(server: *Server) void {
+    // A semantic token response computed before a write holds this from before its read
+    // transaction ends until it is written; the write waits for that transaction, so the refresh
+    // it causes is always written after that response.
+    server.semantic_send.lockUncancelable(server.io);
+    defer server.semantic_send.unlock(server.io);
     if (!server.sendRefresh(&server.semantic_refresh)) return;
     // Retire the baselines only after the refresh is written out: every result sent afterwards
     // reaches the client after the refresh. If they were retired first, a result sent in between
