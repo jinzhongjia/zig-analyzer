@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const engine = @import("../db/engine.zig");
 const database = @import("../database.zig");
 const Db = database.Db;
 const syntax = database.syntax;
@@ -41,17 +42,63 @@ pub const Error = error{ Canceled, OutOfMemory };
 /// Same as the recursion limit for glob imports in rust-analyzer's name resolution.
 pub const max_depth = 100;
 
-/// An import name of a file and the files it may target (see `resolveImportTargets`)
-pub const ImportTargets = struct { name: []const u8, targets: []const FileId };
+/// The targets of the `@import` strings of a file, in import-string order (see
+/// `Resolver.resolveImportTargets`). The computation reads the file's `FileIndex.ImportStrings`,
+/// `ModuleGraph.Input`, and, for `@import("root")` in a file outside the module graph,
+/// `inputs.WorkspaceFiles` and the import strings of the other workspace files (see
+/// `Resolver.singleFileRoots`). The key is the file alone: resolution depends on the file's own
+/// compilation (`ModuleGraph.home`), not on `Resolver.context`. The import graph of a search
+/// (`ImportGraph`), `search.reachable` for files outside it, and `Resolver.moduleAlternatives`
+/// read this instead of resolving the strings again.
+pub const FileImportTargets = struct {
+    pub const kind: engine.Kind = .derived;
+    pub const Key = FileId;
+    pub const Value = Table;
 
-/// The import names and targets of one file as computed in one resolver context: `r.context` can
-/// change within a request, and `@import("std")`, `@import("builtin")` and `@import("root")`
-/// resolve in the current context
-pub const ImportTargetsEntry = struct { context: ?u32, list: []const ImportTargets };
+    pub const Table = struct {
+        /// The targets of the `i`-th string of `FileIndex.ImportStrings`:
+        /// `targets[starts[i]..starts[i + 1]]`
+        targets: []const FileId,
+        starts: []const u32,
 
-/// The import names of files and their targets, cached per request by callers that ask for the
-/// module alternatives of many definitions in the same files
-pub const ImportTargetCache = std.AutoHashMapUnmanaged(FileId, ImportTargetsEntry);
+        /// The number of import strings the targets are for
+        pub fn count(t: Table) usize {
+            return t.starts.len - 1;
+        }
+
+        /// The targets of import string `i`
+        pub fn of(t: Table, i: usize) []const FileId {
+            return t.targets[t.starts[i]..t.starts[i + 1]];
+        }
+    };
+
+    pub fn compute(ctx: *Db.Ctx, file: Key) Error!Value {
+        const gpa = ctx.db.gpa;
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        const imports = (try ctx.get(FileIndex.ImportStrings, file)).imports;
+        const starts = try gpa.alloc(u32, imports.len + 1);
+        errdefer gpa.free(starts);
+        var targets: std.ArrayList(FileId) = .empty;
+        errdefer targets.deinit(gpa);
+        for (imports, 0..) |name, i| {
+            starts[i] = @intCast(targets.items.len);
+            try targets.appendSlice(gpa, try r.resolveImportTargets(file, name));
+        }
+        starts[imports.len] = @intCast(targets.items.len);
+        return .{ .targets = try targets.toOwnedSlice(gpa), .starts = starts };
+    }
+
+    pub fn eql(a: Value, b: Value) bool {
+        return std.mem.eql(FileId, a.targets, b.targets) and std.mem.eql(u32, a.starts, b.starts);
+    }
+
+    pub fn deinit(v: *Value, gpa: Allocator) void {
+        gpa.free(v.targets);
+        gpa.free(v.starts);
+    }
+};
 
 pub const Resolver = struct {
     ctx: *Db.Ctx,
@@ -398,7 +445,8 @@ pub const Resolver = struct {
     /// a file outside the module graph, which name resolution leaves unknown, has the files that
     /// may be compiled as its root (see `singleFileRoots`). Reads the module graph directly,
     /// without `FileImports` cutting off other changes; meant for requests such as goto, and must
-    /// not be used in inference.
+    /// not be used in inference. `FileImportTargets` resolves all strings of a file at once and
+    /// memoizes them.
     pub fn resolveImportTargets(r: *Resolver, file: FileId, name: []const u8) Error![]const FileId {
         if (std.mem.endsWith(u8, name, ".zig") or std.mem.endsWith(u8, name, ".zon")) {
             const target = try r.resolveImport(file, name) orelse return &.{};
@@ -410,17 +458,10 @@ pub const Resolver = struct {
         return targets;
     }
 
-    /// The import names of `file` with their targets, in import order; with `cache`, reused by the
-    /// later calls of the same request for the same file and resolver context
-    fn importTargetLists(r: *Resolver, file: FileId, cache: ?*ImportTargetCache) Error![]const ImportTargets {
-        if (cache) |c| if (c.get(file)) |entry| if (entry.context == r.context) return entry.list;
-        var list: std.ArrayList(ImportTargets) = .empty;
-        for ((try r.ctx.get(FileIndex.ImportStrings, file)).imports) |name| {
-            try list.append(r.arena, .{ .name = name, .targets = try r.resolveImportTargets(file, name) });
-        }
-        const out = try list.toOwnedSlice(r.arena);
-        if (cache) |c| try c.put(r.arena, file, .{ .context = r.context, .list = out });
-        return out;
+    /// The targets of the `@import` strings of `file` in import-string order (see
+    /// `FileImportTargets`)
+    pub fn importTargetsTable(r: *Resolver, file: FileId) Error!FileImportTargets.Value {
+        return r.ctx.get(FileImportTargets, file);
     }
 
     /// The files that may be the root module of `file`, a file outside the module graph: such a
@@ -501,7 +542,7 @@ pub const Resolver = struct {
     /// resolution and inference use the highest-priority module. Empty when `def` is not in such a
     /// file, or is not reached by a path of names (a container returned by a function). Like
     /// `resolveImportTargets`, meant for requests such as goto, and must not be used in inference.
-    pub fn moduleAlternatives(r: *Resolver, file: FileId, def: Def, cache: ?*ImportTargetCache) Error![]const Def {
+    pub fn moduleAlternatives(r: *Resolver, file: FileId, def: Def) Error![]const Def {
         const def_file = switch (def) {
             .item => |it| it.file,
             .file => |f| f,
@@ -512,8 +553,9 @@ pub const Resolver = struct {
         if ((graph.entry(file) orelse return &.{}).others.len == 0) return &.{};
         var out: std.ArrayList(Def) = .empty;
         var path: ?[]const []const u8 = null;
-        for (try r.importTargetLists(file, cache)) |import| {
-            const targets = import.targets;
+        const table = try r.importTargetsTable(file);
+        for (0..table.count()) |i| {
+            const targets = table.of(i);
             if (targets.len < 2 or targets[0] != def_file) continue;
             const names = path orelse switch (def) {
                 .item => |it| try r.memberPath(it.file, it.item) orelse return &.{},
@@ -735,16 +777,15 @@ pub const ImportGraph = struct {
         var n: usize = 0;
         while (n < nodes.count()) : (n += 1) {
             const f = nodes.keys()[n];
-            const file_index = try r.ctx.get(FileIndex.ImportStrings, f);
             // Every module the file belongs to may import a different file under a name
-            for (file_index.imports) |s| for (try r.resolveImportTargets(f, s)) |to| {
+            for ((try r.importTargetsTable(f)).targets) |to| {
                 try forward.items[n].append(temp, to);
                 const gop = try reverse.getOrPut(temp, to);
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                 try gop.value_ptr.append(temp, f);
                 const node = try nodes.getOrPut(temp, to);
                 if (!node.found_existing) try forward.append(temp, .empty);
-            };
+            }
         }
         const keys = try a.dupe(FileId, nodes.keys());
         const edge_starts = try a.alloc(u32, keys.len + 1);

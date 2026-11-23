@@ -166,6 +166,8 @@ When modules import different targets under the same name, name resolution uses 
 - A member reached through such an import corresponds to the member at the same name path in each other target: goto lists them all, and the use is a reference of each, recorded as ambiguous since renaming it would break the other modules. `Resolver.moduleAlternatives` maps a definition in a file the import reaches directly; `Resolver.pathAlternatives` evaluates the name path of a use or alias (`cfg.sub.value`, through constants) in each other target, so the member may also be in a file reached past the import.
 - In a test compilation, `@import("root")` is the test runner.
 
+The resolved targets of a file's `@import` strings, in import-string order, are a derived query (`FileImportTargets`): it reads the file's import strings and the module graph, and, for `@import("root")` in a file outside the module graph, the workspace files and their import strings. The import graph of a search (`ImportGraph`), `search.reachable` for files outside that graph, and `Resolver.moduleAlternatives` read it.
+
 ### Files in no module
 
 Single-file roots, files in no compile set, files during project loading, and build scripts are in a compilation of their own (`ModuleGraph.none`): they use std of the zig environment and a native Debug `builtin`.
