@@ -76,6 +76,15 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
     defer imports_of.deinit(gpa);
     var module_dirs: std.AutoHashMapUnmanaged(u32, ?[]const u8) = .empty;
     defer module_dirs.deinit(gpa);
+    // Standard library files whose imports were already traversed. A standard library file reaches
+    // only standard library files, and its import targets do not depend on the compile step:
+    // `importTargets` resolves named modules only for non-standard-library files, relative imports
+    // stay in the standard library directory, and the targets of `std` and `root` are nodes the
+    // step starts from. Traversing such a file again for another step therefore adds no file,
+    // membership or `missing` entry. Whether a step's standard library was traversed is checked
+    // through its interned root file, because `stdRootOf` can differ between steps.
+    var std_walked: std.AutoHashMapUnmanaged(FileId, void) = .empty;
+    defer std_walked.deinit(gpa);
 
     for (compile_steps) |step| {
         const compile = model.steps[step].kind.compile;
@@ -95,10 +104,20 @@ pub fn compute(gpa: Allocator, model: *const ProjectModel, compile_steps: []cons
         // The standard library (of the compilation's lib directory) is always part of the
         // compilation (the entry point start.zig is in it), even if user code does not import std
         const std_node: Node = .{ .file = try resolver.intern(model.stdRootOf(step)), .module = std_module };
-        try stack.append(gpa, std_node);
+        if (std_walked.contains(std_node.file)) {
+            // The standard library of this step was traversed for an earlier step. Re-apply the
+            // per-step `@import("root")` edge (the root node is normally the step's start node, so
+            // the push is deduplicated).
+            if (root) |r| try stack.append(gpa, r);
+        } else {
+            try stack.append(gpa, std_node);
+        }
 
         while (stack.pop()) |node| {
+            // A standard library node traversed for an earlier step contributes nothing new
+            if (node.module == std_module and std_walked.contains(node.file)) continue;
             if ((try visited.getOrPut(gpa, node)).found_existing) continue;
+            if (node.module == std_module) try std_walked.put(gpa, node.file, {});
             if (node.module != std_module) _ = try result.modules.getOrPutValue(gpa, node.module, step);
             const gop = try result.files.getOrPut(gpa, node.file);
             if (!gop.found_existing) {
@@ -524,4 +543,149 @@ test "std and root are resolved for each compile step" {
     try testing.expectEqual(1, r.missing.count());
     try testing.expectEqual(0, r.others.count());
     for ([_]u32{ 0, 1, 0 }, 0..) |step, module| try testing.expectEqual(step, r.modules.get(@intCast(module)).?);
+}
+
+/// The traversal that visits the standard library of every compile step in full, used by the
+/// comparison test to check that reusing the standard library closure does not change the result.
+fn computeWithoutReuse(gpa: Allocator, model: *const ProjectModel, compile_steps: []const u32, resolver: anytype) !Result {
+    var result: Result = .{};
+    errdefer result.deinit(gpa);
+    const Node = FileModule;
+    var visited: std.AutoHashMapUnmanaged(Node, void) = .empty;
+    defer visited.deinit(gpa);
+    var stack: std.ArrayList(Node) = .empty;
+    defer stack.deinit(gpa);
+    var scratch: std.heap.ArenaAllocator = .init(gpa);
+    defer scratch.deinit();
+    var targets: std.ArrayList(Target) = .empty;
+    defer targets.deinit(gpa);
+    var imports_of: std.AutoHashMapUnmanaged(Node, ?Span) = .empty;
+    defer imports_of.deinit(gpa);
+    var module_dirs: std.AutoHashMapUnmanaged(u32, ?[]const u8) = .empty;
+    defer module_dirs.deinit(gpa);
+
+    for (compile_steps) |step| {
+        const compile = model.steps[step].kind.compile;
+        const root_module = compile.root_module;
+        const root_file = model.modules[root_module].root_file orelse continue;
+        visited.clearRetainingCapacity();
+        try stack.append(gpa, .{ .file = try resolver.intern(root_file), .module = root_module });
+        const root: ?Node = switch (compile.root) {
+            .module => .{ .file = try resolver.intern(root_file), .module = root_module },
+            .test_runner => |path| .{ .file = try resolver.intern(path), .module = std_module },
+            .unknown => null,
+        };
+        if (compile.root == .test_runner) try stack.append(gpa, root.?);
+        const std_node: Node = .{ .file = try resolver.intern(model.stdRootOf(step)), .module = std_module };
+        try stack.append(gpa, std_node);
+
+        while (stack.pop()) |node| {
+            if ((try visited.getOrPut(gpa, node)).found_existing) continue;
+            if (node.module != std_module) _ = try result.modules.getOrPutValue(gpa, node.module, step);
+            const gop = try result.files.getOrPut(gpa, node.file);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{ .module = node.module, .step = step };
+            } else if (gop.value_ptr.module != node.module) {
+                try result.others.put(gpa, node, {});
+            }
+            const resolved = imports_of.get(node) orelse blk: {
+                const computed = try importTargets(gpa, &targets, &scratch, &module_dirs, model, resolver, node);
+                try imports_of.put(gpa, node, computed);
+                break :blk computed;
+            };
+            const span = resolved orelse {
+                try result.missing.put(gpa, node.file, {});
+                continue;
+            };
+            for (targets.items[span.start..][0..span.len]) |t| {
+                const target: Node = switch (t) {
+                    .node => |n| n,
+                    .std => std_node,
+                    .root => root orelse continue,
+                };
+                try stack.append(gpa, target);
+            }
+        }
+    }
+    return result;
+}
+
+fn expectEqualResults(expected: *const Result, actual: *const Result) !void {
+    try testing.expectEqual(expected.files.count(), actual.files.count());
+    for (expected.files.keys(), actual.files.keys(), expected.files.values(), actual.files.values()) |ef, af, em, am| {
+        try testing.expectEqual(ef, af);
+        try testing.expectEqual(em, am);
+    }
+    try testing.expectEqual(expected.others.count(), actual.others.count());
+    for (expected.others.keys(), actual.others.keys()) |e, a| try testing.expectEqual(e, a);
+    try testing.expectEqual(expected.modules.count(), actual.modules.count());
+    for (expected.modules.keys(), actual.modules.keys(), expected.modules.values(), actual.modules.values()) |ek, ak, ev, av| {
+        try testing.expectEqual(ek, ak);
+        try testing.expectEqual(ev, av);
+    }
+    try testing.expectEqual(expected.missing.count(), actual.missing.count());
+    for (expected.missing.keys(), actual.missing.keys()) |e, a| try testing.expectEqual(e, a);
+}
+
+test "reusing the standard library closure keeps the result and its order" {
+    // The standard library closure is reused across compile steps. This test compares the result
+    // with visiting every compile step in full on a graph with two standard library roots, a test
+    // runner, a file shared by modules of different steps, and a file that is not loaded.
+    const gpa = testing.allocator;
+    var modules = [_]ProjectModel.Module{
+        .{ .root_file = native("/p/src/app.zig"), .imports = &.{.{ .name = "dep", .module = 1 }} },
+        .{ .root_file = native("/p/dep/dep.zig"), .imports = &.{} },
+        .{ .root_file = native("/p/src/test_root.zig"), .imports = &.{.{ .name = "dep", .module = 1 }} },
+        .{ .root_file = native("/p/src/lib.zig"), .imports = &.{.{ .name = "dep", .module = 1 }} },
+    };
+    const steps = [_]ProjectModel.Step{
+        .{ .name = "app", .kind = .{ .compile = .{ .root_module = 0 } }, .deps = &.{} },
+        .{ .name = "test", .kind = .{ .compile = .{
+            .root_module = 2,
+            .root = .{ .test_runner = native("/zig/compiler/test_runner.zig") },
+        } }, .deps = &.{} },
+        .{ .name = "lib", .kind = .{ .compile = .{
+            .root_module = 3,
+            .std_root = native("/zig/std/v2/std.zig"),
+        } }, .deps = &.{} },
+        .{ .name = "app-v2", .kind = .{ .compile = .{
+            .root_module = 0,
+            .std_root = native("/zig/std/v2/std.zig"),
+        } }, .deps = &.{} },
+        .{ .name = "test-again", .kind = .{ .compile = .{ .root_module = 2 } }, .deps = &.{} },
+    };
+    const model: ProjectModel = .{ .arena = .{}, .build_root = native("/p"), .std_root = native("/zig/std/std.zig"), .steps = &steps, .modules = &modules, .default_step = 0 };
+
+    var fs: FakeFs = .{};
+    defer fs.deinit();
+    try fs.files.put(gpa, native("/p/src/app.zig"), &.{ "std", "dep", "util.zig", "root" });
+    try fs.files.put(gpa, native("/p/src/util.zig"), &.{ "std", "data/../data.zon" });
+    try fs.files.put(gpa, native("/p/src/data.zon"), &.{});
+    try fs.files.put(gpa, native("/p/src/test_root.zig"), &.{ "std", "dep", "helper.zig" });
+    try fs.files.put(gpa, native("/p/src/helper.zig"), &.{"std"});
+    try fs.files.put(gpa, native("/p/src/lib.zig"), &.{ "std", "helper.zig", "root" });
+    try fs.files.put(gpa, native("/p/dep/dep.zig"), &.{ "std", "inner.zig", "root" });
+    try fs.files.put(gpa, native("/p/dep/inner.zig"), &.{"std"});
+    try fs.files.put(gpa, native("/zig/compiler/test_runner.zig"), &.{ "std", "builtin", "root" });
+    try fs.files.put(gpa, native("/zig/std/std.zig"), &.{ "root", "fs/fs.zig", "pending.zig", "builtin", "std" });
+    try fs.files.put(gpa, native("/zig/std/fs/fs.zig"), &.{ "root", "../std.zig", "std" });
+    // /zig/std/pending.zig is not loaded
+    try fs.files.put(gpa, native("/zig/std/v2/std.zig"), &.{ "root", "mem.zig", "std" });
+    try fs.files.put(gpa, native("/zig/std/v2/mem.zig"), &.{ "std", "../fs/fs.zig", "root" });
+
+    var expected = try computeWithoutReuse(gpa, &model, &.{ 0, 1, 2, 3, 4 }, &fs);
+    defer expected.deinit(gpa);
+    var actual = try compute(gpa, &model, &.{ 0, 1, 2, 3, 4 }, &fs);
+    defer actual.deinit(gpa);
+    try expectEqualResults(&expected, &actual);
+
+    // Both standard library roots, the test runner and the missing file take part
+    try testing.expectEqual(Membership{ .module = std_module, .step = 0 }, actual.files.get(try fs.intern(native("/zig/std/std.zig"))).?);
+    try testing.expectEqual(Membership{ .module = std_module, .step = 2 }, actual.files.get(try fs.intern(native("/zig/std/v2/std.zig"))).?);
+    try testing.expectEqual(Membership{ .module = std_module, .step = 2 }, actual.files.get(try fs.intern(native("/zig/std/v2/mem.zig"))).?);
+    try testing.expectEqual(Membership{ .module = std_module, .step = 1 }, actual.files.get(try fs.intern(native("/zig/compiler/test_runner.zig"))).?);
+    try testing.expect(actual.missing.contains(try fs.intern(native("/zig/std/pending.zig"))));
+    // The file shared by the modules of the first steps keeps the first step that reaches it
+    try testing.expectEqual(Membership{ .module = 0, .step = 0 }, actual.files.get(try fs.intern(native("/p/src/app.zig"))).?);
+    try testing.expectEqual(Membership{ .module = 2, .step = 1 }, actual.files.get(try fs.intern(native("/p/src/test_root.zig"))).?);
 }
