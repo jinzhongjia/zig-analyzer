@@ -1548,6 +1548,24 @@ test "lru: capacities set at runtime apply at the next sweep, 0 is unlimited" {
     try testing.expectEqual(before, executions(&d, Sized));
 }
 
+test "lru: last-use times are counted per table" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    for (1..4) |k| try setText(&d, @intCast(k), "abcdef");
+    var ctx = d.beginRead(testing.allocator);
+    defer ctx.end();
+    // Reads of both tables interleave: a read of one table must not advance the other's times
+    for (1..4) |k| {
+        _ = try ctx.get(Cached, @intCast(k));
+        _ = try ctx.get(Sized, @intCast(k));
+    }
+    inline for (.{ Cached, Sized }) |Q| {
+        const table = &d.tables[comptime Db.queryIndex(Q)];
+        try testing.expectEqual(3, table.access_tick);
+        for (1..4) |k| try testing.expectEqual(@as(u64, @intCast(k)), table.slots.items[k - 1].memo.?.last_used);
+    }
+}
+
 test "concurrent reads: readers of the same query agree" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
