@@ -443,24 +443,17 @@ pub fn namingFor(server: *Server, arena: Allocator, file: Vfs.FileId, text: []co
     // `naming.exclude` paths are relative to the workspace root directory, or to the project root
     // directory when they come from `zig-analyzer.zon`
     var base = try server.rootOf(arena, path);
-    {
-        server.workspaces_mutex.lockUncancelable(server.io);
-        defer server.workspaces_mutex.unlock(server.io);
-        // For nested projects, take the innermost one
-        var best: ?*Workspace = null;
-        for (server.workspaces.items) |ws| {
-            if (server.vfs.isUnder(path, ws.root) and (best == null or ws.root.len > best.?.root.len)) best = ws;
+    const workspace = server.innermostWorkspace(path);
+    defer if (workspace) |ws| ws.release();
+    if (workspace) |ws| if (ws.project) |*p| {
+        if (p.isSet("naming_enable")) enable = p.naming_enable;
+        if (p.isSet("naming_ignore")) ignore = try Server.dupeStrings(arena, p.naming_ignore);
+        if (p.isSet("naming_rules")) rules = p.naming_rules;
+        if (p.isSet("naming_exclude")) {
+            exclude = try Server.dupeStrings(arena, p.naming_exclude);
+            base = try arena.dupe(u8, ws.root);
         }
-        if (best) |ws| if (ws.project) |*p| {
-            if (p.isSet("naming_enable")) enable = p.naming_enable;
-            if (p.isSet("naming_ignore")) ignore = try Server.dupeStrings(arena, p.naming_ignore);
-            if (p.isSet("naming_rules")) rules = p.naming_rules;
-            if (p.isSet("naming_exclude")) {
-                exclude = try Server.dupeStrings(arena, p.naming_exclude);
-                base = try arena.dupe(u8, ws.root);
-            }
-        };
-    }
+    };
     if (!enable) return null;
     if (exclude.len != 0) {
         var rel = path;
@@ -494,20 +487,12 @@ fn hintsEligible(server: *Server, file: Vfs.FileId, text: []const u8) bool {
 /// the file, for open user code that is not generated
 fn unusedFor(server: *Server, file: Vfs.FileId, text: []const u8) bool {
     if (!hintsEligible(server, file, text)) return false;
-    const path = server.vfs.path(file);
     var enable = server.config.load(.acquire).unused_enable;
-    {
-        server.workspaces_mutex.lockUncancelable(server.io);
-        defer server.workspaces_mutex.unlock(server.io);
-        // For nested projects, take the innermost one
-        var best: ?*Workspace = null;
-        for (server.workspaces.items) |ws| {
-            if (server.vfs.isUnder(path, ws.root) and (best == null or ws.root.len > best.?.root.len)) best = ws;
-        }
-        if (best) |ws| if (ws.project) |*p| {
-            if (p.isSet("unused_enable")) enable = p.unused_enable;
-        };
-    }
+    const workspace = server.innermostWorkspace(server.vfs.path(file));
+    defer if (workspace) |ws| ws.release();
+    if (workspace) |ws| if (ws.project) |*p| {
+        if (p.isSet("unused_enable")) enable = p.unused_enable;
+    };
     return enable;
 }
 
@@ -515,23 +500,15 @@ fn unusedFor(server: *Server, file: Vfs.FileId, text: []const u8) bool {
 /// or the project of the file, for open user code that is not generated
 pub fn lintFor(server: *Server, file: Vfs.FileId, text: []const u8) ?Config.LintRules {
     if (!hintsEligible(server, file, text)) return null;
-    const path = server.vfs.path(file);
     const config = server.config.load(.acquire);
     var enable = config.lint_enable;
     var rules = config.lint_rules;
-    {
-        server.workspaces_mutex.lockUncancelable(server.io);
-        defer server.workspaces_mutex.unlock(server.io);
-        // For nested projects, take the innermost one
-        var best: ?*Workspace = null;
-        for (server.workspaces.items) |ws| {
-            if (server.vfs.isUnder(path, ws.root) and (best == null or ws.root.len > best.?.root.len)) best = ws;
-        }
-        if (best) |ws| if (ws.project) |*p| {
-            if (p.isSet("lint_enable")) enable = p.lint_enable;
-            if (p.isSet("lint_rules")) rules = p.lint_rules;
-        };
-    }
+    const workspace = server.innermostWorkspace(server.vfs.path(file));
+    defer if (workspace) |ws| ws.release();
+    if (workspace) |ws| if (ws.project) |*p| {
+        if (p.isSet("lint_enable")) enable = p.lint_enable;
+        if (p.isSet("lint_rules")) rules = p.lint_rules;
+    };
     return if (enable) rules else null;
 }
 
