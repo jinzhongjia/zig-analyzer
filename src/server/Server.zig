@@ -262,6 +262,10 @@ parent_process: ?*client_process.Watch = null,
 /// Projects have been started: changing zig.path after this requires restarting the server
 started: bool = false,
 
+/// Serializes batches of external changes from reading the disk to applying them (see
+/// `file_changes.prepareFileChanges`): a batch that starts later waits for an earlier one, so the
+/// batches cannot apply out of order. Taken before `write_mutex` and released after it.
+changes_mutex: Io.Mutex = .init,
 /// Serializes message handling that modifies server state: held by the main loop while it
 /// handles each message; external changes discovered by the server are also handled under it
 /// (see `watch.zig`)
@@ -644,8 +648,6 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
         }
         return .@"continue";
     };
-    server.write_mutex.lockUncancelable(server.io);
-    defer server.write_mutex.unlock(server.io);
     var pc: panic_context.Text = .{};
     switch (message) {
         .request => |req| messageContext(&pc, "request", req.method, req.params),
@@ -653,6 +655,17 @@ fn processMessage(server: *Server, arena: *std.heap.ArenaAllocator, body: []cons
         .response => pc.enter("response", .{}),
     }
     defer pc.leave();
+    // The disk contents of an external change are read before `write_mutex` is taken (see
+    // `file_changes.prepareFileChanges`). The main loop handles no other message meanwhile, so
+    // the notification keeps its place in the LSP message order.
+    if (message == .notification) {
+        const n = message.notification;
+        if (std.mem.eql(u8, n.method, "workspace/didChangeWatchedFiles")) {
+            return server.processWatchedFilesNotification(arena, n.params);
+        }
+    }
+    server.write_mutex.lockUncancelable(server.io);
+    defer server.write_mutex.unlock(server.io);
     switch (message) {
         .request => |req| try server.processRequest(arena, req.id, req.method, req.params),
         .notification => |n| {
@@ -1304,6 +1317,22 @@ fn waitIdleRequest(server: *Server, _: Allocator, _: void) HandlerError!void {
 
 // ── Notifications ────────────────────────────────────────────────────
 
+/// `workspace/didChangeWatchedFiles`, handled without `write_mutex` at first: the notification
+/// reads the disk before taking it (see `file_changes.didChangeWatchedFiles`). The main loop
+/// handles no other message meanwhile.
+fn processWatchedFilesNotification(server: *Server, arena: *std.heap.ArenaAllocator, params_value: json.Value) !Flow {
+    const a = arena.allocator();
+    defer server.destroyArena(arena);
+    // Before initialization and after shutdown, all notifications except exit are dropped
+    if (server.state == .uninitialized or server.state == .shutdown) return .@"continue";
+    const params = jsonrpc.parseParams(types.DidChangeWatchedFilesParams, a, params_value) catch |err| {
+        log.warn("workspace/didChangeWatchedFiles: malformed params: {t}", .{err});
+        return .@"continue";
+    };
+    file_changes.didChangeWatchedFiles(server, a, params) catch |err| log.err("workspace/didChangeWatchedFiles failed: {t}", .{err});
+    return .@"continue";
+}
+
 fn processNotification(server: *Server, arena: Allocator, method: []const u8, params_value: json.Value) !Flow {
     if (std.mem.eql(u8, method, "exit")) return .exit;
     // Before initialization and after shutdown, all notifications except exit are dropped
@@ -1316,7 +1345,6 @@ fn processNotification(server: *Server, arena: Allocator, method: []const u8, pa
         .{ "textDocument/didClose", doc_sync.didClose },
         .{ "textDocument/didSave", doc_sync.didSave },
         .{ "workspace/didChangeConfiguration", config_sync.didChangeConfiguration },
-        .{ "workspace/didChangeWatchedFiles", file_changes.didChangeWatchedFiles },
         .{ "workspace/didChangeWorkspaceFolders", project_set.didChangeWorkspaceFolders },
         .{ "initialized", initialized },
     };
