@@ -395,44 +395,51 @@ fn publishNow(server: *Server, file: Vfs.FileId, clear: bool, always: bool, gene
 /// Runs AstGen on the file's current text outside any read transaction (see `live.Prepared`):
 /// AstGen does not check for cancellation, so if it ran inside a read transaction, write
 /// transactions would have to wait for it to finish. A read transaction is held briefly, only to
-/// read the text. Returns false when preparing failed: the query then computes the live
-/// diagnostics itself (a publish waiting for a preparation that keeps failing would never finish).
-/// A read canceled by a write transaction is not a failure: it returns true once the write
-/// transaction has the lock, and the caller reads again.
+/// read the text and claim its preparation. Returns false when preparing failed: the query then
+/// computes the live diagnostics itself (a publish waiting for a preparation that keeps failing
+/// would never finish). A read canceled by a write transaction is not a failure: it returns true
+/// once the write transaction has the lock, and the caller reads again.
 fn prepareLive(server: *Server, file: Vfs.FileId) bool {
     if (!liveEligible(server, file)) return true;
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const Read = struct { text: []const u8, backend: live.Backend };
-    const read: ?Read = blk: {
+    const Read = struct { text: []const u8, backend: live.Backend, mode: live.Mode };
+    const Outcome = union(enum) { canceled, prepared, ready: Read };
+    const outcome: Outcome = blk: {
         var ctx = server.db.beginRead(a);
         defer ctx.end();
         const backend: live.Backend = switch (ctx.get(live.LiveBackend, {}) catch |err| switch (err) {
-            error.Canceled => break :blk null,
+            error.Canceled => break :blk .canceled,
             error.OutOfMemory => return false,
         }) {
             .in_process => .in_process,
             .subprocess => |exe| .{ .subprocess = a.dupe(u8, exe) catch return false },
         };
         const t = (ctx.get(FileText, file) catch |err| switch (err) {
-            error.Canceled => break :blk null,
+            error.Canceled => break :blk .canceled,
             error.OutOfMemory => return false,
         }) orelse return true;
-        break :blk .{ .text = a.dupe(u8, t) catch return false, .backend = backend };
+        // The claim is checked on the borrowed text, so that a text that is already prepared is
+        // not copied
+        const mode = live.modeOf(server.vfs.path(file));
+        if (!server.live_prepared.claim(server.io, file, live.Prepared.hash(t, mode, backend))) break :blk .prepared;
+        break :blk .{ .ready = .{ .text = a.dupe(u8, t) catch return false, .backend = backend, .mode = mode } };
     };
-    const r = read orelse {
-        server.db.waitPendingWrites();
-        return true;
+    const r = switch (outcome) {
+        .canceled => {
+            server.db.waitPendingWrites();
+            return true;
+        },
+        .prepared => return true,
+        .ready => |ready| ready,
     };
-    const mode = live.modeOf(server.vfs.path(file));
-    if (!server.live_prepared.claim(server.io, file, live.Prepared.hash(r.text, mode, r.backend))) return true;
-    const result = live.checkWith(server.gpa, server.io, r.backend, server.zig_environ.load(.acquire), r.text, mode) catch return false;
+    const result = live.checkWith(server.gpa, server.io, r.backend, server.zig_environ.load(.acquire), r.text, r.mode) catch return false;
     if (!result.complete) {
         result.destroy(server.gpa);
         return false;
     }
-    server.live_prepared.put(server.io, file, r.text, mode, r.backend, result) catch return false;
+    server.live_prepared.put(server.io, file, r.text, r.mode, r.backend, result) catch return false;
     return true;
 }
 
