@@ -17,6 +17,7 @@ const Body = @import("../hir/Body.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const ast = @import("../syntax/ast.zig");
+const engine = @import("../db/engine.zig");
 
 pub const Kind = enum { namespace, @"struct", @"enum", type, function, method, variable, field, enum_member, parameter, type_parameter };
 
@@ -34,8 +35,18 @@ pub fn ofDecl(r: *Resolver, file: FileId, item: u32) resolve.Error!Symbol {
     return switch (it.kind) {
         .@"fn" => .{ .kind = try functionKind(r, key, tree.containers[it.container]) },
         .field => .{ .kind = if (tree.containers[it.container].kind == .@"enum") .enum_member else .field },
-        .@"const" => .{ .kind = try ofValue(r, try r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable), .readonly = true },
-        .@"var" => .{ .kind = try ofValue(r, try r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable) },
+        .@"const", .@"var" => |decl| {
+            const readonly = decl == .@"const";
+            // Most declarations are classified by their syntax alone, which avoids inferring the
+            // type and evaluating the initializer (see `declForm`)
+            if (try r.itemNode(file, item)) |node| switch (declForm(node)) {
+                .unknown => {},
+                .value => return .{ .kind = .variable, .readonly = readonly },
+                .type => return .{ .kind = .type, .readonly = readonly },
+                .function => return .{ .kind = .function, .readonly = readonly },
+            };
+            return .{ .kind = try ofValue(r, try r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable), .readonly = readonly };
+        },
         .@"test", .@"comptime", .zon => .{ .kind = .variable },
     };
 }
@@ -218,4 +229,37 @@ test "kinds known from the syntax agree with the kinds of the declared types" {
             return err;
         };
     }
+}
+
+test "ofDecl classifies declarations whose form is known from the syntax without inferring their type" {
+    const World = @import("../names/resolve_test.zig").World;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\const a = 5;
+        \\var b: u32 = 0;
+        \\const T = u8;
+        \\const S = struct {};
+        \\
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var trace: engine.Trace = .{ .gpa = w.arena.allocator() };
+    ctx.trace = &trace;
+    var r: Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const tree = try r.itemTree(file);
+    for (tree.items, 0..) |it, index| {
+        if (it.kind != .@"const" and it.kind != .@"var") continue;
+        // Containers need evaluation
+        if (std.mem.eql(u8, it.name.?, "S")) continue;
+        const symbol = try ofDecl(&r, file, @intCast(index));
+        const expected: Kind = if (std.mem.eql(u8, it.name.?, "a") or std.mem.eql(u8, it.name.?, "b")) .variable else .type;
+        try testing.expectEqual(expected, symbol.kind);
+    }
+    const decl_type = comptime for (database.Db.query_types, 0..) |Q, qi| {
+        if (Q == database.sema.DeclType) break qi;
+    } else unreachable;
+    for (trace.events.items) |ev| try testing.expect(ev.query != decl_type);
 }
