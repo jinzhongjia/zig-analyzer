@@ -328,6 +328,9 @@ pub const TestHooks = if (@import("builtin").is_test) struct {
     /// ended, nothing of it has been sent), so that a test can change server state between
     /// computing and sending a publish
     publish: ?*OnceGate = null,
+    /// Holds a request's response after its read transaction has ended, before it is written, so
+    /// that a test can inspect the state the request no longer holds
+    response: ?*OnceGate = null,
     /// Holds the reading task of a project once when the maker's stream has ended, before the exit
     /// is handled (see `Workspace.ExitPause`)
     maker_exit: std.atomic.Value(?*Workspace.ExitPause) = .init(null),
@@ -903,18 +906,29 @@ fn BackgroundTask(comptime func: anytype) type {
     };
 }
 
-/// A handler failed with `err`: answers the request and returns true, or returns false when the
-/// handler must run again. A read interrupted only by a write the server made on its own
-/// (`Db.WriteOrder.unordered`) runs again on the new state: the text the request refers to has not
-/// changed, so the client has nothing to act on. When a write ordered after the request caused the
-/// interruption, the next read transaction would be stale, and `ContentModified` is answered there.
-/// The caller begins the next read only once that write has taken the lock (see
-/// `Db.waitPendingWrites`): beginning it at once could keep the write waiting.
-fn answerFailure(server: *Server, ctx: *const Db.Ctx, pending: *const Pending, err: anyerror) bool {
+/// A handler failed with `err`: sets `response` to the bytes of the error response and returns
+/// true, or returns false when the handler must run again. A read interrupted only by a write the
+/// server made on its own (`Db.WriteOrder.unordered`) runs again on the new state: the text the
+/// request refers to has not changed, so the client has nothing to act on. When a write ordered
+/// after the request caused the interruption, the next read transaction would be stale, and
+/// `ContentModified` is answered there. The caller begins the next read only once that write has
+/// taken the lock (see `Db.waitPendingWrites`): beginning it at once could keep the write waiting.
+/// The response is serialized here, inside the read transaction, because its values may point into
+/// memoized values that the next write frees; it is sent by the caller after `ctx.end()`.
+fn answerFailureBytes(server: *Server, ctx: *const Db.Ctx, pending: *const Pending, err: anyerror, response: *?[]u8) bool {
     const by_client = pending.cancel.load(.acquire);
     if (err == error.Canceled and !by_client and !ctx.stale and !server.isShuttingDown()) return false;
-    server.sendHandlerError(pending.id, err, by_client);
+    response.* = server.handlerErrorBytes(pending.id, err, by_client);
     return true;
+}
+
+/// Sends the response of an attempt after its read transaction has ended (see `answerFailureBytes`)
+fn sendAttempt(server: *Server, response: ?[]u8, slow: ?slow_log.Report) void {
+    if (response) |bytes| {
+        if (@import("builtin").is_test) if (server.hooks.response) |gate| gate.pass(server.io);
+        server.send(bytes);
+    }
+    if (slow) |report| slow_log.logReport(report);
 }
 
 fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
@@ -927,31 +941,41 @@ fn ReadTask(comptime func: anytype, comptime method: []const u8) type {
             while (!attempt(server, pending, params)) server.db.waitPendingWrites();
         }
 
-        /// Returns whether the request was answered (see `answerFailure`)
+        /// Returns whether the request was answered (see `answerFailureBytes`)
         fn attempt(server: *Server, pending: *Pending, params: Params) bool {
             var attempt_arena: std.heap.ArenaAllocator = .init(server.gpa);
             defer attempt_arena.deinit();
             const a = attempt_arena.allocator();
-            var ctx = server.db.beginReadAt(a, pending.since);
-            ctx.cancel = &pending.cancel;
-            defer ctx.end();
-            server.testGate(method, .in_read, pending);
-            var trace: za.db.Trace = .{ .gpa = a };
-            if (slow_log.traceEnabled(server)) ctx.trace = &trace;
-            var pc: panic_context.Text = .{};
-            requestContext(&pc, method, params);
-            defer pc.leave();
-            const zone = za.util.tracy.zone(@src(), method);
-            defer zone.end();
-            const t0 = Io.Clock.awake.now(server.io);
-            defer slow_log.reportIfSlow(server, &ctx, method, t0, &trace);
+            var response: ?[]u8 = null;
+            var slow: ?slow_log.Report = null;
+            const answered = outcome: {
+                var ctx = server.db.beginReadAt(a, pending.since);
+                ctx.cancel = &pending.cancel;
+                defer ctx.end();
+                server.testGate(method, .in_read, pending);
+                var trace: za.db.Trace = .{ .gpa = a };
+                if (slow_log.traceEnabled(server)) ctx.trace = &trace;
+                var pc: panic_context.Text = .{};
+                requestContext(&pc, method, params);
+                defer pc.leave();
+                const zone = za.util.tracy.zone(@src(), method);
+                defer zone.end();
+                const t0 = Io.Clock.awake.now(server.io);
+                defer slow = slow_log.captureIfSlow(server, &ctx, method, t0, &trace);
 
-            const result = func(server, &ctx, a, params) catch |err| return server.answerFailure(&ctx, pending, err);
-            // The handler may have swallowed `Canceled` with a fallback value (such as
-            // `catch null` in type rendering), and then the result is incomplete
-            ctx.checkCanceled() catch |err| return server.answerFailure(&ctx, pending, err);
-            server.sendResponse(pending.id, result);
-            return true;
+                const result = func(server, &ctx, a, params) catch |err| {
+                    break :outcome server.answerFailureBytes(&ctx, pending, err, &response);
+                };
+                // The handler may have swallowed `Canceled` with a fallback value (such as
+                // `catch null` in type rendering), and then the result is incomplete
+                ctx.checkCanceled() catch |err| {
+                    break :outcome server.answerFailureBytes(&ctx, pending, err, &response);
+                };
+                response = server.responseBytes(pending.id, result);
+                break :outcome true;
+            };
+            sendAttempt(server, response, slow);
+            return answered;
         }
     };
 }
@@ -984,7 +1008,7 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
 
         const Next = enum {
             answered,
-            /// Run again once the pending writes have taken the lock (see `answerFailure`)
+            /// Run again once the pending writes have taken the lock (see `answerFailureBytes`)
             again,
             /// Run again after the scans scheduled so far (see `HandlerError.ScanPending`)
             after_scans,
@@ -997,42 +1021,48 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             var attempt_arena: std.heap.ArenaAllocator = .init(server.gpa);
             defer attempt_arena.deinit();
             const a = attempt_arena.allocator();
-            var ctx = server.db.beginReadAt(a, pending.since);
-            ctx.cancel = &pending.cancel;
-            defer ctx.end();
-            // After a wait of seconds, writes since the request was received are common (another
-            // tab opened, a file changed on disk). Its positions only refer to its own document:
-            // when that text is unchanged it is answered on the state now
-            if (waited_for_projects) if (pending.document) |d| {
-                if (ctx.inputChangedAt(FileText, d.file) == d.text_changed_at) ctx.stale = false;
+            var response: ?[]u8 = null;
+            var slow: ?slow_log.Report = null;
+            const next = outcome: {
+                var ctx = server.db.beginReadAt(a, pending.since);
+                ctx.cancel = &pending.cancel;
+                defer ctx.end();
+                // After a wait of seconds, writes since the request was received are common (another
+                // tab opened, a file changed on disk). Its positions only refer to its own document:
+                // when that text is unchanged it is answered on the state now
+                if (waited_for_projects) if (pending.document) |d| {
+                    if (ctx.inputChangedAt(FileText, d.file) == d.text_changed_at) ctx.stale = false;
+                };
+                server.testGate(method, .in_read, pending);
+                var trace: za.db.Trace = .{ .gpa = a };
+                if (slow_log.traceEnabled(server)) ctx.trace = &trace;
+                var pc: panic_context.Text = .{};
+                requestContext(&pc, method, params);
+                defer pc.leave();
+                const zone = za.util.tracy.zone(@src(), method);
+                defer zone.end();
+                const t0 = Io.Clock.awake.now(server.io);
+                defer slow = slow_log.captureIfSlow(server, &ctx, method, t0, &trace);
+                var r: Resolver = .{ .ctx = &ctx, .arena = a };
+                handler_scans_awaited = pending.scans_awaited;
+                defer handler_scans_awaited = 0;
+                sub_projects.dirs.clearRetainingCapacity();
+                handler_sub_projects = sub_projects;
+                defer handler_sub_projects = null;
+                const result = func(server, &r, a, params) catch |err| break :outcome failed(server, &ctx, pending, sub_projects, err, &response);
+                // As in ReadTask: a handler that swallowed `Canceled` has an incomplete result
+                ctx.checkCanceled() catch |err| break :outcome failed(server, &ctx, pending, sub_projects, err, &response);
+                if (comptime isOutcome(@TypeOf(result))) switch (result) {
+                    .ok => |v| response = server.responseBytes(pending.id, v),
+                    .failed => |message| response = server.errorResponseBytes(pending.id, jsonrpc.error_codes.request_failed, message),
+                } else response = server.responseBytes(pending.id, result);
+                break :outcome .answered;
             };
-            server.testGate(method, .in_read, pending);
-            var trace: za.db.Trace = .{ .gpa = a };
-            if (slow_log.traceEnabled(server)) ctx.trace = &trace;
-            var pc: panic_context.Text = .{};
-            requestContext(&pc, method, params);
-            defer pc.leave();
-            const zone = za.util.tracy.zone(@src(), method);
-            defer zone.end();
-            const t0 = Io.Clock.awake.now(server.io);
-            defer slow_log.reportIfSlow(server, &ctx, method, t0, &trace);
-            var r: Resolver = .{ .ctx = &ctx, .arena = a };
-            handler_scans_awaited = pending.scans_awaited;
-            defer handler_scans_awaited = 0;
-            sub_projects.dirs.clearRetainingCapacity();
-            handler_sub_projects = sub_projects;
-            defer handler_sub_projects = null;
-            const result = func(server, &r, a, params) catch |err| return failed(server, &ctx, pending, sub_projects, err);
-            // As in ReadTask: a handler that swallowed `Canceled` has an incomplete result
-            ctx.checkCanceled() catch |err| return failed(server, &ctx, pending, sub_projects, err);
-            if (comptime isOutcome(@TypeOf(result))) switch (result) {
-                .ok => |v| server.sendResponse(pending.id, v),
-                .failed => |message| server.sendError(pending.id, jsonrpc.error_codes.request_failed, message),
-            } else server.sendResponse(pending.id, result);
-            return .answered;
+            sendAttempt(server, response, slow);
+            return next;
         }
 
-        fn failed(server: *Server, ctx: *const Db.Ctx, pending: *const Pending, sub_projects: *const SubProjectWait, err: anyerror) Next {
+        fn failed(server: *Server, ctx: *const Db.Ctx, pending: *Pending, sub_projects: *const SubProjectWait, err: anyerror, response: *?[]u8) Next {
             const go_on = !pending.cancel.load(.acquire) and !server.isShuttingDown();
             // Waits once: after the wait, the scans it waited for are enough (see `scopeIncomplete`),
             // so the scope is still incomplete only when the wait was cut short
@@ -1040,7 +1070,7 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             // Likewise once: sub-projects still not loaded after the wait are left out (see
             // `subProjectGap`), which does not report them again
             if (err == error.SubProjectsPending and !sub_projects.awaited and go_on) return .after_sub_projects;
-            return if (server.answerFailure(ctx, pending, err)) .answered else .again;
+            return if (server.answerFailureBytes(ctx, pending, err, response)) .answered else .again;
         }
     };
 }
@@ -1817,9 +1847,24 @@ pub fn send(server: *Server, bytes: []u8) void {
     server.out.writeMessage(bytes) catch |err| log.err("failed to write message: {t}", .{err});
 }
 
+/// The bytes of a successful response; null when they could not be built (out of memory).
+fn responseBytes(server: *Server, id: jsonrpc.Id, result: anytype) ?[]u8 {
+    return jsonrpc.response(server.gpa, id, result) catch {
+        log.err("out of memory while building response", .{});
+        return null;
+    };
+}
+
+/// The bytes of an error response; null when they could not be built (out of memory).
+fn errorResponseBytes(server: *Server, id: ?jsonrpc.Id, code: i32, message: []const u8) ?[]u8 {
+    return jsonrpc.errorResponse(server.gpa, id, code, message) catch {
+        log.err("out of memory while building error response", .{});
+        return null;
+    };
+}
+
 fn sendResponse(server: *Server, id: jsonrpc.Id, result: anytype) void {
-    const bytes = jsonrpc.response(server.gpa, id, result) catch return log.err("out of memory while building response", .{});
-    server.send(bytes);
+    if (server.responseBytes(id, result)) |bytes| server.send(bytes);
 }
 
 pub fn sendRequest(server: *Server, id: jsonrpc.Id, method: []const u8, params: anytype) void {
@@ -1833,26 +1878,32 @@ pub fn sendNotification(server: *Server, method: []const u8, params: anytype) vo
 }
 
 fn sendError(server: *Server, id: ?jsonrpc.Id, code: i32, message: []const u8) void {
-    const bytes = jsonrpc.errorResponse(server.gpa, id, code, message) catch return log.err("out of memory while building error response", .{});
-    server.send(bytes);
+    if (server.errorResponseBytes(id, code, message)) |bytes| server.send(bytes);
 }
 
-fn sendHandlerError(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_client: bool) void {
-    switch (err) {
+/// The bytes of the error response for `err` (see `sendHandlerError`); null when it could not be
+/// built (out of memory).
+fn handlerErrorBytes(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_client: bool) ?[]u8 {
+    const info: struct { code: i32, message: []const u8 } = switch (err) {
         error.Canceled => if (canceled_by_client)
-            server.sendError(id, jsonrpc.error_codes.request_cancelled, "request cancelled")
+            .{ .code = jsonrpc.error_codes.request_cancelled, .message = "request cancelled" }
         else
-            server.sendError(id, jsonrpc.error_codes.content_modified, "content modified"),
-        error.InvalidParams => server.sendError(id, jsonrpc.error_codes.invalid_params, "invalid params"),
-        error.InvalidIdentifier => server.sendError(id, jsonrpc.error_codes.request_failed, "new name is not a valid identifier"),
+            .{ .code = jsonrpc.error_codes.content_modified, .message = "content modified" },
+        error.InvalidParams => .{ .code = jsonrpc.error_codes.invalid_params, .message = "invalid params" },
+        error.InvalidIdentifier => .{ .code = jsonrpc.error_codes.request_failed, .message = "new name is not a valid identifier" },
         // Answered only when the wait for scans or sub-projects was cut short, by a cancellation or
         // the shutdown (see `SemanticTask`)
         error.ScanPending, error.SubProjectsPending => if (canceled_by_client)
-            server.sendError(id, jsonrpc.error_codes.request_cancelled, "request cancelled")
+            .{ .code = jsonrpc.error_codes.request_cancelled, .message = "request cancelled" }
         else
-            server.sendError(id, jsonrpc.error_codes.request_failed, "the server is shutting down"),
-        else => server.sendError(id, jsonrpc.error_codes.internal_error, @errorName(err)),
-    }
+            .{ .code = jsonrpc.error_codes.request_failed, .message = "the server is shutting down" },
+        else => .{ .code = jsonrpc.error_codes.internal_error, .message = @errorName(err) },
+    };
+    return server.errorResponseBytes(id, info.code, info.message);
+}
+
+fn sendHandlerError(server: *Server, id: jsonrpc.Id, err: anyerror, canceled_by_client: bool) void {
+    if (server.handlerErrorBytes(id, err, canceled_by_client)) |bytes| server.send(bytes);
 }
 
 fn destroyArena(server: *Server, arena: *std.heap.ArenaAllocator) void {

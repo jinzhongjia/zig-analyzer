@@ -1361,6 +1361,35 @@ test "a request interrupted by a later edit is answered with ContentModified" {
     try h.notify("exit", {});
 }
 
+test "a response is written after the read transaction has ended" {
+    // Guards against holding the shared side of the database lock while the client drains a
+    // response: later edits and `$/cancelRequest` would wait for the write.
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:response-after-read.zig";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const alpha_value: u32 = 1;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    var gate: Server.OnceGate = .{};
+    h.server.hooks.response = &gate;
+    defer h.server.hooks.response = null;
+    defer gate.release.set(testing.io);
+    const hover = try h.send("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 0, .character = 6 } });
+    try gate.entered.wait(testing.io);
+    try testing.expectEqual(0, h.server.db.active_readers.load(.acquire));
+    gate.release.set(testing.io);
+    const response = try h.response(hover);
+    try testing.expect(response.object.get("error") == null);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "function completions carry no signature in the list and resolve to the signature and doc" {
     const Harness = @import("test_harness.zig").Harness;
     const Empty = struct {};
