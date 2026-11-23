@@ -868,6 +868,93 @@ test "file import targets follow the import strings and the module graph" {
     }
 }
 
+test "@import(\"root\") outside the module graph follows the workspace files" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const app = (try w.add("/p/app.zig", "pub const root = @import(\"root\");\n")).file;
+    const other = (try w.add("/p/other.zig", "const app = @import(\"app.zig\");\n")).file;
+    // `app.zig` is in no module: the files that may be its root module are the workspace files
+    // outside the module graph that reach it (see `Resolver.singleFileRoots`)
+    try w.setGraph(null, &.{}, &.{});
+    try w.setWorkspaceFiles(&.{app});
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualSlices(FileId, &.{app}, (try r.importTargetsTable(app)).of(0));
+    }
+    // A workspace file that imports `app.zig` is its root module instead
+    try w.setWorkspaceFiles(&.{ app, other });
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualSlices(FileId, &.{other}, (try r.importTargetsTable(app)).of(0));
+    }
+}
+
+test "a relative import keeps its target when the imported file is created" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const main = (try w.add("/p/main.zig", "const lib = @import(\"lib.zig\");\n")).file;
+    try w.setGraph(null, &.{}, &.{});
+    var target: FileId = undefined;
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        const targets = (try r.importTargetsTable(main)).of(0);
+        try testing.expectEqual(1, targets.len);
+        target = targets[0];
+        try testing.expectEqualStrings("lib.zig", std.fs.path.basename(w.vfs.path(target)));
+    }
+    const executions = w.db.executions(resolve.FileImportTargets);
+    // Resolution does not check that the imported file exists; creating it keeps the interned
+    // target and changes no dependency of the query
+    const lib = (try w.add("/p/lib.zig", "pub const x = 1;\n")).file;
+    try testing.expectEqual(target, lib);
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualSlices(FileId, &.{lib}, (try r.importTargetsTable(main)).of(0));
+    }
+    try testing.expectEqual(executions, w.db.executions(resolve.FileImportTargets));
+}
+
+test "a module graph change flips the module-root check of a relative import" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const main = (try w.add("/p/src/main.zig", "const other = @import(\"../other.zig\");\n")).file;
+    const other = (try w.add("/p/other.zig", "pub const x = 1;\n")).file;
+    // Without a module graph, a relative import may leave the directory of the importing file
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualSlices(FileId, &.{other}, (try r.importTargetsTable(main)).of(0));
+    }
+    // A module rooted at `/p/src` rejects an import that leaves its directory
+    try w.setGraph(null, &.{.{ .root = main, .imports = &.{} }}, &.{.{ .file = main, .module = 0, .compile = 0 }});
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualSlices(FileId, &.{}, (try r.importTargetsTable(main)).of(0));
+    }
+    // A graph without the importing file does not limit its imports
+    try w.setGraph(null, &.{}, &.{});
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualSlices(FileId, &.{other}, (try r.importTargetsTable(main)).of(0));
+    }
+}
+
 test "@This, enums, nested containers and generic functions" {
     var w: World = undefined;
     try w.init();
