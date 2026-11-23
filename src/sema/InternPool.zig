@@ -1082,6 +1082,13 @@ pub fn ptrTo(ip: *InternPool, child: Index, size: PtrSize, is_const: bool) Alloc
 /// Error set with the given names (later duplicates are dropped); when a set with the same
 /// members already exists, that set (with the order of its names) is returned
 pub fn errorSet(ip: *InternPool, gpa: Allocator, names: []const []const u8) Allocator.Error!Index {
+    // Sets of at most one name need no ordering or deduplication. `get` copies the slices of the
+    // key it stores, so the caller's slice and the constant index array are safe to pass.
+    switch (names.len) {
+        0 => return ip.get(.{ .error_set_type = .empty }),
+        1 => return ip.get(.{ .error_set_type = .{ .names = names, .sorted = &.{0} } }),
+        else => {},
+    }
     // Positions ordered by the bytes of the names, equal names by position: the first occurrence
     // of a name comes first
     const order = try gpa.alloc(u32, names.len);
@@ -1537,6 +1544,19 @@ test "interning is idempotent and presets are stable" {
     const eu = try ip.get(.{ .error_union_type = .{ .err = .anyerror_type, .payload = try ip.optionalOf(a) } });
     try ip.print(eu, &w, Names{});
     try testing.expectEqualStrings("anyerror!?[]const u8", w.buffered());
+}
+
+test "empty and single-name error sets intern as the general path builds them" {
+    var ip: InternPool = try .init(testing.allocator, testing.io);
+    defer ip.deinit();
+    try testing.expectEqual(Index.empty_error_set, try ip.errorSet(testing.allocator, &.{}));
+    // A duplicate drops to the same single-member set the general path deduplicates to
+    try testing.expectEqual(try ip.errorSet(testing.allocator, &.{"A"}), try ip.errorSet(testing.allocator, &.{ "A", "A" }));
+    // The pool copies the name, so the caller's slice can be reused
+    var names = [_][]const u8{"Z"};
+    const z = try ip.errorSet(testing.allocator, &names);
+    names[0] = "Y";
+    try testing.expectEqualStrings("Z", ip.key(z).error_set_type.names[0]);
 }
 
 test "types of null, undefined and enum literals print as Zig spells them" {
