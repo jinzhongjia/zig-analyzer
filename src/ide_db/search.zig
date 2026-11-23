@@ -136,19 +136,32 @@ pub fn findReferences(r: *Resolver, def: Def, opts: Options) resolve.Error![]Ref
             }
         },
         .item => {
-            // Only whether the one file can reach the definition matters (document highlight)
-            const reach = if (opts.only_file) |f|
-                (if (f == def_file or try reaches(r, f, def_file)) try r.arena.dupe(FileId, &.{f}) else &.{})
-            else
-                try importers(r, def_file, opts.scope);
-            for (reach) |f| try finder.importing.put(r.arena, f, {});
-            const files = if (opts.only_file) |f| try r.arena.dupe(FileId, &.{f}) else try candidateFiles(r, reach, opts.scope);
-            for (files) |f| {
-                const index = try r.ctx.get(FileIndex.Query, f);
-                if (!index.contains(name)) continue;
-                try noteSyntaxError(r, opts.syntax_error, f);
-                const tree = try r.itemTree(f);
-                for (0..tree.items.len) |i| try finder.item(f, @intCast(i));
+            // A declaration that is neither `pub` nor a field is visible only in its own file, so
+            // no other file can refer to it and searching the import closure would only produce
+            // results that member resolution filters away. Document highlight searches the file it
+            // was given, whatever the visibility.
+            if (opts.only_file == null and !try visibleOutsideFile(r, def)) {
+                try finder.importing.put(r.arena, def_file, {});
+                if ((try r.ctx.get(FileIndex.Query, def_file)).contains(name)) {
+                    try noteSyntaxError(r, opts.syntax_error, def_file);
+                    const tree = try r.itemTree(def_file);
+                    for (0..tree.items.len) |i| try finder.item(def_file, @intCast(i));
+                }
+            } else {
+                // Only whether the one file can reach the definition matters (document highlight)
+                const reach = if (opts.only_file) |f|
+                    (if (f == def_file or try reaches(r, f, def_file)) try r.arena.dupe(FileId, &.{f}) else &.{})
+                else
+                    try importers(r, def_file, opts.scope);
+                for (reach) |f| try finder.importing.put(r.arena, f, {});
+                const files = if (opts.only_file) |f| try r.arena.dupe(FileId, &.{f}) else try candidateFiles(r, reach, opts.scope);
+                for (files) |f| {
+                    const index = try r.ctx.get(FileIndex.Query, f);
+                    if (!index.contains(name)) continue;
+                    try noteSyntaxError(r, opts.syntax_error, f);
+                    const tree = try r.itemTree(f);
+                    for (0..tree.items.len) |i| try finder.item(f, @intCast(i));
+                }
             }
         },
         .file => unreachable,
