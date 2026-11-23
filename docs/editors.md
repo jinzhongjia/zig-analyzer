@@ -48,6 +48,18 @@ need to know, including the editors that only need their own LSP client.
       .build = .{ .args = .{"-Dtarget=aarch64-linux"} },
   }
   ```
+- **Build step.** On save, the server runs `zig build <step>` and publishes the compiler's errors;
+  files the step does not compile get only live diagnostics (syntax and AstGen). Without
+  `diagnostics.steps`, the step is `check` when `build.zig` defines it, otherwise the default step
+  (usually `install`, which also copies the artifacts to `zig-out`). A `check` step that depends
+  on the compile steps, without installing or running them, keeps this fast; add the tests to it
+  so their files are compiled too:
+
+  ```zig
+  const check = b.step("check", "Check that everything compiles");
+  check.dependOn(&exe.step);
+  check.dependOn(&tests.step);
+  ```
 - **`.zon` files.** The server handles them by extension. The editor only has to open them and
   attach its LSP client; some editors need `.zon` associated with the Zig file type by hand, and
   each section below says when.
