@@ -47,7 +47,7 @@ ide_db/       reference search · call-site seeds
 sema/         InternPool · type inference · comptime interpreter · type rendering
 names/        module graph · import / name resolution
 hir/          function body IR lowering · local scopes
-syntax/       error-tolerant lossless CST · local reparse · ItemTree · AstId · typed AST layer · file indexes (FileIndex, ErrorSets)
+syntax/       error-tolerant lossless CST · local reparse · ItemTree · AstId · typed AST layer · file indexes (FileIndex, StringLiterals, ErrorSets)
 diagnostics/  live (official parser + AstGen) · compiler (ErrorBundle) · compile sets
 project/      build system protocol client · child-process ErrorBundle validation · zig env · builtin.zig generation
 base/         Vfs · URI · inputs · ProjectModel
@@ -128,6 +128,7 @@ Only `Canceled` and `OutOfMemory` propagate within the engine. Query results are
 - **ItemTree**: the declaration skeleton of a file, without function bodies. When only bodies change its value stays the same, so neither the name layer nor signature inference is invalidated. It also holds the file's `//!` doc, so that completion and hover can show the doc of an imported file without its syntax tree, which is evicted far sooner (see Memory reclamation). A ZON file has one member, its root expression, which is a BodyOwner and not a declaration.
 - **AstId**: derived from the parent AstId, kind, name, and ordinal among same-named nodes, and stable across edits. Nodes inside function bodies are located by their HIR `ExprId`.
 - **Position-independent summaries**: `ItemNames` and `ContainerRels` hold no absolute positions (those stay in `ItemSummaries` / `FileAstIdMap`), so moving code does not invalidate semantic search.
+- **String literals**: `StringLiterals` holds the decoded value of each string literal outside test names with the offset of its first occurrence, so rename checks the string references of a candidate file without parsing and decoding it again. The offsets are part of the value: an edit that moves a literal changes it, so the reported position follows the literal.
 - **Typed AST layer** (`ast.zig`): centralizes which child node holds which information; accessors return optionals.
 - **Incomplete names**: an unterminated quoted identifier is recovered as a name in syntactic decisions; HIR lowers a reference without a valid name to an unknown expression.
 - **Line table**: `LineStarts`, the line starts of a file's `SourceText`, is computed once per revision of the text. Requests and diagnostics convert between byte offsets and LSP positions with it (`offsets.LineIndex`), so a conversion scans only the line of the position. The scans for line breaks and for runs of ASCII bytes (one code unit per byte in every encoding) compare a vector of bytes at a time where the compiler backend supports vectors, under the condition `std.mem` uses.

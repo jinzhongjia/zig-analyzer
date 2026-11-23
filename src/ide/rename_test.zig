@@ -163,6 +163,45 @@ test "rename: names referenced by string literals" {
     try testing.expectEqual(null, try rename.stringReference(&r, &.{file}, "other"));
 }
 
+test "rename: a shifted string literal reports its new offset" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const before =
+        \\const S = struct { fooBar: u32 };
+        \\fn f(s: S) void {
+        \\    _ = @field(s, "fooBar");
+        \\}
+    ;
+    const file = (try w.add("/p/main.zig", before)).file;
+    const a = w.arena.allocator();
+    {
+        var ctx = w.db.beginRead(a);
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = a };
+        const p = (try rename.stringReference(&r, &.{file}, "fooBar")).?;
+        const got = try format(before, p);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("3:19 `fooBar` appears in a string literal, which may refer to it by name (as `@field` and serialization do) and would not be updated", got);
+    }
+    // The literal keeps its value but moves down by one line: the reported offset must follow it
+    const after =
+        \\// a header line
+        \\const S = struct { fooBar: u32 };
+        \\fn f(s: S) void {
+        \\    _ = @field(s, "fooBar");
+        \\}
+    ;
+    _ = try w.add("/p/main.zig", after);
+    var ctx = w.db.beginRead(a);
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = a };
+    const p = (try rename.stringReference(&r, &.{file}, "fooBar")).?;
+    const got = try format(after, p);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("4:19 `fooBar` appears in a string literal, which may refer to it by name (as `@field` and serialization do) and would not be updated", got);
+}
+
 test "rename: multiline string keys are string references" {
     var w: World = undefined;
     try w.init();
