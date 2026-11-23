@@ -819,6 +819,35 @@ test "goto and references on members of a module import that differs between the
     }
 }
 
+test "module alternatives cache is not reused across resolver contexts" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const f = try w.fixture(
+        \\//- /p/main.zig module:a deps:cfg=cfga module:b deps:cfg=cfgb
+        \\const cfg = @import("cfg");
+        \\const value = cfg.value;
+        \\//- /p/cfg_a.zig module:cfga
+        \\pub const value: u32 = 1;
+        \\//- /p/cfg_b.zig module:cfgb
+        \\pub const value: u32 = 2;
+    );
+    const main = f.file("/p/main.zig");
+    const cfg_a = f.file("/p/cfg_a.zig");
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator(), .context = 0 };
+    const text = (try ctx.get(database.syntax.SourceText, cfg_a)).text;
+    const def = try definition.defAt(&r, cfg_a, @intCast(std.mem.indexOf(u8, text, "value").?)) orelse return error.NoDefinition;
+    var cache: resolve.ImportTargetCache = .empty;
+    try testing.expectEqual(@as(usize, 1), (try r.moduleAlternatives(main, def, &cache)).len);
+    try testing.expectEqual(@as(?u32, 0), cache.get(main).?.context);
+    // A list computed for another compilation is not reused
+    r.context = 1;
+    try testing.expectEqual(@as(usize, 1), (try r.moduleAlternatives(main, def, &cache)).len);
+    try testing.expectEqual(@as(?u32, 1), cache.get(main).?.context);
+}
+
 test "@This, enums, nested containers and generic functions" {
     var w: World = undefined;
     try w.init();

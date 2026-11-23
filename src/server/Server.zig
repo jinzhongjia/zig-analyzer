@@ -1631,6 +1631,21 @@ pub fn uriFor(server: *Server, arena: Allocator, file: Vfs.FileId) Allocator.Err
     return uri.fromPath(arena, server.vfs.path(file));
 }
 
+/// URIs of the files a request responds about: `uriFor` takes the document lock and encodes a URI
+/// each time, which repeats for every reference in the same file
+pub const UriCache = struct {
+    server: *Server,
+    arena: Allocator,
+    uris: std.AutoHashMapUnmanaged(Vfs.FileId, []const u8) = .empty,
+
+    pub fn get(cache: *UriCache, file: Vfs.FileId) Allocator.Error![]const u8 {
+        if (cache.uris.get(file)) |u| return u;
+        const u = try uriFor(cache.server, cache.arena, file);
+        try cache.uris.put(cache.arena, file, u);
+        return u;
+    }
+};
+
 /// Maps a URI in a read request to a known file; returns
 /// null for files that are not open or do not exist
 pub fn lookupFile(server: *Server, arena: Allocator, document_uri: []const u8) !?Vfs.FileId {

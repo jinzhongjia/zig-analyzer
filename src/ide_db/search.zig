@@ -460,10 +460,16 @@ pub fn errorUse(r: *Resolver, file: FileId, name: []const u8, accesses: bool, te
     return first;
 }
 
+/// The call-site instances of a member, cached while the uses of an error name in a file are
+/// collected: every `E.X` of the member asks for the same list
+const ErrorInstances = struct { insts: []const InternPool.Index, complete: bool };
+const ErrorInstancesKey = struct { file: FileId, item: u32 };
+
 /// Appends the uses of the error named `name` in `file` (see `findErrorReferences`); member
 /// accesses only with `accesses`, and uses in `test` blocks only with `tests`
 fn errorUses(r: *Resolver, file: FileId, name: []const u8, accesses: bool, tests: bool, out: *std.ArrayList(Reference), opts: Options) resolve.Error!void {
     const tree = try r.itemTree(file);
+    var instances: std.AutoHashMapUnmanaged(ErrorInstancesKey, ErrorInstances) = .empty;
     var skipped: std.ArrayList(Body.Range) = .empty;
     if (!tests) for (tree.items, 0..) |it, i| if (it.kind == .@"test") if (try r.itemNode(file, @intCast(i))) |n| {
         try skipped.append(r.arena, .{ .start = n.range().start, .end = n.range().end });
@@ -487,7 +493,7 @@ fn errorUses(r: *Resolver, file: FileId, name: []const u8, accesses: bool, tests
             },
             .field_access => |fa| if (accesses and fa.field != null and std.mem.eql(u8, fa.field.?, name)) {
                 const at: Reference = .{ .file = file, .start = base + range.start, .end = base + range.end };
-                switch (try errorSetAccess(r, &res, file, item, fa.lhs, at, opts)) {
+                switch (try errorSetAccess(r, &res, file, item, fa.lhs, at, opts, &instances)) {
                     .hit => if (lastNameStart(text, at.end)) |start| try out.append(r.arena, .{ .file = file, .start = start, .end = at.end }),
                     .miss => {},
                     .unknown => if (opts.uncertain) |slot| if (slot.* == null) {
@@ -508,7 +514,7 @@ fn inRanges(ranges: []const Body.Range, offset: u32) bool {
 /// Whether the left-hand side `lhs` of a member access in member `item` is an error set type, which
 /// makes the member an error name: by the inference of the member, else by its call-site instances
 /// (as `Finder.refersTo` decides members)
-fn errorSetAccess(r: *Resolver, res: *?*const infer.Result, file: FileId, item: u32, lhs: Body.ExprId, at: Reference, opts: Options) resolve.Error!Target {
+fn errorSetAccess(r: *Resolver, res: *?*const infer.Result, file: FileId, item: u32, lhs: Body.ExprId, at: Reference, opts: Options, instances: *std.AutoHashMapUnmanaged(ErrorInstancesKey, ErrorInstances)) resolve.Error!Target {
     const ip = r.ctx.db.env.ip;
     const owner = try r.ownerKey(file, item);
     const abstract = res.* orelse blk: {
@@ -519,7 +525,13 @@ fn errorSetAccess(r: *Resolver, res: *?*const infer.Result, file: FileId, item: 
     if (errorSetType(ip, abstract, lhs)) |is| return if (is) .hit else .miss;
     var hit = false;
     var miss = false;
-    const all = try seed.allInstances(r, file, item);
+    const key: ErrorInstancesKey = .{ .file = file, .item = item };
+    const all = instances.get(key) orelse blk: {
+        const list = try seed.allInstances(r, file, item);
+        const entry: ErrorInstances = .{ .insts = list.insts, .complete = list.complete };
+        try instances.put(r.arena, key, entry);
+        break :blk entry;
+    };
     for (all.insts) |inst| {
         const is = errorSetType(ip, try r.ctx.get(sema.Infer, .{ .owner = owner, .mode = .full, .inst = inst }), lhs) orelse continue;
         if (is) hit = true else miss = true;
@@ -742,6 +754,10 @@ const Finder = struct {
     /// Files that can reach the file containing the definition through an `@import` chain (`.item`
     /// definitions). In other files, only code in generic functions may reference the definition
     importing: std.AutoHashMapUnmanaged(FileId, void) = .empty,
+    /// The import names of each file and their targets (see `Resolver.moduleAlternatives`), for
+    /// the matching uses of this request; keyed by the file, and reused only in the resolver
+    /// context the list was computed in
+    module_targets: resolve.ImportTargetCache = .empty,
     /// Call-site instances of the most recent member (`instances`)
     cached: ?struct { file: FileId, item: u32, list: []const InternPool.Index, complete: bool } = null,
 
@@ -1032,7 +1048,7 @@ const Finder = struct {
     fn matches(f: *Finder, file: FileId, d: Def, path_alternatives: []const Def, at: Reference) resolve.Error!Target {
         var hit = deepEql(d, f.def);
         var miss = !hit;
-        for (try f.r.moduleAlternatives(file, d)) |alt| {
+        for (try f.r.moduleAlternatives(file, d, &f.module_targets)) |alt| {
             if (deepEql(alt, f.def)) hit = true else miss = true;
         }
         for (path_alternatives) |alt| {

@@ -59,7 +59,7 @@ fn definitionsOf(r: *Resolver, file: FileId, def: Def) resolve.Error![]const Tar
     var defs: std.ArrayList(Def) = .empty;
     const end = try r.aliasTarget(def);
     try defs.append(r.arena, end);
-    try defs.appendSlice(r.arena, try r.moduleAlternatives(file, end));
+    try defs.appendSlice(r.arena, try r.moduleAlternatives(file, end, null));
     if (try constValue(r, def)) |v| {
         try defs.appendSlice(r.arena, try r.pathAlternatives(v.file, v.item, v.body, v.value));
     }
@@ -179,7 +179,7 @@ fn allTargets(r: *Resolver, file: FileId, offset: u32, follow_alias: bool) resol
     try defs.appendSlice(r.arena, try importedMemberDefs(r, file, offset));
     for (defs.items, 0..) |def, k| {
         var alternatives: std.ArrayList(Def) = .empty;
-        try alternatives.appendSlice(r.arena, try r.moduleAlternatives(file, def));
+        try alternatives.appendSlice(r.arena, try r.moduleAlternatives(file, def, null));
         // The member access at the cursor names the found definition along a path of names
         if (k == 0 and found_def) try alternatives.appendSlice(r.arena, try cursorPathAlternatives(r, file, offset));
         for (0..alternatives.items.len + 1) |i| {
@@ -1251,7 +1251,7 @@ fn appendTypeTargets(r: *Resolver, file: FileId, tv: TypedValue, out: *std.Array
     const ns = try queries.namespaceOfType(r, t) orelse return;
     if (try namespaceTarget(r, ns)) |x| try appendNew(r, out, x);
     const def: Def = if (ns.container == 0) .{ .file = ns.file } else .{ .item = .{ .file = ns.file, .item = try containerDecl(r, ns) orelse return } };
-    for (try r.moduleAlternatives(file, def)) |alt| {
+    for (try r.moduleAlternatives(file, def, null)) |alt| {
         const alt_ns = try r.namespaceOf(alt) orelse continue;
         if (try namespaceTarget(r, alt_ns)) |x| try appendNew(r, out, x);
     }
