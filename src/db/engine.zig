@@ -312,8 +312,6 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         deep_verifications: std.atomic.Value(u64) = .init(0),
         /// See `Stats.writes`
         writes: std.atomic.Value(u64) = .init(0),
-        /// Counter for the last-use times of memos (LRU)
-        access_tick: std.atomic.Value(u64) = .init(0),
         /// Some query that declares `lru` is over capacity and waits for `sweep`
         sweep_wanted: std.atomic.Value(bool) = .init(false),
         /// Current capacities of the queries that declare `lru` (see `setLru`), indexed like
@@ -361,6 +359,9 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 live: usize = 0,
                 /// Bytes of the retained values (counted only for queries that declare `lru_bytes`)
                 live_bytes: usize = 0,
+                /// Counter for the last-use times of this table's memos (LRU), incremented under
+                /// `mutex`; `last_used` is compared only within one table
+                access_tick: u64 = 0,
                 /// A read transaction evicts only above this many bytes (see `claimReadEviction`)
                 read_eviction_floor: usize = 0,
 
@@ -1397,7 +1398,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 defer table.mutex.unlock(db.io);
                 const memo = &(table.slots.items[index].memo orelse return null);
                 if (memo.verified_at != db.revision or memo.evicted) return null;
-                memo.last_used = db.access_tick.fetchAdd(1, .monotonic);
+                table.access_tick += 1;
+                memo.last_used = table.access_tick;
                 return .{ .value = memo.value, .changed_at = memo.changed_at, .durability = memo.durability };
             }
 
@@ -1855,13 +1857,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     if (@hasDecl(Q, "lru_bytes")) table.live_bytes += Q.bytes(value);
                 }
                 if (@hasDecl(Q, "lru") and db.overLru(Q, table)) db.sweep_wanted.store(true, .monotonic);
+                table.access_tick += 1;
                 slot.memo = .{
                     .value = value,
                     .verified_at = db.revision,
                     .changed_at = changed_at,
                     .durability = frame.durability,
                     .deps = deps,
-                    .last_used = db.access_tick.fetchAdd(1, .monotonic),
+                    .last_used = table.access_tick,
                 };
                 return .{ .value = value, .changed_at = changed_at, .durability = frame.durability, .executed = true };
             }
@@ -1918,8 +1921,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         /// The memo of a derived query as it is now, marked as used (LRU). The caller must hold
         /// the table's mutex.
         fn useMemoLocked(db: *Db, comptime Q: type, index: u32) ?Table(Q).Memo {
-            const memo = &(db.tables[comptime queryIndex(Q)].slots.items[index].memo orelse return null);
-            memo.last_used = db.access_tick.fetchAdd(1, .monotonic);
+            const table = &db.tables[comptime queryIndex(Q)];
+            const memo = &(table.slots.items[index].memo orelse return null);
+            table.access_tick += 1;
+            memo.last_used = table.access_tick;
             return memo.*;
         }
 
