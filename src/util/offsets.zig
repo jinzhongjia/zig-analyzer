@@ -29,16 +29,16 @@ pub const Encoding = enum {
     }
 };
 
-/// Bytes compared at once when scanning for line breaks and ASCII text
-const vector_len: usize = @import("vector.zig").width;
+/// The width of the byte scans for line breaks and ASCII text
+const vector = @import("vector.zig");
 
 /// Offset of the first `\r` or `\n` at or after `start`
 fn findBreak(text: []const u8, start: usize) ?usize {
     var i = start;
-    if (comptime vector_len > 0) {
-        const Chunk = @Vector(vector_len, u8);
-        while (i + vector_len <= text.len) : (i += vector_len) {
-            const c: Chunk = text[i..][0..vector_len].*;
+    if (comptime vector.width > 0) {
+        const Chunk = @Vector(vector.width, u8);
+        while (i + vector.width <= text.len) : (i += vector.width) {
+            const c: Chunk = text[i..][0..vector.width].*;
             const hits = (c == @as(Chunk, @splat('\r'))) | (c == @as(Chunk, @splat('\n')));
             if (@reduce(.Or, hits)) return i + std.simd.firstTrue(hits).?;
         }
@@ -58,10 +58,10 @@ fn breakEnd(text: []const u8, nl: usize) usize {
 /// every encoding.
 fn asciiChunksEnd(text: []const u8, from: usize, stop: usize) usize {
     var i = from;
-    if (comptime vector_len > 0) {
-        const Chunk = @Vector(vector_len, u8);
-        while (i + vector_len <= stop) : (i += vector_len) {
-            const c: Chunk = text[i..][0..vector_len].*;
+    if (comptime vector.width > 0) {
+        const Chunk = @Vector(vector.width, u8);
+        while (i + vector.width <= stop) : (i += vector.width) {
+            const c: Chunk = text[i..][0..vector.width].*;
             if (@reduce(.Or, c >= @as(Chunk, @splat(0x80)))) break;
         }
     }
@@ -79,11 +79,11 @@ pub fn lineStarts(gpa: Allocator, text: []const u8) Allocator.Error![]u32 {
     var base: usize = 0;
     // A bit mask of the line breaks of each chunk takes the breaks in order without a branch per
     // byte; vector element `k` is bit `k` of the mask on little-endian targets
-    if (comptime vector_len > 0 and builtin.cpu.arch.endian() == .little) {
-        const Chunk = @Vector(vector_len, u8);
-        const Mask = @Int(.unsigned, vector_len);
-        while (base + vector_len <= text.len) : (base += vector_len) {
-            const c: Chunk = text[base..][0..vector_len].*;
+    if (comptime vector.width > 0 and builtin.cpu.arch.endian() == .little) {
+        const Chunk = @Vector(vector.width, u8);
+        const Mask = @Int(.unsigned, vector.width);
+        while (base + vector.width <= text.len) : (base += vector.width) {
+            const c: Chunk = text[base..][0..vector.width].*;
             var bits: Mask = @bitCast((c == @as(Chunk, @splat('\r'))) | (c == @as(Chunk, @splat('\n'))));
             while (bits != 0) : (bits &= bits - 1) {
                 const nl = base + @ctz(bits);

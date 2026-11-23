@@ -1,6 +1,6 @@
 //! Property test for the edit range of an incremental reparse (fixed-seed random input +
 //! coverage-guided fuzzing): the vector chunk scans find the same byte-exact common prefix and
-//! suffix as a byte-by-byte reference, so a reparse takes the same range as before.
+//! suffix as a byte-by-byte reference, so a reparse takes the same range as the scalar scan.
 
 const std = @import("std");
 const testing = std.testing;

@@ -10,7 +10,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Text = @import("../util/Text.zig");
-const vector_width = @import("../util/vector.zig").width;
+const vector = @import("../util/vector.zig");
 const kind_mod = @import("kind.zig");
 const SyntaxKind = kind_mod.SyntaxKind;
 const lexer = @import("lexer.zig");
@@ -325,30 +325,30 @@ pub fn editRange(old_text: []const u8, text: []const u8) ?EditRange {
 fn commonPrefix(a: []const u8, b: []const u8) usize {
     const n = @min(a.len, b.len);
     var i: usize = 0;
-    if (comptime vector_width > 0) {
-        const Chunk = @Vector(vector_width, u8);
-        while (i + vector_width <= n) : (i += vector_width) {
-            const x: Chunk = a[i..][0..vector_width].*;
-            const y: Chunk = b[i..][0..vector_width].*;
+    if (comptime vector.width > 0) {
+        const Chunk = @Vector(vector.width, u8);
+        while (i + vector.width <= n) : (i += vector.width) {
+            const x: Chunk = a[i..][0..vector.width].*;
+            const y: Chunk = b[i..][0..vector.width].*;
             const differs = x != y;
-            if (@reduce(.Or, differs)) return i + std.simd.firstTrue(differs).?;
+            if (std.simd.firstTrue(differs)) |j| return i + j;
         }
     }
     while (i < n and a[i] == b[i]) i += 1;
     return i;
 }
 
-/// Length of the common suffix of `a` and `b`, at most `max`: the last byte at which they differ
-/// when scanning backwards, which stops before the suffix reaches the prefix
+/// Number of trailing bytes that are equal, at most `max`: it stops before the suffix would reach
+/// into the prefix
 fn commonSuffix(a: []const u8, b: []const u8, max: usize) usize {
     var n: usize = 0;
-    if (comptime vector_width > 0) {
-        const Chunk = @Vector(vector_width, u8);
-        while (n + vector_width <= max) : (n += vector_width) {
-            const x: Chunk = a[a.len - n - vector_width ..][0..vector_width].*;
-            const y: Chunk = b[b.len - n - vector_width ..][0..vector_width].*;
+    if (comptime vector.width > 0) {
+        const Chunk = @Vector(vector.width, u8);
+        while (n + vector.width <= max) : (n += vector.width) {
+            const x: Chunk = a[a.len - n - vector.width ..][0..vector.width].*;
+            const y: Chunk = b[b.len - n - vector.width ..][0..vector.width].*;
             const differs = x != y;
-            if (@reduce(.Or, differs)) return n + vector_width - 1 - std.simd.lastTrue(differs).?;
+            if (std.simd.lastTrue(differs)) |j| return n + vector.width - 1 - j;
         }
     }
     while (n < max and a[a.len - 1 - n] == b[b.len - 1 - n]) n += 1;
