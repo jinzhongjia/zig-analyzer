@@ -6,6 +6,11 @@
 //! latest report) is sent once the response arrives.
 //! If the progress has ended before the response arrives, nothing is sent; if the client replies
 //! with an error, the token is abandoned (nothing more is sent; it is freed at `end`).
+//!
+//! The functions write to the client while holding `mutex`: this keeps the message order (begin,
+//! reports, end) equal to the order of the state changes and keeps the progress alive during its
+//! send. They must not be called while holding a workspace mutex: a client that stops reading
+//! blocks progress messages, not project state.
 
 const std = @import("std");
 const Io = std.Io;
@@ -178,4 +183,40 @@ test "pruneLocked drops ended entries but keeps the ones still in use" {
     reg.pruneLocked(gpa);
     try std.testing.expectEqual(max_active - 1, reg.active.count());
     try std.testing.expect(reg.active.get(live.id) != null);
+}
+
+test "begin, report and end are sent in order" {
+    const gpa = std.testing.allocator;
+    const transport = @import("../lsp/transport.zig");
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var writer: transport.Writer = .{ .io = std.testing.io, .inner = &out.writer };
+    var server: Server = undefined;
+    try server.init(std.testing.io, gpa, &writer);
+    defer server.deinit();
+    server.progress.enabled = true;
+
+    const p = server.progress.begin(&server, "test", true).?;
+    try std.testing.expect(server.progress.handleResponse(&server, p.id, true));
+    server.progress.report(&server, p, "half", 50);
+    server.progress.end(&server, p, "done");
+
+    const Step = enum { create, begin, report, end };
+    var steps: std.ArrayList(Step) = .empty;
+    defer steps.deinit(gpa);
+    var reader: Io.Reader = .fixed(out.written());
+    while (transport.readMessage(&reader, gpa)) |body| {
+        defer gpa.free(body);
+        const msg = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+        defer msg.deinit();
+        const method = msg.value.object.get("method").?.string;
+        if (std.mem.eql(u8, method, "window/workDoneProgress/create")) {
+            try steps.append(gpa, .create);
+            continue;
+        }
+        try std.testing.expectEqualStrings("$/progress", method);
+        const kind = msg.value.object.get("params").?.object.get("value").?.object.get("kind").?.string;
+        try steps.append(gpa, if (std.mem.eql(u8, kind, "begin")) .begin else if (std.mem.eql(u8, kind, "report")) .report else .end);
+    } else |err| if (err != error.EndOfStream) return err;
+    try std.testing.expectEqualSlices(Step, &.{ .create, .begin, .report, .end }, steps.items);
 }
