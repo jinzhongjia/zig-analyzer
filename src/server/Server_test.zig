@@ -1492,49 +1492,40 @@ test "a semantic tokens response is written before the refresh of a later edit" 
     defer h.finish();
     _ = try h.request("initialize", .{
         .capabilities = .{ .workspace = .{ .semanticTokens = .{ .refreshSupport = true } } },
-        .initializationOptions = .{ .diagnostics = .{ .debounce_ms = 0 } },
     });
     try h.notify("initialized", Empty{});
     const uri = "untitled:semantic-order.zig";
-    const other = "untitled:semantic-order-other.zig";
     try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const alpha_value: u32 = 1;\n" } });
-    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = other, .languageId = "zig", .version = 1, .text = "const beta_value: u32 = 1;\n" } });
     _ = try h.request("zig-analyzer/waitIdle", {});
-    // The refresh requested by opening the second document is answered before this response
-    try testing.expectEqual(-32601, errorCode(try h.request("zig-analyzer/probe", {})));
-    while (h.server.semantic_refresh.pending) _ = try h.request("zig-analyzer/probe", {});
     const received_before = h.received.items.len;
 
-    var gate: Server.OnceGate = .{};
-    h.server.hooks.response = &gate;
+    var response_gate: Server.OnceGate = .{};
+    h.server.hooks.response = &response_gate;
     defer h.server.hooks.response = null;
-    defer gate.release.set(testing.io);
+    defer response_gate.release.set(testing.io);
     const tokens = try h.send("textDocument/semanticTokens/full", .{ .textDocument = .{ .uri = uri } });
-    try gate.entered.wait(testing.io);
+    try response_gate.entered.wait(testing.io);
     // The response was computed from the text before this edit, and its read transaction has ended
     const insert = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } };
     try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .range = insert, .text = "const gamma_value: u32 = 2;\n" }} });
     try testing.expectEqual(-32601, errorCode(try h.request("zig-analyzer/probe", {})));
 
-    // The refresh caused by the edit: with the send order restored it waits for the response.
+    // The refresh caused by the edit waits for the response to be written.
+    var refresh_gate: Server.OnceGate = .{};
+    h.server.hooks.semantic_refresh = &refresh_gate;
+    defer h.server.hooks.semantic_refresh = null;
+    defer refresh_gate.release.set(testing.io);
     const Refresh = struct {
         fn run(server: *Server) void {
             server.requestSemanticRefresh();
         }
     };
     const refresh_thread = try std.Thread.spawn(.{}, Refresh.run, .{&h.server});
-    // Let the refresh be sent when nothing serializes it with the response
-    const started = std.Io.Clock.awake.now(testing.io);
-    while (!h.server.semantic_refresh.pending) {
-        const elapsed: u64 = @intCast(@max(0, started.durationTo(std.Io.Clock.awake.now(testing.io)).nanoseconds));
-        if (elapsed >= std.time.ns_per_s) break;
-        (std.Io.Clock.Duration{ .raw = .fromMilliseconds(1), .clock = .awake }).sleep(testing.io) catch {};
-    }
-    if (h.server.semantic_refresh.pending) refresh_thread.join() else {
-        gate.release.set(testing.io);
-        refresh_thread.join();
-    }
-    gate.release.set(testing.io);
+    try refresh_gate.entered.wait(testing.io);
+    // The refresh is claimed and about to take the send order; the response is still held.
+    refresh_gate.release.set(testing.io);
+    response_gate.release.set(testing.io);
+    refresh_thread.join();
 
     const response = try h.response(tokens);
     try testing.expect(response.object.get("error") == null);

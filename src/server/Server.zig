@@ -339,6 +339,9 @@ pub const TestHooks = if (@import("builtin").is_test) struct {
     /// Holds a request's response after its read transaction has ended, before it is written, so
     /// that a test can inspect the state the request no longer holds
     response: ?*OnceGate = null,
+    /// Holds a semantic tokens refresh request after it has been claimed, before it takes
+    /// `semantic_send`, so that a test can order it with a semantic tokens response
+    semantic_refresh: ?*OnceGate = null,
     /// Holds the reading task of a project once when the maker's stream has ended, before the exit
     /// is handled (see `Workspace.ExitPause`)
     maker_exit: std.atomic.Value(?*Workspace.ExitPause) = .init(null),
@@ -1096,7 +1099,9 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
                 } else response = server.responseBytes(pending.id, result);
                 // Acquired before the read transaction ends: a write can begin only after that, and
                 // the refresh it triggers waits for this response to be written (see
-                // `requestSemanticRefresh`)
+                // `requestSemanticRefresh`). Waiting here keeps the read transaction open, as every
+                // request did before responses were sent outside it: another semantic token request
+                // whose response another thread is writing delays writes in this narrow case.
                 if (comptime std.mem.startsWith(u8, method, "textDocument/semanticTokens/")) {
                     server.semantic_send.lockUncancelable(server.io);
                     semantic_send_locked = true;
@@ -1333,29 +1338,39 @@ pub fn openDocumentCount(server: *Server) usize {
     return server.docs.open.count();
 }
 
+/// Claims `r` and builds its request; null when nothing is sent (unsupported, shutting down, no
+/// open document, or one refresh already awaits the client's response).
+fn prepareRefresh(server: *Server, r: *Refresh) ?[]u8 {
+    if (!r.supported or server.isShuttingDown() or server.openDocumentCount() == 0) return null;
+    if (!r.claim(server.io)) return null;
+    return jsonrpc.request(server.gpa, .{ .string = r.id }, r.method, {}) catch {
+        _ = r.finished(server.io);
+        log.err("out of memory while building {s}", .{r.method});
+        return null;
+    };
+}
+
 /// Sends refresh `r` unless one awaits the response; returns whether it was sent. Edits refresh
 /// other documents only after the debounce completes; indexing refreshes only after a stable round
 /// ends. Changes made while waiting for the client's response are merged into the next refresh,
 /// which is not sent inside any read transaction or state lock.
 fn sendRefresh(server: *Server, r: *Refresh) bool {
-    if (!r.supported or server.isShuttingDown() or server.openDocumentCount() == 0) return false;
-    if (!r.claim(server.io)) return false;
-    const bytes = jsonrpc.request(server.gpa, .{ .string = r.id }, r.method, {}) catch {
-        _ = r.finished(server.io);
-        log.err("out of memory while building {s}", .{r.method});
-        return false;
-    };
+    const bytes = server.prepareRefresh(r) orelse return false;
     server.send(bytes);
     return true;
 }
 
 pub fn requestSemanticRefresh(server: *Server) void {
+    // Checked before taking the send lock: calls that send nothing (unsupported client, no open
+    // document, or one refresh already awaits the response) must not make a main-loop caller wait.
+    const bytes = server.prepareRefresh(&server.semantic_refresh) orelse return;
+    if (@import("builtin").is_test) if (server.hooks.semantic_refresh) |gate| gate.pass(server.io);
     // A semantic token response computed before a write holds this from before its read
     // transaction ends until it is written; the write waits for that transaction, so the refresh
     // it causes is always written after that response.
     server.semantic_send.lockUncancelable(server.io);
     defer server.semantic_send.unlock(server.io);
-    if (!server.sendRefresh(&server.semantic_refresh)) return;
+    server.send(bytes);
     // Retire the baselines only after the refresh is written out: every result sent afterwards
     // reaches the client after the refresh. If they were retired first, a result sent in between
     // could arrive before the refresh and become the baseline for the delta request the client
