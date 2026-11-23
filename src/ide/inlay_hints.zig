@@ -268,7 +268,6 @@ comptime {
 
 /// "inferred from the call at file.zig:123"
 fn seedNote(r: *Resolver, s: seed.Seed) resolve.Error![]const u8 {
-    const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, s.file)).text;
-    const line = std.mem.count(u8, text[0..@min(s.offset, text.len)], "\n") + 1;
+    const line = try r.lineOf(s.file, s.offset);
     return std.fmt.allocPrint(r.arena, "inferred from the call at {s}:{d}", .{ std.fs.path.basename(r.ctx.db.env.vfs.path(s.file)), line });
 }

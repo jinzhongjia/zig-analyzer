@@ -18,6 +18,7 @@ const Parse = @import("../syntax/Parse.zig");
 const ast = @import("../syntax/ast.zig");
 const SyntaxNode = ast.SyntaxNode;
 const Body = @import("../hir/Body.zig");
+const offsets = @import("../util/offsets.zig");
 
 /// Result of name resolution
 pub const Def = union(enum) {
@@ -113,6 +114,14 @@ pub const Resolver = struct {
     pub fn itemNode(r: *Resolver, file: FileId, item: u32) Error!?SyntaxNode {
         const tree = try r.itemTree(file);
         return (try r.ctx.get(syntax.FileAstIdMap, file)).get(tree.items[item].ast_id);
+    }
+
+    /// Number (1-based) of the line containing `offset` in `file`, from the line starts cached per
+    /// revision of the text
+    pub fn lineOf(r: *Resolver, file: FileId, offset: usize) Error!u32 {
+        const text = (try r.ctx.get(syntax.SourceText, file)).text;
+        const starts = try r.ctx.get(syntax.LineStarts, file);
+        return (offsets.LineIndex{ .text = text, .line_starts = starts }).lineOf(offset) + 1;
     }
 
     /// Start offset of a member in the file: use this when only the position is needed, since it
