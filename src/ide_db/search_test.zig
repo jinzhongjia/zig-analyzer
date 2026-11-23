@@ -1073,6 +1073,31 @@ test "rename candidate files keep their order with one import graph per request"
     try testing.expect(r.import_graph.? != cached);
 }
 
+test "a later request reuses the resolved import targets" {
+    // Regression test: every request resolved the `@import` strings of the whole import closure
+    // again.
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const lib_file = (try w.add("/p/lib.zig", "pub const x = 1;\n")).file;
+    const main_file = (try w.add("/p/main.zig", "const lib = @import(\"lib.zig\");\npub const y = lib.x;\n")).file;
+    const scope = [_]FileId{ main_file, lib_file };
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualStrings("lib.zig main.zig", try candidateNames(&w, &r, lib_file, &scope));
+    }
+    const resolved = w.db.executions(resolve.FileImportTargets);
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        try testing.expectEqualStrings("lib.zig main.zig", try candidateNames(&w, &r, lib_file, &scope));
+    }
+    try testing.expectEqual(resolved, w.db.executions(resolve.FileImportTargets));
+}
+
 test "reachable ignores a graph cached under another compilation context" {
     // `Resolver.context` changes while a semantic query runs; a graph built under one context must
     // not supply the forward edges of another. Replacing the cached forward edges with none makes

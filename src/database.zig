@@ -11,6 +11,7 @@ pub const ErrorSets = @import("syntax/ErrorSets.zig");
 pub const live = @import("diagnostics/live.zig");
 pub const hir = @import("hir/queries.zig");
 pub const ModuleGraph = @import("names/ModuleGraph.zig");
+pub const resolve = @import("names/resolve.zig");
 pub const sema = @import("sema/queries.zig");
 pub const ide_db = struct {
     pub const seed = @import("ide_db/seed.zig");
@@ -67,6 +68,7 @@ pub const Db = engine.Engine(*const Env, &.{
     ModuleGraph.StdRoot,
     ModuleGraph.FileContext,
     ModuleGraph.ContextImports,
+    resolve.FileImportTargets,
     hir.ItemSyntax,
     hir.ItemBody,
     hir.ParamForms,

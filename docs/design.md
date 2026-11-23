@@ -151,6 +151,8 @@ The graph comes from the build graph, plus:
 - `root`.
 - A module for the `build.zig` of the project and of each dependency package with one, as in the maker's configure program.
 
+`FileImportTargets` holds the resolved targets of a file's `@import` strings in import-string order, per compilation context; the import graph a search assembles over the whole closure (`ImportGraph`) reads it instead of resolving every string again.
+
 ### Module membership
 
 - A file's modules come from the compile sets of the compile steps, and it can belong to several (an exe and a test sharing a root).

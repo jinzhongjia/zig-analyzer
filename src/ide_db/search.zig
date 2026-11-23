@@ -636,9 +636,8 @@ pub fn reachable(r: *Resolver, from: []const FileId) resolve.Error![]const FileI
             for (g.forward_edges[g.forward_starts[n]..g.forward_starts[n + 1]]) |to| try seen.put(r.arena, to, {});
             continue;
         };
-        const index = try r.ctx.get(FileIndex.ImportStrings, f);
         // Every module the file belongs to may import a different file under a name
-        for (index.imports) |s| for (try r.resolveImportTargets(f, s)) |to| try seen.put(r.arena, to, {});
+        for ((try r.importTargetsTable(f)).targets) |to| try seen.put(r.arena, to, {});
     }
     return seen.keys();
 }
@@ -754,10 +753,6 @@ const Finder = struct {
     /// Files that can reach the file containing the definition through an `@import` chain (`.item`
     /// definitions). In other files, only code in generic functions may reference the definition
     importing: std.AutoHashMapUnmanaged(FileId, void) = .empty,
-    /// The import names of each file and their targets (see `Resolver.moduleAlternatives`), for
-    /// the matching uses of this request; keyed by the file, and reused only in the resolver
-    /// context the list was computed in
-    module_targets: resolve.ImportTargetCache = .empty,
     /// Call-site instances of the most recent member (`instances`)
     cached: ?struct { file: FileId, item: u32, list: []const InternPool.Index, complete: bool } = null,
 
@@ -1048,7 +1043,7 @@ const Finder = struct {
     fn matches(f: *Finder, file: FileId, d: Def, path_alternatives: []const Def, at: Reference) resolve.Error!Target {
         var hit = deepEql(d, f.def);
         var miss = !hit;
-        for (try f.r.moduleAlternatives(file, d, &f.module_targets)) |alt| {
+        for (try f.r.moduleAlternatives(file, d)) |alt| {
             if (deepEql(alt, f.def)) hit = true else miss = true;
         }
         for (path_alternatives) |alt| {

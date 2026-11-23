@@ -819,33 +819,53 @@ test "goto and references on members of a module import that differs between the
     }
 }
 
-test "module alternatives cache is not reused across resolver contexts" {
+test "file import targets follow the import strings and the module graph" {
     var w: World = undefined;
     try w.init();
     defer w.deinit();
     const f = try w.fixture(
         \\//- /p/main.zig module:a deps:cfg=cfga module:b deps:cfg=cfgb
         \\const cfg = @import("cfg");
-        \\const value = cfg.value;
+        \\const lib = @import("lib.zig");
         \\//- /p/cfg_a.zig module:cfga
         \\pub const value: u32 = 1;
         \\//- /p/cfg_b.zig module:cfgb
         \\pub const value: u32 = 2;
+        \\//- /p/lib.zig
     );
     const main = f.file("/p/main.zig");
     const cfg_a = f.file("/p/cfg_a.zig");
-    var ctx = w.db.beginRead(w.arena.allocator());
-    defer ctx.end();
-    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator(), .context = 0 };
-    const text = (try ctx.get(database.syntax.SourceText, cfg_a)).text;
-    const def = try definition.defAt(&r, cfg_a, @intCast(std.mem.indexOf(u8, text, "value").?)) orelse return error.NoDefinition;
-    var cache: resolve.ImportTargetCache = .empty;
-    try testing.expectEqual(@as(usize, 1), (try r.moduleAlternatives(main, def, &cache)).len);
-    try testing.expectEqual(@as(?u32, 0), cache.get(main).?.context);
-    // A list computed for another compilation is not reused
-    r.context = 1;
-    try testing.expectEqual(@as(usize, 1), (try r.moduleAlternatives(main, def, &cache)).len);
-    try testing.expectEqual(@as(?u32, 1), cache.get(main).?.context);
+    const cfg_b = f.file("/p/cfg_b.zig");
+    const lib = f.file("/p/lib.zig");
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        const table = try r.importTargetsTable(main);
+        // In import-string order: every module of the file may import another file under a name
+        try testing.expectEqual(2, table.count());
+        try testing.expectEqualSlices(FileId, &.{ cfg_a, cfg_b }, table.of(0));
+        try testing.expectEqualSlices(FileId, &.{lib}, table.of(1));
+    }
+    // Another module graph gives another target for the same string
+    _ = try w.fixture(
+        \\//- /p/main.zig module:a deps:cfg=cfga module:b deps:cfg=cfga
+        \\const cfg = @import("cfg");
+        \\const lib = @import("lib.zig");
+        \\//- /p/cfg_a.zig module:cfga
+        \\pub const value: u32 = 1;
+        \\//- /p/cfg_b.zig module:cfgb
+        \\pub const value: u32 = 2;
+        \\//- /p/lib.zig
+    );
+    {
+        var ctx = w.db.beginRead(w.arena.allocator());
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+        const table = try r.importTargetsTable(main);
+        try testing.expectEqualSlices(FileId, &.{cfg_a}, table.of(0));
+        try testing.expectEqualSlices(FileId, &.{lib}, table.of(1));
+    }
 }
 
 test "@This, enums, nested containers and generic functions" {
