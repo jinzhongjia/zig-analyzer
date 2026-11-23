@@ -1395,6 +1395,69 @@ test "an edit during formatting is answered with ContentModified" {
     try h.notify("exit", {});
 }
 
+test "formatting retries while an unordered write is pending" {
+    // Guards against answering with the renderer copied before an unordered write that is waiting
+    // for the lock; the request runs again once that write has taken it.
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:formatting-pending.zig";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const  x = 1;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    var format_gate: Server.OnceGate = .{};
+    h.server.hooks.format = &format_gate;
+    defer h.server.hooks.format = null;
+    defer format_gate.release.set(testing.io);
+    var response_gate: Server.OnceGate = .{};
+    h.server.hooks.response = &response_gate;
+    defer h.server.hooks.response = null;
+    defer response_gate.release.set(testing.io);
+    const formatting = try h.send("textDocument/formatting", .{ .textDocument = .{ .uri = uri }, .options = .{ .tabSize = 4, .insertSpaces = true } });
+    try format_gate.entered.wait(testing.io);
+
+    // Hold a read transaction so the write stays pending after formatting has produced its result
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var held = h.server.db.beginRead(arena.allocator());
+    const Write = struct {
+        fn run(db: *Db) void {
+            db.beginWriteOf(comptime Db.inputSet(&.{za.ide.format.ZigFmtRenderer}), .unordered);
+            defer db.endWrite();
+        }
+    };
+    const writer = try std.Thread.spawn(.{}, Write.run, .{&h.server.db});
+    var held_ended = false;
+    var writer_joined = false;
+    defer if (!writer_joined) writer.join();
+    defer if (!held_ended) held.end();
+    while (h.server.db.pending_write.load(.acquire) == 0) std.Thread.yield() catch {};
+    // The pending write makes the request discard its result and wait for the write
+    format_gate.release.set(testing.io);
+    var answered_early = true;
+    response_gate.entered.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {
+        answered_early = false;
+    };
+    try testing.expect(!answered_early);
+
+    // The write completes; the next attempt answers
+    held.end();
+    held_ended = true;
+    writer.join();
+    writer_joined = true;
+    try response_gate.entered.wait(testing.io);
+    response_gate.release.set(testing.io);
+    const response = try h.response(formatting);
+    try testing.expect(response.object.get("error") == null);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "code actions after an edit prepare the live check outside the read transaction" {
     // Guards against AstGen (or the user's `zig ast-check`) running inside the code action's read
     // transaction, which would make the edit that triggered the request wait for it.
