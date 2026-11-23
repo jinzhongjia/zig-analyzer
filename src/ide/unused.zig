@@ -206,6 +206,11 @@ fn scan(r: *Resolver, file: FileId) resolve.Error![]const Located {
         const parent = items.containers[item.container].parent_item orelse continue;
         if (isInterface(item)) try edges.append(r.arena, .{ .from = parent, .to = index });
     }
+    // Edges grouped by their source, so that the walk over each live declaration visits only the
+    // declarations it references
+    const outgoing = try r.arena.alloc(std.ArrayList(u32), items.items.len);
+    @memset(outgoing, .empty);
+    for (edges.items) |e| try outgoing[e.from].append(r.arena, e.to);
     for (roots.items) |i| if (!live[i]) {
         live[i] = true;
         try queue.append(r.arena, i);
@@ -217,10 +222,10 @@ fn scan(r: *Resolver, file: FileId) resolve.Error![]const Located {
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const from = queue.items[head];
-        for (edges.items) |e| {
-            if (e.from != from or live[e.to]) continue;
-            live[e.to] = true;
-            try queue.append(r.arena, e.to);
+        for (outgoing[from].items) |to| {
+            if (live[to]) continue;
+            live[to] = true;
+            try queue.append(r.arena, to);
         }
     }
 
