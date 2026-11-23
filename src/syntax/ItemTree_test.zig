@@ -177,6 +177,37 @@ test "AstIdMap.items holds the node of each item" {
     }
 }
 
+test "a container in a function body survives an incremental body edit" {
+    // The member's node and its ancestors on the path to the root are copies: a walk that trusts
+    // their summary bits must still find the container in the body
+    const old = try Parse.create(testing.allocator,
+        \\fn f() void {
+        \\    const Local = struct { v: u8 };
+        \\    _ = Local{ .v = 1 };
+        \\}
+        \\
+    , .zig);
+    defer old.destroy();
+    const inc = (try Parse.reparseBlock(testing.allocator, old,
+        \\fn f() void {
+        \\    const Local = struct { v: u8 };
+        \\    _ = Local{ .v = 2 };
+        \\}
+        \\
+    )) orelse return error.TestUnexpectedResult;
+    defer inc.destroy();
+
+    var items = try ItemTree.build(testing.allocator, inc.rootNode(), .zig);
+    defer items.deinit(testing.allocator);
+    try testing.expectEqual(2, items.containers.len);
+    try testing.expectEqual(ItemTree.Container.Kind.@"struct", items.containers[1].kind);
+    try testing.expectEqualStrings("Local", items.containers[1].name.?);
+
+    var map = try ItemTree.AstIdMap.build(testing.allocator, &items, inc.rootNode());
+    defer map.deinit(testing.allocator);
+    try testing.expectEqual(.container_decl, map.get(items.containers[1].ast_id).?.kind());
+}
+
 test "same-name members are distinguished by index" {
     var r = try buildTree("test {}\ntest {}\ncomptime {}\ncomptime {}");
     defer r.parse.destroy();

@@ -16,6 +16,7 @@ pub const syntax = struct {
     pub const queries = @import("syntax/queries.zig");
     pub const ast = @import("syntax/ast.zig");
     pub const FileIndex = @import("syntax/FileIndex.zig");
+    pub const StringLiterals = @import("syntax/StringLiterals.zig");
     pub const ErrorSets = @import("syntax/ErrorSets.zig");
     pub const nesting = @import("syntax/nesting.zig");
     /// Test-only: checks the incremental syntax-layer values against those built from scratch
