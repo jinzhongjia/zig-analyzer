@@ -150,6 +150,12 @@ pub const Query = struct {
     pub const Key = Vfs.FileId;
     pub const Value = *const List;
 
+    /// Caps the decoded literals kept resident: a file may embed large literals (generated tables,
+    /// templates, blobs), and every workspace file is warmed into this query. A rename that needs
+    /// an evicted file reads it again from a new parse, so the result is the same.
+    pub const lru = 16 * 1024;
+    pub const lru_bytes = 16 * 1024 * 1024;
+
     pub fn bytes(v: Value) usize {
         return @sizeOf(List) + mem.arenaBytes(v.arena);
     }

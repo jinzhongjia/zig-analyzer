@@ -202,6 +202,35 @@ test "rename: a shifted string literal reports its new offset" {
     try testing.expectEqualStrings("4:19 `fooBar` appears in a string literal, which may refer to it by name (as `@field` and serialization do) and would not be updated", got);
 }
 
+test "rename: an evicted string index reports the same offset" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\const S = struct { fooBar: u32 };
+        \\fn f(s: S) void {
+        \\    _ = @field(s, "fooBar");
+        \\}
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    const a = w.arena.allocator();
+    {
+        var ctx = w.db.beginRead(a);
+        defer ctx.end();
+        var r: resolve.Resolver = .{ .ctx = &ctx, .arena = a };
+        const p = (try rename.stringReference(&r, &.{file}, "fooBar")).?;
+        try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "\"fooBar\"").?)), p.offset);
+    }
+    // Keep no decoded literals: the next check reads the file again and must report the same
+    w.db.setLru(database.StringLiterals.Query, null, 1);
+    _ = w.db.trySweep();
+    var ctx = w.db.beginRead(a);
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = a };
+    const p = (try rename.stringReference(&r, &.{file}, "fooBar")).?;
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, text, "\"fooBar\"").?)), p.offset);
+}
+
 test "rename: multiline string keys are string references" {
     var w: World = undefined;
     try w.init();
