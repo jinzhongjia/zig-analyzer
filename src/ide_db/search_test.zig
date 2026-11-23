@@ -659,6 +659,29 @@ test "files that are never compiled together with the definition are not searche
     try testing.expectEqual(2, list.len);
 }
 
+test "a declaration without pub is searched only in its own file" {
+    // Prevents searching files that import the definition's file for a private name, where a
+    // syntax error mentioning the name made rename refuse and the whole import closure was scanned
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const lib = "const secret = 1;\npub fn get() u32 {\n    return secret;\n}\n";
+    const main = "const lib = @import(\"lib.zig\");\nfn broken() void {\n    _ = secret +;\n}\n";
+    const lib_file = (try w.add("/p/lib.zig", lib)).file;
+    const main_file = (try w.add("/p/main.zig", main)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    var syntax_error: ?FileId = null;
+    const def = (try definition.defAt(&r, lib_file, at(lib, "secret", 0))).?;
+    const list = try search.findReferences(&r, def, .{ .scope = &.{ main_file, lib_file }, .syntax_error = &syntax_error });
+    try testing.expectEqual(null, syntax_error);
+    try testing.expectEqual(2, list.len);
+    for (list) |ref| try testing.expectEqual(lib_file, ref.file);
+    // The import closure is not built: only the declaration's file is searched
+    try testing.expectEqual(null, r.import_graph);
+}
+
 test "references in generic code of files that do not import the definition" {
     // Guards against searching only the files that import the file containing the definition:
     // `c.zig` does not import `a.zig` and calls `foo` through an anytype value

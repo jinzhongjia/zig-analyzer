@@ -4,7 +4,7 @@
 
 `FileIndex` filters files by name → the Bloom filter of `ItemNames` filters members → each occurrence is confirmed by precise resolution.
 
-The candidate files are those reaching the definition through an `@import` chain, plus the files those reach: generic code can access a definition's members through an `anytype` value or comptime type parameter without importing its file, while a file none of them reaches is never compiled with the definition. In files not importing the definition, only generic code and typed `.zon` roots are checked.
+The candidate files are those reaching the definition through an `@import` chain, plus the files those reach: generic code can access a definition's members through an `anytype` value or comptime type parameter without importing its file, while a file none of them reaches is never compiled with the definition. In files not importing the definition, only generic code and typed `.zon` roots are checked. A declaration that is neither `pub` nor a field is visible only in its own file, so only that file is searched: another file cannot refer to it, and a syntax error there that mentions the name does not make rename refuse.
 
 Document highlight checks only its own file and reports declarations and assignment targets as writes.
 
