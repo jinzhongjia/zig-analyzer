@@ -4657,6 +4657,10 @@ const Evaluator = struct {
                     if (ip.key(x) == .enum_literal and cx == x) {
                         // Tag of a void field in a union
                         if (ev.isUnion(t)) return Val.of(t, try ip.get(.{ .union_value = .{ .ty = t, .tag = ip.key(x).enum_literal, .payload = .void_value } }));
+                        // Only enums and unions take an enum literal: for any other concrete
+                        // type (`const s: S = .name` with a struct `S`) it is a compile error. An
+                        // abstract type parameter may still be an enum.
+                        if (ip.key(t) != .opaque_param) return error.Abort;
                     }
                     return Val.of(t, cx);
                 },

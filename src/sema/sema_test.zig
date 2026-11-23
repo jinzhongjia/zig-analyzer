@@ -365,6 +365,29 @@ test "decl literals" {
     });
 }
 
+test "enum literals coerced to types that take none have no value" {
+    // `const p: P = .nope` with a struct `P` is a compile error, not a value `.nope` of type `P`
+    try expectTypes(
+        \\const P = struct { x: i32 = 0 };
+        \\const U = union(enum) { a, b: u8 };
+        \\const E = enum { a, b };
+        \\const p: P = .nope;
+        \\const n: u8 = .nope;
+        \\const o: ?P = .nope;
+        \\const u: U = .a;
+        \\const e: E = .b;
+        \\const oe: ?E = .a;
+        \\
+    , &.{
+        .{ "p", "P" },
+        .{ "n", "u8" },
+        .{ "o", "?P" },
+        .{ "u", "U = .{ .a = {} }" },
+        .{ "e", "E = .b" },
+        .{ "oe", "?E = .a" },
+    });
+}
+
 test "decl literals of another file resolve only when pub" {
     // `.secret` with a result type from another file is a compile error, not the declaration
     var w: World = undefined;
@@ -391,9 +414,10 @@ test "decl literals of another file resolve only when pub" {
     const main = try w.add("/p/main.zig", src);
     try w.setGraph(null, &.{}, &.{});
     const cases = [_]struct { []const u8, []const u8 }{
-        // A private declaration is treated like a name the type does not declare
-        .{ "none", "S = .missing" },
-        .{ "x", "S = .secret" },
+        // A private declaration is treated like a name the type does not declare: a struct
+        // takes no enum literal, so neither has a value
+        .{ "none", "S" },
+        .{ "x", "S" },
         .{ "y", "S = .{ .v = 8 }" },
         .{ "z", "S" },
     };
