@@ -42,14 +42,17 @@ pub const Error = error{ Canceled, OutOfMemory };
 /// Same as the recursion limit for glob imports in rust-analyzer's name resolution.
 pub const max_depth = 100;
 
-/// The targets of the `@import` strings of a file, in import-string order, resolved in one
-/// compilation context (see `Resolver.resolveImportTargets`). Requests that assemble an import
-/// graph over the whole closure read this instead of resolving every string again. The key holds
-/// the resolver's compilation context, which can change within a request, and the computation
-/// reads the module graph, so module-graph changes invalidate it.
+/// The targets of the `@import` strings of a file, in import-string order (see
+/// `Resolver.resolveImportTargets`). The computation reads the file's `FileIndex.ImportStrings`,
+/// `ModuleGraph.Input`, and, for `@import("root")` in a file outside the module graph,
+/// `inputs.WorkspaceFiles` and the import strings of the other workspace files (see
+/// `Resolver.singleFileRoots`). The key is the file alone: resolution depends on the file's own
+/// compilation (`ModuleGraph.home`), not on `Resolver.context`. The import graph of a search
+/// (`ImportGraph`), `search.reachable` for files outside it, and `Resolver.moduleAlternatives`
+/// read this instead of resolving the strings again.
 pub const FileImportTargets = struct {
     pub const kind: engine.Kind = .derived;
-    pub const Key = struct { file: FileId, context: ?u32 };
+    pub const Key = FileId;
     pub const Value = Table;
 
     pub const Table = struct {
@@ -69,19 +72,19 @@ pub const FileImportTargets = struct {
         }
     };
 
-    pub fn compute(ctx: *Db.Ctx, key: Key) Error!Value {
+    pub fn compute(ctx: *Db.Ctx, file: Key) Error!Value {
         const gpa = ctx.db.gpa;
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
-        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator(), .context = key.context };
-        const imports = (try ctx.get(FileIndex.ImportStrings, key.file)).imports;
+        var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
+        const imports = (try ctx.get(FileIndex.ImportStrings, file)).imports;
         const starts = try gpa.alloc(u32, imports.len + 1);
         errdefer gpa.free(starts);
         var targets: std.ArrayList(FileId) = .empty;
         errdefer targets.deinit(gpa);
         for (imports, 0..) |name, i| {
             starts[i] = @intCast(targets.items.len);
-            try targets.appendSlice(gpa, try r.resolveImportTargets(key.file, name));
+            try targets.appendSlice(gpa, try r.resolveImportTargets(file, name));
         }
         starts[imports.len] = @intCast(targets.items.len);
         return .{ .targets = try targets.toOwnedSlice(gpa), .starts = starts };
@@ -455,10 +458,10 @@ pub const Resolver = struct {
         return targets;
     }
 
-    /// The targets of the `@import` strings of `file` in this resolver's compilation context, in
-    /// import-string order (see `FileImportTargets`)
+    /// The targets of the `@import` strings of `file` in import-string order (see
+    /// `FileImportTargets`)
     pub fn importTargetsTable(r: *Resolver, file: FileId) Error!FileImportTargets.Value {
-        return r.ctx.get(FileImportTargets, .{ .file = file, .context = r.context });
+        return r.ctx.get(FileImportTargets, file);
     }
 
     /// The files that may be the root module of `file`, a file outside the module graph: such a
