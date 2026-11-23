@@ -1501,8 +1501,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 defer table.mutex.unlock(db.io);
                 const memo = &(table.slots.items[index].memo orelse return null);
                 if (memo.verified_at != db.revision or memo.evicted) return null;
-                table.access_tick += 1;
-                memo.last_used = table.access_tick;
+                // Only the LRU eviction reads `last_used`
+                if (comptime @hasDecl(Q, "lru")) {
+                    table.access_tick += 1;
+                    memo.last_used = table.access_tick;
+                }
                 return .{ .value = memo.value, .changed_at = memo.changed_at, .durability = memo.durability };
             }
 
@@ -1960,7 +1963,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     if (@hasDecl(Q, "lru_bytes")) table.live_bytes += Q.bytes(value);
                 }
                 if (@hasDecl(Q, "lru") and db.overLru(Q, table)) db.sweep_wanted.store(true, .monotonic);
-                table.access_tick += 1;
+                // Only the LRU eviction reads `last_used`
+                if (comptime @hasDecl(Q, "lru")) table.access_tick += 1;
                 slot.memo = .{
                     .value = value,
                     .verified_at = db.revision,
@@ -2026,8 +2030,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         fn useMemoLocked(db: *Db, comptime Q: type, index: u32) ?Table(Q).Memo {
             const table = &db.tables[comptime queryIndex(Q)];
             const memo = &(table.slots.items[index].memo orelse return null);
-            table.access_tick += 1;
-            memo.last_used = table.access_tick;
+            // Only the LRU eviction reads `last_used`
+            if (comptime @hasDecl(Q, "lru")) {
+                table.access_tick += 1;
+                memo.last_used = table.access_tick;
+            }
             return memo.*;
         }
 

@@ -1635,6 +1635,17 @@ test "lru: last-use times are counted per table" {
     }
 }
 
+test "a table without lru does not record use times" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 5, .low);
+    try testing.expectEqual(1, try read(&d, Plus, 1));
+    try testing.expectEqual(1, try read(&d, Plus, 1));
+    const table = &d.tables[comptime Db.queryIndex(Plus)];
+    try testing.expectEqual(0, table.access_tick);
+    try testing.expectEqual(0, table.slots.items[0].memo.?.last_used);
+}
+
 test "concurrent reads: readers of the same query agree" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
