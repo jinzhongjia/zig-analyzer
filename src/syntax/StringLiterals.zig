@@ -43,6 +43,7 @@ const List = struct {
     fn deinit(l: *List, gpa: Allocator) void {
         var arena = l.arena.promote(gpa);
         arena.deinit();
+        l.* = undefined;
     }
 };
 
@@ -191,6 +192,7 @@ test "StringLiterals: deduplicated by value, sorted, first occurrence" {
         \\test "b" {
         \\    _ = "b";
         \\}
+        \\test "onlyInName" {}
     ;
     const parse = try Parse.create(std.testing.allocator, text, .zig);
     defer parse.destroy();
@@ -204,4 +206,6 @@ test "StringLiterals: deduplicated by value, sorted, first occurrence" {
     try std.testing.expectEqual(@as(?u32, @intCast(std.mem.indexOf(u8, text, "\"a\"").?)), list.offsetOf("a"));
     try std.testing.expectEqual(@as(?u32, @intCast(std.mem.indexOf(u8, text, "\"b\"").?)), list.offsetOf("b"));
     try std.testing.expectEqual(@as(?u32, null), list.offsetOf("c"));
+    // A value that appears only as a test name is not a string reference
+    try std.testing.expectEqual(@as(?u32, null), list.offsetOf("onlyInName"));
 }
