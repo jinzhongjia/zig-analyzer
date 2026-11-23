@@ -1456,6 +1456,50 @@ test "function completions insert calls with placeholders only for clients that 
     try expectAddCompletion(.{ .textDocument = .{ .completion = .{ .completionItem = .{ .snippetSupport = false } } } }, Empty{}, null);
     try expectAddCompletion(snippet_client, .{ .completion = .{ .snippets = false } }, null);
     try expectAddCompletion(snippet_client, .{ .completion = .{ .argument_placeholders = false } }, "add($1)");
+    try expectAddCompletion(snippet_client, .{ .completion = .{ .call_snippets = false } }, null);
+}
+
+test "postfix try replaces the dot and the word and inserts `try` before the left-hand side" {
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = .{ .textDocument = .{ .completion = .{ .completionItem = .{ .snippetSupport = true } } } } });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:postfix.zig";
+    const text =
+        \\fn f() !u32 {
+        \\    return 1;
+        \\}
+        \\pub fn main() !void {
+        \\    _ = f().tr;
+        \\}
+        \\
+    ;
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = text } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    const resp = try h.request("textDocument/completion", .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 4, .character = 14 } });
+    const result = resp.object.get("result").?;
+    const items = if (result == .array) result.array.items else result.object.get("items").?.array.items;
+    const item = for (items) |it| {
+        if (std.mem.eql(u8, it.object.get("label").?.string, "try")) break it;
+    } else return error.MissingCompletion;
+    try testing.expectEqualStrings(".try", item.object.get("filterText").?.string);
+    const edit = item.object.get("textEdit").?.object;
+    try testing.expectEqualStrings("", edit.get("newText").?.string);
+    const range = edit.get("range").?.object;
+    try testing.expectEqual(11, range.get("start").?.object.get("character").?.integer);
+    try testing.expectEqual(14, range.get("end").?.object.get("character").?.integer);
+    const extra = item.object.get("additionalTextEdits").?.array.items;
+    try testing.expectEqual(1, extra.len);
+    try testing.expectEqualStrings("try ", extra[0].object.get("newText").?.string);
+    const at = extra[0].object.get("range").?.object.get("start").?.object;
+    try testing.expectEqual(4, at.get("line").?.integer);
+    try testing.expectEqual(8, at.get("character").?.integer);
+
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
 }
 
 /// Character columns of the ranges of a completion edit in one line: the insert range (null for a
@@ -1562,8 +1606,8 @@ test "completion triggered by `/` or `\"` lists only paths" {
         var labels: std.ArrayList([]const u8) = .empty;
         defer labels.deinit(testing.allocator);
         for (items) |it| {
-            // Keywords (`CompletionItemKind.Keyword`)
-            if (it.object.get("kind").?.integer == 14) continue;
+            // Keywords (`CompletionItemKind.Keyword`) and primitive types
+            if (it.object.get("kind").?.integer == 14 or std.zig.primitives.isPrimitive(it.object.get("label").?.string)) continue;
             try labels.append(testing.allocator, it.object.get("label").?.string);
         }
         const got = try std.mem.join(testing.allocator, " ", labels.items);
