@@ -1361,6 +1361,40 @@ test "a request interrupted by a later edit is answered with ContentModified" {
     try h.notify("exit", {});
 }
 
+test "an edit during formatting is answered with ContentModified" {
+    // Guards against applying edits computed against the pre-edit text to the buffer after the
+    // client's edit: formatting no longer holds the read transaction, so the answer must re-check
+    // that the text it formatted is still current.
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const uri = "untitled:formatting-edit.zig";
+    try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uri, .languageId = "zig", .version = 1, .text = "const  x = 1;\n" } });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+
+    var gate: Server.OnceGate = .{};
+    h.server.hooks.format = &gate;
+    defer h.server.hooks.format = null;
+    defer gate.release.set(testing.io);
+    const formatting = try h.send("textDocument/formatting", .{ .textDocument = .{ .uri = uri }, .options = .{ .tabSize = 4, .insertSpaces = true } });
+    try gate.entered.wait(testing.io);
+    // The text was formatted and the read transaction has ended
+    const insert = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } };
+    try h.notify("textDocument/didChange", .{ .textDocument = .{ .uri = uri, .version = 2 }, .contentChanges = &.{.{ .range = insert, .text = "const y = 2;\n" }} });
+    // The main loop has applied the change once it answers a later request
+    try testing.expectEqual(-32601, errorCode(try h.request("zig-analyzer/probe", {})));
+    gate.release.set(testing.io);
+    try testing.expectEqual(-32801, errorCode(try h.response(formatting)));
+
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
+}
+
 test "a response is written after the read transaction has ended" {
     // Guards against holding the shared side of the database lock while the client drains a
     // response: later edits and `$/cancelRequest` would wait for the write.

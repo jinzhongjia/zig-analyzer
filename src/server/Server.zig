@@ -328,6 +328,9 @@ pub const TestHooks = if (@import("builtin").is_test) struct {
     /// ended, nothing of it has been sent), so that a test can change server state between
     /// computing and sending a publish
     publish: ?*OnceGate = null,
+    /// Holds the formatting result once it has been computed outside the read transaction, before
+    /// the staleness check and the answer, so that a test can send an edit in between
+    format: ?*OnceGate = null,
     /// Holds a request's response after its read transaction has ended, before it is written, so
     /// that a test can inspect the state the request no longer holds
     response: ?*OnceGate = null,
@@ -741,6 +744,9 @@ const Mode = enum {
     /// transactions that change no text (such as the module graph after a build) wait for them
     /// instead of canceling them
     syntax,
+    /// Like `syntax`, but the handler only copies the text and the renderer inside the read
+    /// transaction; the formatting itself runs after it ends (see `FormattingTask`)
+    formatting,
 };
 
 /// The command of a code action on a `build.zig.zon` dependency: runs `zig fetch` and applies the
@@ -763,7 +769,7 @@ const request_handlers = .{
     .{ "zig-analyzer/moduleGraph", Mode.read, requests.inspection.moduleGraph },
     .{ "zig-analyzer/reloadWorkspace", Mode.sync, reloadWorkspace },
     .{ "workspace/executeCommand", Mode.background, requests.code_actions.executeCommand },
-    .{ "textDocument/formatting", Mode.syntax, requests.document.formatting },
+    .{ "textDocument/formatting", Mode.formatting, requests.document.formatting },
     .{ "textDocument/documentSymbol", Mode.semantic, requests.document.documentSymbol },
     .{ "textDocument/foldingRange", Mode.syntax, requests.document.foldingRange },
     .{ "textDocument/selectionRange", Mode.syntax, requests.document.selectionRange },
@@ -828,8 +834,8 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                     const result = func(server, a, params) catch |err| return server.sendHandlerError(id, err, false);
                     server.sendResponse(id, result);
                 },
-                .read, .semantic, .syntax => {
-                    const inputs: ?Db.Inputs = if (h[1] == .syntax) comptime Db.inputSet(&.{ FileText, database.syntax.SyntaxDialect, ide.format.ZigFmtRenderer }) else null;
+                .read, .semantic, .syntax, .formatting => {
+                    const inputs: ?Db.Inputs = if (h[1] == .syntax or h[1] == .formatting) comptime Db.inputSet(&.{ FileText, database.syntax.SyntaxDialect, ide.format.ZigFmtRenderer }) else null;
                     const pending = server.addPending(a, id, inputs) catch |err| {
                         defer server.destroyArena(arena);
                         server.sendError(id, jsonrpc.error_codes.internal_error, "out of memory");
@@ -838,7 +844,7 @@ fn processRequest(server: *Server, arena: *std.heap.ArenaAllocator, id: jsonrpc.
                     if (h[1] == .semantic and @typeInfo(Params) == .@"struct" and @hasField(Params, "textDocument")) {
                         server.rememberHeldDocument(a, pending, params.textDocument.uri);
                     }
-                    const Task = if (h[1] == .semantic) SemanticTask(func, h[0]) else ReadTask(func, h[0]);
+                    const Task = if (h[1] == .semantic) SemanticTask(func, h[0]) else if (h[1] == .formatting) FormattingTask(func, h[0]) else ReadTask(func, h[0]);
                     // semantic must run on a separate thread: when the thread count reaches the
                     // limit (CPU core count - 1; long-blocking project tasks also take slots),
                     // `async` runs synchronously on the main loop, while background requests wait
@@ -1071,6 +1077,79 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
             // `subProjectGap`), which does not report them again
             if (err == error.SubProjectsPending and !sub_projects.awaited and go_on) return .after_sub_projects;
             return if (server.answerFailureBytes(ctx, pending, err, response)) .answered else .again;
+        }
+    };
+}
+
+/// `textDocument/formatting`: copies the text and the renderer inside the read transaction, then
+/// formats after it has ended. The whole-file parse and render take long enough that an edit (and
+/// the main loop behind it) would otherwise wait for them. The answer is sent only when no write
+/// to the file's inputs has begun since the request was received: edits computed on the old text
+/// would otherwise be applied to the buffer after the client's edit (see `Db.markChanged`).
+fn FormattingTask(comptime func: anytype, comptime method: []const u8) type {
+    const Params = LastParam(@TypeOf(func));
+    return struct {
+        fn run(server: *Server, arena: *std.heap.ArenaAllocator, pending: *Pending, params: Params) Io.Cancelable!void {
+            defer server.finishRequest(arena, pending);
+            pending.sema_start = publishing.semaUsage(server);
+            server.testGate(method, .before_read, pending);
+            while (!attempt(server, pending, params)) server.db.waitPendingWrites();
+        }
+
+        /// Returns whether the request was answered (see `answerFailureBytes`)
+        fn attempt(server: *Server, pending: *Pending, params: Params) bool {
+            var attempt_arena: std.heap.ArenaAllocator = .init(server.gpa);
+            defer attempt_arena.deinit();
+            const a = attempt_arena.allocator();
+            var response: ?[]u8 = null;
+            var slow: ?slow_log.Report = null;
+            var input: ?requests.document.FormattingInput = null;
+            const answered = outcome: {
+                var ctx = server.db.beginReadAt(a, pending.since);
+                ctx.cancel = &pending.cancel;
+                defer ctx.end();
+                server.testGate(method, .in_read, pending);
+                var trace: za.db.Trace = .{ .gpa = a };
+                if (slow_log.traceEnabled(server)) ctx.trace = &trace;
+                var pc: panic_context.Text = .{};
+                requestContext(&pc, method, params);
+                defer pc.leave();
+                const zone = za.util.tracy.zone(@src(), method);
+                defer zone.end();
+                const t0 = Io.Clock.awake.now(server.io);
+                defer slow = slow_log.captureIfSlow(server, &ctx, method, t0, &trace);
+
+                input = requests.document.formatting(server, &ctx, a, params) catch |err| {
+                    break :outcome server.answerFailureBytes(&ctx, pending, err, &response);
+                };
+                ctx.checkCanceled() catch |err| {
+                    break :outcome server.answerFailureBytes(&ctx, pending, err, &response);
+                };
+                // A document that does not exist is answered with null, serialized inside the
+                // transaction like every other answer
+                if (input == null) response = server.responseBytes(pending.id, @as(?[]const types.TextEdit, null));
+                break :outcome true;
+            };
+            if (!answered) {
+                if (slow) |report| slow_log.logReport(report);
+                return false;
+            }
+            // The result is built from the text copy and the renderer read inside the transaction
+            // and points only into this attempt's arena, so serializing it here is safe.
+            if (response == null) if (input) |in| {
+                if (ide.format.format(a, in.lines, in.mode, server.encoding, in.renderer)) |edits| {
+                    if (@import("builtin").is_test) if (server.hooks.format) |gate| gate.pass(server.io);
+                    if (pending.cancel.load(.acquire)) {
+                        response = server.errorResponseBytes(pending.id, jsonrpc.error_codes.request_cancelled, "request cancelled");
+                    } else if (server.db.markChanged(pending.since)) {
+                        response = server.errorResponseBytes(pending.id, jsonrpc.error_codes.content_modified, "content modified");
+                    } else {
+                        response = server.responseBytes(pending.id, edits);
+                    }
+                } else |err| response = server.errorResponseBytes(pending.id, jsonrpc.error_codes.internal_error, @errorName(err));
+            };
+            sendAttempt(server, response, slow);
+            return true;
         }
     };
 }

@@ -1054,6 +1054,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             return n;
         }
 
+        /// Whether a write transaction ordered after `mark` that may change any of its inputs has
+        /// begun since it was taken. A request that computes its result outside the read
+        /// transaction checks this before answering, so that it does not answer with a result
+        /// computed on state the client has already changed (see `mark`).
+        pub fn markChanged(db: *Db, at: Mark) bool {
+            return db.writesTo(at.inputs) != at.writes;
+        }
+
         /// Begins a read transaction for a read that must see the inputs as they were at `since`
         /// (taken earlier with `mark`), such as a request that is answered on the state it was
         /// received in: when a write transaction ordered after the mark (`WriteOrder.after_marks`)

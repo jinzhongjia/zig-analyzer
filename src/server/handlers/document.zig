@@ -14,11 +14,26 @@ const Resolver = za.names.resolve.Resolver;
 const Server = @import("../Server.zig");
 const HandlerError = Server.HandlerError;
 
-pub fn formatting(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentFormattingParams) HandlerError!types.ResultType("textDocument/formatting") {
+/// What formatting needs from the read transaction: the text and line table copied into `arena`
+/// and the renderer. A write transaction may free the memoized text and line table after the read
+/// transaction ends, so the format itself runs afterwards (see `Server.FormattingTask`).
+pub const FormattingInput = struct {
+    lines: za.util.offsets.LineIndex,
+    mode: ide.format.Mode,
+    renderer: ide.format.Renderer,
+};
+
+pub fn formatting(server: *Server, ctx: *Db.Ctx, arena: Allocator, params: types.DocumentFormattingParams) HandlerError!?FormattingInput {
     const file = try server.lookupFile(arena, params.textDocument.uri) orelse return null;
     const lines = try Server.fileLines(ctx, arena, file);
-    const mode = za.syntax.Parse.modeOf(server.vfs.path(file));
-    return ide.format.format(arena, lines, mode, server.encoding, try ctx.get(ide.format.ZigFmtRenderer, {}));
+    return .{
+        .lines = .{
+            .text = try arena.dupe(u8, lines.text),
+            .line_starts = try arena.dupe(u32, lines.line_starts),
+        },
+        .mode = za.syntax.Parse.modeOf(server.vfs.path(file)),
+        .renderer = try ctx.get(ide.format.ZigFmtRenderer, {}),
+    };
 }
 
 pub fn documentSymbol(server: *Server, r: *Resolver, arena: Allocator, params: types.DocumentSymbolParams) HandlerError!types.ResultType("textDocument/documentSymbol") {

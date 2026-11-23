@@ -368,6 +368,8 @@ With `sema.wait_for_project`, they are held until the load ends and every answer
 
 Reads run concurrently on snapshots and are canceled by `$/cancelRequest` and writes. A request is answered on the state when it was received: when a later write interrupts it or its task starts reading after one, it gets `ContentModified`. The server's own updates (module graph, file list, live backend, files loaded from disk) are not ordered with requests: a request they interrupt runs again on the new state once they have taken the lock (`waitPendingWrites`), as the text it refers to has not changed, so loading a project does not fail requests. Requests depending only on text are canceled only by text writes. A response is serialized inside the read transaction, since it may point into memoized values, and written to the client after the transaction ends.
 
+Formatting copies the text and line table inside its read transaction and parses and renders after it ends, so edits do not wait for the whole-file work. Before answering, it checks that no write to the text, syntax dialect, or renderer has begun since the request was received, and answers `ContentModified` otherwise, because edits computed on the old text would be applied after the client's edit.
+
 ### Diagnostic publishing
 
 Edit-triggered publishing is debounced per file; live diagnostics are computed outside read transactions. During a compile the previous results are kept, then replaced atomically; compile results are immutable and reference counted.
