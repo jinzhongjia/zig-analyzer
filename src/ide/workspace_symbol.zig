@@ -50,38 +50,42 @@ pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usi
             summaries = s;
             const at = s.items[i];
             if (at.name_len == 0) continue;
+            const container = tree.containers[item.container];
             try top.add(.{
                 .name = try document_symbol.symbolName(r.arena, ast.identName(name)),
+                .kind = document_symbol.symbolKind(tree, @intCast(i), container.kind),
+                .container = container.name orelse if (container.is_value) tree.items[container.parent_item.?].name else null,
                 .file = file,
-                .item = @intCast(i),
+                .start = at.name_offset,
+                .end = at.name_offset + at.name_len,
                 .rank = rank,
             });
         }
     }
-    var out: std.ArrayList(Symbol) = .empty;
-    for (try top.selected()) |m| {
-        const tree = try r.itemTree(m.file);
-        const at = (try r.ctx.get(syntax.ItemSummaries, m.file)).items[m.item];
-        const container = tree.containers[tree.items[m.item].container];
-        try out.append(r.arena, .{
-            .name = m.name,
-            .kind = document_symbol.symbolKind(tree, m.item, container.kind),
-            .container = container.name orelse if (container.is_value) tree.items[container.parent_item.?].name else null,
-            .file = m.file,
-            .start = at.name_offset,
-            .end = at.name_offset + at.name_len,
-            .rank = m.rank,
-        });
-    }
-    return out.items;
+    const selected = try top.selected();
+    const out = try r.arena.alloc(Symbol, selected.len);
+    for (selected, out) |m, *s| s.* = .{
+        .name = m.name,
+        .kind = m.kind,
+        .container = m.container,
+        .file = m.file,
+        .start = m.start,
+        .end = m.end,
+        .rank = m.rank,
+    };
+    return out;
 }
 
-/// A match whose `Symbol` is not built yet: the selection keeps these fields only, so a match the
-/// limit drops costs no `Symbol` slot and no kind classification
+/// A matched declaration with everything its `Symbol` needs, taken during the scan so that the
+/// selected matches need not fetch their tree and summaries again. A match the limit drops is not
+/// stored.
 const Match = struct {
     name: []const u8,
+    container: ?[]const u8,
+    kind: types.SymbolKind,
     file: FileId,
-    item: u32,
+    start: u32,
+    end: u32,
     rank: u8,
     /// Position in the scan; breaks ties so that equal keys keep the order a stable sort of every
     /// match gives
@@ -177,8 +181,11 @@ test "the selection keeps what sorting every match and truncating keeps" {
         };
         try all.append(a, .{
             .name = name,
+            .container = if (i % 2 == 0) "C" else null,
+            .kind = .Function,
             .file = @fromBackingInt(@intCast(i % 7)),
-            .item = @intCast(i),
+            .start = @intCast(i),
+            .end = @intCast(i + 1),
             .rank = @intCast(i % 3),
             .order = @intCast(i),
         });
@@ -202,9 +209,12 @@ test "the selection keeps what sorting every match and truncating keeps" {
         try testing.expectEqual(kept, got.len);
         for (got, sorted[0..kept]) |x, y| {
             try testing.expectEqual(y.file, x.file);
-            try testing.expectEqual(y.item, x.item);
+            try testing.expectEqual(y.kind, x.kind);
+            try testing.expectEqual(y.start, x.start);
+            try testing.expectEqual(y.end, x.end);
             try testing.expectEqual(y.rank, x.rank);
             try testing.expectEqual(y.order, x.order);
+            if (y.container) |c| try testing.expectEqualStrings(c, x.container.?) else try testing.expectEqual(null, x.container);
             try testing.expectEqualStrings(y.name, x.name);
         }
     }
