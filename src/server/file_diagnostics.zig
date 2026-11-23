@@ -167,6 +167,7 @@ pub fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file:
     // With `FileText`, the `SourceText` is that text, whose line table is cached
     const lines = if (text != null) try Server.sourceLines(ctx, file) else try offsets.LineIndex.init(arena, current);
     var diags = try compiler.merge(arena, .{
+        .path = server.vfs.path(file),
         .text = current,
         .lines = lines,
         .encoding = server.encoding,

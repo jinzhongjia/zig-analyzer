@@ -313,19 +313,59 @@ fn logTarget(a: Allocator, eb: ErrorBundle, build_root: []const u8) Allocator.Er
     return messages[0];
 }
 
+/// Line diffs of text pairs computed during one `merge` or one `combine`, grouped by the path of
+/// the file the texts belong to. A diff depends only on the two texts and is reused only when both
+/// compare equal, so the result is the same as diffing every time. Entries are kept for the rest
+/// of the operation: the notes of every error point into the same few files, and each build result
+/// holds the text its own build read.
+pub const Diffs = struct {
+    a: Allocator,
+    by_path: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(Entry)) = .empty,
+
+    const Entry = struct {
+        /// Text the ranges of a diagnostic refer to
+        from: []const u8,
+        /// Text the ranges are shifted onto
+        to: []const u8,
+        edits: []const Edit,
+    };
+
+    /// Edits that shift a range of `from` onto `to`; empty when the texts are equal. The texts and
+    /// the path must outlive the cache.
+    pub fn get(d: *Diffs, path: []const u8, from: []const u8, to: []const u8) Allocator.Error![]const Edit {
+        if (equal(from, to)) return &.{};
+        const gop = try d.by_path.getOrPut(d.a, path);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        for (gop.value_ptr.items) |e| {
+            if (equal(e.from, from) and equal(e.to, to)) return e.edits;
+        }
+        const edits = try line_diff.diff(d.a, from, to);
+        try gop.value_ptr.append(d.a, .{ .from = from, .to = to, .edits = edits });
+        return edits;
+    }
+
+    /// Whether two texts are equal; equal slices are not read, since a note into the file being
+    /// published holds the same texts as the diff `merge` computes for the file itself.
+    fn equal(x: []const u8, y: []const u8) bool {
+        return (x.ptr == y.ptr and x.len == y.len) or std.mem.eql(u8, x, y);
+    }
+};
+
 /// Whether two errors are the same error: same range, message and notes (the reference trace,
 /// which differs between the compilations that reach the error, is not compared). Each note's
 /// range refers to the text of its file that its own build read: a note of `y` read from another
 /// text is shifted onto the text of `x`'s note before comparing.
-fn sameError(arena: Allocator, x: Item, y: Item) Allocator.Error!bool {
+fn sameError(diffs: *Diffs, x: Item, y: Item) Allocator.Error!bool {
     if (x.start != y.start or x.end != y.end or !std.mem.eql(u8, x.message, y.message)) return false;
     if (x.note_count != y.note_count) return false;
     for (x.notes[0..x.note_count], y.notes[0..y.note_count]) |m, n| {
         if (!std.mem.eql(u8, m.path, n.path) or !std.mem.eql(u8, m.message, n.message)) return false;
         var start = n.start;
         var end = n.end;
-        if (m.base_text) |mb| if (n.base_text) |nb| if (!std.mem.eql(u8, mb, nb)) {
-            start, end = remap(try line_diff.diff(arena, nb, mb), n.start, n.end) orelse return false;
+        if (m.base_text) |mb| if (n.base_text) |nb| {
+            const span = remap(try diffs.get(m.path, nb, mb), n.start, n.end) orelse return false;
+            start = span[0];
+            end = span[1];
         };
         if (m.start != start or m.end != end) return false;
     }
@@ -359,6 +399,7 @@ fn absolute(a: Allocator, base: []const u8, path: []const u8) Allocator.Error!?[
 pub fn combine(arena: Allocator, results: []const *const FileResult) Allocator.Error!FileResult {
     const base = results[0].base_text;
     var items: std.ArrayList(Item) = .empty;
+    var diffs: Diffs = .{ .a = arena };
     for (results) |r| {
         const edits: []const Edit = if (std.mem.eql(u8, r.base_text, base)) &.{} else try line_diff.diff(arena, r.base_text, base);
         next: for (r.items) |item| {
@@ -370,7 +411,7 @@ pub fn combine(arena: Allocator, results: []const *const FileResult) Allocator.E
                 moved.end = span[1];
             }
             for (items.items) |*x| {
-                if (try sameError(arena, x.*, moved)) {
+                if (try sameError(&diffs, x.*, moved)) {
                     try addCompileLog(arena, x, moved.compile_log);
                     continue :next;
                 }
@@ -384,6 +425,8 @@ pub fn combine(arena: Allocator, results: []const *const FileResult) Allocator.E
 // ── Merging ───────────────────────────────────────────────────────
 
 pub const MergeInput = struct {
+    /// Absolute path of the file the diagnostics belong to: the key of its diff with the build text
+    path: []const u8,
     /// Current buffer text
     text: []const u8,
     lines: offsets.LineIndex,
@@ -411,10 +454,12 @@ pub const OtherFileFn = *const fn (ctx: *anyopaque, arena: Allocator, path: []co
 
 pub fn merge(arena: Allocator, in: MergeInput) Allocator.Error![]const types.Diagnostic {
     var out: std.ArrayList(types.Diagnostic) = .empty;
+    // The diff of the build text and the buffer is kept for the notes that point into this file
+    var diffs: Diffs = .{ .a = arena };
     if (in.compiler) |c| {
         if (std.mem.eql(u8, c.base_text, in.text)) {
             // The buffer matches the build: compiler diagnostics already include AstGen errors
-            for (c.items) |item| try out.append(arena, try compilerDiagnostic(arena, in, item, item.start, item.end));
+            for (c.items) |item| try out.append(arena, try compilerDiagnostic(arena, in, &diffs, item, item.start, item.end));
             return out.items;
         }
     }
@@ -426,10 +471,10 @@ pub fn merge(arena: Allocator, in: MergeInput) Allocator.Error![]const types.Dia
         // diff, and those inside a modified region are hidden. The `@compileLog` output of a
         // hidden error is still the latest output of the build: it is published on its own, at
         // the error's start (the start of the modified region that hides it).
-        const edits = try line_diff.diff(arena, c.base_text, in.text);
+        const edits = try diffs.get(in.path, c.base_text, in.text);
         for (c.items) |item| {
             if (!item.is_astgen) if (remap(edits, item.start, item.end)) |span| {
-                try out.append(arena, try compilerDiagnostic(arena, in, item, span[0], span[1]));
+                try out.append(arena, try compilerDiagnostic(arena, in, &diffs, item, span[0], span[1]));
                 continue;
             };
             if (item.compile_log.len == 0) continue;
@@ -505,7 +550,7 @@ fn liveDiagnostic(arena: Allocator, in: MergeInput, d: live.Diagnostic) Allocato
     };
 }
 
-fn compilerDiagnostic(arena: Allocator, in: MergeInput, item: Item, start: u32, end: u32) Allocator.Error!types.Diagnostic {
+fn compilerDiagnostic(arena: Allocator, in: MergeInput, diffs: *Diffs, item: Item, start: u32, end: u32) Allocator.Error!types.Diagnostic {
     var related: std.ArrayList(types.DiagnosticRelatedInformation) = .empty;
     for (item.notes) |n| {
         const other = in.other_file(in.other_ctx, arena, n.path) orelse continue;
@@ -514,12 +559,11 @@ fn compilerDiagnostic(arena: Allocator, in: MergeInput, item: Item, start: u32, 
         // the file): shift by the diff from the text that build read
         var note_start = n.start;
         var note_end = n.end;
-        if (n.base_text) |base| if (!std.mem.eql(u8, base, other.text)) {
-            const edits = try line_diff.diff(arena, base, other.text);
-            const span = remap(edits, n.start, n.end) orelse continue;
+        if (n.base_text) |base| {
+            const span = remap(try diffs.get(n.path, base, other.text), n.start, n.end) orelse continue;
             note_start = span[0];
             note_end = span[1];
-        };
+        }
         try related.append(arena, .{
             .location = .{ .uri = other.uri, .range = lines.range(note_start, note_end, in.encoding) },
             .message = try arena.dupe(u8, n.message),
