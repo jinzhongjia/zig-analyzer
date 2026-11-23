@@ -295,7 +295,7 @@ fn task(s: *SingleFiles, file: Vfs.FileId) Io.Cancelable!void {
                 const id = doc_sync.toolFile(server, p) catch continue;
                 inputs.put(server.gpa, id, {}) catch continue;
             }
-            break :blk compiler.collect(server.gpa, &.{compiled.errors}, std.fs.path.dirname(path) orelse ".", path, server, readDisk) catch null;
+            break :blk compiler.collect(server.gpa, &.{compiled.errors}, std.fs.path.dirname(path) orelse ".", path, server, readDisk, .{ .io = server.io, .prepared = &server.live_prepared }) catch null;
         };
         var files: std.AutoArrayHashMapUnmanaged(Vfs.FileId, *const compiler.FileResult) = .empty;
         if (result) |r| for (r.files.keys(), r.files.values()) |p, *fr| {

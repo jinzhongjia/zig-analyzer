@@ -72,6 +72,13 @@ pub const BuildResult = struct {
 /// File reading interface: returns the current disk text of a file (null on failure)
 pub const ReadFn = *const fn (ctx: *anyopaque, gpa: Allocator, path: []const u8) ?[]u8;
 
+/// AstGen results that `collect` can reuse: the ones that publishing computed for the same text,
+/// with the lock of their mutex
+pub const LiveCache = struct {
+    io: std.Io,
+    prepared: *live.Prepared,
+};
+
 /// Converts a set of ErrorBundles into per-file results.
 /// A relative `src_path` is relative to `build_root`; errors without location information (such
 /// as link errors) are attached to the start of `fallback_path` (usually build.zig), which is
@@ -86,6 +93,8 @@ pub const ReadFn = *const fn (ctx: *anyopaque, gpa: Allocator, path: []const u8)
 /// text read is the one the compiler read; when it is not (the file changed during the build), no
 /// location in that file is kept: its errors are dropped with their notes, and notes and
 /// references into it are dropped. The next build that reads the file reports them again.
+/// `live_cache` supplies the AstGen results that publishing computed for the same texts; the
+/// `is_astgen` flags are the same with or without it, since only in-process results are reused.
 pub fn collect(
     gpa: Allocator,
     bundles: []const ErrorBundle,
@@ -93,6 +102,7 @@ pub fn collect(
     fallback_path: []const u8,
     read_ctx: *anyopaque,
     read: ReadFn,
+    live_cache: ?LiveCache,
 ) Allocator.Error!*BuildResult {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
@@ -176,9 +186,9 @@ pub fn collect(
     var files: std.StringArrayHashMapUnmanaged(FileResult) = .empty;
     for (lists.keys(), lists.values()) |path, *items| {
         const text = try sources.text(path) orelse "";
-        // Mark AstGen errors: run AstGen on the same text and match by range and message
-        const mode = live.modeOf(path);
-        const astgen = try live.check(gpa, text, mode);
+        // Mark AstGen errors: match the errors against in-process AstGen of the same text, reusing
+        // the check that publishing already ran on it
+        const astgen = try astgenOf(gpa, live_cache, text, live.modeOf(path));
         defer astgen.destroy(gpa);
         for (items.items) |*item| {
             for (astgen.items) |d| {
@@ -192,6 +202,15 @@ pub fn collect(
     // Take the arena state after the last allocation
     result.arena = arena_state.state;
     return result;
+}
+
+/// In-process AstGen of the text, whose errors the `is_astgen` flag compares against. A result that
+/// live diagnostics computed for the same text is taken from `live_cache` instead of checking the
+/// text again. Only in-process results are taken: `LiveBackend` may be the user's `zig ast-check`,
+/// whose diagnostics are not necessarily the ones this AstGen produces.
+fn astgenOf(gpa: Allocator, live_cache: ?LiveCache, text: []const u8, mode: live.Mode) Allocator.Error!*live.Result {
+    if (live_cache) |cache| if (try cache.prepared.take(cache.io, text, mode, .in_process)) |result| return result;
+    return live.check(gpa, text, mode);
 }
 
 /// Disk texts of the files that the locations of a build point into, read after the build

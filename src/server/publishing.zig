@@ -426,13 +426,13 @@ fn prepareLive(server: *Server, file: Vfs.FileId) bool {
         return true;
     };
     const mode = live.modeOf(server.vfs.path(file));
-    if (!server.live_prepared.claim(server.io, file, live.Prepared.hash(r.text, mode, r.backend))) return true;
+    if (!server.live_prepared.claim(server.io, live.Prepared.hash(r.text, mode, r.backend))) return true;
     const result = live.checkWith(server.gpa, server.io, r.backend, server.zig_environ.load(.acquire), r.text, mode) catch return false;
     if (!result.complete) {
         result.destroy(server.gpa);
         return false;
     }
-    server.live_prepared.put(server.io, file, r.text, mode, r.backend, result) catch return false;
+    server.live_prepared.put(server.io, r.text, mode, r.backend, result) catch return false;
     return true;
 }
 
@@ -442,7 +442,7 @@ fn liveReady(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) !bool {
     if (!liveEligible(server, file)) return true;
     const backend = try ctx.get(live.LiveBackend, {});
     const text = try ctx.get(FileText, file) orelse return true;
-    return server.live_prepared.prepared(server.io, file, live.Prepared.hash(text, live.modeOf(server.vfs.path(file)), backend));
+    return server.live_prepared.prepared(server.io, live.Prepared.hash(text, live.modeOf(server.vfs.path(file)), backend));
 }
 
 /// Sends the diagnostics computed with sequence number `seq`, dropping them if a result

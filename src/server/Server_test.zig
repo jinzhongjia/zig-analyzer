@@ -921,9 +921,11 @@ test "live diagnostics are debounced per file and AstGen runs outside the read t
     const diags = published[published.len - 1].object.get("params").?.object.get("diagnostics").?.array.items;
     try testing.expectEqual(1, diags.len);
     try testing.expectEqualStrings("expected expression, found ';'", diags[0].object.get("message").?.string);
-    // AstCheck used the results computed outside the read transaction
+    // AstCheck used the results computed outside the read transaction, and the result of the
+    // published text stays in the memo for the compiler diagnostics of a build of the same text
     try testing.expect(h.server.live_prepared.hits >= 2);
-    try testing.expectEqual(0, h.server.live_prepared.entries.items.len);
+    const live = za.diagnostics.live;
+    try testing.expect(h.server.live_prepared.prepared(h.server.io, live.Prepared.hash(texts[texts.len - 1], .zig, .in_process)));
 
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});

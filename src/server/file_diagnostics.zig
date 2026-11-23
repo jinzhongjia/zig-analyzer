@@ -256,7 +256,7 @@ test "computeDiagnostics: notes of combined results keep the coordinates of thei
             var eb = try wip.toOwnedBundle("");
             defer eb.deinit(gpa);
             var disk: Disk = .{ .text = text };
-            return compiler.collect(gpa, &.{eb}, std.fs.path.dirname(path).?, path, &disk, Disk.read);
+            return compiler.collect(gpa, &.{eb}, std.fs.path.dirname(path).?, path, &disk, Disk.read, null);
         }
     };
     const util = try server.vfs.intern(util_path);

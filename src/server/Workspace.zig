@@ -1296,7 +1296,7 @@ fn storeResult(ws: *Workspace, target: *Workspace) Allocator.Error!void {
     defer ws.clearBundles();
     const build_zig = try std.fs.path.join(ws.gpa, &.{ ws.root, "build.zig" });
     defer ws.gpa.free(build_zig);
-    const result = try compiler.collect(ws.gpa, ws.bundles.items, ws.root, build_zig, ws, readDisk);
+    const result = try compiler.collect(ws.gpa, ws.bundles.items, ws.root, build_zig, ws, readDisk, .{ .io = ws.server.io, .prepared = &ws.server.live_prepared });
     errdefer result.release(ws.gpa);
 
     var files: std.AutoArrayHashMapUnmanaged(FileId, *const compiler.FileResult) = .empty;

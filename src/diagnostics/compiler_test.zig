@@ -54,7 +54,7 @@ fn buildResult() !*compiler.BuildResult {
     var eb = try wip.toOwnedBundle("");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    return compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    return compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
 }
 
 test "collect: path resolution, dedup, errors without location, AstGen flag" {
@@ -66,6 +66,59 @@ test "collect: path resolution, dedup, errors without location, AstGen flag" {
     try testing.expect(!main.items[1].is_astgen); // the type error comes from Sema
     const build_zig = r.files.get(native("/proj/build.zig")).?;
     try testing.expectEqualStrings("undefined symbol: foo", build_zig.items[0].message);
+}
+
+/// An error bundle with the two errors of `main_text` (an AstGen error and a Sema error)
+fn mainBundle() !ErrorBundle {
+    var wip: ErrorBundle.Wip = try .init(testing.allocator);
+    defer wip.deinit();
+    try addError(&wip, "src/main.zig", main_text, "unused", "unused local variable");
+    try addError(&wip, "src/main.zig", main_text, "\"s\"", "expected type 'u32', found '*const [1:0]u8'");
+    return wip.toOwnedBundle("");
+}
+
+test "collect: the AstGen result prepared for the same text is reused" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var prepared: live.Prepared = .{ .gpa = gpa };
+    defer prepared.deinit();
+    // The last publish of the text checked it, in process
+    try prepared.put(io, main_text, .zig, .in_process, try live.check(gpa, main_text, .zig));
+    const hits = prepared.hits;
+    var eb = try mainBundle();
+    defer eb.deinit(gpa);
+    var dummy: u8 = 0;
+    const cache: compiler.LiveCache = .{ .io = io, .prepared = &prepared };
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, cache);
+    defer r.release(gpa);
+    // The flags are the same as with a check of its own, which was not needed here
+    try testing.expectEqual(hits + 1, prepared.hits);
+    const main = r.files.get(native("/proj/src/main.zig")).?;
+    try testing.expect(main.items[0].is_astgen);
+    try testing.expect(!main.items[1].is_astgen);
+    // The result stays in the memo for the publish that follows the build
+    try testing.expect(prepared.prepared(io, live.Prepared.hash(main_text, .zig, .in_process)));
+}
+
+test "collect: a check of the subprocess backend is not used for the AstGen flag" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var prepared: live.Prepared = .{ .gpa = gpa };
+    defer prepared.deinit();
+    // The user's zig checks the text as `zig ast-check`: its diagnostics are not necessarily the
+    // ones in-process AstGen gives, so the flag must not be computed from it
+    try prepared.put(io, main_text, .zig, .{ .subprocess = "zig" }, try live.check(gpa, main_text, .zig));
+    const hits = prepared.hits;
+    var eb = try mainBundle();
+    defer eb.deinit(gpa);
+    var dummy: u8 = 0;
+    const cache: compiler.LiveCache = .{ .io = io, .prepared = &prepared };
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, cache);
+    defer r.release(gpa);
+    try testing.expectEqual(hits, prepared.hits);
+    const main = r.files.get(native("/proj/src/main.zig")).?;
+    try testing.expect(main.items[0].is_astgen);
+    try testing.expect(!main.items[1].is_astgen);
 }
 
 test "a build result stays valid while a reader holds a reference after the owner released it" {
@@ -679,7 +732,7 @@ test "collect: locations in a file changed after the compiler read it are discar
 
     // The disk still has the text the compiler read
     var disk: LibDisk = .{ .lib = lib_v1 };
-    const same = try compiler.collect(gpa, &.{v1}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read);
+    const same = try compiler.collect(gpa, &.{v1}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read, null);
     defer same.release(gpa);
     try testing.expectEqual(std.mem.indexOf(u8, lib_v1, "256").?, same.files.get(lib_path).?.items[0].start);
     try testing.expectEqual(2, same.files.get(main_path).?.items[0].notes.len);
@@ -687,7 +740,7 @@ test "collect: locations in a file changed after the compiler read it are discar
     // Guards against applying the spans to a text written during the build, which put the error
     // inside a comment: everything located in lib.zig is dropped
     disk.lib = lib_v2;
-    const changed = try compiler.collect(gpa, &.{v1}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read);
+    const changed = try compiler.collect(gpa, &.{v1}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read, null);
     defer changed.release(gpa);
     try testing.expect(changed.files.get(lib_path) == null);
     const main = changed.files.get(main_path).?;
@@ -697,7 +750,7 @@ test "collect: locations in a file changed after the compiler read it are discar
     // The build after the change places the error on the new text
     var v2 = try libBundle(lib_v2);
     defer v2.deinit(gpa);
-    const rebuilt = try compiler.collect(gpa, &.{v2}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read);
+    const rebuilt = try compiler.collect(gpa, &.{v2}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read, null);
     defer rebuilt.release(gpa);
     const lib = rebuilt.files.get(lib_path).?;
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -714,7 +767,7 @@ test "collect: reference trace and compile log output are kept" {
     var eb = try traceBundle();
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
 
     const items = r.files.get(native("/proj/src/main.zig")).?.items;
@@ -779,7 +832,7 @@ fn collectIfValid(eb: ErrorBundle) !bool {
     if (!error_bundle.isValid(eb)) return false;
     const gpa = testing.allocator;
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -855,7 +908,7 @@ test "collect: paths that do not resolve to absolute paths count as missing loca
     var eb = try wip.toOwnedBundle("");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
 
     try testing.expectEqual(1, r.files.count());
@@ -891,7 +944,7 @@ test "collect: spans that end before they start become empty" {
     var eb = try wip.toOwnedBundle("");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
     // Guards against publishing a Range that ends before it starts: it becomes an empty range at
     // the start
@@ -955,7 +1008,7 @@ test "compile log: kept apart from the message for dedup and the AstGen flag" {
     var log2 = try unusedWithLog("@as(comptime_int, 2)\n");
     defer log2.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{ plain, log1, log1, log2 }, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{ plain, log1, log1, log2 }, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
     const result = r.files.getPtr(native("/proj/src/main.zig")).?;
     // Guards against the same error showing up several times, and no longer being recognized as an
@@ -1009,7 +1062,7 @@ test "compile log: attached to an error in the build root rather than one sorted
     var eb = try wip.toOwnedBundle("@as(comptime_int, 24)\n");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
     // Guards against attaching the output to the error in the standard library
     try testing.expectEqualStrings("", r.files.get(native("/usr/lib/zig/std/Io/Writer.zig")).?.items[0].compile_log);
@@ -1029,7 +1082,7 @@ test "collect: notes of an error without a location outlive the fallback path" {
     const fallback = try gpa.dupe(u8, native("/proj/build.zig"));
     defer gpa.free(fallback);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), fallback, &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), fallback, &dummy, Disk.read, null);
     defer r.release(gpa);
     // The caller reuses the memory of its path after the call
     @memset(fallback, 'x');
@@ -1062,7 +1115,7 @@ test "collect and combine: errors that differ only in their notes are kept apart
     var eb = try wip.toOwnedBundle("");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
     const result = r.files.getPtr(native("/proj/src/main.zig")).?;
     // Guards against merging the errors of two inline call sites into one
@@ -1095,7 +1148,7 @@ test "collect: repeat counts of messages and notes are kept" {
     var eb = try wip.toOwnedBundle("");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
     const notes = r.files.get(native("/proj/src/main.zig")).?.items[0].notes;
     // Guards against dropping the count that the compiler prints
