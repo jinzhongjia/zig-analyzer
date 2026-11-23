@@ -304,12 +304,11 @@ pub fn describe(r: *Resolver, from: FileId, target: imports.Target) resolve.Erro
             const tv = try r.ctx.get(queries.DeclType, .{ .owner = try r.ownerKey(d.file, d.item) });
             const detail = try context.signature(r, def, tv, .single_line);
             if (try context.docOf(r, def, tv)) |text| w.print("{s}\n\n", .{text}) catch return error.OutOfMemory;
-            const text = (try r.ctx.get(database.syntax.SourceText, d.file)).text;
             var offset: usize = 0;
             if (try r.itemNode(d.file, d.item)) |node| {
                 offset = if (ast.memberName(node, try r.inEnum(d.file, d.item))) |tok| tok.offset else node.offset;
             }
-            const line = std.mem.count(u8, text[0..@min(offset, text.len)], "\n") + 1;
+            const line = try r.lineOf(d.file, offset);
             w.print("Defined in `{s}:{d}`", .{ try imports.displayPath(r, from, d.file), line }) catch return error.OutOfMemory;
             return .{ .detail = detail, .doc = out.written() };
         },

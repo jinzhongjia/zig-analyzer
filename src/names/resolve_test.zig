@@ -1182,6 +1182,22 @@ test "decl literals of another file resolve only when pub" {
     try testing.expectEqualStrings("other.zig:secret", try w.goto(other, try at(&w, other, "secret;")));
 }
 
+test "lineOf counts CRLF and a lone CR as one line break" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text = "a\r\nb\rc\n";
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolve.Resolver{ .ctx = &ctx, .arena = w.arena.allocator() };
+    try testing.expectEqual(1, try r.lineOf(file, 0));
+    try testing.expectEqual(2, try r.lineOf(file, 3));
+    try testing.expectEqual(3, try r.lineOf(file, 5));
+    try testing.expectEqual(4, try r.lineOf(file, text.len));
+    try testing.expectEqual(4, try r.lineOf(file, 100));
+}
+
 test "members of the same file resolve through a self-import" {
     var w: World = undefined;
     try w.init();

@@ -1690,12 +1690,11 @@ fn contains(names: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-/// A name in `NameIndex`. A collision only adds a file to a pre-filter, whose files are then checked
-/// precisely.
-const NameHash = u64;
+/// A name in `NameIndex` (see `FileIndex.NameHash`)
+const NameHash = FileIndex.NameHash;
 
 fn nameHash(name: []const u8) NameHash {
-    return std.hash.Wyhash.hash(0, name);
+    return FileIndex.nameHash(name);
 }
 
 /// The searched files by the names they contain. Queries that pre-filter files by name read
@@ -1721,8 +1720,8 @@ pub const NameIndex = struct {
         var r: Resolver = .{ .ctx = ctx, .arena = scratch.allocator() };
         var lists: std.AutoHashMapUnmanaged(NameHash, std.ArrayList(FileId)) = .empty;
         for (try search.searchFiles(&r)) |f| {
-            for ((try ctx.get(FileIndex.Query, f)).names) |name| {
-                const gop = try lists.getOrPut(r.arena, nameHash(name));
+            for ((try ctx.get(FileIndex.Query, f)).hashes) |hash| {
+                const gop = try lists.getOrPut(r.arena, hash);
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                 try gop.value_ptr.append(r.arena, f);
             }

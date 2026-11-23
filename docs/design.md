@@ -91,7 +91,7 @@ Each thread keeps an active query stack; a cycle calls the query's `cycleFallbac
 
 ### Concurrent reads
 
-Read transactions that need the same memo brought up to date do it once: the first claims it, the others wait, then use what it wrote or claim it themselves when nothing was written. Waiting reads are canceled like running ones. A wait that would close a cycle of read transactions is not taken: the read computes the memo on its own stack, where the cycle falls back as usual.
+Read transactions that need the same memo brought up to date do it once: the first claims it, the others wait, then use what it wrote or claim it themselves when nothing was written. A memo whose dependencies did not change at its durability is verified by the durability check alone, under its table's lock and without the claim: that verification computes nothing and only marks the memo, so concurrent reads repeating it are harmless. Waiting reads are canceled like running ones. A wait that would close a cycle of read transactions is not taken: the read computes the memo on its own stack, where the cycle falls back as usual.
 
 ### Memory reclamation
 
