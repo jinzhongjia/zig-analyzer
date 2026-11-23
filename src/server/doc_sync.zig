@@ -401,10 +401,13 @@ fn closeDocument(server: *Server, id: Vfs.FileId, document_uri: []const u8) Allo
     const i = open.find(document_uri) orelse return .not_open;
     if (open.docs.items.len == 1) return .last;
     const current = open.current();
-    const text = try Text.init(gpa, (if (i == open.docs.items.len - 1) &open.docs.items[i - 1] else current).text.?);
-    errdefer text.release(gpa);
+    var owned: ?*Text = try Text.init(gpa, (if (i == open.docs.items.len - 1) &open.docs.items[i - 1] else current).text.?);
+    errdefer if (owned) |t| t.release(gpa);
     try server.docs.versions.ensureUnusedCapacity(gpa, 1);
     open.docs.orderedRemove(i).deinit(gpa);
+    // `db.set` takes ownership of the text and releases it itself when it fails
+    const text = owned.?;
+    owned = null;
     try server.db.set(FileText, id, text, .low);
     const now = open.current();
     server.docs.versions.putAssumeCapacity(id, now.version);

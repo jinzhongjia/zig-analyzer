@@ -332,8 +332,10 @@ fn applyFileChanges(server: *Server, arena: Allocator, prepared: *Prepared, sour
         server.db.beginWrite();
         defer server.db.endWrite();
         for (changes.items) |*c| if (c.edited) {
-            try server.db.set(FileText, c.file, c.text, c.durability);
+            // `db.set` takes ownership of the text and releases it itself when it fails
+            const text = c.text;
             c.text = null;
+            try server.db.set(FileText, c.file, text, c.durability);
         };
     }
 
