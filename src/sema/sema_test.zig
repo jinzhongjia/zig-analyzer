@@ -3282,6 +3282,41 @@ test "containers in a function capture a comptime var where the body reaches the
     });
 }
 
+test "comptime var writes are found in loops and defers after the declaration" {
+    // Prevents reusing a scan made before the first `comptime var` declaration, when name
+    // resolution could not report one yet, for a later loop or defer.
+    try expectTypes(
+        \\fn BeforeDecl(comptime n: u32) type {
+        \\    for (0..0) |_| {}
+        \\    comptime var x: u32 = 0;
+        \\    inline for (0..n) |_| x += 1;
+        \\    return struct { pub const v = x; };
+        \\}
+        \\fn Loops(comptime n: u32) type {
+        \\    comptime var x: u32 = 0;
+        \\    inline for (0..n) |_| x += 1;
+        \\    inline for (0..n) |_| x += 1;
+        \\    return struct { pub const v = x; };
+        \\}
+        \\fn Defers(comptime n: u32) type {
+        \\    comptime var x: u32 = 0;
+        \\    inline for (0..n) |_| {
+        \\        defer x += 1;
+        \\        const seen = x;
+        \\        _ = seen;
+        \\    }
+        \\    return struct { pub const v = x; };
+        \\}
+        \\const before_decl = BeforeDecl(3).v;
+        \\const loops = Loops(2).v;
+        \\const defers = Defers(3).v;
+    , &.{
+        .{ "before_decl", "u32 = 3" },
+        .{ "loops", "u32 = 4" },
+        .{ "defers", "u32 = 3" },
+    });
+}
+
 test "defer and errdefer write comptime vars at the exit of their block" {
     // Prevents applying a deferred write at the defer statement and applying errdefer writes on
     // the success path; expected values are the results of `zig run`
