@@ -118,6 +118,22 @@ const StablePlus = struct {
     }
 };
 
+/// An LRU query over a low-durability input: after any input change a read only verifies its memo,
+/// so only the use time recorded by verification keeps it alive
+const LruVerified = struct {
+    pub const kind: db.Kind = .derived;
+    pub const Key = u32;
+    pub const Value = i64;
+    pub const lru: usize = 3;
+    pub const lru_bytes: usize = 1 << 20;
+    pub fn compute(ctx: *Db.Ctx, key: Key) db.Error!Value {
+        return (try ctx.get(Number, key)) * 3;
+    }
+    pub fn bytes(_: Value) usize {
+        return 8;
+    }
+};
+
 // Cycle: CycleA(k) = CycleB(k) + 1, CycleB(k) = CycleA(k)
 const CycleA = struct {
     pub const kind: db.Kind = .derived;
@@ -633,7 +649,7 @@ fn crossStarted(which: usize) void {
     while (!cross_started[1 - which].load(.acquire)) std.Thread.yield() catch {};
 }
 
-const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Doubled, TensVia, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Prefix, PrefixLen, Gated, CrossA, CrossB, FixA, FixB, OwnedCycleA, OwnedCycleB, OwnedCycleLen, ReadBounded, ReadBoundedLen, ReadBoundedHolder, ReadBoundedOther, ReadBoundedBoth, ReadSized, ReadSizedLen });
+const Db = db.Engine(void, &.{ Number, Stable, Text, Tens, Plus, Doubled, TensVia, Upper, OnlyStable, StableTens, StablePlus, CycleA, CycleB, Depth, Reach, Succ, Label, Graph, GraphVia, Layer, Lasso, Spin, Swallow, Cached, Sized, CachedLen, Prefix, PrefixLen, Gated, CrossA, CrossB, FixA, FixB, OwnedCycleA, OwnedCycleB, OwnedCycleLen, ReadBounded, ReadBoundedLen, ReadBoundedHolder, ReadBoundedOther, ReadBoundedBoth, ReadSized, ReadSizedLen, LruVerified });
 
 fn executions(d: *Db, comptime Q: type) u64 {
     return d.executions(Q);
@@ -1639,6 +1655,43 @@ test "lru: last-use times are counted per table" {
     }
 }
 
+test "lru: verifying a memo records its use, so the eviction keeps it" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    for (1..6) |k| try setNumber(&d, Number, @intCast(k), @intCast(k + 4), .low);
+    // Capacity 3: the three oldest are 1, 2, 3
+    for (1..4) |k| _ = try read(&d, LruVerified, @intCast(k));
+    const table = &d.tables[comptime Db.queryIndex(LruVerified)];
+    try testing.expectEqual(3, table.access_tick);
+
+    // An unrelated input change: the next read of key 1 only verifies its memo
+    try setNumber(&d, Number, 10, 1, .low);
+    const executed = executions(&d, LruVerified);
+    try testing.expectEqual(15, try read(&d, LruVerified, 1));
+    try testing.expectEqual(executed, executions(&d, LruVerified));
+    // The verification recorded the use: key 1 is now the most recently used
+    try testing.expectEqual(4, table.access_tick);
+    try testing.expectEqual(4, table.slots.items[0].memo.?.last_used);
+
+    // Capacity 3: a fourth key evicts the two least recently used, which are 2 and 3, not 1
+    try testing.expectEqual(24, try read(&d, LruVerified, 4));
+    try testing.expect(d.wantsSweep());
+    try testing.expect(d.trySweep());
+    try testing.expectEqual(2, table.live);
+    {
+        var ctx = d.beginRead(testing.allocator);
+        defer ctx.end();
+        try testing.expect(ctx.memoized(LruVerified, 1) != .evicted);
+        try testing.expect(ctx.memoized(LruVerified, 2) == .evicted);
+        try testing.expect(ctx.memoized(LruVerified, 3) == .evicted);
+    }
+    const before = executions(&d, LruVerified);
+    try testing.expectEqual(15, try read(&d, LruVerified, 1));
+    try testing.expectEqual(before, executions(&d, LruVerified));
+    try testing.expectEqual(18, try read(&d, LruVerified, 2));
+    try testing.expectEqual(before + 1, executions(&d, LruVerified));
+}
+
 test "a table without lru does not record use times" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
@@ -1655,6 +1708,7 @@ test "a frame reuses the buffers of the frame it replaces" {
     defer d.deinit();
     try setNumber(&d, Number, 1, 5, .low);
     try setNumber(&d, Number, 2, 6, .low);
+    try setReadBoundedTexts(&d);
     var ctx = d.beginRead(testing.allocator);
     defer ctx.end();
     // Plus reads Tens, so both frames keep their buffers after they return
@@ -1665,6 +1719,42 @@ test "a frame reuses the buffers of the frame it replaces" {
     try testing.expectEqual(1, try ctx.get(Plus, 2));
     try testing.expectEqual(2, ctx.spares.items.len);
     try testing.expectEqual(buffer, ctx.spares.items[1].deps.keys().ptr);
+
+    // The address of the widest buffer of a kept frame; zero when no frame has one
+    const Widest = struct {
+        fn pinned(c: *Db.Ctx) usize {
+            return widest(c, .pinned);
+        }
+        fn discarded(c: *Db.Ctx) usize {
+            return widest(c, .discarded);
+        }
+        fn widest(c: *Db.Ctx, comptime which: enum { pinned, discarded }) usize {
+            var best: usize = 0;
+            var capacity: usize = 0;
+            for (c.spares.items) |frame| {
+                const list = switch (which) {
+                    .pinned => frame.pinned,
+                    .discarded => frame.discarded,
+                };
+                if (list.capacity <= capacity) continue;
+                capacity = list.capacity;
+                best = @intFromPtr(list.items.ptr);
+            }
+            return best;
+        }
+    };
+    // The frame of `ReadBoundedHolder` holds the pins of the values it read, and the frame of
+    // `OwnedCycleLen` the values of the cycle it read
+    try testing.expect(try ctx.get(ReadBoundedHolder, 0));
+    const pinned = Widest.pinned(&ctx);
+    try testing.expect(pinned != 0);
+    try testing.expect(try ctx.get(ReadBoundedHolder, 1));
+    try testing.expectEqual(pinned, Widest.pinned(&ctx));
+    try testing.expectEqual(2, try ctx.get(OwnedCycleLen, 1));
+    const discarded = Widest.discarded(&ctx);
+    try testing.expect(discarded != 0);
+    try testing.expectEqual(2, try ctx.get(OwnedCycleLen, 2));
+    try testing.expectEqual(discarded, Widest.discarded(&ctx));
 }
 
 test "concurrent reads: readers of the same query agree" {

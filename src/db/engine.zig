@@ -1566,6 +1566,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 if (existing) |memo| if (!memo.evicted or !need_value) fast: {
                     if (memo.verified_at == db.revision) break :fast;
                     if (db.last_changed[@backingInt(memo.durability)] > memo.verified_at) break :fast;
+                    // Defense in depth: the callers already return before `ensureFresh` for a query
+                    // on the stack or at the stack limit, and a memo marked unverifiable in this
+                    // revision was marked while failing the durability check above. Keep the checks
+                    // so that the fast path stays exact if a caller changes.
                     if (ctx.stackIndex(dep) != null or ctx.unverifiableDepth(dep) != null or ctx.stackExhausted()) break :fast;
                     table.mutex.lockUncancelable(db.io);
                     defer table.mutex.unlock(db.io);
