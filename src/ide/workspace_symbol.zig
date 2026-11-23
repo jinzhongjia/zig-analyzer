@@ -1,7 +1,8 @@
 //! workspace/symbol: fuzzy-matches declarations by name in the ItemTrees of the project files.
 //!
 //! Matching rule: the query string (ignoring case) is a subsequence of the name. Exact matches
-//! come first, then prefixes, then subsequences; ties are broken by name length.
+//! come first, then prefixes, then subsequences; ties are broken by name length, then name, then
+//! the order the scan found them.
 
 const std = @import("std");
 const types = @import("../lsp/types.zig");
@@ -24,13 +25,16 @@ pub const Symbol = struct {
     rank: u8,
 };
 
-/// Returns the best `limit` symbols after sorting by match rank, and every exact match beyond
-/// them: same-named symbols tie on the name alone, so the limit cannot choose among them and
-/// typing more of the name cannot select a dropped one. Name positions come from `ItemSummaries`
-/// (never evicted): when there are more project files than the parse result cache holds, repeated
-/// queries do not need to reparse every file
+/// Returns the best `limit` symbols by match rank, name length, and name, and every exact match
+/// beyond them: same-named symbols tie on the name alone, so the limit cannot choose among them
+/// and typing more of the name cannot select a dropped one. Matches with equal rank, name length,
+/// and name are ordered by their position in the scan, as sorting every match and truncating does.
+/// Only the selected matches get a `Symbol`: a short query matches much of the project, and the
+/// limit drops most matches. Name positions come from `ItemSummaries` (never evicted): when there
+/// are more project files than the parse result cache holds, repeated queries do not need to
+/// reparse every file
 pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usize) resolve.Error![]const Symbol {
-    var out: std.ArrayList(Symbol) = .empty;
+    var top: Top = .{ .arena = r.arena, .limit = limit };
     for (files) |file| {
         const tree = try r.itemTree(file);
         // Fetched only when a member matches: files without matches need not compute summaries
@@ -46,29 +50,95 @@ pub fn search(r: *Resolver, files: []const FileId, query: []const u8, limit: usi
             summaries = s;
             const at = s.items[i];
             if (at.name_len == 0) continue;
-            const container = tree.containers[item.container];
-            try out.append(r.arena, .{
+            try top.add(.{
                 .name = try document_symbol.symbolName(r.arena, ast.identName(name)),
-                .kind = document_symbol.symbolKind(tree, @intCast(i), container.kind),
-                .container = container.name orelse if (container.is_value) tree.items[container.parent_item.?].name else null,
                 .file = file,
-                .start = at.name_offset,
-                .end = at.name_offset + at.name_len,
+                .item = @intCast(i),
                 .rank = rank,
             });
         }
     }
-    std.mem.sort(Symbol, out.items, {}, struct {
-        fn lt(_: void, a: Symbol, b: Symbol) bool {
-            if (a.rank != b.rank) return a.rank < b.rank;
-            if (a.name.len != b.name.len) return a.name.len < b.name.len;
-            return std.mem.lessThan(u8, a.name, b.name);
-        }
-    }.lt);
-    var kept = @min(out.items.len, limit);
-    while (kept < out.items.len and out.items[kept].rank == 0) kept += 1;
-    return out.items[0..kept];
+    var out: std.ArrayList(Symbol) = .empty;
+    for (try top.selected()) |m| {
+        const tree = try r.itemTree(m.file);
+        const at = (try r.ctx.get(syntax.ItemSummaries, m.file)).items[m.item];
+        const container = tree.containers[tree.items[m.item].container];
+        try out.append(r.arena, .{
+            .name = m.name,
+            .kind = document_symbol.symbolKind(tree, m.item, container.kind),
+            .container = container.name orelse if (container.is_value) tree.items[container.parent_item.?].name else null,
+            .file = m.file,
+            .start = at.name_offset,
+            .end = at.name_offset + at.name_len,
+            .rank = m.rank,
+        });
+    }
+    return out.items;
 }
+
+/// A match whose `Symbol` is not built yet: the selection keeps these fields only, so a match the
+/// limit drops costs no `Symbol` slot and no kind classification
+const Match = struct {
+    name: []const u8,
+    file: FileId,
+    item: u32,
+    rank: u8,
+    /// Position in the scan; breaks ties so that equal keys keep the order a stable sort of every
+    /// match gives
+    order: u32 = 0,
+};
+
+/// Whether `a` sorts before `b`: match rank, then name length, then name, then scan order
+fn before(_: void, a: Match, b: Match) bool {
+    if (a.rank != b.rank) return a.rank < b.rank;
+    if (a.name.len != b.name.len) return a.name.len < b.name.len;
+    const cmp = std.mem.order(u8, a.name, b.name);
+    if (cmp != .eq) return cmp == .lt;
+    return a.order < b.order;
+}
+
+/// The matches selected so far: every exact match and the best `limit` others. The others live in
+/// a max-heap; a match that does not beat the worst selected one is dropped without being stored.
+const Top = struct {
+    arena: std.mem.Allocator,
+    limit: usize,
+    exact: std.ArrayList(Match) = .empty,
+    rest: std.PriorityQueue(Match, void, worstFirst) = .empty,
+    order: u32 = 0,
+
+    fn add(t: *Top, candidate: Match) std.mem.Allocator.Error!void {
+        var m = candidate;
+        m.order = t.order;
+        t.order += 1;
+        if (m.rank == 0) return t.exact.append(t.arena, m);
+        if (t.limit == 0) return;
+        if (t.rest.count() >= t.limit) {
+            if (!before({}, m, t.rest.peek().?)) return;
+            _ = t.rest.pop();
+        }
+        try t.rest.push(t.arena, m);
+    }
+
+    /// The selected matches in sort order: all exact matches and as many of the others as the
+    /// limit leaves room for
+    fn selected(t: *Top) std.mem.Allocator.Error![]const Match {
+        std.mem.sort(Match, t.exact.items, {}, before);
+        const room = if (t.limit > t.exact.items.len) t.limit - t.exact.items.len else 0;
+        const n = @min(room, t.rest.count());
+        // The heap is not used again, so its storage is sorted in place
+        std.mem.sort(Match, t.rest.items, {}, before);
+        const out = try t.arena.alloc(Match, t.exact.items.len + n);
+        @memcpy(out[0..t.exact.items.len], t.exact.items);
+        @memcpy(out[t.exact.items.len..], t.rest.items[0..n]);
+        return out;
+    }
+
+    /// Reverse of `before`: the worst match has the priority, so `peek` returns the one a new
+    /// match has to beat
+    fn worstFirst(_: void, a: Match, b: Match) std.math.Order {
+        return if (before({}, a, b)) .gt else if (before({}, b, a)) .lt else .eq;
+    }
+};
 
 /// Match rank: 0 exact, 1 prefix, 2 subsequence; null when there is no match (all ignoring case)
 fn match(raw_name: []const u8, query: []const u8) ?u8 {
@@ -89,6 +159,55 @@ test match {
     try std.testing.expectEqual(2, match("ArrayList", "al"));
     try std.testing.expectEqual(null, match("ArrayList", "la"));
     try std.testing.expectEqual(2, match("@\"a b\"", "ab"));
+}
+
+// The selection must keep the entries a sort of every match followed by truncation keeps: with
+// many matches sharing a whole key, only the scan-order tie-break decides which survive
+test "the selection keeps what sorting every match and truncating keeps" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var all: std.ArrayList(Match) = .empty;
+    for (0..900) |i| {
+        // Three names that differ in length and three ranks: a whole key repeats often
+        const name = switch (i % 3) {
+            0 => "same",
+            1 => "same1",
+            else => "sa",
+        };
+        try all.append(a, .{
+            .name = name,
+            .file = @fromBackingInt(@intCast(i % 7)),
+            .item = @intCast(i),
+            .rank = @intCast(i % 3),
+            .order = @intCast(i),
+        });
+    }
+    // The sort of every match and the truncation applied to it, which the selection must match:
+    // `std.mem.sort` is stable, so equal keys keep the scan order
+    const sorted = try a.dupe(Match, all.items);
+    std.mem.sort(Match, sorted, {}, struct {
+        fn lt(_: void, x: Match, y: Match) bool {
+            if (x.rank != y.rank) return x.rank < y.rank;
+            if (x.name.len != y.name.len) return x.name.len < y.name.len;
+            return std.mem.lessThan(u8, x.name, y.name);
+        }
+    }.lt);
+    for ([_]usize{ 0, 1, 2, 3, 7, 16, 255, 256, 257, 450, 899, 900, std.math.maxInt(usize) }) |limit| {
+        var top: Top = .{ .arena = a, .limit = limit };
+        for (all.items) |m| try top.add(m);
+        const got = try top.selected();
+        var kept = @min(sorted.len, limit);
+        while (kept < sorted.len and sorted[kept].rank == 0) kept += 1;
+        try testing.expectEqual(kept, got.len);
+        for (got, sorted[0..kept]) |x, y| {
+            try testing.expectEqual(y.file, x.file);
+            try testing.expectEqual(y.item, x.item);
+            try testing.expectEqual(y.rank, x.rank);
+            try testing.expectEqual(y.order, x.order);
+            try testing.expectEqualStrings(y.name, x.name);
+        }
+    }
 }
 
 const testing = std.testing;
@@ -150,6 +269,47 @@ test "the limit keeps every exact match" {
     try testing.expect(last);
     // Prefix matches are still cut at the limit
     try testing.expectEqual(10, (try search(&r, &.{file}, "initAll", 10)).len);
+}
+
+test "equal-key matches are kept in scan order" {
+    // Every declaration of a name in another file shares the whole key, so the limit decides
+    // by scan order, as sorting every match does
+    const n = 40;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const a = w.arena.allocator();
+    var files: std.ArrayList(FileId) = .empty;
+    for (0..n) |i| {
+        const file = (try w.addNative(try std.fmt.allocPrint(a, "/p/f{d}.zig", .{i}), "pub fn dup() void {}\npub fn dupA() void {}\npub fn dupB() void {}\npub fn durp() void {}\n")).file;
+        try files.append(a, file);
+    }
+    var ctx = w.db.beginRead(a);
+    defer ctx.end();
+    var r: Resolver = .{ .ctx = &ctx, .arena = a };
+    const all = try search(&r, files.items, "dup", std.math.maxInt(usize));
+    try testing.expectEqual(4 * n, all.len);
+    // Exact matches first, then prefixes by name, then subsequences, each group in file order
+    for (all, 0..) |s, i| {
+        const rank: u8 = if (i < n) 0 else if (i < 3 * n) 1 else 2;
+        try testing.expectEqual(rank, s.rank);
+        try testing.expectEqual(files.items[i % n], s.file);
+    }
+    for ([_]usize{ 0, 1, 10, n, n + 1, 2 * n, 3 * n, 3 * n + 1, all.len - 1, all.len, std.math.maxInt(usize) }) |limit| {
+        const found = try search(&r, files.items, "dup", limit);
+        var kept = @min(all.len, limit);
+        while (kept < all.len and all[kept].rank == 0) kept += 1;
+        try testing.expectEqual(kept, found.len);
+        for (found, all[0..kept]) |x, y| {
+            try testing.expectEqual(y.file, x.file);
+            try testing.expectEqual(y.kind, x.kind);
+            try testing.expectEqual(y.rank, x.rank);
+            try testing.expectEqual(y.start, x.start);
+            try testing.expectEqual(y.end, x.end);
+            if (y.container) |c| try testing.expectEqualStrings(c, x.container.?) else try testing.expectEqual(null, x.container);
+            try testing.expectEqualStrings(y.name, x.name);
+        }
+    }
 }
 
 test "blank names are shown in their quoted form" {
