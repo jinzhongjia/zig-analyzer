@@ -42,11 +42,12 @@ pub const Error = resolve.Error;
 /// Inference result of one BodyOwner
 pub const Result = struct {
     arena: std.heap.ArenaAllocator.State,
-    /// Parallel to `Body.exprs`
+    /// Parallel to `Body.exprs`; with signature mode, only its `Body.signature_exprs` prefix
     exprs: []const TypedValue,
-    /// Parallel to `Body.bindings`
+    /// Parallel to `Body.bindings`; with signature mode, only its `Body.signature_bindings` prefix
     bindings: []const TypedValue,
-    /// Parallel to `Body.exprs`: the member (field or declaration) a field access resolves to
+    /// Parallel to `Body.exprs` (in signature mode, its `Body.signature_exprs` prefix): the
+    /// member (field or declaration) a field access resolves to
     members: []const ?hir.OwnerKey,
     /// Value of the `return` the function actually reaches (the result of a type constructor)
     ret: TypedValue,
@@ -272,16 +273,26 @@ pub fn run(ctx: *Db.Ctx, owner: hir.OwnerKey, mode: Mode, inst: ?Index, loop_see
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
+    // Signature inference only reaches the signature expressions (see `Body.signature_exprs`), so
+    // its result holds just that prefix; full inference holds the whole body
+    const exprs_len: usize = switch (mode) {
+        .signature => body.signature_exprs,
+        .full => body.exprs.len,
+    };
+    const bindings_len: usize = switch (mode) {
+        .signature => body.signature_bindings,
+        .full => body.bindings.len,
+    };
     var inf: Inferrer = .{
         .r = &r,
         .ip = ctx.db.env.ip,
         .file = owner.file,
         .item = item,
         .body = body,
-        .exprs = try a.alloc(TypedValue, body.exprs.len),
-        .done = try std.DynamicBitSetUnmanaged.initEmpty(scratch.allocator(), body.exprs.len),
-        .bindings = try a.alloc(TypedValue, body.bindings.len),
-        .members = try a.alloc(?hir.OwnerKey, body.exprs.len),
+        .exprs = try a.alloc(TypedValue, exprs_len),
+        .done = try std.DynamicBitSetUnmanaged.initEmpty(scratch.allocator(), exprs_len),
+        .bindings = try a.alloc(TypedValue, bindings_len),
+        .members = try a.alloc(?hir.OwnerKey, exprs_len),
         .scratch = scratch.allocator(),
         .inst = split.inst,
         .seeds = seeds.items,
@@ -2607,7 +2618,7 @@ const Inferrer = struct {
                 else
                     .{ .ty = init.ty };
                 if (binding.kind == .local_var and binding.is_comptime) {
-                    if (inf.var_levels.len == 0) inf.var_levels = try inf.scratch.alloc(u32, inf.body.bindings.len);
+                    if (inf.var_levels.len == 0) inf.var_levels = try inf.scratch.alloc(u32, inf.bindings.len);
                     inf.var_levels[@backingInt(b)] = inf.uncertain;
                 }
                 return .void_type;
@@ -3009,7 +3020,8 @@ const Inferrer = struct {
         var stops = false;
         for (0..n) |idx| {
             const res = try inf.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = inf.mode, .inst = inst, .loop = .{ .binding = @backingInt(l.capture[0]), .index = @intCast(idx) } });
-            if (res.exprs.len != inf.body.exprs.len) return false;
+            // The other instance has the expressions of the inference mode it ran in
+            if (res.exprs.len != inf.exprs.len) return false;
             for (pending, reached) |b, *values| {
                 if (queries.isInactive(inf.body, res, inf.body.range(b.expr))) continue;
                 try values.append(inf.scratch, if (b.value) |v| res.exprs[@backingInt(v)] else .{ .ty = .void_type, .val = .void_value });
@@ -3116,7 +3128,8 @@ const Inferrer = struct {
         const max = dl.iterations orelse inf.branchQuota();
         for (0..max) |idx| {
             const res = try inf.r.ctx.get(queries.Infer, .{ .owner = owner, .mode = inf.mode, .inst = inst, .loop = .{ .binding = binding, .index = @intCast(idx) } });
-            if (res.exprs.len != inf.body.exprs.len) {
+            // The other instance has the expressions of the inference mode it ran in
+            if (res.exprs.len != inf.exprs.len) {
                 complete = false;
                 break;
             }
@@ -4976,7 +4989,13 @@ fn ownerCtx(r: *Resolver, key: hir.OwnerKey, mode: Mode) Error!?ExprCtx {
     const item = try itemOfKey(r, key) orelse return null;
     const body = try r.ctx.get(hir.ItemBody, key);
     const res = try r.ctx.get(queries.Infer, .{ .owner = key, .mode = mode });
-    if (res.exprs.len != body.exprs.len) return null;
+    if (queries.isFallback(res)) return null;
+    // A signature result holds the signature prefix of `body.exprs`, not the whole body
+    const expected: usize = switch (mode) {
+        .signature => body.signature_exprs,
+        .full => body.exprs.len,
+    };
+    if (res.exprs.len != expected) return null;
     return .{ .file = key.file, .item = item, .body = body, .exprs = res.exprs, .members = res.members };
 }
 

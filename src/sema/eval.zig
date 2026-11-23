@@ -304,7 +304,8 @@ pub fn ownerValue(r: *Resolver, owner: hir.OwnerKey, inst: ?Index, want: ?Index)
 
 /// comptime value of an expression under the given bindings: used when type inference cannot
 /// evaluate a value in a comptime context. `quota` is the backward branch quota (see
-/// `bodyQuota`).
+/// `bodyQuota`). `bindings` may be shorter than `body.bindings` (a signature-mode result holds
+/// only the signature prefix): the remaining bindings stay unknown.
 pub fn exprValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, want: ?Index, quota: u32) Error!TypedValue {
     // Evaluations started outside a computation in a compilation (such as by goto) run in the
     // compilation of `file` and `inst`
@@ -315,7 +316,7 @@ pub fn exprValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: Ex
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena, .quota = quota };
     defer ev.deinit();
     var frame = try ev.newFrame(file, item, body, inst);
-    for (bindings, frame.slots) |b, *slot| slot.* = Evaluator.thaw(b);
+    for (bindings, frame.slots[0..bindings.len]) |b, *slot| slot.* = Evaluator.thaw(b);
     const v = ev.eval(&frame, e, want) catch |err| return giveUp(err);
     return ev.toTyped(v) catch |err| giveUp(err);
 }
@@ -537,7 +538,8 @@ pub fn constPointer(r: *Resolver, ptr_ty: Index, pointee: Index) Error!Index {
 /// type `ptr_ty` to that value (see `constPointer`), which records its place when `e` is a
 /// container-level declaration, a constant local, parameter or capture (`Evaluator.localPlace`),
 /// a value captured from an enclosing function or declaration (`Evaluator.capturePlace`), or a
-/// field or element inside one (`InternPool.Key.ptr_base`), as the interpreter's `&` does
+/// field or element inside one (`InternPool.Key.ptr_base`), as the interpreter's `&` does.
+/// `bindings` may be shorter than `body.bindings` (see `exprValue`)
 pub fn addressValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e: ExprId, inst: ?Index, bindings: []const TypedValue, ptr_ty: Index, pointee: Index) Error!Index {
     const scope = if (r.context == null) try queries.enterContext(r, file, inst) else null;
     defer if (scope) |s| s.leave();
@@ -546,7 +548,7 @@ pub fn addressValue(r: *Resolver, file: FileId, item: u32, body: *const Body, e:
     var ev: Evaluator = .{ .r = r, .ip = r.ctx.db.env.ip, .a = arena.allocator(), .arena = &arena };
     defer ev.deinit();
     var frame = try ev.newFrame(file, item, body, inst);
-    for (bindings, frame.slots) |b, *slot| slot.* = Evaluator.thaw(b);
+    for (bindings, frame.slots[0..bindings.len]) |b, *slot| slot.* = Evaluator.thaw(b);
     const base = ev.addressBase(&frame, e, pointee) catch |err| switch (err) {
         error.Abort, error.Break, error.Continue, error.Return => null,
         else => |x| return x,

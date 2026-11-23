@@ -115,6 +115,13 @@ pub const Infer = struct {
 
 const empty_result: infer.Result = .{ .arena = .{}, .exprs = &.{}, .bindings = &.{}, .members = &.{}, .ret = .unknown };
 
+/// The cycle fallback / empty result of `Infer` (no expressions and bindings). A complete
+/// signature result can also have no expressions when the signature has none, so an empty length
+/// does not identify it.
+pub fn isFallback(res: *const infer.Result) bool {
+    return res == &empty_result;
+}
+
 /// Type of a declaration; includes the value when the value of a const is known at comptime
 /// (e.g. the value of `const S = struct {...}` is the type S)
 pub const DeclType = struct {
@@ -136,13 +143,16 @@ pub const DeclType = struct {
         switch (tree.items[item].kind) {
             .@"fn" => {
                 const res = try ctx.get(Infer, .{ .owner = key, .mode = .signature, .inst = dk.inst });
-                if (res.exprs.len == 0) return .unknown;
+                if (isFallback(res)) return .unknown;
+                // A signature result holds the signature prefix of the body
+                if (res.exprs.len != @as(usize, b.signature_exprs)) return .unknown;
                 // Parameters with bindings (including anytype and unnamed parameters) in order;
                 // `...` has no binding and can only come last (see `varargs` in ItemTree)
                 var params: std.ArrayList(Index) = .empty;
                 var comptime_bits: u32 = 0;
                 var noalias_bits: u32 = 0;
                 for (b.params, 0..) |p, i| {
+                    if (@backingInt(p) >= res.bindings.len) return .unknown;
                     try params.append(r.arena, res.bindings[@backingInt(p)].ty);
                     const binding = b.binding(p);
                     const bit = InternPool.FnType.bitOf(i) orelse continue;
@@ -219,8 +229,11 @@ pub const DeclType = struct {
                 // type void
                 if (b.type_expr == null and tree.containers[container].kind == .@"union") return .{ .ty = .void_type };
                 const res = try ctx.get(Infer, .{ .owner = key, .mode = .signature, .inst = dk.inst });
-                if (res.exprs.len == 0) return .unknown;
-                return .{ .ty = if (b.type_expr) |t| res.exprs[@backingInt(t)].asType() orelse .unknown else .unknown };
+                if (isFallback(res)) return .unknown;
+                // A signature result holds the signature prefix of the body
+                if (res.exprs.len != @as(usize, b.signature_exprs)) return .unknown;
+                const ty: Index = if (b.type_expr) |t| if (@backingInt(t) < res.exprs.len) res.exprs[@backingInt(t)].asType() orelse .unknown else .unknown else .unknown;
+                return .{ .ty = ty };
             },
             .@"test", .@"comptime" => return .{ .ty = .void_type },
             // The root of a ZON file is not a declaration; the value of importing it is `ZonValue`
