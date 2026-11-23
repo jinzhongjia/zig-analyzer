@@ -1364,8 +1364,8 @@ test "a request interrupted by a later edit is answered with ContentModified" {
 
 test "an edit during formatting is answered with ContentModified" {
     // Guards against applying edits computed against the pre-edit text to the buffer after the
-    // client's edit: formatting no longer holds the read transaction, so the answer must re-check
-    // that the text it formatted is still current.
+    // client's edit: formatting runs outside the read transaction, so the answer must re-check that
+    // the text it formatted is still current.
     const Harness = @import("test_harness.zig").Harness;
     const Empty = struct {};
     var h: Harness = undefined;

@@ -1097,11 +1097,10 @@ fn SemanticTask(comptime func: anytype, comptime method: []const u8) type {
                     .ok => |v| response = server.responseBytes(pending.id, v),
                     .failed => |message| response = server.errorResponseBytes(pending.id, jsonrpc.error_codes.request_failed, message),
                 } else response = server.responseBytes(pending.id, result);
-                // Acquired before the read transaction ends: a write can begin only after that, and
-                // the refresh it triggers waits for this response to be written (see
-                // `requestSemanticRefresh`). Waiting here keeps the read transaction open, as every
-                // request did before responses were sent outside it: another semantic token request
-                // whose response another thread is writing delays writes in this narrow case.
+                // A write can begin only after this read transaction ends, so the refresh it
+                // triggers waits for this response to be written (see `requestSemanticRefresh`).
+                // Waiting here keeps this request's read transaction open: while another thread
+                // writes a semantic token response, a second semantic token request delays writes.
                 if (comptime std.mem.startsWith(u8, method, "textDocument/semanticTokens/")) {
                     server.semantic_send.lockUncancelable(server.io);
                     semantic_send_locked = true;
