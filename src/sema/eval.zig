@@ -1897,7 +1897,7 @@ const Evaluator = struct {
             .literal => |text| return if (ev.track != null) ev.trackedLiteral(f, e, text) else ev.literal(text),
             .field_access => |fa| return ev.fieldAccess(f.file, try ev.eval(f, fa.lhs, null), fa.field orelse return error.Abort),
             .enum_literal => |name| {
-                if (want) |t| if (try ev.declLiteral(t, name)) |v| return v;
+                if (want) |t| if (try ev.declLiteral(f.file, t, name)) |v| return v;
                 return Val.of(.enum_literal_type, try ip.get(.{ .enum_literal = name }));
             },
             .error_value => |name| return Val.of(try ip.errorSet(ev.a, &.{name}), try ip.get(.{ .error_value = name })),
@@ -2310,8 +2310,9 @@ const Evaluator = struct {
         return ev.typeMemberIn(null, t, name);
     }
 
-    /// decl literal: the declaration `.name` in the result type
-    fn declLiteral(ev: *Evaluator, t: Index, name: []const u8) EvalError!?Val {
+    /// decl literal: the declaration `.name` in the result type, used in file `from` (a
+    /// declaration of another file must be `pub`)
+    fn declLiteral(ev: *Evaluator, from: FileId, t: Index, name: []const u8) EvalError!?Val {
         const ip = ev.ip;
         if (ip.key(t) != .container_type) return null;
         if (value.isEnumType(ip, t)) {
@@ -2319,8 +2320,8 @@ const Evaluator = struct {
             if (infer.fieldItem(try ev.r.itemTree(ns.file), ns.container, name) != null) return null;
         }
         const ns = try queries.namespaceOfType(ev.r, t) orelse return null;
-        const m = Resolver.lookupDecl(try ev.r.itemTree(ns.file), ns.container, name) orelse return null;
-        return thaw(try queries.defType(ev.r, .{ .item = .{ .file = ns.file, .item = m } }, null, queries.instOfType(ip, t)));
+        const def = try ev.r.memberDef(ns, from, name) orelse return null;
+        return thaw(try queries.defType(ev.r, def, null, queries.instOfType(ip, t)));
     }
 
     /// Enum member names (in declaration order)
@@ -2424,7 +2425,7 @@ const Evaluator = struct {
             },
             .enum_literal => |name| blk: {
                 const t = want orelse return error.Abort;
-                break :blk try ev.declLiteral(t, name) orelse return error.Abort;
+                break :blk try ev.declLiteral(f.file, t, name) orelse return error.Abort;
             },
             else => try ev.eval(f, callee_e, null),
         };
@@ -4656,6 +4657,10 @@ const Evaluator = struct {
                     if (ip.key(x) == .enum_literal and cx == x) {
                         // Tag of a void field in a union
                         if (ev.isUnion(t)) return Val.of(t, try ip.get(.{ .union_value = .{ .ty = t, .tag = ip.key(x).enum_literal, .payload = .void_value } }));
+                        // Only enums and unions take an enum literal: for any other concrete
+                        // type (`const s: S = .name` with a struct `S`) it is a compile error. An
+                        // abstract type parameter may still be an enum.
+                        if (ip.key(t) != .opaque_param) return error.Abort;
                     }
                     return Val.of(t, cx);
                 },

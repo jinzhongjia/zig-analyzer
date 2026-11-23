@@ -1716,7 +1716,8 @@ const Inferrer = struct {
 
     /// decl literal: when the result type (with error unions, optionals, and single-item pointers
     /// stripped, matching the compiler) is a container, `.name` is that type's declaration
-    /// `T.name` (for enums, a member with the same name takes precedence)
+    /// `T.name` (for enums, a member with the same name takes precedence); as for a member
+    /// access, a declaration of another file must be `pub`
     fn declLiteral(inf: *Inferrer, e: ExprId, want: Index, name: []const u8) Error!?TypedValue {
         const ip = inf.ip;
         var t = want;
@@ -1737,9 +1738,7 @@ const Inferrer = struct {
             const tree = try inf.r.itemTree(ns.file);
             if (fieldItem(tree, ns.container, name) != null) return null;
         }
-        const tree = try inf.r.itemTree(ns.file);
-        const m = Resolver.lookupDecl(tree, ns.container, name) orelse return null;
-        const def: resolve.Def = .{ .item = .{ .file = ns.file, .item = m } };
+        const def = try inf.r.memberDef(ns, inf.file, name) orelse return null;
         inf.members[@backingInt(e)] = try defKey(inf.r, def);
         return try queries.defType(inf.r, def, null, c.inst);
     }
