@@ -11,6 +11,7 @@ const Vfs = za.base.Vfs;
 const database = @import("../database.zig");
 const Db = database.Db;
 const FileText = database.inputs.FileText;
+const Text = database.inputs.Text;
 const WorkspaceFiles = database.inputs.WorkspaceFiles;
 const syntax_q = database.syntax;
 const Workspace = @import("Workspace.zig");
@@ -49,7 +50,7 @@ pub const ChangeSource = enum {
 /// Disk contents of one file of a batch of external changes
 const Read = struct {
     /// Contents read from disk; null if the file does not exist (or is too big)
-    text: ?[]u8,
+    text: ?*Text,
     /// Hash of `text`; null if there are no contents
     hash: ?u64,
 };
@@ -68,10 +69,17 @@ pub const Prepared = struct {
     folders: bool = false,
 
     pub fn deinit(p: *Prepared, gpa: Allocator) void {
-        for (p.reads.values()) |r| if (r.text) |t| gpa.free(t);
+        for (p.reads.values()) |r| if (r.text) |t| t.release(gpa);
         p.* = .{};
     }
 };
+
+/// Disk contents as a text buffer shared with `FileText`
+fn asText(gpa: Allocator, disk: ?[]u8) Allocator.Error!?*Text {
+    const bytes = disk orelse return null;
+    defer gpa.free(bytes);
+    return try .init(gpa, bytes);
+}
 
 /// Reads the disk contents of the files of a batch of external changes, and adds the known files
 /// under the folders in it (see `addFolderContents`), before `write_mutex` is taken. The files
@@ -94,7 +102,7 @@ pub fn prepareFileChanges(server: *Server, arena: Allocator, file_events: []cons
         // A deleted file has no contents to read
         if (kind == .Deleted) continue;
         const file = try server.vfs.lookup(path);
-        const read = if (file) |id| blk: {
+        const read: ?[]u8 = if (file) |id| blk: {
             const is_open = blk_open: {
                 server.docs.mutex.lockUncancelable(server.io);
                 defer server.docs.mutex.unlock(server.io);
@@ -123,8 +131,9 @@ pub fn prepareFileChanges(server: *Server, arena: Allocator, file_events: []cons
                 else => null,
             };
         };
-        const hash: ?u64 = if (read) |t| std.hash.Wyhash.hash(0, t) else null;
-        prepared.reads.putAssumeCapacity(path, .{ .text = read, .hash = hash });
+        const text = try asText(server.gpa, read);
+        const hash: ?u64 = if (text) |t| std.hash.Wyhash.hash(0, t.bytes()) else null;
+        prepared.reads.putAssumeCapacity(path, .{ .text = text, .hash = hash });
     }
     return prepared;
 }
@@ -150,7 +159,7 @@ fn applyFileChanges(server: *Server, arena: Allocator, prepared: *Prepared, sour
         file: Vfs.FileId,
         path: []const u8,
         /// Disk contents to write; null for open documents (their buffer is authoritative)
-        text: ?[]u8,
+        text: ?*Text,
         open: bool,
         durability: database.Durability,
         /// Hash of the disk contents; null if the file does not exist
@@ -164,7 +173,7 @@ fn applyFileChanges(server: *Server, arena: Allocator, prepared: *Prepared, sour
         rebuild: bool = true,
     };
     var changes: std.ArrayList(Change) = .empty;
-    defer for (changes.items) |c| if (c.text) |t| server.gpa.free(t);
+    defer for (changes.items) |c| if (c.text) |t| t.release(server.gpa);
     const rules = try server.originRules(arena);
     var build_files: std.ArrayList([]const u8) = .empty;
     var build_zig_dirs: std.ArrayList([]const u8) = .empty;
@@ -225,7 +234,7 @@ fn applyFileChanges(server: *Server, arena: Allocator, prepared: *Prepared, sour
             .known => {},
         };
         // The disk contents were read before `write_mutex`; the read moved the text into `read`
-        var read: ?[]u8 = null;
+        var read: ?*Text = null;
         var disk: ?u64 = null;
         if (kind != .Deleted) {
             if (prepared.reads.getPtr(path)) |r| {
@@ -235,16 +244,17 @@ fn applyFileChanges(server: *Server, arena: Allocator, prepared: *Prepared, sour
             } else {
                 // The read was skipped because the state said so (see `prepareFileChanges`), and
                 // the state has changed: read it here
-                read = server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
+                const contents = server.vfs.readFromDisk(file, server.gpa) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Canceled => return error.Canceled,
                     error.FileTooBig => null,
                 };
-                disk = if (read) |t| std.hash.Wyhash.hash(0, t) else null;
+                read = try asText(server.gpa, contents);
+                disk = if (read) |t| std.hash.Wyhash.hash(0, t.bytes()) else null;
             }
         }
         const text = if (is_open) blk: {
-            if (read) |t| server.gpa.free(t);
+            if (read) |t| t.release(server.gpa);
             break :blk null;
         } else read;
         changes.append(arena, .{
@@ -255,7 +265,7 @@ fn applyFileChanges(server: *Server, arena: Allocator, prepared: *Prepared, sour
             .durability = origin.classify(&server.vfs, rules, server.vfs.path(file), false).durability(),
             .disk = disk,
         }) catch |err| {
-            if (text) |t| server.gpa.free(t);
+            if (text) |t| t.release(server.gpa);
             return err;
         };
     }
@@ -296,7 +306,7 @@ fn applyFileChanges(server: *Server, arena: Allocator, prepared: *Prepared, sour
             else
                 !(doc_sync.isProjectFile(std.fs.path.basename(c.path)) and doc_sync.projectStartedWith(server, c.path, c.disk));
             if (!c.edited and !c.rebuild) {
-                if (c.text) |t| server.gpa.free(t);
+                if (c.text) |t| t.release(server.gpa);
                 continue;
             }
             changes.items[kept] = c.*;
@@ -481,17 +491,17 @@ fn changesWorkspaceFiles(server: *Server, arena: Allocator, rules: origin.Rules,
 /// is kept until the text is set, even to absent: the known text is then that read, and a file
 /// never read has no text that anything was computed from. FSEvents reports writes made shortly
 /// before the stream started, which are not changes to such files.
-fn sameText(ctx: *Db.Ctx, file: Vfs.FileId, text: ?[]const u8) error{Canceled}!bool {
+fn sameText(ctx: *Db.Ctx, file: Vfs.FileId, text: ?*Text) error{Canceled}!bool {
     const current = ctx.get(FileText, file) catch |err| switch (err) {
         error.OutOfMemory => return false,
         error.Canceled => return error.Canceled,
     };
-    if (current) |known| return std.mem.eql(u8, known, text orelse return false);
+    if (current) |known| return std.mem.eql(u8, known.bytes(), if (text) |t| t.bytes() else return false);
     if (ctx.isSet(FileText, file)) return text == null;
     return switch (ctx.memoized(syntax_q.SourceText, file)) {
         .none => true,
         .computing, .evicted => false,
-        .value => |read| if (read.owned) std.mem.eql(u8, read.text, text orelse return false) else text == null,
+        .value => |read| if (read.owned) std.mem.eql(u8, read.text, if (text) |t| t.bytes() else return false) else text == null,
     };
 }
 
@@ -641,7 +651,7 @@ const test_support = struct {
         var ctx = server.db.beginRead(a);
         defer ctx.end();
         const value = try ctx.get(FileText, file);
-        return if (value) |t| try a.dupe(u8, t) else null;
+        return if (value) |t| try a.dupe(u8, t.bytes()) else null;
     }
 
     fn isSet(server: *Server, a: Allocator, file: Vfs.FileId) !bool {
@@ -673,7 +683,7 @@ test "a document opened after the disk read keeps its buffer" {
     {
         server.db.beginWrite();
         defer server.db.endWrite();
-        try server.db.set(FileText, file, try gpa.dupe(u8, disk), .low);
+        try server.db.set(FileText, file, try Text.init(gpa, disk), .low);
     }
     // The rebuild basis is the disk contents: opening the document need not rebuild
     {
@@ -694,7 +704,7 @@ test "a document opened after the disk read keeps its buffer" {
     {
         server.db.beginWrite();
         defer server.db.endWrite();
-        try server.db.set(FileText, file, try gpa.dupe(u8, buffer), .low);
+        try server.db.set(FileText, file, try Text.init(gpa, buffer), .low);
     }
     try testing.expect(!try applyFileChanges(&server, a, &prepared, .notified, null));
     try testing.expectEqualStrings(buffer, (try test_support.text(&server, a, file)).?);
@@ -726,8 +736,8 @@ test "a batch of created, changed and deleted files applies from the disk conten
     {
         server.db.beginWrite();
         defer server.db.endWrite();
-        try server.db.set(FileText, mod, try gpa.dupe(u8, "pub const mod = 1;\n"), .low);
-        try server.db.set(FileText, del, try gpa.dupe(u8, "pub const del = 1;\n"), .low);
+        try server.db.set(FileText, mod, try Text.init(gpa, "pub const mod = 1;\n"), .low);
+        try server.db.set(FileText, del, try Text.init(gpa, "pub const del = 1;\n"), .low);
     }
     // Both rebuilds are based on the new state: neither file is rebuilt
     {

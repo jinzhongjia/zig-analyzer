@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const database = @import("../database.zig");
 const Db = database.Db;
 const FileText = database.inputs.FileText;
+const Text = database.inputs.Text;
 const Vfs = @import("../base/Vfs.zig");
 const FileId = Vfs.FileId;
 const ModuleGraph = @import("ModuleGraph.zig");
@@ -61,9 +62,10 @@ pub const World = struct {
         const file = try w.vfs.intern(path);
         const cursor = std.mem.indexOf(u8, text, "<|>");
         const clean = if (cursor) |c| try std.mem.concat(testing.allocator, u8, &.{ text[0..c], text[c + 3 ..] }) else try testing.allocator.dupe(u8, text);
+        defer testing.allocator.free(clean);
         w.db.beginWrite();
         defer w.db.endWrite();
-        try w.db.set(FileText, file, clean, .low);
+        try w.db.set(FileText, file, try Text.init(testing.allocator, clean), .low);
         return .{ .file = file, .cursor = @intCast(cursor orelse 0) };
     }
 
@@ -896,7 +898,7 @@ test "files that are not loaded are read from disk" {
     {
         w.db.beginWrite();
         defer w.db.endWrite();
-        try w.db.set(FileText, file, try testing.allocator.dupe(u8, text), .low);
+        try w.db.set(FileText, file, try Text.init(testing.allocator, text), .low);
     }
     try testing.expectEqualStrings("other.zig:thing", try w.goto(file, @intCast(std.mem.indexOf(u8, text, "thing").?)));
 }

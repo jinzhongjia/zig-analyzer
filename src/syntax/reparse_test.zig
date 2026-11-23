@@ -263,3 +263,30 @@ test "zon files keep the zon mode and are always parsed in full" {
         try testing.expect(inc.rootNode().childNode(.container_field) == null);
     }
 }
+
+test "parses that share the file text buffer give the same results" {
+    const Text = @import("../util/Text.zig");
+    const a = testing.allocator;
+    const old_text = "const a = 1;\nfn f() void {\n    g();\n}\nconst b = 2;\n";
+    const new_text = "const a = 1;\nfn f() void {\n    g(1, 2);\n}\nconst b = 2;\n";
+    const old = try Parse.create(a, old_text, .zig);
+    defer old.destroy();
+    const full = try Parse.create(a, new_text, .zig);
+    defer full.destroy();
+    const buffer: *Text = try .init(a, new_text);
+    defer buffer.release(a);
+
+    // A full parse keeps the buffer of the input and reads it from there
+    const shared = try Parse.createInShared(a, buffer, .zig, .latest);
+    defer shared.destroy();
+    try testing.expect(shared.sameAs(full));
+    try testing.expectEqual(buffer.source().ptr, shared.source.ptr);
+
+    // An incremental result shares the buffer of the new text and gets the same tree
+    const inc = try Parse.reparseShared(a, old, buffer);
+    defer inc.destroy();
+    try testing.expect(inc.base != null);
+    try testing.expect(inc.sameAs(full));
+    try testing.expectEqual(buffer.source().ptr, inc.source.ptr);
+    try testing.expectEqualStrings(new_text, inc.source);
+}

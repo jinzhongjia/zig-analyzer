@@ -12,6 +12,7 @@ const Vfs = za.base.Vfs;
 const database = @import("../database.zig");
 const Db = database.Db;
 const FileText = database.inputs.FileText;
+const Text = database.inputs.Text;
 const live = database.live;
 
 const Server = @import("Server.zig");
@@ -419,7 +420,7 @@ fn prepareLive(server: *Server, file: Vfs.FileId) bool {
             error.Canceled => break :blk null,
             error.OutOfMemory => return false,
         }) orelse return true;
-        break :blk .{ .text = a.dupe(u8, t) catch return false, .backend = backend };
+        break :blk .{ .text = a.dupe(u8, t.bytes()) catch return false, .backend = backend };
     };
     const r = read orelse {
         server.db.waitPendingWrites();
@@ -441,7 +442,7 @@ fn prepareLive(server: *Server, file: Vfs.FileId) bool {
 fn liveReady(server: *Server, ctx: *Db.Ctx, file: Vfs.FileId) !bool {
     if (!liveEligible(server, file)) return true;
     const backend = try ctx.get(live.LiveBackend, {});
-    const text = try ctx.get(FileText, file) orelse return true;
+    const text = if (try ctx.get(FileText, file)) |t| t.bytes() else return true;
     return server.live_prepared.prepared(server.io, file, live.Prepared.hash(text, live.modeOf(server.vfs.path(file)), backend));
 }
 
@@ -576,7 +577,7 @@ test "publishFiles: large batches use a bounded number of workers" {
         file.* = try server.vfs.intern(path);
         server.db.beginWrite();
         defer server.db.endWrite();
-        try server.db.set(FileText, file.*, try gpa.dupe(u8, text), .low);
+        try server.db.set(FileText, file.*, try Text.init(gpa, text), .low);
     }
     publishFiles(&server, files, true);
     {
@@ -610,7 +611,7 @@ test "publishFiles: requests for a file being published coalesce into one more r
     {
         server.db.beginWrite();
         defer server.db.endWrite();
-        try server.db.set(FileText, file, try gpa.dupe(u8, "fn f() void {\n    var x = 1;\n}\n"), .low);
+        try server.db.set(FileText, file, try Text.init(gpa, "fn f() void {\n    var x = 1;\n}\n"), .low);
     }
     const before = server.publish_seq.load(.monotonic);
     // During the write transaction, publish tasks stop before their read transactions: all later
@@ -642,7 +643,7 @@ test "publishFiles: a publish interrupted by write transactions again and again 
     {
         server.db.beginWrite();
         defer server.db.endWrite();
-        try server.db.set(FileText, file, try gpa.dupe(u8, "fn f() void {\n    var x = 1;\n}\n"), .low);
+        try server.db.set(FileText, file, try Text.init(gpa, "fn f() void {\n    var x = 1;\n}\n"), .low);
     }
     publishFiles(&server, &.{file}, true);
     // Write transactions follow each other for a while, canceling the reads the publish begins

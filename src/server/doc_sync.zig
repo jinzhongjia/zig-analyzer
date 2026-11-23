@@ -13,6 +13,7 @@ const uri = za.base.uri;
 const Vfs = za.base.Vfs;
 const database = @import("../database.zig");
 const FileText = database.inputs.FileText;
+const Text = database.inputs.Text;
 const Workspace = @import("Workspace.zig");
 const origin = @import("origin.zig");
 
@@ -148,7 +149,7 @@ pub fn isVirtual(path: []const u8) bool {
 }
 
 fn setFileText(server: *Server, id: Vfs.FileId, text: ?[]const u8) !void {
-    const owned = if (text) |t| try server.gpa.dupe(u8, t) else null;
+    const owned = if (text) |t| try Text.init(server.gpa, t) else null;
     server.db.beginWrite();
     defer server.db.endWrite();
     try server.db.set(FileText, id, owned, .low);
@@ -209,11 +210,11 @@ pub fn didOpen(server: *Server, arena: Allocator, params: types.DidOpenTextDocum
         _ = server.watched_built.remove(id);
     }
     {
-        const owned = try server.gpa.dupe(u8, params.textDocument.text);
+        const owned = try Text.init(server.gpa, params.textDocument.text);
         server.db.beginWrite();
         defer server.db.endWrite();
         addDocument(server, id, params.textDocument) catch |err| {
-            server.gpa.free(owned);
+            owned.release(server.gpa);
             return err;
         };
         try server.db.set(FileText, id, owned, .low);
@@ -260,7 +261,7 @@ fn addDocument(server: *Server, id: Vfs.FileId, item: types.TextDocumentItem) Al
     if (open.docs.items.len != 0) {
         // The file gets several documents: the one open so far keeps the file's text
         const other = &open.docs.items[0];
-        if (other.text == null) other.text = try gpa.dupe(u8, server.db.peek(FileText, id) orelse "");
+        if (other.text == null) other.text = try gpa.dupe(u8, if (server.db.peek(FileText, id)) |t| t.bytes() else "");
         text = try gpa.dupe(u8, item.text);
     }
     open.docs.appendAssumeCapacity(.{ .uri = doc_uri, .text = text, .version = item.version });
@@ -287,7 +288,7 @@ pub fn didChange(server: *Server, arena: Allocator, params: types.DidChangeTextD
 /// Applies the changes of `params` to its document of file `id` and makes it the current one
 /// (see `OpenDoc`); returns the new text of the file (owned by the caller), or null when the
 /// document is not open. Called in a write transaction.
-fn changeDocument(server: *Server, id: Vfs.FileId, params: types.DidChangeTextDocumentParams) Allocator.Error!?[]u8 {
+fn changeDocument(server: *Server, id: Vfs.FileId, params: types.DidChangeTextDocumentParams) Allocator.Error!?*Text {
     const gpa = server.gpa;
     server.docs.mutex.lockUncancelable(server.io);
     defer server.docs.mutex.unlock(server.io);
@@ -295,13 +296,15 @@ fn changeDocument(server: *Server, id: Vfs.FileId, params: types.DidChangeTextDo
     const i = open.find(params.textDocument.uri) orelse return null;
     const doc = &open.docs.items[i];
     const old = doc.text orelse {
-        const new = try offsets.applyChanges(gpa, server.db.peek(FileText, id) orelse "", params.contentChanges, server.encoding);
+        const current: []const u8 = if (server.db.peek(FileText, id)) |t| t.bytes() else "";
+        const new = try offsets.applyChanges(gpa, current, params.contentChanges, server.encoding);
+        defer gpa.free(new);
         doc.version = params.textDocument.version;
-        return new;
+        return try .init(gpa, new);
     };
     const new = try offsets.applyChanges(gpa, old, params.contentChanges, server.encoding);
     errdefer gpa.free(new);
-    const file_text = try gpa.dupe(u8, new);
+    const file_text = try Text.init(gpa, new);
     gpa.free(old);
     doc.text = new;
     doc.version = params.textDocument.version;
@@ -398,8 +401,8 @@ fn closeDocument(server: *Server, id: Vfs.FileId, document_uri: []const u8) Allo
     const i = open.find(document_uri) orelse return .not_open;
     if (open.docs.items.len == 1) return .last;
     const current = open.current();
-    const text = try gpa.dupe(u8, (if (i == open.docs.items.len - 1) &open.docs.items[i - 1] else current).text.?);
-    errdefer gpa.free(text);
+    const text = try Text.init(gpa, (if (i == open.docs.items.len - 1) &open.docs.items[i - 1] else current).text.?);
+    errdefer text.release(gpa);
     try server.docs.versions.ensureUnusedCapacity(gpa, 1);
     open.docs.orderedRemove(i).deinit(gpa);
     try server.db.set(FileText, id, text, .low);

@@ -115,7 +115,7 @@ test "full lifecycle: initialize, document sync, read requests, shutdown" {
     const id = (try s.server.vfs.lookup(try za.base.uri.toPath(s.arena.allocator(), file_uri))).?;
     var ctx = s.server.db.beginRead(testing.allocator);
     defer ctx.end();
-    try testing.expectEqualStrings("const a = 42;\n", (try ctx.get(FileText, id)).?);
+    try testing.expectEqualStrings("const a = 42;\n", (try ctx.get(FileText, id)).?.bytes());
 
     // Valid code: the last pushed diagnostics are empty
     const notes = try s.notifications();
@@ -2321,7 +2321,7 @@ test "an external change compared while a write transaction waits for the lock i
     {
         var ctx = h.server.db.beginRead(a);
         defer ctx.end();
-        try testing.expectEqualStrings(changed, (try ctx.get(FileText, file)).?);
+        try testing.expectEqualStrings(changed, (try ctx.get(FileText, file)).?.bytes());
     }
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
