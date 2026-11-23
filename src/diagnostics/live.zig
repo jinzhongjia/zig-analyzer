@@ -4,6 +4,7 @@
 //! Errors from the in-house CST do not contribute to diagnostics.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
@@ -61,10 +62,31 @@ pub const Result = struct {
         var arena = r.arena.promote(gpa);
         arena.deinit();
     }
+
+    /// A copy with the same diagnostics, owned by the caller
+    pub fn clone(r: *const Result, gpa: Allocator) Allocator.Error!*Result {
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        errdefer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const items = try arena.alloc(Diagnostic, r.items.len);
+        for (r.items, items) |d, *item| {
+            const notes = try arena.alloc(Note, d.notes.len);
+            for (d.notes, notes) |n, *note| note.* = .{ .start = n.start, .end = n.end, .message = try arena.dupe(u8, n.message) };
+            item.* = .{ .start = d.start, .end = d.end, .message = try arena.dupe(u8, d.message), .notes = notes };
+        }
+        const copy = try arena.create(Result);
+        copy.* = .{ .arena = undefined, .items = items, .complete = r.complete };
+        copy.arena = arena_state.state;
+        return copy;
+    }
 };
 
 pub const Mode = Parse.Mode;
 pub const modeOf = Parse.modeOf;
+
+/// Number of live checks (`checkWith`, either backend) in this process, counted in test builds: a
+/// test checks that publishing does not check a text that it already prepared (see `Prepared`)
+pub var check_count: std.atomic.Value(usize) = .init(0);
 
 /// Runs parsing and AstGen (or ZonGen) on the text and returns all errors. The thread to run on is
 /// chosen by nesting depth, so deeply nested text does not exhaust the native stack.
@@ -188,7 +210,7 @@ pub const AstCheck = struct {
         const vfs: *Vfs = ctx.db.env.vfs;
         const mode = modeOf(vfs.path(file));
         const backend = try ctx.get(LiveBackend, {});
-        if (ctx.db.env.live_prepared) |p| if (p.take(ctx.db.io, text, mode, backend)) |r| return r;
+        if (ctx.db.env.live_prepared) |p| if (try p.take(ctx.db.gpa, ctx.db.io, text, mode, backend)) |r| return r;
         const result = try checkWith(ctx.db.gpa, ctx.db.io, backend, ctx.db.env.zig_environ.load(.acquire), text, mode);
         // A check that could not run is computed again by the next read
         if (!result.complete) ctx.markIncomplete(.unavailable);
@@ -211,6 +233,7 @@ pub const AstCheck = struct {
 /// Runs the live check on the text with the given backend; `environ_map` is passed to the
 /// `zig ast-check` child process of the subprocess backend (null: the current process's)
 pub fn checkWith(gpa: Allocator, io: Io, backend: Backend, environ_map: ?*const Environ.Map, text: []const u8, mode: Mode) (Allocator.Error || Io.Cancelable)!*Result {
+    if (builtin.is_test) _ = check_count.fetchAdd(1, .monotonic);
     return switch (backend) {
         .in_process => check(gpa, text, mode),
         .subprocess => |zig_exe| checkSubprocess(gpa, io, zig_exe, environ_map, text, mode) catch |err| switch (err) {
@@ -222,25 +245,41 @@ pub fn checkWith(gpa: Allocator, io: Io, backend: Backend, environ_map: ?*const 
     };
 }
 
-/// `checkWith` results computed ahead of time outside read transactions, indexed by text, mode and
-/// backend. Neither AstGen nor a `zig ast-check` child process checks for cancellation, so when one
-/// runs inside a read transaction, write transactions (typing) must wait for it to finish;
-/// diagnostics publishing computes the result outside the lock first and puts it here, and
-/// `AstCheck` takes a matching result when it computes. Results depend only on the text, so this
-/// does not affect the pure-function semantics of queries. The capacity is small: results that are
-/// never taken (the memo is already valid) are evicted in FIFO order.
+/// AstGen results of texts that `take` hands out a copy of, indexed by text, mode and backend.
+/// `claim`/`prepared` answer from `last` instead, so a text stays prepared for its file even after
+/// its result has been evicted: the entries only save the check when a reader needs the result.
+/// Neither AstGen nor a `zig ast-check` child process checks for cancellation, so when one runs
+/// inside a read transaction, write transactions (typing) must wait for it to finish; diagnostics
+/// publishing computes the result outside the lock first and puts it here, and `AstCheck` takes a
+/// copy of a matching result when it computes. The compiler diagnostics pipeline takes a copy too
+/// (see `compiler.collect`): the AstGen errors of a build are matched against the check of the same
+/// text, so a file is not checked twice for one save. Results depend only on the text, so this does
+/// not affect the pure-function semantics of queries. The capacity is small: entries are evicted in
+/// FIFO order, and an evicted result is checked again when a reader needs it.
 pub const Prepared = struct {
     gpa: Allocator,
     mutex: Io.Mutex = .init,
+    /// Results kept for `take`, oldest first
     entries: std.ArrayList(Entry) = .empty,
     /// Hash of the text most recently prepared (put) for each file: an unchanged text is not
-    /// prepared again
+    /// prepared again, whether or not its result is still in `entries`. Never pruned: 8 bytes per
+    /// file ever prepared.
     last: std.AutoHashMapUnmanaged(Vfs.FileId, u64) = .empty,
     /// Number of `take` hits (for statistics and tests)
     hits: usize = 0,
 
-    const Entry = struct { mode: Mode, backend: BackendKind, text: []const u8, result: *Result };
-    const BackendKind = std.meta.Tag(Backend);
+    const Entry = struct {
+        mode: Mode,
+        /// The checker that produced `result`. In-process AstGen depends only on the text and the
+        /// mode (`checkSource` reads no environment), so that entry is identified by those; a
+        /// subprocess result comes from the `zig ast-check` of one executable, which the entry
+        /// therefore records (and owns). The environment the child ran with is not part of it:
+        /// `AstCheck` memos are not recomputed when `zig_environ` changes either, so an entry is no
+        /// staler than the result that takes it.
+        backend: Backend,
+        text: []const u8,
+        result: *Result,
+    };
     pub const capacity = 8;
 
     pub fn deinit(p: *Prepared) void {
@@ -274,38 +313,53 @@ pub const Prepared = struct {
     pub fn put(p: *Prepared, io: Io, file: Vfs.FileId, text: []const u8, mode: Mode, backend: Backend, result: *Result) Allocator.Error!void {
         assert(result.complete);
         errdefer result.destroy(p.gpa);
-        const owned = try p.gpa.dupe(u8, text);
-        errdefer p.gpa.free(owned);
+        const owned_text = try p.gpa.dupe(u8, text);
+        errdefer p.gpa.free(owned_text);
+        const owned_backend: Backend = switch (backend) {
+            .in_process => .in_process,
+            .subprocess => |exe| .{ .subprocess = try p.gpa.dupe(u8, exe) },
+        };
+        errdefer freeBackend(p.gpa, owned_backend);
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
         try p.last.put(p.gpa, file, hash(text, mode, backend));
-        const kind = std.meta.activeTag(backend);
-        if (p.find(text, mode, kind) != null) {
-            p.gpa.free(owned);
+        // Another publish already prepared this text
+        if (p.find(text, mode, owned_backend) != null) {
+            freeBackend(p.gpa, owned_backend);
+            p.gpa.free(owned_text);
             result.destroy(p.gpa);
             return;
         }
         if (p.entries.items.len == capacity) p.destroyEntry(p.entries.orderedRemove(0));
-        try p.entries.append(p.gpa, .{ .mode = mode, .backend = kind, .text = owned, .result = result });
+        try p.entries.append(p.gpa, .{ .mode = mode, .backend = owned_backend, .text = owned_text, .result = result });
     }
 
-    /// Takes the result of `checkWith(backend, text, mode)` (the caller takes ownership)
-    pub fn take(p: *Prepared, io: Io, text: []const u8, mode: Mode, backend: Backend) ?*Result {
+    /// Takes a copy of the result of `checkWith(backend, text, mode)`, allocated with `gpa` (the
+    /// caller destroys it with the same allocator); the entry stays in the memo for the later
+    /// readers of the same text
+    pub fn take(p: *Prepared, gpa: Allocator, io: Io, text: []const u8, mode: Mode, backend: Backend) Allocator.Error!?*Result {
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
-        const i = p.find(text, mode, std.meta.activeTag(backend)) orelse return null;
-        const e = p.entries.orderedRemove(i);
-        p.gpa.free(e.text);
+        const i = p.find(text, mode, backend) orelse return null;
+        const copy = try p.entries.items[i].result.clone(gpa);
         p.hits += 1;
-        return e.result;
+        return copy;
     }
 
-    fn find(p: *Prepared, text: []const u8, mode: Mode, backend: BackendKind) ?usize {
-        for (p.entries.items, 0..) |e, i| if (e.mode == mode and e.backend == backend and std.mem.eql(u8, e.text, text)) return i;
+    fn find(p: *Prepared, text: []const u8, mode: Mode, backend: Backend) ?usize {
+        for (p.entries.items, 0..) |e, i| if (e.mode == mode and LiveBackend.eql(e.backend, backend) and std.mem.eql(u8, e.text, text)) return i;
         return null;
     }
 
+    fn freeBackend(gpa: Allocator, backend: Backend) void {
+        switch (backend) {
+            .in_process => {},
+            .subprocess => |exe| gpa.free(exe),
+        }
+    }
+
     fn destroyEntry(p: *Prepared, e: Entry) void {
+        freeBackend(p.gpa, e.backend);
         p.gpa.free(e.text);
         e.result.destroy(p.gpa);
     }
@@ -609,34 +663,55 @@ test "error locations and notes" {
     try testing.expectEqualStrings("struct declared here", d.notes[1].message);
 }
 
-test "prepared results: matched by text, mode and backend, taken once, oldest evicted" {
+test "prepared results: matched by text, mode and backend, copied out, oldest evicted" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var p: Prepared = .{ .gpa = gpa };
     defer p.deinit();
-    try p.put(io, @fromBackingInt(@as(u32, 1)), "const a = ;", .zig, .in_process, try check(gpa, "const a = ;", .zig));
+    const file: Vfs.FileId = @fromBackingInt(@as(u32, 1));
+    const other_file: Vfs.FileId = @fromBackingInt(@as(u32, 2));
+    try p.put(io, file, "const a = ;", .zig, .in_process, try check(gpa, "const a = ;", .zig));
     // The same text with a different mode or backend does not match
-    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zon, .in_process));
-    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zig, .{ .subprocess = "zig" }));
-    const r = p.take(io, "const a = ;", .zig, .in_process).?;
+    try std.testing.expectEqual(null, try p.take(gpa, io, "const a = ;", .zon, .in_process));
+    try std.testing.expectEqual(null, try p.take(gpa, io, "const a = ;", .zig, .{ .subprocess = "zig" }));
+    const r = (try p.take(gpa, io, "const a = ;", .zig, .in_process)).?;
     defer r.destroy(gpa);
     try std.testing.expectEqual(1, r.items.len);
-    try std.testing.expectEqual(null, p.take(io, "const a = ;", .zig, .in_process));
+    // The entry stays: another reader of the same text gets the same diagnostics
+    const again = (try p.take(gpa, io, "const a = ;", .zig, .in_process)).?;
+    defer again.destroy(gpa);
+    try std.testing.expect(r.eql(again));
 
     for (0..Prepared.capacity + 1) |i| {
         var buf: [32]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buf, "const a = {d};", .{i});
-        try p.put(io, @fromBackingInt(@as(u32, 1)), text, .zig, .in_process, try check(gpa, text, .zig));
+        const text = try std.fmt.bufPrint(&buf, "const b = {d};", .{i});
+        try p.put(io, other_file, text, .zig, .in_process, try check(gpa, text, .zig));
     }
     try std.testing.expectEqual(Prepared.capacity, p.entries.items.len);
-    try std.testing.expectEqual(null, p.take(io, "const a = 0;", .zig, .in_process));
+    // The result of the oldest text was evicted by the other file's texts, and a reader of it
+    // checks the text again
+    try std.testing.expectEqual(null, try p.take(gpa, io, "const a = ;", .zig, .in_process));
+    // Eviction does not make the text unprepared: its file remembers the last text it prepared,
+    // so publishing it again does not check it again (its AstCheck is still valid)
+    try std.testing.expect(!p.claim(io, file, Prepared.hash("const a = ;", .zig, .in_process)));
+    // Prepared per file: another file with the same text is prepared on its own
+    try std.testing.expect(p.claim(io, other_file, Prepared.hash("const a = ;", .zig, .in_process)));
+    // A text that is prepared is not prepared again; other texts and other backends still are
+    try std.testing.expect(!p.claim(io, other_file, Prepared.hash("const b = 8;", .zig, .in_process)));
+    try std.testing.expect(p.claim(io, other_file, Prepared.hash("y", .zig, .in_process)));
+    try std.testing.expect(p.claim(io, other_file, Prepared.hash("const b = 8;", .zig, .{ .subprocess = "zig" })));
+}
 
-    // After a put, the same text of the same file is not prepared again; other texts and other
-    // backends still need preparation
-    try std.testing.expect(!p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = 8;", .zig, .in_process)));
-    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("y", .zig, .in_process)));
-    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = 8;", .zig, .{ .subprocess = "zig" })));
-    try std.testing.expect(p.claim(io, @fromBackingInt(@as(u32, 2)), Prepared.hash("const a = 8;", .zig, .in_process)));
+test "prepared results: a subprocess result is matched by its executable" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var p: Prepared = .{ .gpa = gpa };
+    defer p.deinit();
+    try p.put(io, @fromBackingInt(@as(u32, 1)), "const a = ;", .zig, .{ .subprocess = "zig-a" }, try check(gpa, "const a = ;", .zig));
+    try std.testing.expectEqual(null, try p.take(gpa, io, "const a = ;", .zig, .{ .subprocess = "zig-b" }));
+    try std.testing.expectEqual(null, try p.take(gpa, io, "const a = ;", .zig, .in_process));
+    const r = (try p.take(gpa, io, "const a = ;", .zig, .{ .subprocess = "zig-a" })).?;
+    r.destroy(gpa);
 }
 
 test "results compare by their diagnostics" {

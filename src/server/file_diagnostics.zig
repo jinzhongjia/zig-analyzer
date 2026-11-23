@@ -167,6 +167,7 @@ pub fn computeDiagnostics(server: *Server, ctx: *Db.Ctx, arena: Allocator, file:
     // With `FileText`, the `SourceText` is that text, whose line table is cached
     const lines = if (text != null) try Server.sourceLines(ctx, file) else try offsets.LineIndex.init(arena, current);
     var diags = try compiler.merge(arena, .{
+        .path = server.vfs.path(file),
         .text = current,
         .lines = lines,
         .encoding = server.encoding,
@@ -255,7 +256,7 @@ test "computeDiagnostics: notes of combined results keep the coordinates of thei
             var eb = try wip.toOwnedBundle("");
             defer eb.deinit(gpa);
             var disk: Disk = .{ .text = text };
-            return compiler.collect(gpa, &.{eb}, std.fs.path.dirname(path).?, path, &disk, Disk.read);
+            return compiler.collect(gpa, &.{eb}, std.fs.path.dirname(path).?, path, &disk, Disk.read, null);
         }
     };
     const util = try server.vfs.intern(util_path);
