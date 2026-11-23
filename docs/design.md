@@ -391,6 +391,8 @@ The server registers `workspace/didChangeWatchedFiles` when the client supports 
 
 Files of interest are interned files, configure inputs, and root build files, excluding dependency libraries. Open documents are included: buffers win over disk, but builds read the disk.
 
+A batch of changes reads its disk contents before taking the write lock, so a large checkout does not stall other messages; the state decisions and database writes then re-check open documents under the lock, and batches are applied one at a time in the order they start.
+
 **Unchanged contents are not a modification.** A build step that rewrites a source file unchanged would otherwise rebuild forever.
 
 - Writing and republishing compares against the known text. A comparison canceled by a write waiting for the lock tells nothing either way and is made again (see `waitPendingWrites`). A file nothing has read is not changed: FSEvents reports writes from just before the stream started, which would cancel requests in flight. A notified file still being read is compared once the read is done, since what the read gets is not known yet; its rebuild does not wait.
