@@ -1646,6 +1646,23 @@ test "a table without lru does not record use times" {
     try testing.expectEqual(0, table.slots.items[0].memo.?.last_used);
 }
 
+test "a frame reuses the buffers of the frame it replaces" {
+    var d: Db = .init(testing.io, testing.allocator, {});
+    defer d.deinit();
+    try setNumber(&d, Number, 1, 5, .low);
+    try setNumber(&d, Number, 2, 6, .low);
+    var ctx = d.beginRead(testing.allocator);
+    defer ctx.end();
+    // Plus reads Tens, so both frames keep their buffers after they return
+    try testing.expectEqual(1, try ctx.get(Plus, 1));
+    try testing.expectEqual(2, ctx.spares.items.len);
+    const buffer = ctx.spares.items[1].deps.keys().ptr;
+    try testing.expect(ctx.spares.items[1].deps.capacity() > 0);
+    try testing.expectEqual(1, try ctx.get(Plus, 2));
+    try testing.expectEqual(2, ctx.spares.items.len);
+    try testing.expectEqual(buffer, ctx.spares.items[1].deps.keys().ptr);
+}
+
 test "concurrent reads: readers of the same query agree" {
     var d: Db = .init(testing.io, testing.allocator, {});
     defer d.deinit();
