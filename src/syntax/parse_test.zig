@@ -765,3 +765,39 @@ test "zon files are lossless" {
     };
     for (cases) |source| try expectLosslessIn(.zon, source);
 }
+
+test "green nodes carry summary bits for their whole subtree" {
+    const p = try Parse.create(testing.allocator,
+        \\const a = @import("a");
+        \\const T = struct { x: u8 };
+        \\fn f() void {
+        \\    const Local = struct { v: u8 };
+        \\    _ = @import("b");
+        \\}
+        \\
+    , .zig);
+    defer p.destroy();
+    const root = p.rootNode();
+    try testing.expect(root.green.flags.has_container and root.green.flags.has_import);
+
+    var decls: [3]tree.SyntaxNode = undefined;
+    var it = root.children();
+    var k: usize = 0;
+    while (it.next()) |e| switch (e) {
+        .node => |n| if (n.kind() == .var_decl or n.kind() == .fn_decl) {
+            decls[k] = n;
+            k += 1;
+        },
+        .token => {},
+    };
+    try testing.expectEqual(3, k);
+    const a = decls[0];
+    try testing.expect(a.green.flags.has_import and !a.green.flags.has_container);
+    const t = decls[1];
+    try testing.expect(t.green.flags.has_container and !t.green.flags.has_import);
+    const f = decls[2];
+    try testing.expect(f.green.flags.has_container and f.green.flags.has_import);
+    // The container and the import are in the body, not in the prototype
+    const body = f.childNode(.block).?;
+    try testing.expect(body.green.flags.has_container and body.green.flags.has_import);
+}

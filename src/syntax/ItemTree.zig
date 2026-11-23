@@ -589,6 +589,7 @@ const Builder = struct {
     /// without descending into containers already found. `value` is the offset of the container
     /// that is the member's initializer or field type (see `valueOffset`)
     fn visitNested(b: *Builder, node: SyntaxNode, parent_item: u32, value: ?u32) Allocator.Error!void {
+        if (!node.green.flags.has_container) return;
         var it = node.children();
         while (it.nextNode()) |c| {
             if (c.kind() != .container_decl) {
@@ -952,6 +953,7 @@ pub const AstIdMap = struct {
     }
 
     fn walkNested(w: *Walker, node: SyntaxNode) void {
+        if (!node.green.flags.has_container) return;
         var it = node.children();
         while (it.nextNode()) |c| {
             if (c.kind() != .container_decl) {
