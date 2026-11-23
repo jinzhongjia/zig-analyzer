@@ -151,8 +151,6 @@ The graph comes from the build graph, plus:
 - `root`.
 - A module for the `build.zig` of the project and of each dependency package with one, as in the maker's configure program.
 
-`FileImportTargets` holds the resolved targets of a file's `@import` strings in import-string order, per compilation context; the import graph a search assembles over the whole closure (`ImportGraph`) reads it instead of resolving every string again.
-
 ### Module membership
 
 - A file's modules come from the compile sets of the compile steps, and it can belong to several (an exe and a test sharing a root).
@@ -166,6 +164,8 @@ When modules import different targets under the same name, name resolution uses 
 - Goto on an `@import` returns all targets in that order.
 - A member reached through such an import corresponds to the member at the same name path in each other target: goto lists them all, and the use is a reference of each, recorded as ambiguous since renaming it would break the other modules. `Resolver.moduleAlternatives` maps a definition in a file the import reaches directly; `Resolver.pathAlternatives` evaluates the name path of a use or alias (`cfg.sub.value`, through constants) in each other target, so the member may also be in a file reached past the import.
 - In a test compilation, `@import("root")` is the test runner.
+
+The resolved targets of a file's `@import` strings, in import-string order, are a derived query (`FileImportTargets`): it reads the file's import strings and the module graph, and, for `@import("root")` in a file outside the module graph, the workspace files and their import strings. The import graph of a search (`ImportGraph`), `search.reachable` for files outside that graph, and `Resolver.moduleAlternatives` read it.
 
 ### Files in no module
 
