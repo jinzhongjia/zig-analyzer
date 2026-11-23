@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const ErrorBundle = std.zig.ErrorBundle;
 const compiler = @import("compiler.zig");
 const live = @import("live.zig");
+const Vfs = @import("../base/Vfs.zig");
 const line_diff = @import("../util/line_diff.zig");
 const offsets = @import("../util/offsets.zig");
 const native = @import("../util/test_path.zig").native;
@@ -83,7 +84,7 @@ test "collect: the AstGen result prepared for the same text is reused" {
     var prepared: live.Prepared = .{ .gpa = gpa };
     defer prepared.deinit();
     // The last publish of the text checked it, in process
-    try prepared.put(io, main_text, .zig, .in_process, try live.check(gpa, main_text, .zig));
+    try prepared.put(io, @as(Vfs.FileId, @fromBackingInt(@as(u32, 1))), main_text, .zig, .in_process, try live.check(gpa, main_text, .zig));
     const hits = prepared.hits;
     var eb = try mainBundle();
     defer eb.deinit(gpa);
@@ -97,7 +98,7 @@ test "collect: the AstGen result prepared for the same text is reused" {
     try testing.expect(main.items[0].is_astgen);
     try testing.expect(!main.items[1].is_astgen);
     // The result stays in the memo for the publish that follows the build
-    try testing.expect(prepared.prepared(io, live.Prepared.hash(main_text, .zig, .in_process)));
+    try testing.expect(prepared.prepared(io, @as(Vfs.FileId, @fromBackingInt(@as(u32, 1))), live.Prepared.hash(main_text, .zig, .in_process)));
 }
 
 test "collect: a check of the subprocess backend is not used for the AstGen flag" {
@@ -107,7 +108,7 @@ test "collect: a check of the subprocess backend is not used for the AstGen flag
     defer prepared.deinit();
     // The user's zig checks the text as `zig ast-check`: its diagnostics are not necessarily the
     // ones in-process AstGen gives, so the flag must not be computed from it
-    try prepared.put(io, main_text, .zig, .{ .subprocess = "zig" }, try live.check(gpa, main_text, .zig));
+    try prepared.put(io, @as(Vfs.FileId, @fromBackingInt(@as(u32, 1))), main_text, .zig, .{ .subprocess = "zig" }, try live.check(gpa, main_text, .zig));
     const hits = prepared.hits;
     var eb = try mainBundle();
     defer eb.deinit(gpa);

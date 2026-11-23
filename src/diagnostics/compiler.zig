@@ -209,7 +209,7 @@ pub fn collect(
 /// text again. Only in-process results are taken: `LiveBackend` may be the user's `zig ast-check`,
 /// whose diagnostics are not necessarily the ones this AstGen produces.
 fn astgenOf(gpa: Allocator, live_cache: ?LiveCache, text: []const u8, mode: live.Mode) Allocator.Error!*live.Result {
-    if (live_cache) |cache| if (try cache.prepared.take(cache.io, text, mode, .in_process)) |result| return result;
+    if (live_cache) |cache| if (try cache.prepared.take(gpa, cache.io, text, mode, .in_process)) |result| return result;
     return live.check(gpa, text, mode);
 }
 
