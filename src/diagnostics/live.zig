@@ -84,14 +84,13 @@ pub const Result = struct {
 pub const Mode = Parse.Mode;
 pub const modeOf = Parse.modeOf;
 
-/// Number of `check` runs in this process, counted in test builds: a test checks that publishing
-/// does not check a text that it already prepared (see `Prepared`)
+/// Number of live checks (`checkWith`, either backend) in this process, counted in test builds: a
+/// test checks that publishing does not check a text that it already prepared (see `Prepared`)
 pub var check_count: std.atomic.Value(usize) = .init(0);
 
 /// Runs parsing and AstGen (or ZonGen) on the text and returns all errors. The thread to run on is
 /// chosen by nesting depth, so deeply nested text does not exhaust the native stack.
 pub fn check(gpa: Allocator, text: []const u8, mode: Mode) Allocator.Error!*Result {
-    if (builtin.is_test) _ = check_count.fetchAdd(1, .monotonic);
     const source = try gpa.dupeSentinel(u8, text, 0);
     defer gpa.free(source);
     const depth = try nesting.estimate(gpa, source, nesting.thread_depth);
@@ -234,6 +233,7 @@ pub const AstCheck = struct {
 /// Runs the live check on the text with the given backend; `environ_map` is passed to the
 /// `zig ast-check` child process of the subprocess backend (null: the current process's)
 pub fn checkWith(gpa: Allocator, io: Io, backend: Backend, environ_map: ?*const Environ.Map, text: []const u8, mode: Mode) (Allocator.Error || Io.Cancelable)!*Result {
+    if (builtin.is_test) _ = check_count.fetchAdd(1, .monotonic);
     return switch (backend) {
         .in_process => check(gpa, text, mode),
         .subprocess => |zig_exe| checkSubprocess(gpa, io, zig_exe, environ_map, text, mode) catch |err| switch (err) {
@@ -347,21 +347,8 @@ pub const Prepared = struct {
     }
 
     fn find(p: *Prepared, text: []const u8, mode: Mode, backend: Backend) ?usize {
-        for (p.entries.items, 0..) |e, i| if (e.mode == mode and sameBackend(e.backend, backend) and std.mem.eql(u8, e.text, text)) return i;
+        for (p.entries.items, 0..) |e, i| if (e.mode == mode and LiveBackend.eql(e.backend, backend) and std.mem.eql(u8, e.text, text)) return i;
         return null;
-    }
-
-    fn sameBackend(a: Backend, b: Backend) bool {
-        return switch (a) {
-            .in_process => switch (b) {
-                .in_process => true,
-                .subprocess => false,
-            },
-            .subprocess => |exe| switch (b) {
-                .in_process => false,
-                .subprocess => |other| std.mem.eql(u8, exe, other),
-            },
-        };
     }
 
     fn freeBackend(gpa: Allocator, backend: Backend) void {
