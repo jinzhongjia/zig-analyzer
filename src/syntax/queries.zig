@@ -27,7 +27,7 @@ pub const SourceText = struct {
     pub const Value = struct { text: []const u8, owned: bool };
 
     pub fn compute(ctx: anytype, file: Key) engine.Error!Value {
-        if (try ctx.get(inputs.FileText, file)) |text| return .{ .text = text, .owned = false };
+        if (try ctx.get(inputs.FileText, file)) |text| return .{ .text = text.bytes(), .owned = false };
         // Test Db without a Vfs
         if (comptime @TypeOf(ctx.db.env) == void) return .{ .text = "", .owned = false };
         const vfs: *Vfs = ctx.db.env.vfs;
@@ -100,21 +100,31 @@ pub const ParseFile = struct {
     pub const lru_bytes = parse_lru_bytes;
 
     /// An incremental parse result reuses the previous tree's nodes and holds a reference to it:
-    /// count the arenas of the whole chain
+    /// count the arenas of the whole chain and the text buffers it keeps alive
     pub fn bytes(v: Value) usize {
-        return @sizeOf(Parse) + v.chain_bytes + v.sourceBytes();
+        return v.bytes();
     }
 
     /// Picks the parse mode by path (`.zon` is ZON). When there is a previous result of the same
     /// dialect, attempts a local reparse (the mode is kept and the result is the same as a full
-    /// parse; see `Parse.reparse`)
+    /// parse; see `Parse.reparse`). The file text buffer is shared with the result instead of
+    /// copied when `FileText` holds the contents
     pub fn computeIncremental(ctx: anytype, file: Key, prev: ?Value) engine.Error!Value {
-        const text = (try ctx.get(SourceText, file)).text;
+        const file_text = try ctx.get(inputs.FileText, file);
         const dialect = try ctx.get(SyntaxDialect, {});
-        if (prev) |old| if (old.dialect == dialect) return Parse.reparse(ctx.db.gpa, old, text);
+        const gpa = ctx.db.gpa;
+        if (prev) |old| if (old.dialect == dialect) {
+            return if (file_text) |text|
+                Parse.reparseShared(gpa, old, text)
+            else
+                Parse.reparse(gpa, old, (try ctx.get(SourceText, file)).text);
+        };
         // The test Db without a Vfs only has Zig files
         const mode: Parse.Mode = if (comptime @TypeOf(ctx.db.env) == void) .zig else Parse.modeOf(ctx.db.env.vfs.path(file));
-        return Parse.createIn(ctx.db.gpa, text, mode, dialect);
+        return if (file_text) |text|
+            Parse.createInShared(gpa, text, mode, dialect)
+        else
+            Parse.createIn(gpa, (try ctx.get(SourceText, file)).text, mode, dialect);
     }
 
     pub fn eql(a: Value, b: Value) bool {
@@ -418,7 +428,7 @@ pub const FileAstIdMap = struct {
     /// `ParseFile` is evicted)
     pub fn bytes(v: Value) usize {
         const owned: *const Owned = @fieldParentPtr("map", v);
-        return owned.map.bytes() + owned.parse.chain_bytes + owned.parse.sourceBytes();
+        return owned.map.bytes() + owned.parse.bytes();
     }
 
     /// The parse result the nodes of `v` point into
@@ -457,4 +467,5 @@ pub const FileAstIdMap = struct {
 
 test {
     _ = @import("queries_test.zig");
+    _ = @import("shared_text_test.zig");
 }
