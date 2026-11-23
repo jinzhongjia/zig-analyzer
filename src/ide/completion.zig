@@ -7,7 +7,8 @@
 //! `syntaxAt`), lists the names visible at the cursor (local names and the declarations of
 //! enclosing containers). When `build.zig.zon` has no result type, its fields
 //! and paths are listed by the built-in schema (see `manifest.zig`).
-//! Keywords are offered where the syntax admits them (see `addKeywords`).
+//! Keywords, primitive types and primitive values are offered where the syntax admits them (see
+//! `addKeywords` and `addPrimitives`).
 //! No completion in comments and strings (other than `@import("` and the paths of `build.zig.zon`).
 //! With snippets, functions and builtins complete as calls (see `addCallSnippets`), and common
 //! snippets are also offered where a statement or a declaration starts (see `addKeywordSnippets`).
@@ -121,7 +122,7 @@ pub const Item = struct {
         target: imports.Target,
     };
 
-    pub const Kind = enum { param, type_param, constant, variable, function, method, namespace, @"struct", @"enum", type, field, enum_member, error_name, builtin, module, file, folder, label, keyword, snippet };
+    pub const Kind = enum { param, type_param, constant, variable, function, method, namespace, @"struct", @"enum", type, field, enum_member, error_name, builtin, module, file, folder, label, keyword, snippet, primitive_type, primitive_value };
     pub const Range = struct { start: u32, end: u32 };
 };
 
@@ -152,7 +153,10 @@ pub fn complete(r: *Resolver, file: FileId, offset: u32, options: Options) resol
     };
     var items: std.ArrayList(Item) = .empty;
     try items.appendSlice(r.arena, base);
-    if (pos) |p| try addKeywords(r.arena, text, visible, p, &items);
+    if (pos) |p| {
+        try addKeywords(r.arena, text, visible, p, &items);
+        try addPrimitives(r, visible, p, &items);
+    }
     if (name == null and !options.snippets) {
         try rankExpected(items.items, expected);
         return .{ .items = items.items, .is_incomplete = incomplete };
@@ -2154,7 +2158,8 @@ fn coerces(ip: *InternPool, want: Index, have: Index) bool {
     if (have == .unknown) return false;
     if (value.eqlTypes(ip, want, have) orelse false) return true;
     switch (ip.key(want)) {
-        .optional_type => |child| return coerces(ip, child, have),
+        // `null` as any optional
+        .optional_type => |child| return have == .null_type or coerces(ip, child, have),
         .error_union_type => |eu| {
             if (coerces(ip, eu.payload, have)) return true;
             // An error set that fits in `E`, and `E'!T` whose error set fits in `E`
@@ -2955,6 +2960,42 @@ fn addKeywordList(arena: Allocator, items: *std.ArrayList(Item), list: []const [
 
 fn addKeyword(arena: Allocator, items: *std.ArrayList(Item), keyword: []const u8, range: Item.Range) Allocator.Error!void {
     try items.append(arena, .{ .label = keyword, .kind = .keyword, .replace = range, .weight = keyword_weight });
+}
+
+/// Primitive values (`true`, `false`, `null`, `undefined`) offered in expressions
+const primitive_values = [_][]const u8{ "true", "false", "null", "undefined" };
+
+/// Primitive type names offered in expressions and types. Integer types of other widths (`u7`) are
+/// valid too, but only the common widths are listed
+const primitive_types = [_][]const u8{
+    "bool",       "void",        "type",         "noreturn", "anyerror", "anyopaque", "comptime_int", "comptime_float",
+    "usize",      "isize",       "u8",           "u16",      "u32",      "u64",       "u128",         "i8",
+    "i16",        "i32",         "i64",          "i128",     "f16",      "f32",       "f64",          "f80",
+    "f128",       "c_char",      "c_short",      "c_ushort", "c_int",    "c_uint",    "c_long",       "c_ulong",
+    "c_longlong", "c_ulonglong", "c_longdouble",
+};
+
+/// Primitive type names and values where the syntax admits them (see `addKeywords`): types and
+/// values in expressions (a type is a value), types alone in type positions. The type of each is
+/// known, so they take part in ranking by the expected type (`Item.Origin`)
+fn addPrimitives(r: *Resolver, visible: Visible, pos: Position, items: *std.ArrayList(Item)) resolve.Error!void {
+    if (visible.context == .none) return;
+    const values = switch (visible.syntax.keywords) {
+        .expression => true,
+        .type, .ptr_type => false,
+        .param => |p| if (p.has_colon or (p.fn_type and !p.has_any)) false else return,
+        else => return,
+    };
+    const range: Item.Range = .{ .start = pos.start, .end = pos.end };
+    const ip = r.ctx.db.env.ip;
+    if (values) for (primitive_values) |name| {
+        const tv = (try infer.primitive(ip, name)).?;
+        try items.append(r.arena, .{ .label = name, .kind = .primitive_value, .replace = range, .weight = keyword_weight, .origin = .{ .value = tv } });
+    };
+    for (primitive_types) |name| {
+        const tv = (try infer.primitive(ip, name)).?;
+        try items.append(r.arena, .{ .label = name, .kind = .primitive_type, .replace = range, .weight = keyword_weight, .origin = .{ .value = tv } });
+    }
 }
 
 // ── snippet ──────────────────────────────────────────────────────────

@@ -280,7 +280,10 @@ pub const World = struct {
         var r: resolve.Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
         const items = (try completion.complete(&r, file, offset, .{ .auto_import = false })).items;
         var list: std.ArrayList([]const u8) = .empty;
-        for (items) |it| if (it.kind != .keyword) try list.append(w.arena.allocator(), it.label);
+        for (items) |it| if (switch (it.kind) {
+            .keyword, .primitive_type, .primitive_value => false,
+            else => true,
+        }) try list.append(w.arena.allocator(), it.label);
         const labels = list.items;
         std.mem.sort([]const u8, labels, {}, struct {
             fn lt(_: void, a: []const u8, b: []const u8) bool {

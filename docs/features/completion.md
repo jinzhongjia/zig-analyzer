@@ -15,7 +15,7 @@ Match scores come from `ide_db/fuzzy.zig`, ported from gopls's `internal/fuzzy` 
 | Members of the enclosing container | 0.94 (0.02 less per outer level, at least 0.86) |
 | Member paths of local values | 0.9 |
 | Auto-import through a visible name | 0.85 |
-| Keywords, statement and declaration snippets | 0.8 |
+| Keywords, primitives, statement and declaration snippets | 0.8 |
 | Auto-import needing a new import | 0.75 |
 
 Member paths and auto-import candidates are also multiplied by a depth factor that drops 0.05 per extra path segment (at least 0.5).
@@ -40,6 +40,8 @@ Keywords are offered in `.zig` files, with or without snippets, only where the s
 - **Types** (annotations, return types, children of `?`, `!`, pointer, slice and array types, tag types of enums and unions): `struct`, `enum`, `union`, `opaque`, `error`, `fn`, `packed`, `extern`, `comptime`, `if`, `switch`; after `*` or `[]` also the pointer attributes not written yet (`const`, `volatile`, `allowzero`, `align`, `addrspace`); as a parameter type also `anytype`.
 - **Parameters**: `comptime` and `noalias` before the name; a parameter of a function type may be a type alone.
 - **Switch cases**: `else` as the only item of a case.
+
+Primitive values (`true`, `false`, `null`, `undefined`) and the common primitive types (`bool`, `void`, `type`, `noreturn`, `anyerror`, `anyopaque`, `comptime_int`, `comptime_float`, `usize`, `isize`, the integers of 8 to 128 bits, the floats, and the C types) are offered with the keywords: values and types in expressions, types alone in type positions, and none at the start of a statement or a member. Their types are known, so they rank by the expected type: `true` and `false` fit `bool`, `null` fits an optional, the types fit `type`; `undefined` fits anything and is never ranked first.
 
 In statements and expressions, `return` is offered only in the body of a function or test, `break` only in a loop or a labeled block or switch, and `continue` only in a loop or a labeled switch; none of them inside `defer` or `errdefer`, which control cannot leave, except for the loops and labels inside it.
 

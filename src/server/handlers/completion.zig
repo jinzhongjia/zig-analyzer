@@ -91,6 +91,8 @@ pub fn completion(server: *Server, r: *Resolver, arena: Allocator, params: types
                 .label => .Reference,
                 .keyword => .Keyword,
                 .snippet => .Snippet,
+                .primitive_type => .Class,
+                .primitive_value => .Keyword,
             }),
             .documentation = if (it.doc) |d| .{ .MarkupContent = try Server.markup(arena, server.caps.completion_markdown, d) } else null,
             .detail = it.detail,

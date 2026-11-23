@@ -46,6 +46,14 @@ fn setup(w: *World) !FileId {
     return (try w.add("/p/main.zig", src)).file;
 }
 
+/// Not a keyword, primitive type, or primitive value: the names these tests check
+fn isName(kind: completion.Item.Kind) bool {
+    return switch (kind) {
+        .keyword, .primitive_type, .primitive_value => false,
+        else => true,
+    };
+}
+
 fn offsetOf(needle: []const u8, nth: usize) u32 {
     var start: usize = 0;
     for (0..nth) |_| start = std.mem.indexOfPos(u8, src, start, needle).? + 1;
@@ -945,7 +953,7 @@ test "name completion ranks scope names before namespace members, each by how we
         }
     }.less);
     var labels: std.ArrayList([]const u8) = .empty;
-    for (items) |it| if (it.kind != .keyword) try labels.append(w.arena.allocator(), it.label);
+    for (items) |it| if (isName(it.kind)) try labels.append(w.arena.allocator(), it.label);
     // Local names, parameters, container members and members through `std` come in that order;
     // names in scope that do not match sort last and are filtered by the client
     try testing.expectEqualStrings("memory mem_param memo std.mem std.mem.eql std run", try std.mem.join(w.arena.allocator(), " ", labels.items));
@@ -1319,7 +1327,7 @@ fn rankedLabels(source: []const u8, auto_import: bool) ![]u8 {
     const at = f.cursor.?;
     var labels: std.ArrayList([]const u8) = .empty;
     for ((try completion.complete(&r, at.file, at.offset, .{ .auto_import = auto_import })).items) |it| {
-        if (it.score > 0) try labels.append(w.arena.allocator(), it.label);
+        if (it.score > 0 and isName(it.kind)) try labels.append(w.arena.allocator(), it.label);
     }
     return testing.allocator.dupe(u8, try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
@@ -1422,6 +1430,7 @@ fn tierSummary(source: []const u8) ![]u8 {
     var sorted: usize = 0;
     for (items) |it| if (it.sort) |s| {
         sorted += 1;
+        if (!isName(it.kind)) continue;
         if (std.mem.eql(u8, s, "0")) try first.append(w.arena.allocator(), it.label) else try testing.expectEqualStrings("1", s);
     };
     try testing.expect(sorted == 0 or sorted == items.len);
@@ -2966,7 +2975,7 @@ fn completionAt(w: *World, at: World.Added) ![]const u8 {
     var r = resolver(w, &ctx);
     var labels: std.ArrayList([]const u8) = .empty;
     for ((try completion.complete(&r, at.file, at.cursor, .{ .auto_import = false })).items) |it| {
-        if (it.kind != .keyword) try labels.append(w.arena.allocator(), it.label);
+        if (isName(it.kind)) try labels.append(w.arena.allocator(), it.label);
     }
     return std.mem.join(w.arena.allocator(), " ", labels.items);
 }
@@ -6858,7 +6867,7 @@ fn completionLabels(text: []const u8) ![]const u8 {
     var r = resolver(&w, &ctx);
     const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
     var labels: std.ArrayList([]const u8) = .empty;
-    for (items) |it| if (it.kind != .keyword) try labels.append(testing.allocator, it.label);
+    for (items) |it| if (isName(it.kind)) try labels.append(testing.allocator, it.label);
     defer labels.deinit(testing.allocator);
     return testing.allocator.dupe(u8, try std.mem.join(w.arena.allocator(), " ", labels.items));
 }
@@ -9208,6 +9217,89 @@ test "completion: keywords follow the syntax position" {
             };
         }
     }
+}
+
+/// Labels of the primitive items at the cursor, `values` then `types` (`-` when there are none of a
+/// kind), and those of each kind ranked first by the expected type
+fn primitiveSummary(w: *World, file: FileId, offset: u32) ![]const u8 {
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(w, &ctx);
+    const arena = w.arena.allocator();
+    var values: std.ArrayList([]const u8) = .empty;
+    var types: usize = 0;
+    var first: std.ArrayList([]const u8) = .empty;
+    for ((try completion.complete(&r, file, offset, .{ .auto_import = false })).items) |it| {
+        switch (it.kind) {
+            .primitive_value => try values.append(arena, it.label),
+            .primitive_type => types += 1,
+            else => continue,
+        }
+        if (it.sort) |s| if (std.mem.eql(u8, s, "0")) try first.append(arena, it.label);
+    }
+    return std.fmt.allocPrint(arena, "values: {s}; types: {d}; first: {s}", .{
+        if (values.items.len == 0) "-" else try std.mem.join(arena, " ", values.items),
+        types,
+        if (first.items.len == 0) "-" else if (first.items.len > 3) "types" else try std.mem.join(arena, " ", first.items),
+    });
+}
+
+test "completion: primitive types and values follow the syntax position and the expected type" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        // Expressions: values and types (a type is a value)
+        .{ "fn t() void {\n    const a = <|>;\n    _ = a;\n}", "values: true false null undefined; types: 35; first: -" },
+        .{ "fn t() void {\n    t(<|>);\n}", "values: true false null undefined; types: 35; first: -" },
+        // Types only
+        .{ "fn t() void {\n    const a: <|> = undefined;\n    _ = a;\n}", "values: -; types: 35; first: -" },
+        .{ "fn t() void {\n    const a: ?<|> = undefined;\n    _ = a;\n}", "values: -; types: 35; first: -" },
+        .{ "fn t() void {\n    const a: *const <|> = undefined;\n    _ = a;\n}", "values: -; types: 35; first: -" },
+        .{ "fn t() <|> {}", "values: -; types: 35; first: -" },
+        .{ "fn t(a: <|>) void {}", "values: -; types: 35; first: -" },
+        .{ "const S = struct {\n    a: <|>,\n};", "values: -; types: 35; first: -" },
+        // The expected type ranks those that fit first; `undefined` fits anything, so it does not
+        // count
+        .{ "fn t() void {\n    const a: bool = <|>;\n    _ = a;\n}", "values: true false null undefined; types: 35; first: true false" },
+        .{ "fn t() void {\n    const a: ?u8 = <|>;\n    _ = a;\n}", "values: true false null undefined; types: 35; first: null" },
+        .{ "fn t() void {\n    const a: ?*u8 = <|>;\n    _ = a;\n}", "values: true false null undefined; types: 35; first: null" },
+        .{ "fn t() void {\n    const a: type = <|>;\n    _ = a;\n}", "values: true false null undefined; types: 35; first: types" },
+        .{ "fn t() void {\n    const a: u8 = <|>;\n    _ = a;\n}", "values: true false null undefined; types: 35; first: -" },
+        // None at the start of a statement or member, in names, parameter names, or after `.`
+        .{ "fn t() void {\n    <|>\n}", "values: -; types: 0; first: -" },
+        .{ "<|>", "values: -; types: 0; first: -" },
+        .{ "fn t() void {\n    const <|>\n}", "values: -; types: 0; first: -" },
+        .{ "fn t(<|>) void {}", "values: -; types: 0; first: -" },
+        .{ "const S = struct {\n    a: u8,\n};\nconst b = S.<|>;", "values: -; types: 0; first: -" },
+        .{ "fn t() void {\n    // tr<|>\n}", "values: -; types: 0; first: -" },
+    };
+    for (cases, 0..) |c, i| {
+        var w: World = undefined;
+        try w.init();
+        defer w.deinit();
+        const added = try w.add("/p/main.zig", c[0]);
+        testing.expectEqualStrings(c[1], try primitiveSummary(&w, added.file, added.cursor)) catch |err| {
+            std.debug.print("case {d}: `{s}`\n", .{ i, c[0] });
+            return err;
+        };
+    }
+}
+
+test "completion: primitives rank by the input after names in scope" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const added = try w.add("/p/main.zig", "fn t(usage: u8) void {\n    _ = us<|>;\n}");
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const items = (try completion.complete(&r, added.file, added.cursor, .{ .auto_import = false })).items;
+    var usage: ?completion.Item = null;
+    var usize_item: ?completion.Item = null;
+    for (items) |it| {
+        if (std.mem.eql(u8, it.label, "usage")) usage = it;
+        if (it.kind == .primitive_type and std.mem.eql(u8, it.label, "usize")) usize_item = it;
+    }
+    try testing.expectEqual(added.cursor - 2, usize_item.?.replace.?.start);
+    try testing.expect(std.mem.order(u8, usage.?.sort.?, usize_item.?.sort.?) == .lt);
 }
 
 test "completion: keywords replace the word at the cursor and rank by the input" {

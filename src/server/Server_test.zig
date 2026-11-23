@@ -1561,8 +1561,8 @@ test "completion triggered by `/` or `\"` lists only paths" {
         var labels: std.ArrayList([]const u8) = .empty;
         defer labels.deinit(testing.allocator);
         for (items) |it| {
-            // Keywords (`CompletionItemKind.Keyword`)
-            if (it.object.get("kind").?.integer == 14) continue;
+            // Keywords (`CompletionItemKind.Keyword`) and primitive types
+            if (it.object.get("kind").?.integer == 14 or std.zig.primitives.isPrimitive(it.object.get("label").?.string)) continue;
             try labels.append(testing.allocator, it.object.get("label").?.string);
         }
         const got = try std.mem.join(testing.allocator, " ", labels.items);
