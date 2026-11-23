@@ -39,6 +39,13 @@ align_expr: ?ExprId,
 /// clauses of pointer types and the `callconv` of function types are part of `Expr.ptr_type` /
 /// `Expr.fn_type`.
 clauses: []const Clause,
+/// Number of leading entries of `exprs` that belong to the signature: the parameter types,
+/// clauses and return type of a function, and the type annotation and clauses of a variable or
+/// field. They are lowered before `value`, so they form a contiguous prefix.
+signature_exprs: u32,
+/// Number of leading entries of `bindings` that belong to the signature (see `signature_exprs`):
+/// parameters, and the locals of comptime blocks in the signature.
+signature_bindings: u32,
 
 pub const ExprId = enum(u32) { _ };
 pub const BindingId = enum(u32) { _ };
