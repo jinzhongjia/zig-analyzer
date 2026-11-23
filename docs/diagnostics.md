@@ -73,6 +73,7 @@ Opening a file does not by itself create a compile entry point. Checked in this 
 ## Compiler diagnostics
 
 - They come from the latest build of each project containing the file. Single-file results are used for dependency libraries and detached files, but not files in projects: a detached file importing them is a different module, where named imports differ.
+- AstGen errors are recognized by running in-process AstGen on the same disk text and matching range and message: the compiler reports them among its own errors, and a file with unsaved changes drops them in favour of its live diagnostics. The result that publishing computed for the same text is reused from `live.Prepared` while it is cached (the last few texts), so a save does not check the file once for the publish and again for the build.
 - Multiple results merge: the most recently read text is authoritative, results from other text contribute only non-AstGen errors shifted by the diff, and duplicates with the same range, message, and notes collapse. Errors differing only in notes (one per inline call site) are all kept.
 - Ranges refer to the text the compiler read. A file lacking the reported source line changed during the build, so its locations are discarded until a later build reads it.
 - A save or disk change rebuilds every project containing the file (restarting for a build script), and recompiles a detached file and the roots that read it or reported errors in it.

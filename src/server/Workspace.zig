@@ -1296,7 +1296,7 @@ fn storeResult(ws: *Workspace, target: *Workspace) Allocator.Error!void {
     defer ws.clearBundles();
     const build_zig = try std.fs.path.join(ws.gpa, &.{ ws.root, "build.zig" });
     defer ws.gpa.free(build_zig);
-    const result = try compiler.collect(ws.gpa, ws.bundles.items, ws.root, build_zig, ws, readDisk);
+    const result = try compiler.collect(ws.gpa, ws.bundles.items, ws.root, build_zig, ws, readDisk, .{ .io = ws.server.io, .prepared = &ws.server.live_prepared });
     errdefer result.release(ws.gpa);
 
     var files: std.AutoArrayHashMapUnmanaged(FileId, *const compiler.FileResult) = .empty;
@@ -1700,22 +1700,28 @@ fn computeSet(ws: *Workspace, steps: []const u32, read: *std.AutoHashMapUnmanage
 }
 
 fn loadFiles(ws: *Workspace, files: []const FileId) Allocator.Error!void {
-    const Loaded = struct { file: FileId, text: ?[]u8, durability: database.Durability };
+    const Text = database.inputs.Text;
+    const Loaded = struct { file: FileId, text: ?*Text, durability: database.Durability };
     var batch: std.ArrayList(Loaded) = .empty;
     defer batch.deinit(ws.gpa);
     // The batch owns a text until it is given to `db.set`; reading the following files and storing
     // a text can fail
-    errdefer for (batch.items) |l| if (l.text) |t| ws.gpa.free(t);
+    errdefer for (batch.items) |l| if (l.text) |t| t.release(ws.gpa);
     var arena: std.heap.ArenaAllocator = .init(ws.gpa);
     defer arena.deinit();
     const rules = try ws.server.originRules(arena.allocator());
     for (files) |file| {
         try ws.loaded.put(ws.gpa, file, {});
         const path = ws.server.vfs.path(file);
-        const text = ws.server.vfs.readFromDisk(file, ws.gpa) catch |err| switch (err) {
+        const disk = ws.server.vfs.readFromDisk(file, ws.gpa) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
         };
+        const text: ?*Text = if (disk) |t| blk: {
+            defer ws.gpa.free(t);
+            break :blk try .init(ws.gpa, t);
+        } else null;
+        errdefer if (text) |t| t.release(ws.gpa);
         try batch.append(ws.gpa, .{ .file = file, .text = text, .durability = origin.classify(&ws.server.vfs, rules, path, false).durability() });
     }
     const db = &ws.server.db;
@@ -1729,7 +1735,7 @@ fn loadFiles(ws: *Workspace, files: []const FileId) Allocator.Error!void {
         l.text = null;
         // Files the client opened in the meantime: their buffers take precedence
         if (db.peek(FileText, l.file) != null) {
-            if (text) |t| ws.gpa.free(t);
+            if (text) |t| t.release(ws.gpa);
             continue;
         }
         try db.set(FileText, l.file, text, l.durability);

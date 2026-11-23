@@ -115,7 +115,7 @@ test "full lifecycle: initialize, document sync, read requests, shutdown" {
     const id = (try s.server.vfs.lookup(try za.base.uri.toPath(s.arena.allocator(), file_uri))).?;
     var ctx = s.server.db.beginRead(testing.allocator);
     defer ctx.end();
-    try testing.expectEqualStrings("const a = 42;\n", (try ctx.get(FileText, id)).?);
+    try testing.expectEqualStrings("const a = 42;\n", (try ctx.get(FileText, id)).?.bytes());
 
     // Valid code: the last pushed diagnostics are empty
     const notes = try s.notifications();
@@ -921,9 +921,10 @@ test "live diagnostics are debounced per file and AstGen runs outside the read t
     const diags = published[published.len - 1].object.get("params").?.object.get("diagnostics").?.array.items;
     try testing.expectEqual(1, diags.len);
     try testing.expectEqualStrings("expected expression, found ';'", diags[0].object.get("message").?.string);
-    // AstCheck used the results computed outside the read transaction
+    // AstCheck used the results computed outside the read transaction, and they stay in the memo
+    // for the compiler diagnostics of a build of the same text
     try testing.expect(h.server.live_prepared.hits >= 2);
-    try testing.expectEqual(0, h.server.live_prepared.entries.items.len);
+    try testing.expect(h.server.live_prepared.entries.items.len > 0);
 
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
@@ -2616,7 +2617,7 @@ test "an external change compared while a write transaction waits for the lock i
     {
         var ctx = h.server.db.beginRead(a);
         defer ctx.end();
-        try testing.expectEqualStrings(changed, (try ctx.get(FileText, file)).?);
+        try testing.expectEqualStrings(changed, (try ctx.get(FileText, file)).?.bytes());
     }
     _ = try h.request("shutdown", {});
     try h.notify("exit", {});
@@ -2881,4 +2882,43 @@ test "case-variant URIs of one file: each keeps its text and gets the diagnostic
 fn setDefaultBuiltin(server: *Server, path: []const u8) !void {
     const current = server.toolchain.load(.acquire);
     try project_set.setToolchain(server, .{ .env = current.env, .source_tree = current.source_tree, .default_builtin = path });
+}
+
+test "one edit publishes the other open files without checking their unchanged texts again" {
+    const Harness = @import("test_harness.zig").Harness;
+    const Empty = struct {};
+    const live = za.diagnostics.live;
+    var h: Harness = undefined;
+    try h.start();
+    defer h.finish();
+    _ = try h.request("initialize", .{ .capabilities = Empty{} });
+    try h.notify("initialized", Empty{});
+    const a = h.arena.allocator();
+    const docs = 12;
+    var uris: [docs][]const u8 = undefined;
+    for (0..docs) |i| {
+        uris[i] = try std.fmt.allocPrint(a, "untitled:Untitled-{d}", .{i + 1});
+        const text = try std.fmt.allocPrint(a, "pub fn f{d}() u32 {{\n    return {d};\n}}\n", .{ i, i });
+        try h.notify("textDocument/didOpen", .{ .textDocument = .{ .uri = uris[i], .languageId = "zig", .version = 1, .text = text } });
+    }
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    // Guards against checking every open file again on each edit: publishing republishes all of
+    // them (`publishDependents`), and the unchanged ones must keep the prepared text of their file
+    const before = live.check_count.load(.monotonic);
+    try h.notify("textDocument/didChange", .{
+        .textDocument = .{ .uri = uris[0], .version = 2 },
+        .contentChanges = &.{.{ .text = "pub fn f0() u32 {\n    return 99;\n}\n" }},
+    });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(1, live.check_count.load(.monotonic) - before);
+    // The same after a second edit of the same file
+    const after_first = live.check_count.load(.monotonic);
+    try h.notify("textDocument/didChange", .{
+        .textDocument = .{ .uri = uris[0], .version = 3 },
+        .contentChanges = &.{.{ .text = "pub fn f0() u32 {\n    return 100;\n}\n" }},
+    });
+    _ = try h.request("zig-analyzer/waitIdle", {});
+    try testing.expectEqual(1, live.check_count.load(.monotonic) - after_first);
+    _ = try h.request("shutdown", {});
+    try h.notify("exit", {});
 }

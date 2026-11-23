@@ -4,6 +4,8 @@ const Allocator = std.mem.Allocator;
 const ErrorBundle = std.zig.ErrorBundle;
 const compiler = @import("compiler.zig");
 const live = @import("live.zig");
+const Vfs = @import("../base/Vfs.zig");
+const line_diff = @import("../util/line_diff.zig");
 const offsets = @import("../util/offsets.zig");
 const native = @import("../util/test_path.zig").native;
 const error_bundle = @import("../project/error_bundle.zig");
@@ -53,7 +55,7 @@ fn buildResult() !*compiler.BuildResult {
     var eb = try wip.toOwnedBundle("");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    return compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    return compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
 }
 
 test "collect: path resolution, dedup, errors without location, AstGen flag" {
@@ -65,6 +67,59 @@ test "collect: path resolution, dedup, errors without location, AstGen flag" {
     try testing.expect(!main.items[1].is_astgen); // the type error comes from Sema
     const build_zig = r.files.get(native("/proj/build.zig")).?;
     try testing.expectEqualStrings("undefined symbol: foo", build_zig.items[0].message);
+}
+
+/// An error bundle with the two errors of `main_text` (an AstGen error and a Sema error)
+fn mainBundle() !ErrorBundle {
+    var wip: ErrorBundle.Wip = try .init(testing.allocator);
+    defer wip.deinit();
+    try addError(&wip, "src/main.zig", main_text, "unused", "unused local variable");
+    try addError(&wip, "src/main.zig", main_text, "\"s\"", "expected type 'u32', found '*const [1:0]u8'");
+    return wip.toOwnedBundle("");
+}
+
+test "collect: the AstGen result prepared for the same text is reused" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var prepared: live.Prepared = .{ .gpa = gpa };
+    defer prepared.deinit();
+    // The last publish of the text checked it, in process
+    try prepared.put(io, @as(Vfs.FileId, @fromBackingInt(@as(u32, 1))), main_text, .zig, .in_process, try live.check(gpa, main_text, .zig));
+    const hits = prepared.hits;
+    var eb = try mainBundle();
+    defer eb.deinit(gpa);
+    var dummy: u8 = 0;
+    const cache: compiler.LiveCache = .{ .io = io, .prepared = &prepared };
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, cache);
+    defer r.release(gpa);
+    // The flags are the same as with a check of its own, which was not needed here
+    try testing.expectEqual(hits + 1, prepared.hits);
+    const main = r.files.get(native("/proj/src/main.zig")).?;
+    try testing.expect(main.items[0].is_astgen);
+    try testing.expect(!main.items[1].is_astgen);
+    // The result stays in the memo for the publish that follows the build
+    try testing.expect(prepared.prepared(io, @as(Vfs.FileId, @fromBackingInt(@as(u32, 1))), live.Prepared.hash(main_text, .zig, .in_process)));
+}
+
+test "collect: a check of the subprocess backend is not used for the AstGen flag" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var prepared: live.Prepared = .{ .gpa = gpa };
+    defer prepared.deinit();
+    // The user's zig checks the text as `zig ast-check`: its diagnostics are not necessarily the
+    // ones in-process AstGen gives, so the flag must not be computed from it
+    try prepared.put(io, @as(Vfs.FileId, @fromBackingInt(@as(u32, 1))), main_text, .zig, .{ .subprocess = "zig" }, try live.check(gpa, main_text, .zig));
+    const hits = prepared.hits;
+    var eb = try mainBundle();
+    defer eb.deinit(gpa);
+    var dummy: u8 = 0;
+    const cache: compiler.LiveCache = .{ .io = io, .prepared = &prepared };
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, cache);
+    defer r.release(gpa);
+    try testing.expectEqual(hits, prepared.hits);
+    const main = r.files.get(native("/proj/src/main.zig")).?;
+    try testing.expect(main.items[0].is_astgen);
+    try testing.expect(!main.items[1].is_astgen);
 }
 
 test "a build result stays valid while a reader holds a reference after the owner released it" {
@@ -88,6 +143,7 @@ fn mergeMessages(arena: Allocator, text: []const u8, use_live: bool, result: ?*c
     const l = try live.check(arena, text, .zig);
     var dummy: u8 = 0;
     const diags = try compiler.merge(arena, .{
+        .path = native("/proj/src/main.zig"),
         .text = text,
         .lines = try offsets.LineIndex.init(arena, text),
         .encoding = .utf16,
@@ -186,6 +242,7 @@ test "merge: notes in another file are remapped by that file's edits" {
     defer arena.deinit();
     const a = arena.allocator();
     const diags = try compiler.merge(a, .{
+        .path = native("/proj/src/main.zig"),
         .text = main,
         .lines = try offsets.LineIndex.init(a, main),
         .encoding = .utf16,
@@ -200,6 +257,137 @@ test "merge: notes in another file are remapped by that file's edits" {
     // A line is inserted at the top of the note's file: the note moves down one line
     try testing.expectEqual(2, related.location.range.start.line);
     try testing.expectEqual(4, related.location.range.start.character);
+}
+
+test "merge: every error's notes are shifted with the diff of the published file and of their own" {
+    const base = "fn f() void {\n    g();\n    h();\n}\n";
+    const text = "// top\n" ++ base;
+    const other_base = "fn n() void {\n    x();\n}\n";
+    const other_text = "// top\n" ++ other_base;
+    const g = spanOf(base, "g()", 0);
+    const h = spanOf(base, "h()", 0);
+    const decl = spanOf(base, "f()", 0);
+    const other_n = spanOf(other_base, "n()", 0);
+    const other_x = spanOf(other_base, "x()", 0);
+    const result: compiler.FileResult = .{ .base_text = base, .items = &.{
+        .{ .start = g[0], .end = g[1], .message = "first", .is_astgen = false, .notes = &.{
+            .{ .path = native("/proj/src/main.zig"), .start = decl[0], .end = decl[1], .message = "declared here", .base_text = base },
+            .{ .path = native("/proj/src/other.zig"), .start = other_n[0], .end = other_n[1], .message = "called here", .base_text = other_base },
+        } },
+        .{ .start = h[0], .end = h[1], .message = "second", .is_astgen = false, .notes = &.{
+            .{ .path = native("/proj/src/main.zig"), .start = decl[0], .end = decl[1], .message = "declared here", .base_text = base },
+            .{ .path = native("/proj/src/other.zig"), .start = other_x[0], .end = other_x[1], .message = "called here", .base_text = other_base },
+        } },
+    } };
+    const Ctx = struct {
+        fn get(_: *anyopaque, _: Allocator, path: []const u8) ?compiler.OtherFile {
+            if (std.mem.endsWith(u8, path, "other.zig")) return .{ .uri = "file:///proj/src/other.zig", .text = other_text };
+            if (std.mem.endsWith(u8, path, "main.zig")) return .{ .uri = "file:///proj/src/main.zig", .text = text };
+            return null;
+        }
+    };
+    var ctx: u8 = 0;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diags = try compiler.merge(a, .{
+        .path = native("/proj/src/main.zig"),
+        .text = text,
+        .lines = try offsets.LineIndex.init(a, text),
+        .encoding = .utf8,
+        .uri = "file:///proj/src/main.zig",
+        .live = null,
+        .compiler = &result,
+        .other_file = Ctx.get,
+        .other_ctx = &ctx,
+    });
+    try testing.expectEqual(2, diags.len);
+    // Every note is shifted by the diff of the text its own build read, both times with the same
+    // pair of texts
+    const expected = [_][2]u32{ .{ 1, 3 }, .{ 2, 4 } };
+    for (diags, expected) |d, e| {
+        const related = d.relatedInformation.?;
+        try testing.expectEqual(2, related.len);
+        try testing.expectEqual(1, related[0].location.range.start.line);
+        try testing.expectEqual(3, related[0].location.range.start.character);
+        try testing.expectEqual(e[0], related[1].location.range.start.line);
+        try testing.expectEqual(e[1], related[1].location.range.start.character);
+    }
+    try testing.expectEqual(2, diags[0].range.start.line);
+    try testing.expectEqual(4, diags[0].range.start.character);
+    try testing.expectEqual(3, diags[1].range.start.line);
+}
+
+test "diffs: a text pair is diffed once and its result is reused" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diffs: compiler.Diffs = .{ .a = a };
+    const old = "fn f() void {\n    g();\n}\n";
+    const new = "// top\n" ++ old;
+    const path = native("/proj/src/other.zig");
+    const edits = try diffs.get(path, old, new);
+    try testing.expect(edits.len != 0);
+    // The same texts, as other slices, give the same diff instead of a new one
+    try testing.expectEqual(edits.ptr, (try diffs.get(path, try a.dupe(u8, old), try a.dupe(u8, new))).ptr);
+    // Equal texts need no diff
+    try testing.expectEqual(0, (try diffs.get(path, new, new)).len);
+    // Another pair of the same file is diffed on its own
+    try testing.expect(edits.ptr != (try diffs.get(path, new, old)).ptr);
+    // So is the same old text with another new text
+    const other_new = "// other\n" ++ old;
+    const other_edits = try diffs.get(path, old, other_new);
+    try testing.expect(edits.ptr != other_edits.ptr);
+    try testing.expect(other_edits.len != 0);
+    // The path is only a key: the same texts of another path are diffed again, with the same result
+    const other_path = try diffs.get(native("/proj/src/third.zig"), old, new);
+    try testing.expect(edits.ptr != other_path.ptr);
+    try testing.expectEqualSlices(line_diff.Edit, edits, other_path);
+}
+
+test "merge: a note whose base text came from an older build is not shifted by the seeded diff" {
+    // The published file's build read `base`, and the buffer is `text`; a note of that error points
+    // into the file with the text `old_base` of an older build, so it needs the diff
+    // old_base -> text, not the diff of the file itself (base -> text)
+    const base = "fn f() void {\n    g();\n}\n";
+    const old_base = "// o\n" ++ base;
+    const text = "// a\n// b\n" ++ base;
+    const err = spanOf(base, "g()", 0);
+    const note = spanOf(old_base, "g()", 0);
+    const result: compiler.FileResult = .{ .base_text = base, .items = &.{.{
+        .start = err[0],
+        .end = err[1],
+        .message = "error",
+        .is_astgen = false,
+        .notes = &.{.{ .path = native("/proj/src/main.zig"), .start = note[0], .end = note[1], .message = "note", .base_text = old_base }},
+    }} };
+    const Ctx = struct {
+        fn get(_: *anyopaque, _: Allocator, path: []const u8) ?compiler.OtherFile {
+            if (!std.mem.endsWith(u8, path, "main.zig")) return null;
+            return .{ .uri = "file:///proj/src/main.zig", .text = text };
+        }
+    };
+    var ctx: u8 = 0;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const diags = try compiler.merge(a, .{
+        .path = native("/proj/src/main.zig"),
+        .text = text,
+        .lines = try offsets.LineIndex.init(a, text),
+        .encoding = .utf8,
+        .uri = "file:///proj/src/main.zig",
+        .live = null,
+        .compiler = &result,
+        .other_file = Ctx.get,
+        .other_ctx = &ctx,
+    });
+    try testing.expectEqual(1, diags.len);
+    const range = diags[0].relatedInformation.?[0].location.range;
+    // Guards against shifting the note with the diff of the published file's text, which moves it
+    // onto the closing brace
+    try testing.expectEqual(3, range.start.line);
+    try testing.expectEqual(4, range.start.character);
 }
 
 /// Span of the `n`th (from 0) occurrence of `needle` in `text`
@@ -217,6 +405,7 @@ fn remappedRanges(a: Allocator, base: []const u8, text: []const u8, spans: []con
     const result: compiler.FileResult = .{ .base_text = base, .items = items };
     var dummy: u8 = 0;
     const diags = try compiler.merge(a, .{
+        .path = native("/proj/src/main.zig"),
         .text = text,
         .lines = try offsets.LineIndex.init(a, text),
         .encoding = .utf8,
@@ -289,6 +478,7 @@ test "merge: a note after several modified regions of its file shifts by the tot
     const a = arena.allocator();
     var dummy: u8 = 0;
     const diags = try compiler.merge(a, .{
+        .path = native("/proj/src/main.zig"),
         .text = main,
         .lines = try offsets.LineIndex.init(a, main),
         .encoding = .utf8,
@@ -359,6 +549,7 @@ test "combine: each note is shifted from the text its own build read" {
     };
     var dummy: u8 = 0;
     const diags = try compiler.merge(a, .{
+        .path = native("/proj/src/main.zig"),
         .text = main,
         .lines = try offsets.LineIndex.init(a, main),
         .encoding = .utf8,
@@ -592,7 +783,7 @@ test "collect: locations in a file changed after the compiler read it are discar
 
     // The disk still has the text the compiler read
     var disk: LibDisk = .{ .lib = lib_v1 };
-    const same = try compiler.collect(gpa, &.{v1}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read);
+    const same = try compiler.collect(gpa, &.{v1}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read, null);
     defer same.release(gpa);
     try testing.expectEqual(std.mem.indexOf(u8, lib_v1, "256").?, same.files.get(lib_path).?.items[0].start);
     try testing.expectEqual(2, same.files.get(main_path).?.items[0].notes.len);
@@ -600,7 +791,7 @@ test "collect: locations in a file changed after the compiler read it are discar
     // Guards against applying the spans to a text written during the build, which put the error
     // inside a comment: everything located in lib.zig is dropped
     disk.lib = lib_v2;
-    const changed = try compiler.collect(gpa, &.{v1}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read);
+    const changed = try compiler.collect(gpa, &.{v1}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read, null);
     defer changed.release(gpa);
     try testing.expect(changed.files.get(lib_path) == null);
     const main = changed.files.get(main_path).?;
@@ -610,7 +801,7 @@ test "collect: locations in a file changed after the compiler read it are discar
     // The build after the change places the error on the new text
     var v2 = try libBundle(lib_v2);
     defer v2.deinit(gpa);
-    const rebuilt = try compiler.collect(gpa, &.{v2}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read);
+    const rebuilt = try compiler.collect(gpa, &.{v2}, native("/proj"), native("/proj/build.zig"), &disk, LibDisk.read, null);
     defer rebuilt.release(gpa);
     const lib = rebuilt.files.get(lib_path).?;
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -627,7 +818,7 @@ test "collect: reference trace and compile log output are kept" {
     var eb = try traceBundle();
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
 
     const items = r.files.get(native("/proj/src/main.zig")).?.items;
@@ -658,6 +849,7 @@ test "collect: reference trace and compile log output are kept" {
     defer arena.deinit();
     var ctx: u8 = 0;
     const diags = try compiler.merge(arena.allocator(), .{
+        .path = native("/proj/src/main.zig"),
         .text = main_text,
         .lines = try offsets.LineIndex.init(arena.allocator(), main_text),
         .encoding = .utf16,
@@ -691,7 +883,7 @@ fn collectIfValid(eb: ErrorBundle) !bool {
     if (!error_bundle.isValid(eb)) return false;
     const gpa = testing.allocator;
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -702,6 +894,7 @@ fn collectIfValid(eb: ErrorBundle) !bool {
         for (fr.items) |item| for (item.notes) |n| try testing.expect(std.fs.path.isAbsolute(n.path));
         for ([_][]const u8{ fr.base_text, try std.mem.concat(a, u8, &.{ "// x\n", fr.base_text }) }) |text| {
             _ = try compiler.merge(a, .{
+                .path = native("/proj/src/main.zig"),
                 .text = text,
                 .lines = try offsets.LineIndex.init(a, text),
                 .encoding = .utf16,
@@ -766,7 +959,7 @@ test "collect: paths that do not resolve to absolute paths count as missing loca
     var eb = try wip.toOwnedBundle("");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
 
     try testing.expectEqual(1, r.files.count());
@@ -802,7 +995,7 @@ test "collect: spans that end before they start become empty" {
     var eb = try wip.toOwnedBundle("");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
     // Guards against publishing a Range that ends before it starts: it becomes an empty range at
     // the start
@@ -866,7 +1059,7 @@ test "compile log: kept apart from the message for dedup and the AstGen flag" {
     var log2 = try unusedWithLog("@as(comptime_int, 2)\n");
     defer log2.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{ plain, log1, log1, log2 }, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{ plain, log1, log1, log2 }, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
     const result = r.files.getPtr(native("/proj/src/main.zig")).?;
     // Guards against the same error showing up several times, and no longer being recognized as an
@@ -920,7 +1113,7 @@ test "compile log: attached to an error in the build root rather than one sorted
     var eb = try wip.toOwnedBundle("@as(comptime_int, 24)\n");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
     // Guards against attaching the output to the error in the standard library
     try testing.expectEqualStrings("", r.files.get(native("/usr/lib/zig/std/Io/Writer.zig")).?.items[0].compile_log);
@@ -940,7 +1133,7 @@ test "collect: notes of an error without a location outlive the fallback path" {
     const fallback = try gpa.dupe(u8, native("/proj/build.zig"));
     defer gpa.free(fallback);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), fallback, &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), fallback, &dummy, Disk.read, null);
     defer r.release(gpa);
     // The caller reuses the memory of its path after the call
     @memset(fallback, 'x');
@@ -973,7 +1166,7 @@ test "collect and combine: errors that differ only in their notes are kept apart
     var eb = try wip.toOwnedBundle("");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
     const result = r.files.getPtr(native("/proj/src/main.zig")).?;
     // Guards against merging the errors of two inline call sites into one
@@ -1006,7 +1199,7 @@ test "collect: repeat counts of messages and notes are kept" {
     var eb = try wip.toOwnedBundle("");
     defer eb.deinit(gpa);
     var dummy: u8 = 0;
-    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read);
+    const r = try compiler.collect(gpa, &.{eb}, native("/proj"), native("/proj/build.zig"), &dummy, Disk.read, null);
     defer r.release(gpa);
     const notes = r.files.get(native("/proj/src/main.zig")).?.items[0].notes;
     // Guards against dropping the count that the compiler prints
