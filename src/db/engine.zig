@@ -761,15 +761,27 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             }
         }
 
+        /// Releases the pins the read transaction holds on `deps`. The caller holds no table lock.
         fn unpin(db: *Db, deps: []const DepKey) void {
-            for (deps) |dep| inline for (queries, 0..) |Q, qi| {
-                if (comptime @hasDecl(Q, "lru_read_bytes")) if (dep.query == qi) {
-                    const table = &db.tables[qi];
+            inline for (queries, 0..) |Q, qi| {
+                if (comptime @hasDecl(Q, "lru_read_bytes")) unpinTable(db, qi, deps);
+            }
+        }
+
+        /// Releases all pins of `deps` in table `qi`, taking its lock once for all of them. Only one
+        /// table lock is held at a time.
+        fn unpinTable(db: *Db, comptime qi: usize, deps: []const DepKey) void {
+            const table = &db.tables[qi];
+            var locked = false;
+            defer if (locked) table.mutex.unlock(db.io);
+            for (deps) |dep| {
+                if (dep.query != qi) continue;
+                if (!locked) {
                     table.mutex.lockUncancelable(db.io);
-                    defer table.mutex.unlock(db.io);
-                    table.slots.items[dep.index].pins -= 1;
-                };
-            };
+                    locked = true;
+                }
+                table.slots.items[dep.index].pins -= 1;
+            }
         }
 
         /// ⌊n × 3/4⌋, without overflow when n is the maximum value (unlimited)
