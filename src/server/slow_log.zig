@@ -13,8 +13,8 @@ const Server = @import("Server.zig");
 
 const log = std.log.scoped(.server);
 
-/// Whether requests record a trace: `reportIfSlow` is the only consumer of `Ctx.trace`, and it
-/// produces nothing when the threshold is 0
+/// Whether requests record a trace: `captureIfSlow` is the only consumer of `Ctx.trace`, and
+/// `logReport` writes what it built; nothing is recorded when the threshold is 0
 pub fn traceEnabled(server: *Server) bool {
     return server.config.load(.acquire).slow_request_ms != 0;
 }
