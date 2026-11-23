@@ -13,6 +13,12 @@ const Server = @import("Server.zig");
 
 const log = std.log.scoped(.server);
 
+/// Whether requests record a trace: `reportIfSlow` is the only consumer of `Ctx.trace`, and it
+/// produces nothing when the threshold is 0
+pub fn traceEnabled(server: *Server) bool {
+    return server.config.load(.acquire).slow_request_ms != 0;
+}
+
 /// Logs requests that take longer than `log.slow_request_ms`: self time summed per query, and the
 /// slow paths in the call tree. Called before the read transaction ends (describing a key reads
 /// the ItemTree).
@@ -21,6 +27,8 @@ pub fn reportIfSlow(server: *Server, ctx: *Db.Ctx, method: []const u8, t0: Io.Ti
     // build output show a misleading `failed command`; the report contents are covered by tests
     // that call writeSlowReport directly
     if (@import("builtin").is_test) return;
+    // The trace is recorded only when `traceEnabled` was true when the request began
+    if (ctx.trace == null) return;
     const threshold = server.config.load(.acquire).slow_request_ms;
     if (threshold == 0) return;
     const ns: u64 = @intCast(@max(0, t0.durationTo(Io.Clock.awake.now(server.io)).nanoseconds));
@@ -42,15 +50,7 @@ pub fn writeSlowReport(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, trace: 
     // after it with a greater depth
     var self_by_query: [Db.query_types.len]u64 = @splat(0);
     var count_by_query: [Db.query_types.len]u32 = @splat(0);
-    for (events, 0..) |e, i| {
-        var children: u64 = 0;
-        var j = i + 1;
-        while (j < events.len and events[j].depth > e.depth) : (j += 1) {
-            if (events[j].depth == e.depth + 1) children += events[j].ns;
-        }
-        self_by_query[e.query] += e.ns -| children;
-        count_by_query[e.query] += 1;
-    }
+    try sumSelfTime(ctx.gpa, events, &self_by_query, &count_by_query);
     var order: [Db.query_types.len]usize = undefined;
     for (&order, 0..) |*o, i| o.* = i;
     std.mem.sort(usize, &order, &self_by_query, struct {
@@ -84,6 +84,37 @@ pub fn writeSlowReport(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, trace: 
         try w.print("{s} ", .{za.db_report.shortName(queryName(e.query))});
         try describeKey(server, w, ctx, e.query, e.key);
         try w.print(" {d:.1} ms{s}{s}\n", .{ za.db_report.ms(e.ns), if (e.cutoff) " (cutoff)" else "", if (e.failed) " (canceled)" else "" });
+    }
+}
+
+/// Sums self time and counts per query in one pass over the pre-order events: a node's self time is
+/// its total time minus the time of its direct children, summed on a stack of the open ancestors
+fn sumSelfTime(
+    gpa: std.mem.Allocator,
+    events: []const za.db.Trace.Event,
+    self_by_query: *[Db.query_types.len]u64,
+    count_by_query: *[Db.query_types.len]u32,
+) !void {
+    const Open = struct {
+        event: *const za.db.Trace.Event,
+        child_ns: u64 = 0,
+    };
+    var open: std.ArrayList(Open) = .empty;
+    defer open.deinit(gpa);
+    for (events) |*e| {
+        // Events at or below this depth end the runs of their deeper predecessors
+        while (open.items.len > 0 and open.items[open.items.len - 1].event.depth >= e.depth) {
+            const done = open.pop().?;
+            self_by_query[done.event.query] += done.event.ns -| done.child_ns;
+        }
+        if (open.items.len > 0 and open.items[open.items.len - 1].event.depth + 1 == e.depth) {
+            open.items[open.items.len - 1].child_ns += e.ns;
+        }
+        count_by_query[e.query] += 1;
+        try open.append(gpa, .{ .event = e });
+    }
+    while (open.pop()) |done| {
+        self_by_query[done.event.query] += done.event.ns -| done.child_ns;
     }
 }
 
@@ -124,4 +155,55 @@ fn writeValue(server: *Server, w: *std.Io.Writer, ctx: *Db.Ctx, value: anytype) 
         .@"enum" => try w.print("{any}", .{value}),
         else => try w.print("{any}", .{value}),
     }
+}
+
+test "self time equals the subtree scan" {
+    const gpa = std.testing.allocator;
+    const Event = za.db.Trace.Event;
+    var events: std.ArrayList(Event) = .empty;
+    defer events.deinit(gpa);
+
+    // Roots and siblings, grandchildren, a child that takes longer than its parent (saturating
+    // subtraction), and a deep chain below the second root
+    const fixed = [_]Event{
+        .{ .query = 0, .key = 0, .depth = 0, .ns = 100 },
+        .{ .query = 1, .key = 0, .depth = 1, .ns = 30 },
+        .{ .query = 2, .key = 0, .depth = 2, .ns = 10 },
+        .{ .query = 0, .key = 0, .depth = 2, .ns = 5 },
+        .{ .query = 1, .key = 0, .depth = 1, .ns = 40 },
+        .{ .query = 2, .key = 0, .depth = 2, .ns = 70 },
+        .{ .query = 0, .key = 0, .depth = 3, .ns = 20 },
+        .{ .query = 1, .key = 0, .depth = 2, .ns = 1 },
+        .{ .query = 2, .key = 0, .depth = 1, .ns = 0 },
+        .{ .query = 0, .key = 0, .depth = 0, .ns = 60 },
+        .{ .query = 1, .key = 0, .depth = 1, .ns = 10 },
+    };
+    try events.appendSlice(gpa, &fixed);
+    for (0..200) |i| {
+        try events.append(gpa, .{
+            .query = @intCast(i % 3),
+            .key = 0,
+            .depth = @intCast(i + 2),
+            .ns = @intCast(1 + i % 7),
+        });
+    }
+
+    // Reference: the subtree scan this one replaces, O(n x depth)
+    var want_self: [Db.query_types.len]u64 = @splat(0);
+    var want_count: [Db.query_types.len]u32 = @splat(0);
+    for (events.items, 0..) |e, i| {
+        var children: u64 = 0;
+        var j = i + 1;
+        while (j < events.items.len and events.items[j].depth > e.depth) : (j += 1) {
+            if (events.items[j].depth == e.depth + 1) children += events.items[j].ns;
+        }
+        want_self[e.query] += e.ns -| children;
+        want_count[e.query] += 1;
+    }
+
+    var got_self: [Db.query_types.len]u64 = @splat(0);
+    var got_count: [Db.query_types.len]u32 = @splat(0);
+    try sumSelfTime(gpa, events.items, &got_self, &got_count);
+    try std.testing.expectEqualDeep(want_self, got_self);
+    try std.testing.expectEqualDeep(want_count, got_count);
 }
