@@ -158,6 +158,25 @@ test "AstId stable across edits, AstIdMap finds the node" {
     try testing.expect(std.mem.startsWith(u8, node.text(b.parse.source), "fn f()"));
 }
 
+test "AstIdMap.items holds the node of each item" {
+    var r = try buildTree(
+        \\const S = struct { x: u8, fn f() void {} };
+        \\fn g() void {
+        \\    const E = enum { a };
+        \\}
+        \\
+    );
+    defer r.parse.destroy();
+    defer r.items.deinit(testing.allocator);
+    var map = try ItemTree.AstIdMap.build(testing.allocator, &r.items, r.parse.rootNode());
+    defer map.deinit(testing.allocator);
+    try testing.expectEqual(r.items.items.len, map.items.len);
+    for (r.items.items, map.items) |item, node| {
+        const found = map.get(item.ast_id) orelse return error.MissingItemNode;
+        try testing.expect(node.green == found.green and node.offset == found.offset);
+    }
+}
+
 test "same-name members are distinguished by index" {
     var r = try buildTree("test {}\ntest {}\ncomptime {}\ncomptime {}");
     defer r.parse.destroy();

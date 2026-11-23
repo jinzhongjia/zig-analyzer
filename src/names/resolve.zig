@@ -612,12 +612,12 @@ pub const Resolver = struct {
     /// The innermost member containing `offset` (`inclusive_end`: a cursor at the end of the member
     /// also counts)
     pub fn ownerAt(r: *Resolver, file: FileId, offset: u32, inclusive_end: bool) Error!?u32 {
-        const tree = try r.itemTree(file);
+        // `AstIdMap.items` is parallel to `ItemTree.items`: each entry is the node of that item's
+        // AstId
         const map = try r.ctx.get(syntax.FileAstIdMap, file);
         var best: ?u32 = null;
         var best_len: u32 = std.math.maxInt(u32);
-        for (tree.items, 0..) |it, i| {
-            const node = map.get(it.ast_id) orelse continue;
+        for (map.items, 0..) |node, i| {
             const range = node.range();
             const inside = range.start <= offset and (offset < range.end or (inclusive_end and offset == range.end));
             if (inside and range.end - range.start < best_len) {
