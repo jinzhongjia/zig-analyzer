@@ -1062,6 +1062,16 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             return db.writesTo(at.inputs) != at.writes;
         }
 
+        /// Whether a write transaction of any order that may change `inputs` is waiting for the
+        /// exclusive lock (null: any write). A request that answered after ending its read
+        /// transaction checks this as its last in-transaction check did (see `Ctx.checkCanceled`).
+        pub fn pendingInputWrite(db: *Db, inputs: ?Inputs) bool {
+            const some = inputs orelse return db.pending_write.load(.acquire) != 0;
+            var it = some.iterator(.{});
+            while (it.next()) |qi| if (db.pending_inputs[qi].load(.acquire) != 0) return true;
+            return false;
+        }
+
         /// Begins a read transaction for a read that must see the inputs as they were at `since`
         /// (taken earlier with `mark`), such as a request that is answered on the state it was
         /// received in: when a write transaction ordered after the mark (`WriteOrder.after_marks`)

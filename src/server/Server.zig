@@ -756,8 +756,8 @@ const Mode = enum {
     /// transactions that change no text (such as the module graph after a build) wait for them
     /// instead of canceling them
     syntax,
-    /// Like `syntax`, but the handler only copies the text and the renderer inside the read
-    /// transaction; the formatting itself runs after it ends (see `FormattingTask`)
+    /// Like `syntax`, but the handler only copies the text, line table, and renderer inside the
+    /// read transaction; the formatting itself runs after it ends (see `FormattingTask`)
     formatting,
 };
 
@@ -1173,6 +1173,15 @@ fn FormattingTask(comptime func: anytype, comptime method: []const u8) type {
                         response = server.errorResponseBytes(pending.id, jsonrpc.error_codes.request_cancelled, "request cancelled");
                     } else if (server.db.markChanged(pending.since)) {
                         response = server.errorResponseBytes(pending.id, jsonrpc.error_codes.content_modified, "content modified");
+                    } else if (server.db.pendingInputWrite(pending.since.inputs)) {
+                        // The final `ctx.checkCanceled` saw pending writes of any order and retried;
+                        // an unordered write can have started after the read transaction ended
+                        if (server.isShuttingDown()) {
+                            response = server.errorResponseBytes(pending.id, jsonrpc.error_codes.content_modified, "content modified");
+                        } else {
+                            if (slow) |report| slow_log.logReport(report);
+                            return false;
+                        }
                     } else {
                         response = server.responseBytes(pending.id, edits);
                     }
