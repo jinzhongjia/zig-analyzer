@@ -17,6 +17,7 @@ const Body = @import("../hir/Body.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const FileId = @import("../base/Vfs.zig").FileId;
 const ast = @import("../syntax/ast.zig");
+const engine = @import("../db/engine.zig");
 
 pub const Kind = enum { namespace, @"struct", @"enum", type, function, method, variable, field, enum_member, parameter, type_parameter };
 
@@ -34,8 +35,18 @@ pub fn ofDecl(r: *Resolver, file: FileId, item: u32) resolve.Error!Symbol {
     return switch (it.kind) {
         .@"fn" => .{ .kind = try functionKind(r, key, tree.containers[it.container]) },
         .field => .{ .kind = if (tree.containers[it.container].kind == .@"enum") .enum_member else .field },
-        .@"const" => .{ .kind = try ofValue(r, try r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable), .readonly = true },
-        .@"var" => .{ .kind = try ofValue(r, try r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable) },
+        .@"const", .@"var" => |decl| {
+            const readonly = decl == .@"const";
+            // Most declarations are classified by their syntax alone, which avoids inferring the
+            // type and evaluating the initializer (see `declForm`)
+            if (try r.itemNode(file, item)) |node| switch (declForm(node)) {
+                .unknown => {},
+                .value => return .{ .kind = .variable, .readonly = readonly },
+                .type => return .{ .kind = .type, .readonly = readonly },
+                .function => return .{ .kind = .function, .readonly = readonly },
+            };
+            return .{ .kind = try ofValue(r, try r.ctx.get(database.sema.DeclType, .{ .owner = key }), .variable), .readonly = readonly };
+        },
         .@"test", .@"comptime", .zon => .{ .kind = .variable },
     };
 }
@@ -110,23 +121,25 @@ pub const Form = enum {
 
 /// Kind of the `const` / `var` declaration `node`:
 /// - A value when the type annotation is a primitive type other than `type`, `?T`, `[]T`, `[N]T`
-///   or `E!T`, and a function when it is a function type; other annotations (such as pointers or
-///   aliases) may be pointers to functions and are not decided by the syntax
-/// - A value when initialized with a literal, `true` / `false` / `null` / `undefined`, an enum
-///   literal, `error.X`, an init expression (`.{...}`, `S{...}`), a negation, a logical or bitwise
-///   not, or a binary operation other than `orelse`, `catch` and `||`
-/// - A type when initialized with a primitive type name, type syntax (`?T`, `*T`, `[]T`, `[N]T`,
-///   `E!T`, `error{...}`, `fn (...) R`, `anyframe`) or a merge of error sets (`A || B`)
+///   or `E!T`, and a function when it is a function type; any other annotation (such as a pointer,
+///   an alias or `type`) may be a pointer to a function and leaves the form unknown, even when the
+///   initializer alone would decide it
+/// - Without an annotation, a value when initialized with a literal, `true` / `false` / `null` /
+///   `undefined`, an enum literal, `error.X`, an init expression (`.{...}`, `S{...}`), a negation, a
+///   logical or bitwise not, or a binary operation other than `orelse`, `catch` and `||`
+/// - Without an annotation, a type when initialized with a primitive type name, type syntax (`?T`,
+///   `*T`, `[]T`, `[N]T`, `E!T`, `error{...}`, `fn (...) R`, `anyframe`) or a merge of error sets
+///   (`A || B`)
 pub fn declForm(node: ast.SyntaxNode) Form {
     const decl = ast.cast(ast.VarDecl, node) orelse return .unknown;
     if (decl.typeExpr()) |annotation| switch (annotation.kind()) {
-        .name_ref => switch (primitive(annotation)) {
-            .type_name => return .value,
-            else => {},
+        .name_ref => return switch (primitive(annotation)) {
+            .type_name => .value,
+            else => .unknown,
         },
         .optional_type, .slice_type, .array_type, .error_union_type => return .value,
         .fn_proto => return .function,
-        else => {},
+        else => return .unknown,
     };
     const init = decl.initExpr() orelse return .unknown;
     return switch (init.kind()) {
@@ -168,7 +181,20 @@ test "kinds known from the syntax agree with the kinds of the declared types" {
     defer w.deinit();
     const text =
         \\const S = struct {};
+        \\const Callback = fn (c_int) callconv(.c) void;
         \\fn f() void {}
+        \\fn TypeFn(comptime T: type) type {
+        \\    return struct { x: T };
+        \\}
+        \\const other = @import("other.zig");
+        \\const Self = @This();
+        \\const someFn = f;
+        \\const indirect = &someFn;
+        \\const alias_fn = *const fn () void;
+        \\const handler: *const fn () void = undefined;
+        \\var g_cb: Callback = undefined;
+        \\threadlocal var tls_cb: *const fn () void = undefined;
+        \\extern var ext: u32;
         \\const a = 5;
         \\const b = -1;
         \\const c = "s";
@@ -186,6 +212,7 @@ test "kinds known from the syntax agree with the kinds of the declared types" {
         \\const p: usize = 3;
         \\const q: ?*u8 = null;
         \\const r: fn () void = f;
+        \\var cb: fn () void = someFn;
         \\const s = S{};
         \\const t = error.Oops;
         \\const u = !true;
@@ -194,8 +221,10 @@ test "kinds known from the syntax agree with the kinds of the declared types" {
         \\const y = n || error{B};
         \\const z = 64 * 1024 + (1 << 2);
         \\const w = @as(?type, null) orelse u8;
+        \\const Type = TypeFn(u8);
         \\
     ;
+    _ = try w.add("/p/other.zig", "pub const x = 1;\n");
     const file = (try w.add("/p/main.zig", text)).file;
     var ctx = w.db.beginRead(w.arena.allocator());
     defer ctx.end();
@@ -205,9 +234,11 @@ test "kinds known from the syntax agree with the kinds of the declared types" {
         if (it.kind != .@"const" and it.kind != .@"var") continue;
         const item: u32 = @intCast(index);
         const form = declForm((try r.itemNode(file, item)).?);
-        const symbol = try ofDecl(&r, file, item);
-        // Containers and aliases need evaluation and are not decided by the syntax
-        const expected: Form = if (std.mem.eql(u8, it.name.?, "S") or std.mem.eql(u8, it.name.?, "x") or std.mem.eql(u8, it.name.?, "w")) .unknown else switch (symbol.kind) {
+        // An unknown form goes through `DeclType` (see `ofDecl`); the kinds the syntax claims to
+        // know must equal the kind inferred from the declared type
+        if (form == .unknown) continue;
+        const inferred = try ofValue(&r, try r.ctx.get(database.sema.DeclType, .{ .owner = .{ .file = file, .item = it.ast_id } }), .variable);
+        const expected: Form = switch (inferred) {
             .type => .type,
             .function => .function,
             .variable => .value,
@@ -218,4 +249,37 @@ test "kinds known from the syntax agree with the kinds of the declared types" {
             return err;
         };
     }
+}
+
+test "ofDecl classifies declarations whose form is known from the syntax without inferring their type" {
+    const World = @import("../names/resolve_test.zig").World;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const text =
+        \\const a = 5;
+        \\var b: u32 = 0;
+        \\const T = u8;
+        \\const S = struct {};
+        \\
+    ;
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var trace: engine.Trace = .{ .gpa = w.arena.allocator() };
+    ctx.trace = &trace;
+    var r: Resolver = .{ .ctx = &ctx, .arena = w.arena.allocator() };
+    const tree = try r.itemTree(file);
+    for (tree.items, 0..) |it, index| {
+        if (it.kind != .@"const" and it.kind != .@"var") continue;
+        // Containers need evaluation
+        if (std.mem.eql(u8, it.name.?, "S")) continue;
+        const symbol = try ofDecl(&r, file, @intCast(index));
+        const expected: Kind = if (std.mem.eql(u8, it.name.?, "a") or std.mem.eql(u8, it.name.?, "b")) .variable else .type;
+        try testing.expectEqual(expected, symbol.kind);
+    }
+    const decl_type = comptime for (database.Db.query_types, 0..) |Q, qi| {
+        if (Q == database.sema.DeclType) break qi;
+    } else unreachable;
+    for (trace.events.items) |ev| try testing.expect(ev.query != decl_type);
 }

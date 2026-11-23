@@ -322,9 +322,12 @@ pub const Prepared = struct {
         errdefer freeBackend(p.gpa, owned_backend);
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
-        try p.last.put(p.gpa, file, hash(text, mode, backend));
+        const h = hash(text, mode, backend);
         // Another publish already prepared this text
         if (p.find(text, mode, owned_backend) != null) {
+            // Record it only after finding the entry, so that a text is marked prepared only when
+            // reading it can find a result
+            try p.last.put(p.gpa, file, h);
             freeBackend(p.gpa, owned_backend);
             p.gpa.free(owned_text);
             result.destroy(p.gpa);
@@ -332,6 +335,12 @@ pub const Prepared = struct {
         }
         if (p.entries.items.len == capacity) p.destroyEntry(p.entries.orderedRemove(0));
         try p.entries.append(p.gpa, .{ .mode = mode, .backend = owned_backend, .text = owned_text, .result = result });
+        // Likewise: record the text only after its entry is in place. On failure, remove the entry
+        // again so that the errdefers free the text, the backend and the result.
+        p.last.put(p.gpa, file, h) catch |err| {
+            _ = p.entries.pop();
+            return err;
+        };
     }
 
     /// Takes a copy of the result of `checkWith(backend, text, mode)`, allocated with `gpa` (the
@@ -712,6 +721,27 @@ test "prepared results: a subprocess result is matched by its executable" {
     try std.testing.expectEqual(null, try p.take(gpa, io, "const a = ;", .zig, .in_process));
     const r = (try p.take(gpa, io, "const a = ;", .zig, .{ .subprocess = "zig-a" })).?;
     r.destroy(gpa);
+}
+
+test "prepared results: a failed put does not record the text as prepared" {
+    const gpa = testing.allocator;
+    const io = std.testing.io;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        var failing: std.testing.FailingAllocator = .init(gpa, .{});
+        var p: Prepared = .{ .gpa = failing.allocator() };
+        defer p.deinit();
+        const result = try check(gpa, "const a = ;", .zig);
+        failing.fail_index = failing.alloc_index + i;
+        const failed_put = if (p.put(io, @fromBackingInt(@as(u32, 1)), "const a = ;", .zig, .in_process, result)) |_| false else |_| true;
+        // `put` owns the result, whether it succeeds or fails
+        if (failed_put) {
+            try testing.expect(!p.prepared(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = ;", .zig, .in_process)));
+        } else {
+            try testing.expect(p.prepared(io, @fromBackingInt(@as(u32, 1)), Prepared.hash("const a = ;", .zig, .in_process)));
+            break;
+        }
+    }
 }
 
 test "results compare by their diagnostics" {

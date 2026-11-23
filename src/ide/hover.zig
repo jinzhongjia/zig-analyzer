@@ -395,8 +395,7 @@ fn writeStep(w: *std.Io.Writer, r: *Resolver, file: FileId, step: seed.Seed.Loop
 /// `file.zig:12`, the line of `offset` in `file`; with `links`, a link to that line
 /// (`[file.zig:12](file:///p/file.zig#L12)`)
 fn writeLocation(w: *std.Io.Writer, r: *Resolver, file: FileId, offset: u32, links: ?Links) resolve.Error!void {
-    const text = (try r.ctx.get(@import("../database.zig").syntax.SourceText, file)).text;
-    const line = std.mem.count(u8, text[0..@min(offset, text.len)], "\n") + 1;
+    const line = try r.lineOf(file, offset);
     const name = std.fs.path.basename(r.ctx.db.env.vfs.path(file));
     if (links) |l| {
         const target = try l.uri(l.ctx, r.arena, file);

@@ -1104,6 +1104,10 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             /// `beginReadAt`): all its reads are canceled
             stale: bool = false,
             stack: std.ArrayList(Frame) = .empty,
+            /// Frames whose buffers are kept for reuse: a frame at the same depth follows the one
+            /// just popped in most computations, so `pushFrame` takes one of these rather than
+            /// allocating the dependency set again
+            spares: std.ArrayList(Frame) = .empty,
             /// Like `Frame.pinned`, for the reads outside any query
             pinned: std.ArrayList(DepKey) = .empty,
             /// Stack position where the read transaction began (the stack grows downward)
@@ -1171,6 +1175,12 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
             pub fn end(ctx: *Ctx) void {
                 assert(ctx.stack.items.len == 0 and ctx.unverifiable.items.len == 0 and ctx.deep_frames.count() == 0 and ctx.waiting_for == null);
+                for (ctx.spares.items) |*frame| {
+                    frame.deps.deinit(ctx.db.gpa);
+                    frame.discarded.deinit(ctx.db.gpa);
+                    frame.pinned.deinit(ctx.db.gpa);
+                }
+                ctx.spares.deinit(ctx.db.gpa);
                 ctx.db.unpin(ctx.pinned.items);
                 ctx.pinned.deinit(ctx.db.gpa);
                 ctx.stack.deinit(ctx.gpa);
@@ -1360,13 +1370,26 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             }
 
             /// Ends the reads of the popped `frame`: frees the results it gave up (see
-            /// `Frame.discarded`) and unpins the values it held (see `Frame.pinned`)
+            /// `Frame.discarded`), unpins the values it held (see `Frame.pinned`) and keeps its
+            /// buffers for reuse (see `recycleFrame`)
             fn releaseReads(ctx: *Ctx, frame: *Frame) void {
                 const gpa = ctx.db.gpa;
                 for (frame.discarded.items) |d| d.free(d.ptr, gpa);
-                frame.discarded.deinit(gpa);
+                frame.discarded.clearRetainingCapacity();
                 ctx.db.unpin(frame.pinned.items);
-                frame.pinned.deinit(gpa);
+                frame.pinned.clearRetainingCapacity();
+            }
+
+            /// Ends the reads of the popped `frame` (see `releaseReads`) and keeps its buffers for
+            /// the next frame; `pushFrame` takes them instead of allocating
+            fn recycleFrame(ctx: *Ctx, frame: *Frame) void {
+                ctx.releaseReads(frame);
+                frame.deps.clearRetainingCapacity();
+                ctx.spares.append(ctx.db.gpa, frame.*) catch {
+                    frame.deps.deinit(ctx.db.gpa);
+                    frame.discarded.deinit(ctx.db.gpa);
+                    frame.pinned.deinit(ctx.db.gpa);
+                };
             }
 
             /// Reads a derived query inside a compute without recording it as a dependency. Only
@@ -1518,8 +1541,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 defer table.mutex.unlock(db.io);
                 const memo = &(table.slots.items[index].memo orelse return null);
                 if (memo.verified_at != db.revision or memo.evicted) return null;
-                table.access_tick += 1;
-                memo.last_used = table.access_tick;
+                // Only the LRU eviction reads `last_used`
+                if (comptime @hasDecl(Q, "lru")) {
+                    table.access_tick += 1;
+                    memo.last_used = table.access_tick;
+                }
                 return .{ .value = memo.value, .changed_at = memo.changed_at, .durability = memo.durability };
             }
 
@@ -1549,6 +1575,32 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 const dep: DepKey = .{ .query = comptime queryIndex(Q), .index = index };
 
                 if (existing) |memo| if (upToDate(memo, db.revision, need_value)) return freshMemo(Q, memo);
+                // A memo whose dependencies did not change at its durability is verified by
+                // `deepVerify` without looking at them. Verifying it then only writes
+                // `verified_at`, so it needs neither the claim nor a second lock pair: concurrent
+                // readers repeating it are harmless. The evicted value that a read needs still
+                // goes through the claim, which brings it back.
+                if (existing) |memo| if (!memo.evicted or !need_value) fast: {
+                    if (memo.verified_at == db.revision) break :fast;
+                    if (db.last_changed[@backingInt(memo.durability)] > memo.verified_at) break :fast;
+                    // Defense in depth: the callers already return before `ensureFresh` for a query
+                    // on the stack or at the stack limit, and a memo marked unverifiable in this
+                    // revision was marked while failing the durability check above. Keep the checks
+                    // so that the fast path stays exact if a caller changes.
+                    if (ctx.stackIndex(dep) != null or ctx.unverifiableDepth(dep) != null or ctx.stackExhausted()) break :fast;
+                    table.mutex.lockUncancelable(db.io);
+                    defer table.mutex.unlock(db.io);
+                    const slot = &table.slots.items[index];
+                    const m = &(slot.memo orelse break :fast);
+                    if (upToDate(m.*, db.revision, need_value)) return freshMemo(Q, m.*);
+                    if (m.evicted and need_value) break :fast;
+                    if (db.last_changed[@backingInt(m.durability)] > m.verified_at) break :fast;
+                    const value = if (m.evicted) undefined else m.value;
+                    const changed_at = m.changed_at;
+                    const durability = m.durability;
+                    markVerified(m, db.revision, durability);
+                    return .{ .value = value, .changed_at = changed_at, .durability = durability };
+                };
                 var held: Claim = .{};
                 defer ctx.endClaim(Q, index, &held);
                 const current = switch (try ctx.claim(Q, index, need_value, &held)) {
@@ -1768,7 +1820,16 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
             fn pushFrame(ctx: *Ctx, key: DepKey) Allocator.Error!void {
                 const index: u32 = @intCast(ctx.stack.items.len);
                 if (index >= linear_frames) try ctx.deep_frames.ensureUnusedCapacity(ctx.gpa, 1);
-                try ctx.stack.append(ctx.gpa, .{ .key = key });
+                try ctx.stack.ensureUnusedCapacity(ctx.gpa, 1);
+                var frame: Frame = ctx.spares.pop() orelse .{ .key = key };
+                assert(frame.deps.count() == 0 and frame.pinned.items.len == 0 and frame.discarded.items.len == 0);
+                frame.key = key;
+                frame.durability = .high;
+                frame.in_cycle = false;
+                frame.incomplete = false;
+                frame.cycle_head = null;
+                frame.child_ns = 0;
+                ctx.stack.appendAssumeCapacity(frame);
                 if (index >= linear_frames) ctx.deep_frames.putAssumeCapacityNoClobber(key, {});
             }
 
@@ -1881,9 +1942,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 } else Q.compute(ctx, key);
                 var value = computed catch |err| {
                     var frame = ctx.popFrame();
-                    defer ctx.releaseReads(&frame);
+                    defer ctx.recycleFrame(&frame);
                     ctx.finishTiming(qi, &frame, t0, trace_index, true);
-                    frame.deps.deinit(ctx.db.gpa);
                     return err;
                 };
                 // compute may have swallowed the `Canceled` of an inner read (a fallback such as
@@ -1893,15 +1953,14 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 // acquires the exclusive lock), so a single check here is enough to detect it.
                 if (ctx.checkCanceled()) |_| {} else |err| {
                     var frame = ctx.popFrame();
-                    defer ctx.releaseReads(&frame);
+                    defer ctx.recycleFrame(&frame);
                     ctx.finishTiming(qi, &frame, t0, trace_index, true);
-                    frame.deps.deinit(db.gpa);
                     // Never published, the new value has no other references: free it directly
                     deinitValue(Q, &value, db.gpa);
                     return err;
                 }
                 var frame = ctx.popFrame();
-                defer ctx.releaseReads(&frame);
+                defer ctx.recycleFrame(&frame);
                 ctx.finishTiming(qi, &frame, t0, trace_index, false);
 
                 const table = &db.tables[qi];
@@ -1916,7 +1975,6 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 // the claim, see `claim`) already published a result in this revision and it wins;
                 // the new value was never published, so free it directly
                 if (slot.memo) |old| if (old.verified_at == db.revision and !old.evicted) {
-                    frame.deps.deinit(db.gpa);
                     deinitValue(Q, &value, db.gpa);
                     return .{ .value = old.value, .changed_at = old.changed_at, .durability = old.durability, .executed = true };
                 };
@@ -1924,7 +1982,6 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                 // value is returned for the caller to use and freed when the caller is done with
                 // it (see `Frame.discarded`).
                 if (frame.in_cycle) {
-                    defer frame.deps.deinit(db.gpa);
                     ctx.discardForReader(Q, &value) catch |err| {
                         deinitValue(Q, &value, db.gpa);
                         return err;
@@ -1939,7 +1996,6 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
 
                 // Failure before committing the memo: the unpublished new value is freed directly
                 errdefer deinitValue(Q, &value, db.gpa);
-                defer frame.deps.deinit(db.gpa);
                 const deps = try db.gpa.dupe(DepKey, frame.deps.keys());
                 errdefer db.gpa.free(deps);
 
@@ -1977,7 +2033,8 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
                     if (@hasDecl(Q, "lru_bytes")) table.live_bytes += Q.bytes(value);
                 }
                 if (@hasDecl(Q, "lru") and db.overLru(Q, table)) db.sweep_wanted.store(true, .monotonic);
-                table.access_tick += 1;
+                // Only the LRU eviction reads `last_used`
+                if (comptime @hasDecl(Q, "lru")) table.access_tick += 1;
                 slot.memo = .{
                     .value = value,
                     .verified_at = db.revision,
@@ -2043,8 +2100,11 @@ pub fn Engine(comptime Env: type, comptime queries: []const type) type {
         fn useMemoLocked(db: *Db, comptime Q: type, index: u32) ?Table(Q).Memo {
             const table = &db.tables[comptime queryIndex(Q)];
             const memo = &(table.slots.items[index].memo orelse return null);
-            table.access_tick += 1;
-            memo.last_used = table.access_tick;
+            // Only the LRU eviction reads `last_used`
+            if (comptime @hasDecl(Q, "lru")) {
+                table.access_tick += 1;
+                memo.last_used = table.access_tick;
+            }
             return memo.*;
         }
 
