@@ -24,10 +24,12 @@
   if (root.dataset.theme) syncThemeColor();
 })();
 
-// Copy buttons copy the command in the data-copy attribute of their container.
+// Copy buttons copy the text in the data-copy attribute of their container, or the container's
+// code when the attribute is empty.
 document.querySelectorAll("[data-copy] .copy").forEach(function (button) {
   button.addEventListener("click", function () {
-    var text = button.closest("[data-copy]").dataset.copy;
+    var block = button.closest("[data-copy]");
+    var text = block.dataset.copy || block.querySelector("code").textContent;
     navigator.clipboard.writeText(text).then(function () {
       button.textContent = "Copied";
       button.classList.add("done");
@@ -39,9 +41,9 @@ document.querySelectorAll("[data-copy] .copy").forEach(function (button) {
   });
 });
 
-// Install tabs, with arrow-key navigation as in the WAI-ARIA tabs pattern.
-(function () {
-  var tabs = Array.prototype.slice.call(document.querySelectorAll('[role="tab"]'));
+// Tabs, with arrow-key navigation as in the WAI-ARIA tabs pattern; each tab list works on its own.
+document.querySelectorAll('[role="tablist"]').forEach(function (list) {
+  var tabs = Array.prototype.slice.call(list.querySelectorAll('[role="tab"]'));
 
   function select(tab) {
     tabs.forEach(function (t) {
@@ -63,6 +65,7 @@ document.querySelectorAll("[data-copy] .copy").forEach(function (button) {
     });
   });
 
-  // Windows visitors see the Scoop tab first.
-  if (/Windows/.test(navigator.userAgent)) select(document.getElementById("t-scoop"));
-})();
+  // Windows visitors see the Scoop tab of the install methods first.
+  var scoop = list.querySelector("#t-scoop");
+  if (scoop && /Windows/.test(navigator.userAgent)) select(scoop);
+});
