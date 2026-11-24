@@ -91,7 +91,7 @@
           <p>The extension runs <code>zig-analyzer.server.path</code> when it is set, else the release installed by <strong>Install Server</strong>, else <code>zig-analyzer</code> from <code>PATH</code>. Once a day it checks for a newer release and offers to install it (<code>zig-analyzer.server.checkUpdates</code> turns this off).</p>
           <h3>Settings</h3>
           <p>Server options are VS Code settings under <code>zig-analyzer.</code>, one per option. Only the settings you set are sent to the server.</p>
-          <div class="block" data-copy><pre><code>// settings.json
+          <div class="block" data-copy><pre><code data-lang="json">// settings.json
 {
   "zig-analyzer.zig.path": "/usr/local/bin/zig",
   "zig-analyzer.build.args": ["-Dtarget=aarch64-linux"],
@@ -112,7 +112,7 @@
           <p>The extension starts <code>lsp.zig-analyzer.binary.path</code> when it is set, else <code>zig-analyzer</code> in <code>PATH</code>, else a release it downloads and verifies. The <code>download</code> setting picks the release (<code>{ "version": "v0.5.0", "optimize": "ReleaseFast" }</code>) or, with <code>false</code>, turns downloads off. Zed is the only integration that updates the server without asking; pin a version to avoid that.</p>
           <h3>Settings</h3>
           <p>Put zig-analyzer first and turn ZLS off; server options go in <code>lsp.zig-analyzer.settings</code>. <code>"semantic_tokens": "combined"</code> keeps Zed's highlighting and adds the server's tokens, which pairs with the server's <code>semantic_tokens.mode = .partial</code>.</p>
-          <div class="block" data-copy><pre><code>// settings.json
+          <div class="block" data-copy><pre><code data-lang="json">// settings.json
 {
   "languages": {
     "Zig": {
@@ -136,10 +136,10 @@
         <div class="panel" role="tabpanel" id="tab-nvim" aria-labelledby="t-nvim" hidden>
           <h3>Install</h3>
           <p>Neovim 0.12+. With the built-in <code>vim.pack</code>:</p>
-          <div class="block" data-copy><pre><code>vim.pack.add({ 'https://github.com/jinzhongjia/zig-analyzer.nvim' })
+          <div class="block" data-copy><pre><code data-lang="lua">vim.pack.add({ 'https://github.com/jinzhongjia/zig-analyzer.nvim' })
 require('zig-analyzer').setup()</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
           <p>Or with lazy.nvim, where <code>opts</code> is passed to <code>setup()</code>:</p>
-          <div class="block" data-copy><pre><code>{
+          <div class="block" data-copy><pre><code data-lang="lua">{
   'jinzhongjia/zig-analyzer.nvim',
   ft = 'zig',
   opts = {},
@@ -148,7 +148,7 @@ require('zig-analyzer').setup()</code></pre><button class="copy" type="button" a
           <p><code>:ZigAnalyzer install</code> installs the latest release (<code>:ZigAnalyzer install v0.5.0 ReleaseFast</code> picks one) and restarts the running servers; it needs <code>curl</code> and <code>tar</code>. The plugin runs <code>cmd</code> from <code>setup()</code> when set, else the installed release, else <code>zig-analyzer</code> in <code>PATH</code>. It reports a newer release once per session (<code>check_updates = false</code> turns this off).</p>
           <h3>Settings</h3>
           <p><code>setup()</code> takes any field of <code>vim.lsp.Config</code>; server options go in <code>settings</code> as a Lua table:</p>
-          <div class="block" data-copy><pre><code>require('zig-analyzer').setup({
+          <div class="block" data-copy><pre><code data-lang="lua">require('zig-analyzer').setup({
   -- cmd = { '/path/to/zig-analyzer' },
   settings = {
     build = { args = { '-Dtarget=aarch64-linux' } },
@@ -163,14 +163,14 @@ require('zig-analyzer').setup()</code></pre><button class="copy" type="button" a
         <div class="panel" role="tabpanel" id="tab-vim" aria-labelledby="t-vim" hidden>
           <h3>Install</h3>
           <p>Install the plugin together with <a href="https://github.com/yegappan/lsp">yegappan/lsp</a> (Vim 9) or <a href="https://github.com/prabirshrestha/vim-lsp">vim-lsp</a>; it registers the server with whichever is loaded. With vim-plug:</p>
-          <div class="block" data-copy><pre><code>call plug#begin()
+          <div class="block" data-copy><pre><code data-lang="vim">call plug#begin()
 Plug 'yegappan/lsp'
 Plug 'jinzhongjia/zig-analyzer.vim'
 call plug#end()</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
           <h3>Server</h3>
           <p><code>:ZigAnalyzer install</code> installs the latest release (<code>:ZigAnalyzer install v0.5.0 ReleaseFast</code> picks one) and restarts the running server; it needs <code>curl</code>, <code>tar</code>, and <code>sha256sum</code> or <code>shasum</code>, and checks the signature when <code>minisign</code> is installed. The plugin runs <code>g:zig_analyzer_cmd</code> when set, else the installed release, else <code>zig-analyzer</code> from <code>PATH</code>. <code>g:zig_analyzer_check_updates = 0</code> turns off the update check.</p>
           <h3>Settings</h3>
-          <div class="block" data-copy><pre><code>let g:zig_analyzer_settings = {
+          <div class="block" data-copy><pre><code data-lang="vim">let g:zig_analyzer_settings = {
       \ 'build': {'args': ['-Dtarget=aarch64-linux']},
       \ 'inlay_hints': {'parameters': v:false},
       \ }</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
@@ -180,7 +180,7 @@ call plug#end()</code></pre><button class="copy" type="button" aria-label="Copy"
         <div class="panel" role="tabpanel" id="tab-emacs" aria-labelledby="t-emacs" hidden>
           <h3>Install</h3>
           <p>Emacs 29.1+ with <a href="https://melpa.org/#/zig-mode"><code>zig-mode</code></a> or <a href="https://melpa.org/#/zig-ts-mode"><code>zig-ts-mode</code></a>. The package registers the server with the built-in Eglot and starts it in Zig buffers:</p>
-          <div class="block" data-copy><pre><code>(package-vc-install
+          <div class="block" data-copy><pre><code data-lang="elisp">(package-vc-install
  '(zig-analyzer . (:url "https://github.com/jinzhongjia/zig-analyzer.el")))
 (require 'zig-analyzer)
 (zig-analyzer-mode 1)</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
@@ -188,7 +188,7 @@ call plug#end()</code></pre><button class="copy" type="button" aria-label="Copy"
           <p><strong>M-x zig-analyzer-install-server</strong> installs a release (it needs <code>minisign</code>, <code>curl</code>, and <code>tar</code>). The package uses <code>zig-analyzer-executable</code> when set, else the installed release, else <code>zig-analyzer</code> in <code>PATH</code>.</p>
           <h3>Settings</h3>
           <p><code>zig-analyzer-settings</code> is a plist: arrays are vectors, and false is <code>:json-false</code>. Set it before <code>zig-analyzer-mode</code>, or run <code>M-x zig-analyzer-restart</code> after a change.</p>
-          <div class="block" data-copy><pre><code>(setq zig-analyzer-settings
+          <div class="block" data-copy><pre><code data-lang="elisp">(setq zig-analyzer-settings
       '(:build (:args ["-Dtarget=aarch64-linux"])
         :inlay_hints (:parameters :json-false)))</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
           <h3>Commands</h3>
@@ -197,7 +197,7 @@ call plug#end()</code></pre><button class="copy" type="button" aria-label="Copy"
 
         <div class="panel" role="tabpanel" id="tab-other" aria-labelledby="t-other" hidden>
           <p>Any LSP client works without a plugin. Start <code>zig-analyzer</code> over stdio with no arguments, attach it to <code>.zig</code> and <code>.zon</code> files, use the nearest directory with <code>build.zig</code> or <code>.git</code> as the root, and turn off ZLS so that only one server runs. Settings go in <code>initializationOptions</code>, or in the <code>zig-analyzer</code> section of <code>workspace/configuration</code>. For example, Helix:</p>
-          <div class="block" data-copy><pre><code># ~/.config/helix/languages.toml
+          <div class="block" data-copy><pre><code data-lang="toml"># ~/.config/helix/languages.toml
 [language-server.zig-analyzer]
 command = "zig-analyzer"
 
@@ -254,7 +254,7 @@ language-servers = ["zig-analyzer"]</code></pre><button class="copy" type="butto
           <li>Save it as <code>zig-analyzer.zon</code> in the project root, the directory with <code>build.zig</code>. A nested project (such as an example with its own <code>build.zig</code>) reads its own file.</li>
           <li>Keep only the options the project needs, and commit it.</li>
         </ol>
-        <div class="block" data-copy><pre><code>// zig-analyzer.zon
+        <div class="block" data-copy><pre><code data-lang="zon">// zig-analyzer.zon
 .{
     .build = .{ .args = .{"-Dtarget=aarch64-linux"} },
     .diagnostics = .{ .steps = .{ "check", "test" } },

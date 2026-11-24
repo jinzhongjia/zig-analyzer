@@ -273,6 +273,9 @@ h1 {
 .fd { color: var(--syn-fd); }
 .pa { color: var(--syn-pa); font-style: italic; }
 .va { color: var(--syn-va); }
+.com { color: var(--hint-fg); font-style: italic; }
+.key { color: var(--syn-ty); }
+.enum { color: var(--syn-bi); }
 .hint {
   margin: 0 4px 0 1px; padding: 0 5px;
   border-radius: 4px;
