@@ -68,7 +68,7 @@ Check the tag does not exist yet: `git tag -l vX.Y.Z` and `git ls-remote --tags 
 
 ## 3. Check CI
 
-The CI run of `main` must have passed and completed: the release commit (step 5) then changes
+The CI run of `main` must have passed and completed: the release commit (step 6) then changes
 only the changelog and the version, and the release workflow uses that run instead of running CI
 again. Without it (still running, cancelled, or failed), the workflow runs the whole CI on the
 tagged commit, which takes about an hour, and refuses to publish if it fails:
@@ -99,7 +99,66 @@ user-facing text: what changed for the user, in one line each, keeping the PR li
 about the same change; add a first line when the Zig versions supported change. Show the section to
 the user and revise it until approved.
 
-## 5. Bump the version
+## 5. Compare performance with the last release
+
+The changelog section ends with a `### Performance compared with vA.B.C` subsection, where `vA.B.C`
+is the release the section counts from (for a candidate, the last final release). Measure on this
+machine with the current benchmark client against both servers; it takes about 10 minutes. Measure
+`main` as it will be tagged, after step 3.
+
+Build both servers and the benchmark client in a temporary directory outside the repository:
+
+```sh
+B=$(mktemp -d)
+git worktree add --detach "$B/old" vA.B.C
+git worktree add --detach "$B/new" main
+(cd "$B/old" && zig build -Doptimize=ReleaseSafe) & (cd "$B/new" && zig build -Doptimize=ReleaseSafe) & wait
+(cd "$B/new" && zig build bench -Doptimize=ReleaseSafe)   # builds lsp-bench; the run fails without arguments
+cp "$(ls -t $(find "$B/new/.zig-cache/o" -name lsp-bench -type f) | head -1)" "$B/lsp-bench"
+```
+
+The benchmark project is the Zig compiler source of the local `zig version`: the `src.tarball` of
+that version in https://ziglang.org/download/index.json, checked against its `src.shasum` and
+extracted into its own empty directory `$B/src`. The tarball has no `.git`, so its `build.zig`
+needs `-Dversion-string`:
+
+```sh
+v=$(zig version)
+P=$B/src/zig-$v
+export BENCH_CONFIG='{"completion":{"snippets":false},"build":{"args":["-Dversion-string='"$v"'"]}}'
+run() { "$B/lsp-bench" "$B/$1/zig-out/bin/zig-analyzer" "$P" "$3" > "$B/$2-$1.txt" 2>&1; echo "exit $?" >> "$B/$2-$1.txt"; }
+run old warm src/Sema.zig; run new warm src/Sema.zig   # warms the zig build cache; discarded
+for r in 1 2 3; do run old full$r src/Sema.zig; run new full$r src/Sema.zig; done
+export BENCH_QUICK=1 BENCH_REFS=40
+for r in 1 2; do for f in Sema Zcu; do run old refs-$f$r src/$f.zig; run new refs-$f$r src/$f.zig; done; done
+```
+
+Every output must end with `checks failed: 0` and `exit 0`, and none may contain `failed to
+configure`; otherwise fix the setup and measure again. When the release's Performance lines claim
+a gain these runs do not exercise, add the matching runs from the header of `tools/lsp_bench.zig`
+(`BENCH_SAVE=1` for compiler diagnostics, `BENCH_TYPE_WORDS` for typing, `BENCH_CONCURRENT`,
+`BENCH_INSTANCE_HOVER`, ...) with two rounds per version, alternating as above.
+
+Write the subsection from the results:
+
+- One line with the setup: OS and architecture, CPU count, ReleaseSafe, the Zig version, the
+  measured files, and the number of rounds.
+- A table `| Scenario | vA.B.C | vX.Y.Z | Change |` of the metrics whose ranges over the rounds do not
+  overlap between the versions, improvements and regressions alike, giving each version's range
+  (`7.1–10.0 ms`) and the change as a factor or percentage. Slowest requests (`max`) count only when
+  every round agrees.
+- Resident memory at the end of the full run, always.
+- One line naming the metrics that are unchanged within noise.
+
+No rows of wins the runs did not show; the per-PR numbers stay in the Performance lines above it.
+Show the subsection to the user and revise it until approved, as with the rest of the section. Remove the worktrees and the
+directory afterwards (`git worktree remove --force "$B/old"`, the same for `"$B/new"`, then
+`rm -rf "$B"`).
+
+For a final release after candidates, `zig build changelog` replaces the candidates' sections, so
+measure again against the last final release.
+
+## 6. Bump the version
 
 `.version` in `build.zig.zon` is the single source of the version; the tag only marks its commit.
 Set it to `X.Y.Z` (no `v`). Until the tag exists, builds print `X.Y.Z-dev+<commit>`; at the tagged
@@ -110,7 +169,7 @@ commit `X.Y.Z`; after it `X.Y.Z+<commits since the tag>.g<commit>`. Commit it wi
 release: vX.Y.Z
 ```
 
-## 6. Tag and push
+## 7. Tag and push
 
 The tag message is `zig-analyzer vX.Y.Z`; the notes come from `CHANGELOG.md`.
 
@@ -120,7 +179,7 @@ git push origin main
 git push origin vX.Y.Z
 ```
 
-## 7. Follow the workflow
+## 8. Follow the workflow
 
 ```sh
 gh run list --workflow release.yml --limit 1
@@ -165,7 +224,7 @@ as a pre-release, so it does not become the latest release.
   its candidates with one section since the last final release, and `build.zig.zon` drops the
   suffix. The candidates' GitHub releases stay as they are.
 
-## 8. When something fails
+## 9. When something fails
 
 Until the release is published nothing is public but the tag, and a tag can be deleted only by an
 admin (the ruleset lets the user, not the workflow, do it).
