@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Editor plugins and configuration · zig-analyzer</title>
+  <meta name="description" content="How to set up the zig-analyzer editor plugins, how to configure the server from the editor, and how to share project settings with zig-analyzer.zon.">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#121212" media="(prefers-color-scheme: dark)">
+  <meta property="og:title" content="zig-analyzer: editor plugins and configuration">
+  <meta property="og:description" content="Set up the editor plugins and configure zig-analyzer, per editor or per project with zig-analyzer.zon.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://zig-analyzer.dev/configuration">
+  <meta property="og:image" content="https://zig-analyzer.dev/assets/og-light.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+  <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+  <link rel="stylesheet" href="style.css">
+  <!-- Applies the stored theme before the first paint, so a dark page never flashes light. -->
+  <script>
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("theme"); } catch (e) {}
+      if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+    })();
+  </script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="nav">
+    <div class="wrap nav-inner">
+      <a class="brand" href="index.html" aria-label="zig-analyzer home">
+        <img src="assets/logo.svg" alt="" width="30" height="24">
+        <span>zig-analyzer</span>
+      </a>
+      <nav class="nav-links" aria-label="Primary">
+        <a href="index.html#features">Features</a>
+        <a href="index.html#install">Install</a>
+        <a href="index.html#editors">Editors</a>
+        <a href="configuration.html" aria-current="page">Configuration</a>
+        <a href="https://github.com/jinzhongjia/zig-analyzer/blob/main/CHANGELOG.md">Changelog</a>
+      </nav>
+      <div class="nav-actions">
+        <a class="icon-btn" href="https://github.com/jinzhongjia/zig-analyzer" aria-label="GitHub repository">
+          <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        </a>
+        <button class="icon-btn" id="theme-toggle" type="button" aria-label="Toggle color theme">
+          <svg class="i-sun" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+          <svg class="i-moon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="page-head">
+      <div class="wrap">
+        <h1>Editor plugins and configuration</h1>
+        <p class="lead">Set up a plugin for your editor, then configure the server: in the editor for yourself, or in <code>zig-analyzer.zon</code> for everyone working on a project.</p>
+        <nav class="toc" aria-label="On this page">
+          <a href="#plugins">Plugins</a>
+          <a href="#settings">Editor settings</a>
+          <a href="#project-file">zig-analyzer.zon</a>
+          <a href="#options">All options</a>
+          <a href="#troubleshooting">Troubleshooting</a>
+        </nav>
+      </div>
+    </section>
+
+    <section id="plugins" class="section">
+      <div class="wrap prose">
+        <h2 class="section-title"><span class="hash">//</span> Plugins</h2>
+        <p class="section-lead">Every plugin starts the server for <code>.zig</code> and <code>.zon</code> files and needs Zig 0.17.0 or 0.17.1 in <code>PATH</code> (or in the <code>zig.path</code> setting). The VS Code, Neovim, Vim, and Emacs plugins install a release of the server only when you run their install command; Zed downloads one by itself. Each checks the minisign signature and SHA-256 of the release first.</p>
+
+        <div class="tabs" role="tablist" aria-label="Editor">
+          <button role="tab" aria-selected="true" aria-controls="tab-vscode" id="t-vscode">VS Code</button>
+          <button role="tab" aria-selected="false" aria-controls="tab-zed" id="t-zed" tabindex="-1">Zed</button>
+          <button role="tab" aria-selected="false" aria-controls="tab-nvim" id="t-nvim" tabindex="-1">Neovim</button>
+          <button role="tab" aria-selected="false" aria-controls="tab-vim" id="t-vim" tabindex="-1">Vim</button>
+          <button role="tab" aria-selected="false" aria-controls="tab-emacs" id="t-emacs" tabindex="-1">Emacs</button>
+          <button role="tab" aria-selected="false" aria-controls="tab-other" id="t-other" tabindex="-1">Other editors</button>
+        </div>
+
+        <div class="panel" role="tabpanel" id="tab-vscode" aria-labelledby="t-vscode">
+          <h3>Install</h3>
+          <p>Search for <code>zig-analyzer</code> in the Extensions view, from the <a href="https://marketplace.visualstudio.com/items?itemName=jinzhongjia.zig-analyzer">Visual Studio Marketplace</a> or <a href="https://open-vsx.org/extension/jinzhongjia/zig-analyzer">Open VSX</a> (VSCodium, Cursor). Then run <strong>zig-analyzer: Install Server</strong> from the command palette.</p>
+          <h3>Server</h3>
+          <p>The extension runs <code>zig-analyzer.server.path</code> when it is set, else the release installed by <strong>Install Server</strong>, else <code>zig-analyzer</code> from <code>PATH</code>. Once a day it checks for a newer release and offers to install it (<code>zig-analyzer.server.checkUpdates</code> turns this off).</p>
+          <h3>Settings</h3>
+          <p>Server options are VS Code settings under <code>zig-analyzer.</code>, one per option. Only the settings you set are sent to the server.</p>
+          <div class="block" data-copy><pre><code data-lang="json">// settings.json
+{
+  "zig-analyzer.zig.path": "/usr/local/bin/zig",
+  "zig-analyzer.build.args": ["-Dtarget=aarch64-linux"],
+  "zig-analyzer.inlay_hints.parameters": false,
+  "zig-analyzer.lint.enable": true,
+  "zig-analyzer.lint.rules": { "dead_errdefer": false }
+}</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
+          <p>Settings of the extension itself: <code>zig-analyzer.server.path</code>, <code>server.extraEnv</code>, <code>server.checkUpdates</code>, <code>trace.server</code> (log LSP messages to the output channel), and <code>debug.adapter</code>.</p>
+          <h3>Commands</h3>
+          <p>Click the <code>zig-analyzer</code> status bar item or use the command palette: <strong>Restart Server</strong>, <strong>Install Server</strong>, <strong>Reload Workspace</strong> (rerun <code>build.zig</code>), <strong>Run</strong>, <strong>Debug</strong>, and <strong>Show Server Status</strong>, <strong>File Status</strong>, <strong>Syntax Tree</strong>, <strong>Module Graph</strong>, <strong>Packages</strong>. Tests of open files appear in the Testing view.</p>
+          <p>The Zig extension (<code>ziglang.vscode-zig</code>) is not needed. With both enabled, ZLS runs too and both format Zig files; disable the Zig extension. <a href="https://github.com/jinzhongjia/zig-analyzer/tree/main/editors/vscode">Extension README →</a></p>
+        </div>
+
+        <div class="panel" role="tabpanel" id="tab-zed" aria-labelledby="t-zed" hidden>
+          <h3>Install</h3>
+          <p>Install both the <strong>Zig</strong> extension (grammar, highlighting, file types) and the <strong>zig-analyzer</strong> extension from Zed's extensions page (<code>zed: extensions</code>).</p>
+          <h3>Server</h3>
+          <p>The extension starts <code>lsp.zig-analyzer.binary.path</code> when it is set, else <code>zig-analyzer</code> in <code>PATH</code>, else a release it downloads and verifies. The <code>download</code> setting picks the release (<code>{ "version": "v0.5.0", "optimize": "ReleaseFast" }</code>) or, with <code>false</code>, turns downloads off. Zed is the only integration that updates the server without asking; pin a version to avoid that.</p>
+          <h3>Settings</h3>
+          <p>Put zig-analyzer first and turn ZLS off; server options go in <code>lsp.zig-analyzer.settings</code>. <code>"semantic_tokens": "combined"</code> keeps Zed's highlighting and adds the server's tokens, which pairs with the server's <code>semantic_tokens.mode = .partial</code>.</p>
+          <div class="block" data-copy><pre><code data-lang="json">// settings.json
+{
+  "languages": {
+    "Zig": {
+      "language_servers": ["zig-analyzer", "!zls", "..."],
+      "semantic_tokens": "combined"
+    }
+  },
+  "lsp": {
+    "zig-analyzer": {
+      "settings": {
+        "build": { "args": ["-Dtarget=aarch64-linux"] },
+        "semantic_tokens": { "mode": "partial" },
+        "inlay_hints": { "parameters": false }
+      }
+    }
+  }
+}</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
+          <p>Settings are sent at startup and whenever they change; <code>editor: restart language server</code> restarts the server. <a href="https://github.com/jinzhongjia/zig-analyzer/tree/main/editors/zed">Extension README →</a></p>
+        </div>
+
+        <div class="panel" role="tabpanel" id="tab-nvim" aria-labelledby="t-nvim" hidden>
+          <h3>Install</h3>
+          <p>Neovim 0.12+. With the built-in <code>vim.pack</code>:</p>
+          <div class="block" data-copy><pre><code data-lang="lua">vim.pack.add({ 'https://github.com/jinzhongjia/zig-analyzer.nvim' })
+require('zig-analyzer').setup()</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
+          <p>Or with lazy.nvim, where <code>opts</code> is passed to <code>setup()</code>:</p>
+          <div class="block" data-copy><pre><code data-lang="lua">{
+  'jinzhongjia/zig-analyzer.nvim',
+  ft = 'zig',
+  opts = {},
+}</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
+          <h3>Server</h3>
+          <p><code>:ZigAnalyzer install</code> installs the latest release (<code>:ZigAnalyzer install v0.5.0 ReleaseFast</code> picks one) and restarts the running servers; it needs <code>curl</code> and <code>tar</code>. The plugin runs <code>cmd</code> from <code>setup()</code> when set, else the installed release, else <code>zig-analyzer</code> in <code>PATH</code>. It reports a newer release once per session (<code>check_updates = false</code> turns this off).</p>
+          <h3>Settings</h3>
+          <p><code>setup()</code> takes any field of <code>vim.lsp.Config</code>; server options go in <code>settings</code> as a Lua table:</p>
+          <div class="block" data-copy><pre><code data-lang="lua">require('zig-analyzer').setup({
+  -- cmd = { '/path/to/zig-analyzer' },
+  settings = {
+    build = { args = { '-Dtarget=aarch64-linux' } },
+    inlay_hints = { parameters = false },
+    semantic_tokens = { mode = 'partial' },
+  },
+})</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
+          <h3>Commands</h3>
+          <p><code>:ZigAnalyzer status</code>, <code>fileStatus</code>, <code>syntaxTree</code>, <code>moduleGraph</code>, <code>reloadWorkspace</code>, <code>restart</code>, <code>install</code>, and <code>checkUpdates</code>. See <code>:help zig-analyzer</code> and <code>:checkhealth zig-analyzer</code>. <a href="https://github.com/jinzhongjia/zig-analyzer.nvim">Plugin repository →</a></p>
+        </div>
+
+        <div class="panel" role="tabpanel" id="tab-vim" aria-labelledby="t-vim" hidden>
+          <h3>Install</h3>
+          <p>Install the plugin together with <a href="https://github.com/yegappan/lsp">yegappan/lsp</a> (Vim 9) or <a href="https://github.com/prabirshrestha/vim-lsp">vim-lsp</a>; it registers the server with whichever is loaded. With vim-plug:</p>
+          <div class="block" data-copy><pre><code data-lang="vim">call plug#begin()
+Plug 'yegappan/lsp'
+Plug 'jinzhongjia/zig-analyzer.vim'
+call plug#end()</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
+          <h3>Server</h3>
+          <p><code>:ZigAnalyzer install</code> installs the latest release (<code>:ZigAnalyzer install v0.5.0 ReleaseFast</code> picks one) and restarts the running server; it needs <code>curl</code>, <code>tar</code>, and <code>sha256sum</code> or <code>shasum</code>, and checks the signature when <code>minisign</code> is installed. The plugin runs <code>g:zig_analyzer_cmd</code> when set, else the installed release, else <code>zig-analyzer</code> from <code>PATH</code>. <code>g:zig_analyzer_check_updates = 0</code> turns off the update check.</p>
+          <h3>Settings</h3>
+          <div class="block" data-copy><pre><code data-lang="vim">let g:zig_analyzer_settings = {
+      \ 'build': {'args': ['-Dtarget=aarch64-linux']},
+      \ 'inlay_hints': {'parameters': v:false},
+      \ }</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
+          <p>See <code>:help zig_analyzer</code> for the settings and the <code>:ZigAnalyzer</code> subcommands. <a href="https://github.com/jinzhongjia/zig-analyzer.vim">Plugin repository →</a></p>
+        </div>
+
+        <div class="panel" role="tabpanel" id="tab-emacs" aria-labelledby="t-emacs" hidden>
+          <h3>Install</h3>
+          <p>Emacs 29.1+ with <a href="https://melpa.org/#/zig-mode"><code>zig-mode</code></a> or <a href="https://melpa.org/#/zig-ts-mode"><code>zig-ts-mode</code></a>. The package registers the server with the built-in Eglot and starts it in Zig buffers:</p>
+          <div class="block" data-copy><pre><code data-lang="elisp">(package-vc-install
+ '(zig-analyzer . (:url "https://github.com/jinzhongjia/zig-analyzer.el")))
+(require 'zig-analyzer)
+(zig-analyzer-mode 1)</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
+          <h3>Server</h3>
+          <p><strong>M-x zig-analyzer-install-server</strong> installs a release (it needs <code>minisign</code>, <code>curl</code>, and <code>tar</code>). The package uses <code>zig-analyzer-executable</code> when set, else the installed release, else <code>zig-analyzer</code> in <code>PATH</code>.</p>
+          <h3>Settings</h3>
+          <p><code>zig-analyzer-settings</code> is a plist: arrays are vectors, and false is <code>:json-false</code>. Set it before <code>zig-analyzer-mode</code>, or run <code>M-x zig-analyzer-restart</code> after a change.</p>
+          <div class="block" data-copy><pre><code data-lang="elisp">(setq zig-analyzer-settings
+      '(:build (:args ["-Dtarget=aarch64-linux"])
+        :inlay_hints (:parameters :json-false)))</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
+          <h3>Commands</h3>
+          <p><code>M-x zig-analyzer-status</code>, <code>zig-analyzer-file-status</code>, <code>zig-analyzer-syntax-tree</code>, <code>zig-analyzer-module-graph</code>, <code>zig-analyzer-reload-workspace</code>, <code>zig-analyzer-restart</code>, and <code>zig-analyzer-show-log</code>. <a href="https://github.com/jinzhongjia/zig-analyzer.el">Package repository →</a></p>
+        </div>
+
+        <div class="panel" role="tabpanel" id="tab-other" aria-labelledby="t-other" hidden>
+          <p>Any LSP client works without a plugin. Start <code>zig-analyzer</code> over stdio with no arguments, attach it to <code>.zig</code> and <code>.zon</code> files, use the nearest directory with <code>build.zig</code> or <code>.git</code> as the root, and turn off ZLS so that only one server runs. Settings go in <code>initializationOptions</code>, or in the <code>zig-analyzer</code> section of <code>workspace/configuration</code>. For example, Helix:</p>
+          <div class="block" data-copy><pre><code data-lang="toml"># ~/.config/helix/languages.toml
+[language-server.zig-analyzer]
+command = "zig-analyzer"
+
+[language-server.zig-analyzer.config]
+build.args = ["-Dtarget=aarch64-linux"]
+
+[[language]]
+name = "zig"
+language-servers = ["zig-analyzer"]</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
+          <p>Setups for Helix, Sublime Text, Kate, JetBrains IDEs (LSP4IJ), coc.nvim, and plain Neovim or Eglot are in <a href="https://github.com/jinzhongjia/zig-analyzer/blob/main/docs/editors.md">docs/editors.md →</a></p>
+        </div>
+      </div>
+    </section>
+
+    <section id="settings" class="section">
+      <div class="wrap prose">
+        <h2 class="section-title"><span class="hash">//</span> Editor settings</h2>
+        <p class="section-lead">The server reads its settings from two places: the editor, for yourself, and a project's <code>zig-analyzer.zon</code>, for everyone. Both have the structure of <a href="https://github.com/jinzhongjia/zig-analyzer/blob/main/zig-analyzer.default.zon"><code>zig-analyzer.default.zon</code></a>, the reference file that lists every option with its default and what it does.</p>
+
+        <h3>From the reference file to your editor</h3>
+        <p>The reference is written in ZON. Editors send the same structure as JSON: a nested struct becomes an object, a list becomes an array, and an enum literal such as <code>.partial</code> becomes the string <code>"partial"</code>. Options you leave out keep their defaults.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Where</th><th>The option <code>.build = .{ .args = .{"-Dfoo"} }</code></th></tr></thead>
+            <tbody>
+              <tr><td>JSON (any LSP client)</td><td><code>{ "build": { "args": ["-Dfoo"] } }</code></td></tr>
+              <tr><td>VS Code</td><td><code>"zig-analyzer.build.args": ["-Dfoo"]</code></td></tr>
+              <tr><td>Zed</td><td><code>"lsp": { "zig-analyzer": { "settings": { "build": { "args": ["-Dfoo"] } } } }</code></td></tr>
+              <tr><td>Neovim</td><td><code>settings = { build = { args = { '-Dfoo' } } }</code></td></tr>
+              <tr><td>Vim</td><td><code>let g:zig_analyzer_settings = {'build': {'args': ['-Dfoo']}}</code></td></tr>
+              <tr><td>Emacs</td><td><code>(setq zig-analyzer-settings '(:build (:args ["-Dfoo"])))</code></td></tr>
+              <tr><td>Helix</td><td><code>build.args = ["-Dfoo"]</code> in <code>[language-server.zig-analyzer.config]</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>How the server receives them</h3>
+        <ul>
+          <li>At startup in <code>initializationOptions</code>, and later in the <code>zig-analyzer</code> section of <code>workspace/configuration</code> and <code>workspace/didChangeConfiguration</code>. An outer <code>"zig-analyzer"</code> wrapper is accepted in both.</li>
+          <li>Settings that arrive later replace the current ones; a change of a setting the build uses (such as <code>build.args</code>) restarts the projects; <code>zig.path</code> takes effect after restarting the server.</li>
+          <li>An unknown option, or a value of the wrong type, is reported as a warning; that option keeps its default and the others still apply.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="project-file" class="section">
+      <div class="wrap prose">
+        <h2 class="section-title"><span class="hash">//</span> zig-analyzer.zon</h2>
+        <p class="section-lead">A project can commit its settings, so everyone gets the same build arguments, diagnostics, and checks whatever editor they use.</p>
+
+        <h3>Create it</h3>
+        <ol>
+          <li>Copy <a href="https://github.com/jinzhongjia/zig-analyzer/blob/main/zig-analyzer.default.zon"><code>zig-analyzer.default.zon</code></a> from the repository, or start an empty file.</li>
+          <li>Save it as <code>zig-analyzer.zon</code> in the project root, the directory with <code>build.zig</code>. A nested project (such as an example with its own <code>build.zig</code>) reads its own file.</li>
+          <li>Keep only the options the project needs, and commit it.</li>
+        </ol>
+        <div class="block" data-copy><pre><code data-lang="zon">// zig-analyzer.zon
+.{
+    .build = .{ .args = .{"-Dtarget=aarch64-linux"} },
+    .diagnostics = .{ .steps = .{ "check", "test" } },
+    .naming = .{
+        .enable = true,
+        .ignore = .{"SDL_*"},
+        .exclude = .{"vendor/*"},
+        .rules = .{ .field = false },
+    },
+    .unused = .{ .enable = true },
+    .lint = .{ .enable = true },
+    .imports = .{ .derived = .separate, .sort = .name },
+}</code></pre><button class="copy" type="button" aria-label="Copy">Copy</button></div>
+
+        <h3>How it is used</h3>
+        <ul>
+          <li><strong><code>zig-analyzer.default.zon</code> is a reference, not a configuration file.</strong> The server never reads it from disk; it ships the same text inside the binary for completion and hover in <code>zig-analyzer.zon</code>. Only a file named <code>zig-analyzer.zon</code> in a project root has an effect.</li>
+          <li><strong>The file wins.</strong> Every option written in <code>zig-analyzer.zon</code> takes precedence over the same option in each team member's editor. Options it leaves out come from the editor. A copy of the whole reference file therefore pins every project option to its default, which is why you should keep only what you change.</li>
+          <li><strong>Only project options.</strong> The options written as fields in the reference file can be set: <code>build.args</code>, <code>diagnostics.steps</code>, <code>diagnostics.compiler</code>, <code>imports</code>, <code>naming</code>, <code>unused</code>, and <code>lint</code>. Those shown in comments marked <em>editor only</em> (<code>zig</code>, <code>inlay_hints</code>, <code>hover</code>, <code>log</code>, ...) are personal; written here they are reported and ignored, and the rest of the file still applies.</li>
+          <li><strong>Paths are relative to the project root.</strong> <code>naming.exclude</code> patterns are <code>/</code>-separated paths from the directory of <code>zig-analyzer.zon</code> (from the workspace root in editor settings).</li>
+          <li><strong>Changes apply on save.</strong> Saving the file, or changing it on disk (a <code>git pull</code>, say), restarts the project with the new settings. The old results stay until the new build completes.</li>
+          <li><strong>Errors ignore the whole file.</strong> A syntax error, a wrong type, or an unknown option is shown at its location, in the file and as a warning, and the whole file is ignored until it is fixed, so a typo never applies half a configuration.</li>
+          <li><strong>The editor helps.</strong> In <code>zig-analyzer.zon</code>, completion offers the options and enum values that can be set, and hover shows each option's description from the reference file.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="options" class="section">
+      <div class="wrap prose">
+        <h2 class="section-title"><span class="hash">//</span> All options</h2>
+        <p class="section-lead">A summary of <code>zig-analyzer.default.zon</code>, which has the full description and an example of each. <span class="scope project">project</span> options can be set in the editor and in <code>zig-analyzer.zon</code>; <span class="scope">editor</span> options only in the editor.</p>
+
+        <div class="table-wrap">
+          <table class="options">
+            <thead><tr><th>Option</th><th>Default</th><th>Scope</th><th>What it does</th></tr></thead>
+            <tbody>
+              <tr class="group"><th colspan="4"><code>zig</code>: the Zig installation</th></tr>
+              <tr><td><code>zig.path</code></td><td>from <code>PATH</code></td><td><span class="scope">editor</span></td><td>The <code>zig</code> executable, 0.17.0 or 0.17.1. Takes effect after a restart.</td></tr>
+              <tr><td><code>zig.lib_path</code></td><td>from <code>zig env</code></td><td><span class="scope">editor</span></td><td>Lib directory containing <code>std/std.zig</code>.</td></tr>
+              <tr><td><code>zig.global_cache_path</code></td><td>from <code>zig env</code></td><td><span class="scope">editor</span></td><td>Global cache directory.</td></tr>
+              <tr><td><code>zig.builtin_path</code></td><td>native target</td><td><span class="scope">editor</span></td><td><code>@import("builtin")</code> of files outside any project.</td></tr>
+
+              <tr class="group"><th colspan="4"><code>build</code>: how projects are built</th></tr>
+              <tr><td><code>build.enable</code></td><td><code>true</code></td><td><span class="scope">editor</span></td><td>Load projects through the build system; <code>false</code> uses single-file mode everywhere.</td></tr>
+              <tr><td><code>build.args</code></td><td><code>.{}</code></td><td><span class="scope project">project</span></td><td>Extra arguments for <code>zig build</code>, such as <code>-Dtarget=...</code>.</td></tr>
+              <tr><td><code>build.sub_projects</code></td><td><code>true</code></td><td><span class="scope">editor</span></td><td>Load sub-projects that depend on a loaded project by <code>.path</code> (such as a library's examples).</td></tr>
+
+              <tr class="group"><th colspan="4"><code>diagnostics</code></th></tr>
+              <tr><td><code>diagnostics.steps</code></td><td><code>.{}</code></td><td><span class="scope project">project</span></td><td>Build steps for compiler diagnostics; empty means <code>check</code> if it exists, else the default step.</td></tr>
+              <tr><td><code>diagnostics.compiler</code></td><td><code>true</code></td><td><span class="scope project">project</span></td><td>Run the compiler on save; <code>false</code> leaves only live diagnostics (syntax and AstGen).</td></tr>
+              <tr><td><code>diagnostics.inactive_code</code></td><td><code>false</code></td><td><span class="scope">editor</span></td><td>Mark code the current build configuration does not compile as inactive.</td></tr>
+              <tr><td><code>diagnostics.debounce_ms</code></td><td><code>50</code></td><td><span class="scope">editor</span></td><td>Milliseconds without edits before live diagnostics run.</td></tr>
+
+              <tr class="group"><th colspan="4"><code>inlay_hints</code></th></tr>
+              <tr><td><code>types</code>, <code>capture_types</code>, <code>field_types</code></td><td><code>true</code></td><td><span class="scope">editor</span></td><td>Types of untyped locals, of captures, and of fields in initializers.</td></tr>
+              <tr><td><code>anonymous_containers</code></td><td><code>false</code></td><td><span class="scope">editor</span></td><td>Also show types that have an anonymous container.</td></tr>
+              <tr><td><code>parameters</code>, <code>builtin_parameters</code></td><td><code>true</code></td><td><span class="scope">editor</span></td><td>Parameter names at call arguments, and at arguments of builtins such as <code>@memcpy</code>.</td></tr>
+              <tr><td><code>exclude_single_argument</code></td><td><code>true</code></td><td><span class="scope">editor</span></td><td>No parameter names for single-argument calls.</td></tr>
+              <tr><td><code>hide_redundant_param_names</code></td><td><code>true</code></td><td><span class="scope">editor</span></td><td>Hide a parameter name the argument already has.</td></tr>
+              <tr><td><code>max_length</code></td><td><code>25</code></td><td><span class="scope">editor</span></td><td>Truncate longer type hints with <code>…</code>; <code>0</code> never truncates.</td></tr>
+
+              <tr class="group"><th colspan="4"><code>semantic_tokens</code>, <code>hover</code></th></tr>
+              <tr><td><code>semantic_tokens.mode</code></td><td><code>.full</code></td><td><span class="scope">editor</span></td><td><code>.partial</code> sends only tokens that need name resolution, leaving the rest to the editor's highlighting.</td></tr>
+              <tr><td><code>semantic_tokens.global_var</code></td><td><code>false</code></td><td><span class="scope">editor</span></td><td>Mark container-level <code>var</code>s with the <code>global</code> modifier.</td></tr>
+              <tr><td><code>hover.layout</code></td><td><code>true</code></td><td><span class="scope">editor</span></td><td>Show the size, alignment, and field offsets of types.</td></tr>
+              <tr><td><code>hover.instances</code></td><td><code>.count</code></td><td><span class="scope">editor</span></td><td>In generic code, <code>.full</code> shows every instance's declaration instead of how many there are.</td></tr>
+              <tr><td><code>hover.fqn</code></td><td><code>false</code></td><td><span class="scope">editor</span></td><td>Also show the compiler's fully qualified name.</td></tr>
+
+              <tr class="group"><th colspan="4"><code>completion</code></th></tr>
+              <tr><td><code>auto_import</code></td><td><code>true</code></td><td><span class="scope">editor</span></td><td>Offer declarations not imported yet, adding the import.</td></tr>
+              <tr><td><code>max_auto_imports</code></td><td><code>128</code></td><td><span class="scope">editor</span></td><td>At most this many candidates besides the names in scope; <code>0</code> never limits.</td></tr>
+              <tr><td><code>snippets</code>, <code>call_snippets</code>, <code>argument_placeholders</code></td><td><code>true</code></td><td><span class="scope">editor</span></td><td>Statement and declaration snippets, functions completed as calls, and a placeholder per argument.</td></tr>
+
+              <tr class="group"><th colspan="4"><code>imports</code>: Organize imports and auto-import</th></tr>
+              <tr><td><code>imports.derived</code></td><td><code>.with_import</code></td><td><span class="scope project">project</span></td><td>Where <code>const Allocator = std.mem.Allocator;</code> goes: after its import, or <code>.separate</code> in a last group.</td></tr>
+              <tr><td><code>imports.sort</code></td><td><code>.path</code></td><td><span class="scope project">project</span></td><td>Order within a group: by what is imported, or <code>.name</code> by declaration name.</td></tr>
+
+              <tr class="group"><th colspan="4"><code>naming</code>, <code>unused</code>, <code>lint</code>: opt-in hints</th></tr>
+              <tr><td><code>naming.enable</code></td><td><code>false</code></td><td><span class="scope project">project</span></td><td>Hint names that do not follow the Zig style guide, with rename fixes.</td></tr>
+              <tr><td><code>naming.ignore</code>, <code>naming.exclude</code></td><td><code>.{}</code></td><td><span class="scope project">project</span></td><td>Names and files to skip; <code>*</code> matches any characters.</td></tr>
+              <tr><td><code>naming.rules</code></td><td>all <code>true</code></td><td><span class="scope project">project</span></td><td><code>type</code>, <code>type_function</code>, <code>function</code>, <code>namespace</code>, <code>value</code>, <code>field</code>.</td></tr>
+              <tr><td><code>unused.enable</code></td><td><code>false</code></td><td><span class="scope project">project</span></td><td>Hint private declarations no code in their file uses.</td></tr>
+              <tr><td><code>lint.enable</code></td><td><code>false</code></td><td><span class="scope project">project</span></td><td>Hint code that compiles but has no effect or a constant result.</td></tr>
+              <tr><td><code>lint.rules</code></td><td>all <code>true</code></td><td><span class="scope project">project</span></td><td><code>redundant_cast</code>, <code>constant_comparison</code>, <code>dead_errdefer</code>.</td></tr>
+
+              <tr class="group"><th colspan="4">Performance and environment</th></tr>
+              <tr><td><code>sema.callsite_seeding</code></td><td><code>true</code></td><td><span class="scope">editor</span></td><td>Infer generic function bodies with the instances from their call sites.</td></tr>
+              <tr><td><code>sema.wait_for_project</code></td><td><code>false</code></td><td><span class="scope">editor</span></td><td>Make requests wait for the projects to load, so every answer is complete.</td></tr>
+              <tr><td><code>sema.max_intern_pool_mb</code></td><td><code>64</code></td><td><span class="scope">editor</span></td><td>Discard cached type information above this size; <code>0</code> never discards.</td></tr>
+              <tr><td><code>cache.capacity</code>, <code>cache.queries</code></td><td><code>64</code></td><td><span class="scope">editor</span></td><td>Memory limits of the caches; they trade memory for time and never change results.</td></tr>
+              <tr><td><code>workspace_symbol.dependencies</code></td><td><code>false</code></td><td><span class="scope">editor</span></td><td>Also list symbols from dependencies.</td></tr>
+              <tr><td><code>workspace_symbol.limit</code></td><td><code>256</code></td><td><span class="scope">editor</span></td><td>At most this many symbols per query; <code>0</code> never limits.</td></tr>
+              <tr><td><code>files.watcher</code></td><td><code>.auto</code></td><td><span class="scope">editor</span></td><td>Who detects changes on disk: <code>.auto</code>, <code>.client</code>, or <code>.server</code>.</td></tr>
+              <tr><td><code>log.level</code>, <code>log.file</code></td><td><code>.info</code>, stderr</td><td><span class="scope">editor</span></td><td>Log level, and a file to append logs to.</td></tr>
+              <tr><td><code>log.slow_request_ms</code></td><td><code>100</code></td><td><span class="scope">editor</span></td><td>Log a query breakdown for slower requests; <code>0</code> turns it off.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="troubleshooting" class="section">
+      <div class="wrap prose">
+        <h2 class="section-title"><span class="hash">//</span> Troubleshooting</h2>
+        <ul>
+          <li><strong>A setting does not apply.</strong> Check whether the project's <code>zig-analyzer.zon</code> sets it; the file wins over the editor. Check also that the file has no error, since an error ignores the whole file.</li>
+          <li><strong>No compiler diagnostics.</strong> Run <code>zig version</code>: projects need 0.17.0 or 0.17.1. Add a <code>check</code> step to <code>build.zig</code> that depends on the compile steps and tests, or set <code>diagnostics.steps</code>.</li>
+          <li><strong>Two servers run.</strong> ZLS and zig-analyzer both give diagnostics and formatting; turn ZLS off in the editor or the other Zig extension.</li>
+          <li><strong>Something else.</strong> Set <code>log.level</code> to <code>.debug</code> and <code>log.file</code> to a path, and use the plugin's status commands to see what the server knows about the project and the file.</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="wrap footer-inner">
+      <span>zig-analyzer · <a href="https://github.com/jinzhongjia/zig-analyzer/blob/main/LICENSE">MIT License</a></span>
+      <span class="muted">Not affiliated with the Zig Software Foundation.</span>
+    </div>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>
