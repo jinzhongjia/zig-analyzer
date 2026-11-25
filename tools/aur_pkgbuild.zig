@@ -1,12 +1,16 @@
-//! Writes the AUR package zig-analyzer-bin of a release (`PKGBUILD` and `.SRCINFO`), which the
-//! release workflow pushes to ssh://aur@aur.archlinux.org/zig-analyzer-bin.git.
+//! Writes the AUR packages of a release (`PKGBUILD` and `.SRCINFO` of each), which the release
+//! workflow pushes to ssh://aur@aur.archlinux.org/<package>.git:
+//!
+//! - zig-analyzer-bin installs the ReleaseSafe archives of Linux (x86_64 and aarch64).
+//! - zig-analyzer builds the tagged source with the zig of Arch Linux, as the release does
+//!   (ReleaseSafe, baseline CPU).
 //!
 //! Usage: zig build aur-pkgbuild -- <tag> <SHA256SUMS of the release> <output directory>
 //!
-//! The package installs the ReleaseSafe archives of Linux (x86_64 and aarch64). The executable is
-//! not stripped: it carries the debug information that gives stack traces file names and line
-//! numbers. `.SRCINFO` is written here, as `makepkg --printsrcinfo` would, so that no Arch Linux
-//! system is needed.
+//! Each package is written to the subdirectory of the output directory named after it. The
+//! executable is not stripped: it carries the debug information that gives stack traces file names
+//! and line numbers. `.SRCINFO` is written here, as `makepkg --printsrcinfo` would, so that no Arch
+//! Linux system is needed.
 
 const std = @import("std");
 const Io = std.Io;
@@ -14,11 +18,13 @@ const Io = std.Io;
 const checksum = @import("homebrew_formula.zig").checksum;
 
 const repo_url = "https://github.com/jinzhongjia/zig-analyzer";
-const pkgname = "zig-analyzer-bin";
 const pkgdesc = "Zig language server with compiler diagnostics and comptime-aware analysis";
 const optdepend = "zig: diagnostics and build.zig projects (Zig 0.17.0 or 0.17.1)";
+/// The zig versions that build the source package (`minimum_zig_version` in `build.zig.zon` up to
+/// the next minor version, whose language and standard library changes break the build)
+const zig_makedepends = [_][]const u8{ "zig>=0.17.0", "zig<0.18" };
 
-/// The archives of the package, by the Arch Linux architecture (`CARCH`) that selects them
+/// The archives of zig-analyzer-bin, by the Arch Linux architecture (`CARCH`) that selects them
 const arches = [_][]const u8{ "x86_64", "aarch64" };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -29,45 +35,53 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("usage: {s} <tag> <SHA256SUMS> <output directory>\n", .{args[0]});
         return 2;
     }
+    const tag = args[1];
+    const version = releaseVersion(tag) orelse {
+        std.debug.print("error: {s} is a pre-release, which the AUR packages do not follow\n", .{tag});
+        return 1;
+    };
     const sums = try Io.Dir.cwd().readFileAlloc(io, args[2], arena, .unlimited);
+    var out = try Io.Dir.cwd().openDir(io, args[3], .{});
+    defer out.close(io);
+
     var pkgbuild: Io.Writer.Allocating = .init(arena);
     var srcinfo: Io.Writer.Allocating = .init(arena);
-    package(&pkgbuild.writer, &srcinfo.writer, args[1], sums) catch |err| switch (err) {
+    binPackage(&pkgbuild.writer, &srcinfo.writer, tag, version, sums) catch |err| switch (err) {
         error.MissingArchive => {
-            std.debug.print("error: {s} lacks a ReleaseSafe archive of {s}\n", .{ args[2], args[1] });
-            return 1;
-        },
-        error.PreRelease => {
-            std.debug.print("error: {s} is a pre-release, which the AUR package does not follow\n", .{args[1]});
+            std.debug.print("error: {s} lacks a ReleaseSafe archive of {s}\n", .{ args[2], tag });
             return 1;
         },
         else => |e| return e,
     };
-    var dir = try Io.Dir.cwd().openDir(io, args[3], .{});
-    defer dir.close(io);
-    try dir.writeFile(io, .{ .sub_path = "PKGBUILD", .data = pkgbuild.written() });
-    try dir.writeFile(io, .{ .sub_path = ".SRCINFO", .data = srcinfo.written() });
+    try writePackage(io, out, "zig-analyzer-bin", pkgbuild.written(), srcinfo.written());
+
+    pkgbuild.clearRetainingCapacity();
+    srcinfo.clearRetainingCapacity();
+    try sourcePackage(&pkgbuild.writer, &srcinfo.writer, version);
+    try writePackage(io, out, "zig-analyzer", pkgbuild.written(), srcinfo.written());
     return 0;
 }
 
-/// The `PKGBUILD` and `.SRCINFO` of the release `tag`, whose archives have the checksums listed in
-/// `sums` (the output of `sha256sum`)
-fn package(
-    pkgbuild: *Io.Writer,
-    srcinfo: *Io.Writer,
-    tag: []const u8,
-    sums: []const u8,
-) (Io.Writer.Error || error{ MissingArchive, PreRelease })!void {
-    const version = std.mem.cutPrefix(u8, tag, "v") orelse tag;
-    // pkgver cannot hold `-`, and pre-releases stay out of the package
-    if (std.mem.indexOfScalar(u8, version, '-') != null) return error.PreRelease;
-    var hashes: [arches.len][]const u8 = undefined;
-    for (arches, &hashes) |arch, *hash| {
-        const target = if (std.mem.eql(u8, arch, "x86_64")) "x86_64-linux" else "aarch64-linux";
-        hash.* = checksum(sums, tag, target) orelse return error.MissingArchive;
-    }
+/// Writes `PKGBUILD` and `.SRCINFO` to the subdirectory `pkgname` of `out`
+fn writePackage(io: Io, out: Io.Dir, pkgname: []const u8, pkgbuild: []const u8, srcinfo: []const u8) !void {
+    try out.createDirPath(io, pkgname);
+    var dir = try out.openDir(io, pkgname, .{});
+    defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = "PKGBUILD", .data = pkgbuild });
+    try dir.writeFile(io, .{ .sub_path = ".SRCINFO", .data = srcinfo });
+}
 
-    try pkgbuild.print(
+/// The `pkgver` of the release `tag`; null for a pre-release, which stays out of the packages
+/// (`pkgver` cannot hold `-` either)
+fn releaseVersion(tag: []const u8) ?[]const u8 {
+    const version = std.mem.cutPrefix(u8, tag, "v") orelse tag;
+    if (std.mem.indexOfScalar(u8, version, '-') != null) return null;
+    return version;
+}
+
+/// The lines of `PKGBUILD` up to `optdepends`, shared by the packages
+fn pkgbuildHeader(w: *Io.Writer, pkgname: []const u8, version: []const u8) Io.Writer.Error!void {
+    try w.print(
         \\# Maintainer: jinzhongjia <mail@nvimer.org>
         \\# Generated by tools/aur_pkgbuild.zig in jinzhongjia/zig-analyzer for each release.
         \\pkgname={s}
@@ -77,12 +91,50 @@ fn package(
         \\arch=('x86_64' 'aarch64')
         \\url="{s}"
         \\license=('MIT')
+        \\
+    , .{ pkgname, version, pkgdesc, repo_url });
+}
+
+/// The fields of `.SRCINFO` up to `license`, shared by the packages; .SRCINFO indents the fields of
+/// the package base with a tab
+fn srcinfoHeader(w: *Io.Writer, pkgname: []const u8, version: []const u8) Io.Writer.Error!void {
+    try w.print("pkgbase = {s}\n", .{pkgname});
+    const fields = [_][2][]const u8{
+        .{ "pkgdesc", pkgdesc },
+        .{ "pkgver", version },
+        .{ "pkgrel", "1" },
+        .{ "url", repo_url },
+        .{ "arch", "x86_64" },
+        .{ "arch", "aarch64" },
+        .{ "license", "MIT" },
+    };
+    for (fields) |f| try w.print("\t{s} = {s}\n", .{ f[0], f[1] });
+}
+
+/// zig-analyzer-bin of the release `tag`, whose archives have the checksums listed in `sums` (the
+/// output of `sha256sum`)
+fn binPackage(
+    pkgbuild: *Io.Writer,
+    srcinfo: *Io.Writer,
+    tag: []const u8,
+    version: []const u8,
+    sums: []const u8,
+) (Io.Writer.Error || error{MissingArchive})!void {
+    const pkgname = "zig-analyzer-bin";
+    var hashes: [arches.len][]const u8 = undefined;
+    for (arches, &hashes) |arch, *hash| {
+        const target = if (std.mem.eql(u8, arch, "x86_64")) "x86_64-linux" else "aarch64-linux";
+        hash.* = checksum(sums, tag, target) orelse return error.MissingArchive;
+    }
+
+    try pkgbuildHeader(pkgbuild, pkgname, version);
+    try pkgbuild.print(
         \\provides=('zig-analyzer')
         \\conflicts=('zig-analyzer')
         \\optdepends=('{s}')
         \\options=('!strip' '!debug')
         \\
-    , .{ pkgname, version, pkgdesc, repo_url, optdepend });
+    , .{optdepend});
     for (arches, hashes) |arch, hash| {
         try pkgbuild.print(
             \\source_{s}=("{s}/releases/download/v${{pkgver}}/zig-analyzer-v${{pkgver}}-{s}-linux-ReleaseSafe.tar.gz")
@@ -101,16 +153,8 @@ fn package(
         \\
     );
 
-    // .SRCINFO indents the fields of the package base with a tab
-    try srcinfo.print("pkgbase = {s}\n", .{pkgname});
+    try srcinfoHeader(srcinfo, pkgname, version);
     const fields = [_][2][]const u8{
-        .{ "pkgdesc", pkgdesc },
-        .{ "pkgver", version },
-        .{ "pkgrel", "1" },
-        .{ "url", repo_url },
-        .{ "arch", "x86_64" },
-        .{ "arch", "aarch64" },
-        .{ "license", "MIT" },
         .{ "optdepends", optdepend },
         .{ "provides", "zig-analyzer" },
         .{ "conflicts", "zig-analyzer" },
@@ -125,19 +169,72 @@ fn package(
     try srcinfo.print("\npkgname = {s}\n", .{pkgname});
 }
 
-test package {
-    const sums =
-        \\1111111111111111111111111111111111111111111111111111111111111111  zig-analyzer-v1.2.3-aarch64-macos-ReleaseSafe.tar.gz
-        \\3333333333333333333333333333333333333333333333333333333333333333 *zig-analyzer-v1.2.3-aarch64-linux-ReleaseSafe.tar.gz
-        \\4444444444444444444444444444444444444444444444444444444444444444  zig-analyzer-v1.2.3-x86_64-linux-ReleaseSafe.tar.gz
-        \\5555555555555555555555555555555555555555555555555555555555555555  zig-analyzer-v1.2.3-x86_64-linux-ReleaseFast.tar.gz
+/// zig-analyzer of the release `version`, built from the tag's source. The source is a git checkout:
+/// the build takes the version from the tag (a GitHub source archive has no git metadata and gives
+/// a development version).
+fn sourcePackage(
+    pkgbuild: *Io.Writer,
+    srcinfo: *Io.Writer,
+    version: []const u8,
+) Io.Writer.Error!void {
+    const pkgname = "zig-analyzer";
+
+    try pkgbuildHeader(pkgbuild, pkgname, version);
+    try pkgbuild.writeAll("makedepends=('git'");
+    for (zig_makedepends) |d| try pkgbuild.print(" '{s}'", .{d});
+    try pkgbuild.print(
+        \\)
+        \\optdepends=('{s}')
+        \\options=('!strip' '!debug')
+        \\source=("git+{s}.git#tag=v${{pkgver}}")
+        \\sha256sums=('SKIP')
         \\
-    ;
+        \\build() {{
+        \\  cd zig-analyzer
+        \\  ZIG_GLOBAL_CACHE_DIR="$srcdir/zig-global-cache" zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+        \\}}
+        \\
+        \\package() {{
+        \\  cd zig-analyzer
+        \\  install -Dm755 zig-out/bin/zig-analyzer "$pkgdir/usr/bin/zig-analyzer"
+        \\  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+        \\  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+        \\}}
+        \\
+    , .{ optdepend, repo_url });
+
+    try srcinfoHeader(srcinfo, pkgname, version);
+    try srcinfo.writeAll("\tmakedepends = git\n");
+    for (zig_makedepends) |d| try srcinfo.print("\tmakedepends = {s}\n", .{d});
+    const fields = [_][2][]const u8{
+        .{ "optdepends", optdepend },
+        .{ "options", "!strip" },
+        .{ "options", "!debug" },
+    };
+    for (fields) |f| try srcinfo.print("\t{s} = {s}\n", .{ f[0], f[1] });
+    try srcinfo.print("\tsource = git+{s}.git#tag=v{s}\n", .{ repo_url, version });
+    try srcinfo.print("\tsha256sums = SKIP\n\npkgname = {s}\n", .{pkgname});
+}
+
+const test_sums =
+    \\1111111111111111111111111111111111111111111111111111111111111111  zig-analyzer-v1.2.3-aarch64-macos-ReleaseSafe.tar.gz
+    \\3333333333333333333333333333333333333333333333333333333333333333 *zig-analyzer-v1.2.3-aarch64-linux-ReleaseSafe.tar.gz
+    \\4444444444444444444444444444444444444444444444444444444444444444  zig-analyzer-v1.2.3-x86_64-linux-ReleaseSafe.tar.gz
+    \\5555555555555555555555555555555555555555555555555555555555555555  zig-analyzer-v1.2.3-x86_64-linux-ReleaseFast.tar.gz
+    \\
+;
+
+test releaseVersion {
+    try std.testing.expectEqualStrings("1.2.3", releaseVersion("v1.2.3").?);
+    try std.testing.expectEqual(null, releaseVersion("v1.2.3-rc.1"));
+}
+
+test binPackage {
     var pkgbuild: Io.Writer.Allocating = .init(std.testing.allocator);
     defer pkgbuild.deinit();
     var srcinfo: Io.Writer.Allocating = .init(std.testing.allocator);
     defer srcinfo.deinit();
-    try package(&pkgbuild.writer, &srcinfo.writer, "v1.2.3", sums);
+    try binPackage(&pkgbuild.writer, &srcinfo.writer, "v1.2.3", "1.2.3", test_sums);
     try std.testing.expectEqualStrings(
         \\# Maintainer: jinzhongjia <mail@nvimer.org>
         \\# Generated by tools/aur_pkgbuild.zig in jinzhongjia/zig-analyzer for each release.
@@ -185,9 +282,63 @@ test package {
         "\n" ++
         "pkgname = zig-analyzer-bin\n", srcinfo.written());
 
-    // Every archive must be listed, and pre-releases are refused
+    // Every archive must be listed
     pkgbuild.clearRetainingCapacity();
     srcinfo.clearRetainingCapacity();
-    try std.testing.expectError(error.MissingArchive, package(&pkgbuild.writer, &srcinfo.writer, "v1.2.4", sums));
-    try std.testing.expectError(error.PreRelease, package(&pkgbuild.writer, &srcinfo.writer, "v1.2.3-rc.1", sums));
+    try std.testing.expectError(error.MissingArchive, binPackage(&pkgbuild.writer, &srcinfo.writer, "v1.2.4", "1.2.4", test_sums));
+}
+
+test sourcePackage {
+    var pkgbuild: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer pkgbuild.deinit();
+    var srcinfo: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer srcinfo.deinit();
+    try sourcePackage(&pkgbuild.writer, &srcinfo.writer, "1.2.3");
+    try std.testing.expectEqualStrings(
+        \\# Maintainer: jinzhongjia <mail@nvimer.org>
+        \\# Generated by tools/aur_pkgbuild.zig in jinzhongjia/zig-analyzer for each release.
+        \\pkgname=zig-analyzer
+        \\pkgver=1.2.3
+        \\pkgrel=1
+        \\pkgdesc="Zig language server with compiler diagnostics and comptime-aware analysis"
+        \\arch=('x86_64' 'aarch64')
+        \\url="https://github.com/jinzhongjia/zig-analyzer"
+        \\license=('MIT')
+        \\makedepends=('git' 'zig>=0.17.0' 'zig<0.18')
+        \\optdepends=('zig: diagnostics and build.zig projects (Zig 0.17.0 or 0.17.1)')
+        \\options=('!strip' '!debug')
+        \\source=("git+https://github.com/jinzhongjia/zig-analyzer.git#tag=v${pkgver}")
+        \\sha256sums=('SKIP')
+        \\
+        \\build() {
+        \\  cd zig-analyzer
+        \\  ZIG_GLOBAL_CACHE_DIR="$srcdir/zig-global-cache" zig build -Doptimize=ReleaseSafe -Dcpu=baseline
+        \\}
+        \\
+        \\package() {
+        \\  cd zig-analyzer
+        \\  install -Dm755 zig-out/bin/zig-analyzer "$pkgdir/usr/bin/zig-analyzer"
+        \\  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+        \\  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+        \\}
+        \\
+    , pkgbuild.written());
+    try std.testing.expectEqualStrings("pkgbase = zig-analyzer\n" ++
+        "\tpkgdesc = Zig language server with compiler diagnostics and comptime-aware analysis\n" ++
+        "\tpkgver = 1.2.3\n" ++
+        "\tpkgrel = 1\n" ++
+        "\turl = https://github.com/jinzhongjia/zig-analyzer\n" ++
+        "\tarch = x86_64\n" ++
+        "\tarch = aarch64\n" ++
+        "\tlicense = MIT\n" ++
+        "\tmakedepends = git\n" ++
+        "\tmakedepends = zig>=0.17.0\n" ++
+        "\tmakedepends = zig<0.18\n" ++
+        "\toptdepends = zig: diagnostics and build.zig projects (Zig 0.17.0 or 0.17.1)\n" ++
+        "\toptions = !strip\n" ++
+        "\toptions = !debug\n" ++
+        "\tsource = git+https://github.com/jinzhongjia/zig-analyzer.git#tag=v1.2.3\n" ++
+        "\tsha256sums = SKIP\n" ++
+        "\n" ++
+        "pkgname = zig-analyzer\n", srcinfo.written());
 }
