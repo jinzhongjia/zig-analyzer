@@ -349,11 +349,11 @@ jobs:
           git push origin HEAD:main
 
   aur:
-    name: Update the AUR package
+    name: Update the AUR packages
     needs: release
     if: ${{ !cancelled() && needs.release.result == 'success' && !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     environment: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -365,35 +365,41 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release download "$GITHUB_REF_NAME" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
-      - name: Write the package
+      - name: Write the packages
         run: |
-          mkdir "$RUNNER_TEMP/package"
-          zig build aur-pkgbuild -- "$GITHUB_REF_NAME" "$RUNNER_TEMP/SHA256SUMS" "$RUNNER_TEMP/package"
-      # The package must build, install, and run on Arch Linux, and its .SRCINFO must be what
-      # makepkg writes, before it reaches the AUR
-      - name: Build and install the package on Arch Linux
+          mkdir "$RUNNER_TEMP/packages"
+          zig build aur-pkgbuild -- "$GITHUB_REF_NAME" "$RUNNER_TEMP/SHA256SUMS" "$RUNNER_TEMP/packages"
+      # Each package must build, install, and run on Arch Linux, and its .SRCINFO must be what
+      # makepkg writes, before it reaches the AUR; zig-analyzer builds the tag with the zig of
+      # Arch Linux
+      - name: Build and install the packages on Arch Linux
         run: |
           # pacman's download sandbox needs seccomp and Landlock, which containers may not offer
-          docker run --rm -v "$RUNNER_TEMP/package:/package:ro" archlinux:base-devel bash -euo pipefail -c '
+          docker run --rm -v "$RUNNER_TEMP/packages:/packages:ro" archlinux:base-devel bash -euo pipefail -c '
             sed -i "/^\[options\]/a DisableSandbox" /etc/pacman.conf
-            pacman -Syu --noconfirm --needed namcap > /dev/null
+            pacman -Syu --noconfirm --needed namcap git zig > /dev/null
             useradd -m builder
-            cp -r /package /home/builder/package
-            chown -R builder /home/builder/package
-            cd /home/builder/package
-            su builder -c "makepkg --printsrcinfo" | diff -u .SRCINFO -
-            su builder -c "makepkg --noconfirm"
-            namcap PKGBUILD ./*.pkg.tar.zst
-            pacman -U --noconfirm ./*.pkg.tar.zst
-            test "$(zig-analyzer --version)" = "${0#v}"
+            for package in zig-analyzer-bin zig-analyzer; do
+              echo "::group::$package"
+              cp -r "/packages/$package" "/home/builder/$package"
+              chown -R builder "/home/builder/$package"
+              cd "/home/builder/$package"
+              su builder -c "makepkg --printsrcinfo" | diff -u .SRCINFO -
+              su builder -c "makepkg --noconfirm"
+              namcap PKGBUILD ./*.pkg.tar.zst
+              pacman -U --noconfirm ./*.pkg.tar.zst
+              test "$(zig-analyzer --version)" = "${0#v}"
+              pacman -R --noconfirm "$package"
+              echo "::endgroup::"
+            done
           ' "$GITHUB_REF_NAME"
-      - name: Push the package to the AUR
-        # The SSH key of the AUR account that maintains zig-analyzer-bin
+      - name: Push the packages to the AUR
+        # The SSH key of the AUR account that maintains zig-analyzer-bin and zig-analyzer
         env:
           AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
           if [ -z "$AUR_KEY" ]; then
-            echo "::error::The secret AUR_SSH_PRIVATE_KEY (the SSH key of the AUR account of zig-analyzer-bin) of the environment release is not set"
+            echo "::error::The secret AUR_SSH_PRIVATE_KEY (the SSH key of the AUR account of zig-analyzer-bin and zig-analyzer) of the environment release is not set"
             exit 1
           fi
           mkdir -p ~/.ssh
@@ -402,15 +408,17 @@ jobs:
           # The AUR's published host key (SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4)
           echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' > ~/.ssh/known_hosts
           export GIT_SSH_COMMAND='ssh -i ~/.ssh/aur_key -o IdentitiesOnly=yes'
-          # Cloning a package that does not exist yet gives an empty repository, which the push creates
-          git clone -q ssh://aur@aur.archlinux.org/zig-analyzer-bin.git "$RUNNER_TEMP/aur"
-          cp "$RUNNER_TEMP/package/PKGBUILD" "$RUNNER_TEMP/package/.SRCINFO" "$RUNNER_TEMP/aur/"
-          cd "$RUNNER_TEMP/aur"
-          git add PKGBUILD .SRCINFO
-          if git diff --cached --quiet; then
-            echo "The package is already at $GITHUB_REF_NAME"
-            exit 0
-          fi
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -q -m "zig-analyzer-bin ${GITHUB_REF_NAME#v}-1"
-          git push origin HEAD:master
+          for package in zig-analyzer-bin zig-analyzer; do
+            # Cloning a package that does not exist yet gives an empty repository, which the push creates
+            git clone -q "ssh://aur@aur.archlinux.org/$package.git" "$RUNNER_TEMP/aur/$package"
+            cp "$RUNNER_TEMP/packages/$package/PKGBUILD" "$RUNNER_TEMP/packages/$package/.SRCINFO" "$RUNNER_TEMP/aur/$package/"
+            cd "$RUNNER_TEMP/aur/$package"
+            git add PKGBUILD .SRCINFO
+            if git diff --cached --quiet; then
+              echo "$package is already at $GITHUB_REF_NAME"
+            else
+              git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit -q -m "$package ${GITHUB_REF_NAME#v}-1"
+              git push origin HEAD:master
+            fi
+          done

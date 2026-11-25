@@ -25,15 +25,16 @@ Pushing it runs `.github/workflows/release.yml`:
 6. **homebrew** (not for pre-releases): the formula that `zig build homebrew-formula`
    (`tools/homebrew_formula.zig`) writes from the release's `SHA256SUMS` is committed to the tap
    `jinzhongjia/homebrew-tap`, whose CI then audits, installs, and tests it on macOS and Linux.
-7. **aur** (not for pre-releases): the `PKGBUILD` and `.SRCINFO` of `zig-analyzer-bin` that
-   `zig build aur-pkgbuild` (`tools/aur_pkgbuild.zig`) writes from the release's `SHA256SUMS` are
-   built, checked with namcap, installed, and run in an `archlinux` container, then pushed to
-   `ssh://aur@aur.archlinux.org/zig-analyzer-bin.git`.
+7. **aur** (not for pre-releases): the `PKGBUILD` and `.SRCINFO` that `zig build aur-pkgbuild`
+   (`tools/aur_pkgbuild.zig`) writes for `zig-analyzer-bin` (the release archives, from the
+   release's `SHA256SUMS`) and `zig-analyzer` (the tag built from source with Arch Linux's `zig`)
+   are built, checked with namcap, installed, and run in an `archlinux` container, then pushed to
+   `ssh://aur@aur.archlinux.org/<package>.git`.
 
 The signing key is in the secrets `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` of the `release`
 environment, which only `v*` tags can deploy to; `HOMEBREW_TAP_DEPLOY_KEY` there is a deploy key of
 the tap with write access, and `AUR_SSH_PRIVATE_KEY` the SSH key of the AUR account that maintains
-`zig-analyzer-bin`. Only repository admins can create, move, or delete
+`zig-analyzer-bin` and `zig-analyzer`. Only repository admins can create, move, or delete
 `v*` tags (ruleset "Release tags"), and published releases are immutable. The editor extensions in
 `editors/` are versioned and published separately; a release does not touch them (the VS Code
 extension: the release-vscode skill).
@@ -205,7 +206,8 @@ extract and check that `zig-analyzer --version` prints `X.Y.Z`.
 
 For a final release, check that the tap has the commit `zig-analyzer X.Y.Z` and that its CI passed
 (`gh run list -R jinzhongjia/homebrew-tap --limit 1`), and that
-https://aur.archlinux.org/packages/zig-analyzer-bin shows `X.Y.Z-1`. The Scoop manifest `bucket/zig-analyzer.json`
+https://aur.archlinux.org/packages/zig-analyzer-bin and https://aur.archlinux.org/packages/zig-analyzer show
+`X.Y.Z-1`. The Scoop manifest `bucket/zig-analyzer.json`
 of `jinzhongjia/scoop-bucket` is not updated by this workflow: the bucket's Excavator workflow
 picks up the latest release within four hours (its `checkver` and `autoupdate`, hashes from
 `SHA256SUMS`).
@@ -241,6 +243,6 @@ admin (the ruleset lets the user, not the workflow, do it).
   `main`) and rerun the job (`gh run rerun <run id> --failed`). It runs the tool of the tagged
   commit, so a fixed tool applies from the next release; until then, generate the formula with
   the fixed tool and commit it to the tap by hand (with consent).
-- `aur` fails: the release is published; the same applies, with the AUR package in place of the
-  formula. To change the package within a version (a fix of `PKGBUILD` only), raise `pkgrel` in
+- `aur` fails: the release is published; the same applies, with the AUR packages in place of the
+  formula. To change a package within a version (a fix of `PKGBUILD` only), raise `pkgrel` in
   both files and push by hand (with consent).
