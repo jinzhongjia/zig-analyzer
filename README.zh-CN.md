@@ -67,7 +67,7 @@ macOS 和 Linux 上可以用 [Homebrew](https://brew.sh) 安装：
 brew install jinzhongjia/tap/zig-analyzer
 ```
 
-Arch Linux（x86_64 和 aarch64）上可以从 [AUR](https://aur.archlinux.org/packages/zig-analyzer-bin) 安装，例如用 AUR 助手 yay：
+Arch Linux（x86_64 和 aarch64）上可以从 AUR 安装，例如用 AUR 助手 yay：[`zig-analyzer-bin`](https://aur.archlinux.org/packages/zig-analyzer-bin) 安装 release 压缩包，[`zig-analyzer`](https://aur.archlinux.org/packages/zig-analyzer) 用 `zig` 包从源码构建 release：
 
 ```sh
 yay -S zig-analyzer-bin

@@ -67,7 +67,7 @@ On macOS and Linux, with [Homebrew](https://brew.sh):
 brew install jinzhongjia/tap/zig-analyzer
 ```
 
-On Arch Linux (x86_64 and aarch64), from the [AUR](https://aur.archlinux.org/packages/zig-analyzer-bin), with an AUR helper such as yay:
+On Arch Linux (x86_64 and aarch64), from the AUR, with an AUR helper such as yay: [`zig-analyzer-bin`](https://aur.archlinux.org/packages/zig-analyzer-bin) installs the release archive, [`zig-analyzer`](https://aur.archlinux.org/packages/zig-analyzer) builds the release from source with the `zig` package:
 
 ```sh
 yay -S zig-analyzer-bin
@@ -80,7 +80,7 @@ scoop bucket add jin https://github.com/jinzhongjia/scoop-bucket
 scoop install jin/zig-analyzer
 ```
 
-Each installs the ReleaseSafe build of the latest release, with its debug information; `brew upgrade`, `yay -Syu`, or `scoop update zig-analyzer` updates it. The tap and the AUR package are updated when a release is published, the Scoop bucket within a few hours. Pre-releases are in none of them. The Emacs package can install a checked release with `M-x zig-analyzer-install-server`; see [`editors/emacs`](editors/emacs).
+Each installs the ReleaseSafe build of the latest release, with its debug information; `brew upgrade`, `yay -Syu`, or `scoop update zig-analyzer` updates it. The tap and the AUR packages are updated when a release is published, the Scoop bucket within a few hours. Pre-releases are in none of them. The Emacs package can install a checked release with `M-x zig-analyzer-install-server`; see [`editors/emacs`](editors/emacs).
 
 Each [release](https://github.com/jinzhongjia/zig-analyzer/releases) has an archive per platform (x86_64 and aarch64 on Linux, macOS, and Windows) in two builds:
 
