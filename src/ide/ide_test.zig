@@ -11528,3 +11528,71 @@ test "hover shows the hidden tag of an untagged union by optimize mode" {
         };
     }
 }
+
+test "hover shows the inferred error set of functions returning !T" {
+    const text =
+        \\const A = error{A};
+        \\const B = error{B};
+        \\fn foo() !void {
+        \\    return A.A;
+        \\}
+        \\fn bar() !void {
+        \\    try foo();
+        \\    return B.B;
+        \\}
+        \\fn none() !void {}
+        \\fn viaPtr(p: *const fn () anyerror!void) !void {
+        \\    try p();
+        \\}
+        \\fn wrap(x: anytype) !@TypeOf(x) {
+        \\    if (x == 0) return error.Zero;
+        \\    return x;
+        \\}
+        \\fn Gen(comptime T: type) type {
+        \\    return struct {
+        \\        fn get(v: T) !T {
+        \\            if (@sizeOf(T) == 1) return error.Small;
+        \\            return v;
+        \\        }
+        \\    };
+        \\}
+        \\const alias = bar;
+        \\fn run() void {
+        \\    _ = bar();
+        \\    _ = none();
+        \\    _ = viaPtr(&foo);
+        \\    _ = wrap(@as(u8, 1));
+        \\    _ = Gen(u16).get(1);
+        \\    _ = alias;
+        \\}
+        \\
+    ;
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const file = (try w.add("/p/main.zig", text)).file;
+    var ctx = w.db.beginRead(w.arena.allocator());
+    defer ctx.end();
+    var r = resolver(&w, &ctx);
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "bar() !void", "```zig\nfn bar() !void\n```\n\nerrors: `error{A,B}`" },
+        .{ "bar();", "```zig\nfn bar() !void\n```\n\nerrors: `error{A,B}`" },
+        .{ "none();", "```zig\nfn none() !void\n```\n\nerrors: `error{}`" },
+        // Propagating `anyerror` gives no members to list
+        .{ "viaPtr(&", "```zig\nfn viaPtr(p: *const fn () anyerror!void) !void\n```" },
+        // The set of a generic function depends on its instance
+        .{ "wrap(@as", "```zig\nfn wrap(x: anytype) !@TypeOf(x)\n```" },
+        // Without an instance `T` is abstract, and the set would count `error.Small` for every `T`
+        .{ "get(v", "```zig\nfn get(v: T) !T\n```" },
+        .{ "get(1)", "```zig\nfn get(v: T) !T\n```\n\nerrors: `error{}`" },
+        // The type of a constant already shows the members
+        .{ "alias;", "```zig\nconst alias: fn () error{A,B}!void\n```" },
+    };
+    for (cases) |c| {
+        const info = try hover.hover(&r, file, @intCast(std.mem.indexOf(u8, text, c[0]).?), &.{}, .count) orelse return error.NoHover;
+        testing.expectEqualStrings(c[1], info.text) catch |err| {
+            std.debug.print("at `{s}`\n", .{c[0]});
+            return err;
+        };
+    }
+}

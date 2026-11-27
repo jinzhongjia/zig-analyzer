@@ -59,6 +59,12 @@ Nothing is shown for comptime-only types (`type`, `comptime_int`, `fn () void`, 
 
 `hover.layout` (default on) turns both lines off.
 
+### Inferred error sets
+
+A function declaration's signature is shown as written, so `!T` does not say which errors the function can return. Hover on a function returning `!T` adds the members of its inferred error set after the code block, at the declaration and at references to it: `` errors: `error{A,B}` ``. The members are those the analyzer infers from the body (`ErrorSetOf`): errors that are `return`ed and errors propagated by `try`, without branches that are inactive at comptime, and with the least fixpoint for recursive functions, as the compiler computes them. They are listed in full.
+
+The line is omitted when the members cannot be determined exactly: when the set is `anyerror` or inference falls back to it, for a generic function (`anytype` or comptime parameters, or a return type that refers to a parameter), whose set depends on the instance, and for a function inside a generic function's returned container hovered without a concrete instance, whose abstract parameters could count errors that no instance returns. At a reference through a concrete instance (`Gen(u16).get`), the members are those of that instance. A constant whose value is a function shows no line, because its type already includes the members (`fn () error{A,B}!void`).
+
 ## Fields of `.zon` values
 
 Goto on a field of a value imported from a `.zon` file reads the literal from the type of the value and goes to the name in the file, including through a copy, a parameter of a generic function (one target per instance), and the items of a tuple being iterated.
