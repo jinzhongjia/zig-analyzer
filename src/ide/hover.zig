@@ -11,6 +11,7 @@ const context = @import("context.zig");
 const render = @import("../sema/render.zig");
 const queries = @import("../sema/queries.zig");
 const eval = @import("../sema/eval.zig");
+const value = @import("../sema/value.zig");
 const InternPool = @import("../sema/InternPool.zig");
 const TypedValue = InternPool.TypedValue;
 const Index = InternPool.Index;
@@ -267,6 +268,7 @@ fn writeBlock(w: *std.Io.Writer, r: *Resolver, a: context.At, def: ?Def, tv: Typ
             w.print("\n\nfqn: `{s}`", .{name}) catch return error.OutOfMemory,
         else => {},
     };
+    try writeErrors(w, r, def, tv);
     if (embed) |x| writeEmbedded(w, r.ctx.db.env.vfs.shownPath(opts.roots, r.ctx.db.env.vfs.path(x.file)), x.text) catch return error.OutOfMemory;
     if (seeded) |s| {
         w.writeAll("\n\n") catch return error.OutOfMemory;
@@ -280,6 +282,40 @@ fn writeBlock(w: *std.Io.Writer, r: *Resolver, a: context.At, def: ?Def, tv: Typ
     }
     if (def) |d| if (try context.docOf(r, d, tv)) |text| w.print("\n\n{s}", .{text}) catch return error.OutOfMemory;
     return true;
+}
+
+/// The members of the inferred error set of a function declaration returning `!T`
+/// (`errors: error{A,B}`), which its source signature does not show. Nothing when they cannot be
+/// computed, when the set is `anyerror`, or when the body is inferred under an abstract instance
+/// (a method of a generic container hovered without a concrete instance), whose members can differ
+/// from those of every real instance.
+fn writeErrors(w: *std.Io.Writer, r: *Resolver, def: ?Def, tv: TypedValue) resolve.Error!void {
+    const it = switch (def orelse return) {
+        .item => |x| x,
+        else => return,
+    };
+    if ((try r.itemTree(it.file)).items[it.item].kind != .@"fn") return;
+    const ip = r.ctx.db.env.ip;
+    const f = switch (ip.key(tv.ty)) {
+        .fn_type => |f| f,
+        else => return,
+    };
+    const err = switch (ip.key(f.ret)) {
+        .error_union_type => |eu| eu.err,
+        else => return,
+    };
+    const inst = switch (ip.key(err)) {
+        .inferred_error_set => |s| s.inst,
+        else => return,
+    };
+    if (inst) |i| {
+        if (!value.isSettled(ip, i)) return;
+    } else if (f.hasGenericParams() or f.generic_ret) return;
+    // Without an instance of its own, the body runs in the instance of its container
+    if (!value.isSettled(ip, try queries.containerType(r, try queries.memberNamespace(r, it.file, it.item), inst))) return;
+    if (try queries.errorSetOf(r, err) == null) return;
+    // `render` displays an inferred error set by its members
+    w.print("\n\nerrors: `{s}`", .{try render.typeAlloc(r, err)}) catch return error.OutOfMemory;
 }
 
 /// The instance of the container that declares the definition shown at `e`, when it is known: the
