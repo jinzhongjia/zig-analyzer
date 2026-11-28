@@ -14184,6 +14184,30 @@ test "@embedFile reads the file next to the source; missing files are unknown" {
     try testing.expectEqualStrings("usize = 2", try typeAt(&w, f.file, src, "count", 0));
 }
 
+test "@embedFile of a module name reads the root file of the imported module" {
+    var w: World = undefined;
+    try w.init();
+    defer w.deinit();
+    const shader = try w.add("/p/zig-out/vert.spv", "spv");
+    // A file with the module's name next to the source: the compiler embeds the module instead
+    _ = try w.add("/p/src/vert_spv", "relative");
+    _ = try w.add("/p/src/local.txt", "local");
+    const src =
+        \\const vertex = @embedFile("vert_spv");
+        \\const local = @embedFile("local.txt");
+    ;
+    const f = try w.add("/p/src/main.zig", src);
+    try w.setGraph(null, &.{
+        .{ .root = f.file, .imports = &.{.{ .name = "vert_spv", .module = 1 }} },
+        .{ .root = shader.file, .imports = &.{} },
+    }, &.{
+        .{ .file = f.file, .module = 0, .compile = 0 },
+        .{ .file = shader.file, .module = 1, .compile = 0 },
+    });
+    try testing.expectEqualStrings("*const [3:0]u8 = \"spv\"", try typeAt(&w, f.file, src, "vertex", 0));
+    try testing.expectEqualStrings("*const [5:0]u8 = \"local\"", try typeAt(&w, f.file, src, "local", 0));
+}
+
 test "@import of a zon file is its value in inference and comptime evaluation" {
     var w: World = undefined;
     try w.init();

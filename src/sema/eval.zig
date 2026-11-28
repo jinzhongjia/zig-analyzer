@@ -622,8 +622,8 @@ pub fn builtinValue(r: *Resolver, name: []const u8, args: []const TypedValue) Er
     return if (tv.val != null) tv else null;
 }
 
-/// `@embedFile(path)`: content of the file in the directory of `file`, with the same type as a
-/// string literal (`*const [len:0]u8`). Null when the file does not exist (see `embeddedFile`).
+/// `@embedFile(path)`: content of the file `path` names in `file` (see `Resolver.embedTarget`),
+/// with the same type as a string literal (`*const [len:0]u8`). Null when the file does not exist (see `embeddedFile`).
 pub fn embedFile(r: *Resolver, file: FileId, path: []const u8) Error!?TypedValue {
     const text = (try embeddedFile(r, file, path) orelse return null).text;
     const ip = r.ctx.db.env.ip;
@@ -635,7 +635,7 @@ pub fn embedFile(r: *Resolver, file: FileId, path: []const u8) Error!?TypedValue
 /// is authoritative; otherwise the file is read from disk (see `SourceText`). When the file does
 /// not exist the compiler reports an error, and the result is null.
 pub fn embeddedFile(r: *Resolver, file: FileId, path: []const u8) Error!?struct { file: FileId, text: []const u8 } {
-    const target = try r.relativeFile(file, path) orelse return null;
+    const target = try r.embedTarget(file, path) orelse return null;
     const source = try r.ctx.get(syntax.SourceText, target);
     // Not open, and could not be read from disk either: the file does not exist (reading an empty
     // file yields empty content)

@@ -440,6 +440,14 @@ pub const Resolver = struct {
         return graph.importTarget(file, name);
     }
 
+    /// The file `@embedFile(path)` in `file` reads: the root file of the module the file's module
+    /// imports as `path` (such as one added with `addAnonymousImport`), which the compiler prefers
+    /// over a file of the same name; otherwise the file at relative path `path`
+    pub fn embedTarget(r: *Resolver, file: FileId, path: []const u8) Error!?FileId {
+        if (try r.ctx.get(ModuleGraph.Input, {})) |graph| if (graph.importTarget(file, path)) |target| return target;
+        return r.relativeFile(file, path);
+    }
+
     /// The file at relative path `path` in the directory of `file` (`@embedFile`); null for
     /// absolute paths (the compiler rejects them)
     pub fn relativeFile(r: *Resolver, file: FileId, path: []const u8) Error!?FileId {
