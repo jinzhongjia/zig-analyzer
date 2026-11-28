@@ -121,6 +121,20 @@ function serverCommand(context: vscode.ExtensionContext): { command: string; sou
   return { command: "zig-analyzer", source: "path" };
 }
 
+/**
+ * A `LanguageClient` that suppresses error popups while the extension awaits `start()`: a start
+ * failure is reported by the extension's own message with Install Server / Open Settings / Show
+ * Output, so the client's duplicate popup is not shown. The text still reaches the output channel.
+ */
+class Client extends LanguageClient {
+  /** True while the extension awaits `start()` */
+  starting = false;
+
+  override error(message: string, data?: any, showNotification?: boolean | "force"): void {
+    super.error(message, data, this.starting ? false : showNotification ?? true);
+  }
+}
+
 async function start(context: vscode.ExtensionContext): Promise<void> {
   const { command, source } = serverCommand(context);
   clientSource = source;
@@ -146,12 +160,13 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
       },
     },
   };
-  const c = new LanguageClient(section, "zig-analyzer", serverOptions, clientOptions);
+  const c = new Client(section, "zig-analyzer", serverOptions, clientOptions);
   c.onDidChangeState((e) => updateStatus(e.newState));
   client = c;
   clientCommand = command;
   updateStatus(State.Starting);
   try {
+    c.starting = true;
     await c.start();
     // The tooltip names the version from the initialize result
     if (client === c) updateStatus(c.state);
@@ -181,6 +196,8 @@ async function start(context: vscode.ExtensionContext): Promise<void> {
           output.show(true);
         }
       });
+  } finally {
+    c.starting = false;
   }
 }
 
